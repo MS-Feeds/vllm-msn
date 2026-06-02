@@ -11,7 +11,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     get_paged_mqa_logits_metadata,
-    has_deep_gemm,
+    is_deep_gemm_supported,
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
@@ -122,7 +122,7 @@ class DeepseekV32IndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [1, 64] if current_platform.is_rocm() else [64]
+        return [1 if current_platform.is_rocm() else 64]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -288,19 +288,22 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
-        # Shared workspace for decode seq_lens. Native MTP views this as
-        # (B, max_decode_len) at runtime, keeping context_lens contiguous even
-        # when max_decode_len is smaller than next_n.
-        self.decode_seq_lens_buffer = torch.zeros(
-            (scheduler_config.max_num_batched_tokens,),
-            dtype=torch.int32,
-            device=self.device,
-        )
+        if not self.use_flattening and next_n > 1:
+            # Native MTP: 2D buffer for per-token seq_lens.
+            self.decode_seq_lens_buffer = torch.zeros(
+                (scheduler_config.max_num_seqs, next_n),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            # Flattening or no MTP: 1D buffer for expanded per-token seq_lens.
+            self.decode_seq_lens_buffer = torch.zeros(
+                (scheduler_config.max_num_batched_tokens,),
+                dtype=torch.int32,
+                device=self.device,
+            )
         self.arange_buffer = torch.arange(
-            max(
-                scheduler_config.max_num_seqs * next_n,
-                scheduler_config.max_num_batched_tokens,
-            ),
+            scheduler_config.max_num_seqs * next_n,
             dtype=torch.int32,
             device=self.device,
         )
@@ -367,8 +370,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
           Plain decode or spec-decode with 2D per-token context lengths.
 
         Returns (seq_lens, block_table, decode_lens, batch_size, requires_padding).
-        seq_lens is 1D (batch_size,) for flatten/plain, 2D (B, max_decode_len)
-        for native MTP.
+        seq_lens is 1D (batch_size,) for flatten/plain, 2D (B, next_n) for native MTP.
         """
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native and max_decode_len > 1:
@@ -449,19 +451,16 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # (requires_padding) instead.
             requires_padding = min_decode_len != max_decode_len
             if use_native and next_n > 1:
-                assert self.decode_seq_lens_buffer.dim() == 1
+                assert self.decode_seq_lens_buffer.dim() == 2
                 # (B, max_decode_len): token j attends to
                 # L - max_decode_len + j + 1 KV tokens.
-                seq_lens_buffer = self.decode_seq_lens_buffer[
-                    : num_decodes * max_decode_len
-                ].view(num_decodes, max_decode_len)
-                seq_lens_buffer[:] = (
+                self.decode_seq_lens_buffer[:num_decodes, :max_decode_len] = (
                     seq_lens.unsqueeze(1)
                     - max_decode_len
                     + 1
                     + self.offsets_buffer[:max_decode_len]
                 )
-                seq_lens = seq_lens_buffer
+                seq_lens = self.decode_seq_lens_buffer[:num_decodes, :max_decode_len]
             return seq_lens, block_table, decode_lens, num_decodes, requires_padding
 
     def build(
@@ -608,8 +607,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if seq_lens.dim() == 1:
                 seq_lens = seq_lens.unsqueeze(-1)
 
-            # DeepGEMM is required for the paged MQA logits on CUDA devices
-            if current_platform.is_cuda() and has_deep_gemm():
+            # DeepGEMM's `get_paged_mqa_logits_metadata` asserts SM90+ at
+            # the C++ level; skip on platforms where DeepGEMM hyperconnection
+            # isn't usable (the SM80 path consumes the Triton fp8 fallback,
+            # which doesn't need this scheduler metadata).
+            if current_platform.is_cuda() and is_deep_gemm_supported():
                 self.scheduler_metadata_buffer[:] = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.storage_block_size,

@@ -1,0 +1,1150 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Triton kernels for DeepseekV4 paged K-cache management and sparse-attention index
+preparation.
+
+- quantize_and_insert_k_cache: quantize bf16 K to UE8M0 FP8 and insert into
+  the paged cache.
+- dequantize_and_gather_k_cache: gather and dequantize FP8 K from the paged
+  cache for sparse/SWA prefill.
+- compute_global_topk_indices_and_lens: map local topk indices to global KV
+  cache slots and count valid entries.
+- combine_topk_swa_indices: concatenate topk compressed indices with SWA
+  window indices for sparse prefill.
+"""
+
+import torch
+
+from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.mqa_logits_triton import _decode_e4m3fn
+
+
+@triton.jit
+def quantize_and_insert_k_kernel(
+    # Input tensors
+    k_ptr,  # [num_tokens, 512] bf16
+    slot_mapping_ptr,  # [num_tokens] int64
+    # Output tensor
+    k_cache_ptr,  # [num_blocks, block_bytes] as uint8 (flattened view)
+    # Dimensions
+    num_tokens,
+    input_dim: tl.constexpr,  # 512
+    fp8_dim: tl.constexpr,  # 448
+    bf16_dim: tl.constexpr,  # 64
+    scale_dim: tl.constexpr,  # 8
+    quant_block: tl.constexpr,  # 64 (quantization block size)
+    cache_block_size: tl.constexpr,  # 64 (paged cache block size)
+    token_data_size: tl.constexpr,  # 576 bytes per token data
+    block_stride: tl.constexpr,  # total bytes per block (padded)
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,  # 8 (7 real + 1 padding)
+):
+    """
+    Quantize K tensor and insert into paged K cache.
+
+    K Cache block layout (block_size=64 tokens):
+    - [0, 64*576): Token data, each token has 448 fp8 + 128 bf16
+    - [64*576, 64*576 + 64*8): Scales, each token has 8 uint8 scales
+    - [64*576 + 64*8, block_stride): Padding
+
+    One program per token.
+    """
+    pid = tl.program_id(0)
+
+    if pid >= num_tokens:
+        return
+
+    # Get slot mapping
+    slot_idx = tl.load(slot_mapping_ptr + pid)
+    if slot_idx == -1:
+        return
+
+    block_idx = slot_idx // cache_block_size
+    pos_in_block = slot_idx % cache_block_size
+
+    # Input pointer for this token
+    input_row_ptr = k_ptr + pid * input_dim
+
+    # int64: block_idx * block_stride can exceed 2^31 with many KV-cache blocks
+    # (e.g. >= 57K at block_stride ~37K). Matches gather path below.
+    cache_block_ptr = k_cache_ptr + block_idx.to(tl.int64) * block_stride
+
+    # Token data pointer: token data is stored contiguously at start of block
+    # Each token's data is at offset pos_in_block * token_data_size
+    token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+
+    # Scale pointer: scales are stored after ALL token data in the block
+    # Scale for this token is at offset (64 * 576) + pos_in_block * 8
+    token_scale_ptr = (
+        cache_block_ptr + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    # Token data layout: [0:448] fp8, [448:576] bf16
+    token_fp8_ptr = token_data_ptr
+    token_bf16_ptr = token_data_ptr + fp8_dim
+
+    # ========== Quantize and store FP8 portion (first 448 elements) ==========
+    # Using UE8M0 quantization strategy (scale is power of 2, stored as uint8 exponent)
+    for qblock_idx in tl.static_range(n_quant_blocks):
+        qblock_start = qblock_idx * quant_block
+
+        if qblock_start < fp8_dim:
+            offsets = qblock_start + tl.arange(0, quant_block)
+            mask = offsets < fp8_dim
+
+            # Load bf16 input
+            x = tl.load(input_row_ptr + offsets, mask=mask, other=0.0)
+
+            # Compute absmax scale (same as CUDA kernel)
+            abs_x = tl.abs(x)
+            block_max = tl.max(abs_x, axis=0)
+            block_max = tl.maximum(block_max, 1e-4)  # Match CUDA: fmaxf(amax, 1e-4)
+
+            # UE8M0: Round scale UP to next power of 2
+            # scale = 2^ceil(log2(block_max / fp8_max))
+            raw_scale = block_max / fp8_max
+            log_scale = tl.log2(raw_scale)
+            exponent = tl.ceil(log_scale)  # Round UP to next integer exponent
+            scale = tl.exp2(exponent)  # scale = 2^exponent (power of 2)
+
+            # Quantize to fp8: fp8_value = bf16_value / scale
+            x_scaled = x / scale
+            x_clamped = tl.clamp(x_scaled, -fp8_max, fp8_max)
+
+            # Convert to fp8, then bitcast to uint8 for storage
+            x_fp8 = x_clamped.to(tl.float8e4nv)
+            x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+
+            # Store as uint8 (1 byte each)
+            tl.store(token_fp8_ptr + offsets, x_uint8, mask=mask)
+
+            # UE8M0 scale encoding: stored_value = exponent + 127 (bias)
+            # During dequant: scale = 2^(stored_value - 127)
+            encoded_scale = exponent + 127.0
+            encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
+            tl.store(token_scale_ptr + qblock_idx, encoded_scale.to(tl.uint8))
+
+    # Padding scale at index 7
+    tl.store(token_scale_ptr + 7, tl.zeros((), dtype=tl.uint8))
+
+    # ========== Store BF16 portion (last 64 elements, no quantization) ==========
+    bf16_input_offset = fp8_dim
+
+    # Process bf16 in chunks of 16
+    bf16_out_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+    for i in tl.static_range(bf16_dim // 16):
+        chunk_offsets = i * 16 + tl.arange(0, 16)
+        bf16_vals = tl.load(input_row_ptr + bf16_input_offset + chunk_offsets)
+        tl.store(bf16_out_ptr + chunk_offsets, bf16_vals)
+
+
+def quantize_and_insert_k_cache(
+    k: torch.Tensor,  # [num_tokens, 512] bf16
+    k_cache: torch.Tensor,  # [num_blocks, block_bytes] uint8
+    slot_mapping: torch.Tensor,  # [num_tokens] int64
+    block_size: int = 64,
+    is_ue8m0: bool = True,
+):
+    """
+    Quantize K tensor and insert into paged K cache.
+
+    K Cache block layout (block_size=64 tokens):
+    - First 64 * 576 = 36864 bytes: Token data
+      - Each token: 448 bytes (fp8) + 128 bytes (bf16)
+    - Next 64 * 8 = 512 bytes: Scales
+      - Each token: 8 bytes (uint8 scales, 7 real + 1 padding)
+    - Padded to multiple of 576
+    """
+    assert k.dim() == 2 and k.shape[1] == 512, (
+        f"K must be [num_tokens, 512], got {k.shape}"
+    )
+    assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
+    assert is_ue8m0, "Only support ue8m0 quantization."
+
+    # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
+    # padding. Always use slot_mapping.shape[0] as the token count.
+    num_tokens = slot_mapping.shape[0]
+    block_stride = k_cache.stride(0)  # bytes per block
+
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+
+    grid = (num_tokens,)
+
+    quantize_and_insert_k_kernel[grid](
+        k,
+        slot_mapping,
+        k_cache,
+        num_tokens,
+        input_dim=512,
+        fp8_dim=TOKEN_FP8_DIM,
+        bf16_dim=TOKEN_BF16_DIM,
+        scale_dim=TOKEN_SCALE_DIM,
+        quant_block=QUANT_BLOCK_SIZE,
+        cache_block_size=block_size,
+        token_data_size=TOKEN_DATA_SIZE,
+        block_stride=block_stride,
+        fp8_max=FP8_MAX,
+        n_quant_blocks=8,
+    )
+
+
+@triton.jit
+def _dequantize_and_gather_k_kernel(
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    k_cache_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    offset,
+    gather_lens_ptr,
+    # Constants
+    max_blocks_per_seq: tl.constexpr,
+    fp8_dim: tl.constexpr,  # 448
+    bf16_dim: tl.constexpr,  # 64
+    scale_dim: tl.constexpr,  # 8
+    quant_block: tl.constexpr,  # 64 (quantization block size)
+    cache_block_size: tl.constexpr,  # 64 or 128 (paged cache block size)
+    token_data_size: tl.constexpr,  # 576 bytes per token data
+    block_stride: tl.constexpr,  # total bytes per block (padded) int32
+    output_dim: tl.constexpr,  # 512
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,  # 7 real blocks
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    if gather_lens_ptr is not None:  # noqa: SIM108
+        gather_len = tl.load(gather_lens_ptr + batch_idx)
+    else:
+        # Gather all tokens
+        gather_len = seq_len
+    start_pos = seq_len - gather_len
+
+    for i in range(worker_id, gather_len, num_workers):
+        # Calculate the actual token index in the sequence
+        pos = start_pos + i
+
+        # Calculate which block and position within block
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+
+        # Get physical block index from block table
+        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
+        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
+
+        # int64: physical_block_idx * block_stride can exceed 2^31 with many
+        # KV-cache blocks (e.g. >= 57K at block_stride ~37K).
+        cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+
+        # Token data pointer
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+
+        # Scale pointer: after all token data
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
+
+        # Token data layout: [0:448] fp8, [448:576] bf16
+        token_fp8_ptr = token_data_ptr
+        token_bf16_ptr = token_data_ptr + fp8_dim
+
+        # Output pointer for this token (flattened)
+        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+
+        # ========== Dequantize FP8 portion using UE8M0 ==========
+        for qblock_idx in tl.static_range(n_quant_blocks):
+            qblock_start = qblock_idx * quant_block
+
+            if qblock_start < fp8_dim:
+                offsets = qblock_start + tl.arange(0, quant_block)
+                mask = offsets < fp8_dim
+
+                # Load quantized fp8 values (stored as uint8)
+                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+
+                # Bitcast uint8 back to fp8
+                x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+
+                # Convert fp8 to float32 for computation
+                x_float = x_fp8.to(tl.float32)
+
+                # Load and decode UE8M0 scale
+                # UE8M0: scale = 2^(stored_value - 127)
+                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+                exponent = encoded_scale.to(tl.float32) - 127.0
+                scale = tl.exp2(exponent)
+
+                # Dequantize: bf16_value = fp8_value * scale
+                x_dequant = x_float * scale
+
+                # Store as bf16
+                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+
+        # ========== Copy BF16 portion directly ==========
+        bf16_output_offset = fp8_dim  # After 448 elements in output
+
+        # Read bf16 from cache
+        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+
+        # Process in chunks of 16
+        for j in tl.static_range(bf16_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
+            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+
+
+def _dequantize_and_gather_k_cache_torch(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """SM80 PyTorch fallback. Vectorised — single batched gather across all
+    (req, token_in_seq) pairs, then dequant + scatter into `out`."""
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+    OUTPUT_DIM = 512
+    N_NOPE_BLOCKS = TOKEN_FP8_DIM // QUANT_BLOCK_SIZE
+
+    device = out.device
+    num_reqs = seq_lens.shape[0]
+    if num_reqs == 0:
+        return
+
+    k_cache_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+    n_blocks = k_cache_u8.shape[0]
+    block_stride = k_cache_u8[0].numel()
+    flat = k_cache_u8.view(n_blocks, block_stride)
+
+    effective_lens = (
+        gather_lens.to(torch.int64)
+        if gather_lens is not None
+        else seq_lens.to(torch.int64)
+    )
+    if effective_lens.numel() == 0:
+        return
+    max_len = int(effective_lens.max().item())
+    if max_len <= 0:
+        return
+
+    t_grid = torch.arange(max_len, device=device, dtype=torch.int64)
+    valid = t_grid.unsqueeze(0) < effective_lens.unsqueeze(-1)  # (R, max_len)
+    req_idx_flat, t_flat = valid.nonzero(as_tuple=True)
+    if req_idx_flat.numel() == 0:
+        return
+
+    block_indices = t_flat // block_size
+    block_offsets = t_flat % block_size
+    block_numbers = block_table[req_idx_flat, block_indices].to(torch.int64)
+
+    t_off = block_offsets * TOKEN_DATA_SIZE
+    s_off = block_size * TOKEN_DATA_SIZE + block_offsets * TOKEN_SCALE_DIM
+
+    fp8_idx = t_off.unsqueeze(-1) + torch.arange(
+        TOKEN_FP8_DIM, device=device, dtype=torch.int64
+    )
+    bf16_idx = (t_off + TOKEN_FP8_DIM).unsqueeze(-1) + torch.arange(
+        TOKEN_BF16_DIM * 2, device=device, dtype=torch.int64
+    )
+    scale_idx = s_off.unsqueeze(-1) + torch.arange(
+        N_NOPE_BLOCKS, device=device, dtype=torch.int64
+    )
+
+    fp8_bytes = flat[block_numbers.unsqueeze(-1), fp8_idx].view(torch.float8_e4m3fn)
+    bf16_bytes_raw = flat[block_numbers.unsqueeze(-1), bf16_idx].contiguous()
+    bf16_view = bf16_bytes_raw.view(torch.bfloat16).view(-1, TOKEN_BF16_DIM)
+    scales_u8 = flat[block_numbers.unsqueeze(-1), scale_idx]
+
+    x_fp32 = fp8_bytes.to(torch.float32).view(-1, N_NOPE_BLOCKS, QUANT_BLOCK_SIZE)
+    scale_factor = torch.pow(2.0, scales_u8.to(torch.float32) - 127.0).unsqueeze(-1)
+    dequant_fp8 = (x_fp32 * scale_factor).view(-1, TOKEN_FP8_DIM).to(torch.bfloat16)
+
+    full = torch.empty(
+        (req_idx_flat.shape[0], OUTPUT_DIM),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    full[:, :TOKEN_FP8_DIM] = dequant_fp8
+    full[:, TOKEN_FP8_DIM:] = bf16_view
+
+    out[req_idx_flat, t_flat + offset, :] = full
+
+
+@triton.jit
+def _dequantize_and_gather_k_kernel_sm80(
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    k_cache_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    offset,
+    gather_lens_ptr,
+    max_blocks_per_seq: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    bf16_dim: tl.constexpr,
+    scale_dim: tl.constexpr,
+    quant_block: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    token_data_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    output_dim: tl.constexpr,
+    fp8_max: tl.constexpr,
+    n_quant_blocks: tl.constexpr,
+):
+    """SM80 variant of `_dequantize_and_gather_k_kernel`. Replaces the
+    `tl.float8e4nv` bitcast with the software `_decode_e4m3fn` decoder
+    from PR 38476 (uint8 → fp32 in ~6 ops/elt). Same launch shape and
+    layout as the SM90+ kernel."""
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    if gather_lens_ptr is not None:  # noqa: SIM108
+        gather_len = tl.load(gather_lens_ptr + batch_idx)
+    else:
+        gather_len = seq_len
+    start_pos = seq_len - gather_len
+
+    for i in range(worker_id, gather_len, num_workers):
+        pos = start_pos + i
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+
+        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
+        physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)
+        cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
+        token_fp8_ptr = token_data_ptr
+        token_bf16_ptr = token_data_ptr + fp8_dim
+        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+
+        for qblock_idx in tl.static_range(n_quant_blocks):
+            qblock_start = qblock_idx * quant_block
+            if qblock_start < fp8_dim:
+                offsets = qblock_start + tl.arange(0, quant_block)
+                mask = offsets < fp8_dim
+                x_uint8 = tl.load(token_fp8_ptr + offsets, mask=mask, other=0)
+                # Software fp8e4nv → fp32 (no tl.float8e4nv reference).
+                x_float = _decode_e4m3fn(x_uint8)
+                encoded_scale = tl.load(token_scale_ptr + qblock_idx)
+                exponent = encoded_scale.to(tl.float32) - 127.0
+                scale = tl.exp2(exponent)
+                x_dequant = x_float * scale
+                tl.store(
+                    output_row_ptr + offsets,
+                    x_dequant.to(tl.bfloat16),
+                    mask=mask,
+                )
+
+        bf16_output_offset = fp8_dim
+        bf16_cache_ptr = token_bf16_ptr.to(tl.pointer_type(tl.bfloat16))
+        for j in tl.static_range(bf16_dim // 16):
+            chunk_offsets = j * 16 + tl.arange(0, 16)
+            bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
+            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+
+
+def _dequantize_and_gather_k_cache_triton(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """SM80 Triton dispatch — uses _decode_e4m3fn instead of the
+    fp8e4nv bitcast that Triton refuses to compile on SM80."""
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+
+    num_reqs = seq_lens.shape[0]
+    NUM_WORKERS = 128
+    _dequantize_and_gather_k_kernel_sm80[(num_reqs, NUM_WORKERS)](
+        out,
+        out.stride(0),
+        out.stride(1),
+        k_cache,
+        seq_lens,
+        block_table,
+        offset,
+        gather_lens,
+        max_blocks_per_seq=block_table.shape[-1],
+        fp8_dim=TOKEN_FP8_DIM,
+        bf16_dim=TOKEN_BF16_DIM,
+        scale_dim=TOKEN_SCALE_DIM,
+        quant_block=QUANT_BLOCK_SIZE,
+        cache_block_size=block_size,
+        token_data_size=TOKEN_DATA_SIZE,
+        block_stride=k_cache.stride(0),
+        output_dim=512,
+        fp8_max=FP8_MAX,
+        n_quant_blocks=7,
+    )
+
+
+def _dequant_gather_sm80_op(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    _dequantize_and_gather_k_cache_triton(
+        out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+    )
+
+
+def _dequant_gather_sm80_op_fake(
+    out: torch.Tensor,
+    k_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor | None,
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    return None
+
+
+from vllm.utils.torch_utils import direct_register_custom_op  # noqa: E402
+
+direct_register_custom_op(
+    op_name="deepseek_v4_dequant_gather_sm80",
+    op_func=_dequant_gather_sm80_op,
+    mutates_args=["out"],
+    fake_impl=_dequant_gather_sm80_op_fake,
+)
+
+
+def dequantize_and_gather_k_cache(
+    # [num_reqs, max_num_tokens, head_size]
+    out: torch.Tensor,
+    # [num_blocks, block_size, head_bytes]
+    k_cache: torch.Tensor,
+    # [num_reqs]
+    seq_lens: torch.Tensor,
+    # [num_reqs]
+    gather_lens: torch.Tensor | None,
+    # [num_reqs, max_blocks_per_seq]
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    from vllm.utils.deep_gemm import use_dsv4_reference_kernels
+
+    if use_dsv4_reference_kernels():
+        # SM80: Triton can't bitcast uint8 → float8e4nv; route through the
+        # custom op so cudagraph capture splits at this call site (the body
+        # uses .max().item() and .nonzero(), forbidden during capture).
+        torch.ops.vllm.deepseek_v4_dequant_gather_sm80(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
+
+    TOKEN_FP8_DIM = 448
+    TOKEN_BF16_DIM = 64
+    TOKEN_SCALE_DIM = 8
+    QUANT_BLOCK_SIZE = 64
+    FP8_MAX = 448.0
+    TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
+
+    num_reqs = seq_lens.shape[0]
+    NUM_WORKERS = 128
+    _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
+        out,
+        out.stride(0),
+        out.stride(1),
+        k_cache,
+        seq_lens,
+        block_table,
+        offset,
+        gather_lens,
+        max_blocks_per_seq=block_table.shape[-1],
+        fp8_dim=TOKEN_FP8_DIM,
+        bf16_dim=TOKEN_BF16_DIM,
+        scale_dim=TOKEN_SCALE_DIM,
+        quant_block=QUANT_BLOCK_SIZE,
+        cache_block_size=block_size,
+        token_data_size=TOKEN_DATA_SIZE,
+        block_stride=k_cache.stride(0),
+        output_dim=512,
+        fp8_max=FP8_MAX,
+        n_quant_blocks=7,
+    )
+
+
+@triton.jit
+def _flat_index_dequant_gather_blocked_kernel(
+    cache_ptr,  # uint8 [n_blocks, block_stride]
+    indices_ptr,  # int64 [N]
+    out_ptr,  # bf16 [N, head_dim]
+    n_blocks,
+    block_stride: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    rope_bytes: tl.constexpr,  # rope_dim * 2
+    head_dim: tl.constexpr,
+    n_quant_blocks: tl.constexpr,
+    quant_block: tl.constexpr,
+):
+    """One row per program. Mirror existing `_dequantize_and_gather_k_kernel_sm80`
+    layout assumptions, but indexed by an arbitrary flat slot id rather than
+    sequential per-seq positions. Negative or out-of-range slot ids produce
+    zero rows."""
+    pid = tl.program_id(0)
+    flat_idx = tl.load(indices_ptr + pid)
+    cache_capacity = n_blocks * cache_block_size
+    valid = (flat_idx >= 0) & (flat_idx < cache_capacity)
+    safe_idx = tl.where(valid, flat_idx, 0)
+    block_idx = safe_idx // cache_block_size
+    pos_in_block = safe_idx % cache_block_size
+
+    token_data_size = fp8_dim + rope_bytes
+    scale_dim = n_quant_blocks + 1
+
+    block_base = cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data = block_base + pos_in_block * token_data_size
+    token_scale = (
+        block_base + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    out_row = out_ptr + pid * head_dim
+
+    for qb in tl.static_range(n_quant_blocks):
+        offsets = qb * quant_block + tl.arange(0, quant_block)
+        offset_mask = offsets < fp8_dim
+        x_u8 = tl.load(token_data + offsets, mask=offset_mask, other=0)
+        x_dequant = _decode_e4m3fn(x_u8)
+        scale_u8 = tl.load(token_scale + qb)
+        scale = tl.exp2(scale_u8.to(tl.float32) - 127.0)
+        x_bf16 = (x_dequant * scale).to(tl.bfloat16)
+        x_bf16 = tl.where(valid, x_bf16, tl.zeros_like(x_bf16))
+        tl.store(out_row + offsets, x_bf16, mask=offset_mask)
+
+    bf16_src = (token_data + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+    out_bf16 = out_row + fp8_dim
+    for j in tl.static_range(rope_bytes // (2 * 16)):
+        chunk_offsets = j * 16 + tl.arange(0, 16)
+        bf16_vals = tl.load(bf16_src + chunk_offsets)
+        bf16_vals = tl.where(valid, bf16_vals, tl.zeros_like(bf16_vals))
+        tl.store(out_bf16 + chunk_offsets, bf16_vals)
+
+
+def flat_index_dequant_gather_blocked(
+    kv_cache: torch.Tensor,
+    flat_indices: torch.Tensor,
+    block_size: int,
+    nope_dim: int,
+    rope_dim: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Gather and dequantise K vectors at arbitrary flat indices
+    (block_idx * block_size + pos_in_block) directly from the paged FP8
+    K-cache. Returns (N, head_dim) bf16; negative or out-of-range indices
+    produce zero rows. Replaces a 20-op PyTorch implementation in
+    ``DeepseekV4MLAAttention._gather_dequant_blocked_k_at_indices``."""
+    assert nope_dim % 64 == 0, "FP8 quant block size is 64"
+    assert head_dim == nope_dim + rope_dim
+    assert flat_indices.dim() == 1
+
+    n = flat_indices.shape[0]
+    device = kv_cache.device
+    out = torch.empty((n, head_dim), dtype=torch.bfloat16, device=device)
+    if n == 0:
+        return out
+
+    cache_u8 = kv_cache.view(torch.uint8) if kv_cache.dtype != torch.uint8 else kv_cache
+    n_blocks = cache_u8.shape[0]
+    # IMPORTANT: use stride(0), not numel — the SWA cache has stride padding
+    # (e.g. (n_blocks, 64, 584) uint8 with stride(0)=37440 vs numel
+    # 64*584=37376). PyTorch's fancy indexing is stride-aware so the
+    # PyTorch reference path works either way; Triton does raw pointer
+    # arithmetic and silently reads from wrong offsets if we use numel.
+    block_stride = cache_u8.stride(0)
+
+    if flat_indices.dtype == torch.int64:
+        indices_i64 = flat_indices
+    else:
+        indices_i64 = flat_indices.to(torch.int64)
+
+    n_quant_blocks = nope_dim // 64
+    _flat_index_dequant_gather_blocked_kernel[(n,)](
+        cache_u8,
+        indices_i64,
+        out,
+        n_blocks,
+        block_stride=block_stride,
+        cache_block_size=block_size,
+        fp8_dim=nope_dim,
+        rope_bytes=rope_dim * 2,
+        head_dim=head_dim,
+        n_quant_blocks=n_quant_blocks,
+        quant_block=64,
+    )
+    return out
+
+
+@triton.jit
+def _gather_with_mask_kernel(
+    cache_ptr,           # uint8 [n_blocks, block_stride]
+    indices_ptr,         # int64 [B*topk_in]   (per-scope flat indices)
+    topk_lens_ptr,       # int32 [B] or dummy when HAS_TOPK_LENS=False
+    out_ptr,             # bf16 [B, total_topk, head_dim]
+    mask_ptr,            # bool [B, total_topk] (writes True=invalid)
+    n_blocks,
+    block_stride: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    fp8_dim: tl.constexpr,
+    rope_bytes: tl.constexpr,
+    head_dim: tl.constexpr,
+    topk_in: tl.constexpr,         # per-scope topk
+    total_topk: tl.constexpr,      # merged topk (swa_topk + extra_topk)
+    slot_offset: tl.constexpr,     # where this scope's slots start in merged
+    n_quant_blocks: tl.constexpr,
+    quant_block: tl.constexpr,
+    HAS_TOPK_LENS: tl.constexpr,
+):
+    """Gather + per-row dequant + write merged invalid_mask in a single launch.
+
+    Replaces the gather + (indices == -1) + (arange >= topk_lens) + or +
+    (torch.cat) chain in ``_ref_sparse_attn_decode_gather`` with one
+    kernel per scope. Each scope writes into slots
+    [slot_offset, slot_offset + topk_in) of the merged buffer; the SWA
+    case uses slot_offset=0, total_topk=swa_topk+extra_topk; the
+    extra-KV case uses slot_offset=swa_topk."""
+    pid = tl.program_id(0)
+    flat_idx = tl.load(indices_ptr + pid)
+
+    token_id = pid // topk_in
+    slot_in = pid % topk_in
+    dst_slot = slot_offset + slot_in
+    dst_row = token_id * total_topk + dst_slot
+
+    cache_capacity = n_blocks * cache_block_size
+    is_padding = flat_idx == -1
+    is_in_range = (flat_idx >= 0) & (flat_idx < cache_capacity)
+
+    if HAS_TOPK_LENS:
+        topk_len = tl.load(topk_lens_ptr + token_id).to(tl.int64)
+        is_beyond = slot_in.to(tl.int64) >= topk_len
+    else:
+        is_beyond = False
+
+    invalid = is_padding | is_beyond
+    tl.store(mask_ptr + dst_row, invalid)
+
+    safe_idx = tl.where(is_in_range, flat_idx, 0)
+    block_idx = safe_idx // cache_block_size
+    pos_in_block = safe_idx % cache_block_size
+
+    token_data_size = fp8_dim + rope_bytes
+    scale_dim = n_quant_blocks + 1
+
+    block_base = cache_ptr + block_idx.to(tl.int64) * block_stride
+    token_data = block_base + pos_in_block * token_data_size
+    token_scale = (
+        block_base + cache_block_size * token_data_size + pos_in_block * scale_dim
+    )
+
+    out_row = out_ptr + dst_row * head_dim
+
+    for qb in tl.static_range(n_quant_blocks):
+        offsets = qb * quant_block + tl.arange(0, quant_block)
+        offset_mask = offsets < fp8_dim
+        x_u8 = tl.load(token_data + offsets, mask=offset_mask, other=0)
+        x_dequant = _decode_e4m3fn(x_u8)
+        scale_u8 = tl.load(token_scale + qb)
+        scale = tl.exp2(scale_u8.to(tl.float32) - 127.0)
+        x_bf16 = (x_dequant * scale).to(tl.bfloat16)
+        x_bf16 = tl.where(is_in_range, x_bf16, tl.zeros_like(x_bf16))
+        tl.store(out_row + offsets, x_bf16, mask=offset_mask)
+
+    bf16_src = (token_data + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+    out_bf16 = out_row + fp8_dim
+    for j in tl.static_range(rope_bytes // (2 * 16)):
+        chunk_offsets = j * 16 + tl.arange(0, 16)
+        bf16_vals = tl.load(bf16_src + chunk_offsets)
+        bf16_vals = tl.where(is_in_range, bf16_vals, tl.zeros_like(bf16_vals))
+        tl.store(out_bf16 + chunk_offsets, bf16_vals)
+
+
+def gather_dequant_two_scopes_with_mask(
+    swa_kv_cache: torch.Tensor,
+    swa_block_size: int,
+    swa_indices: torch.Tensor,            # (B*S, swa_topk) int64 (or castable)
+    swa_topk_length: torch.Tensor | None,  # (B*S,) or None
+    extra_kv_cache: torch.Tensor | None,
+    extra_block_size: int,
+    extra_indices: torch.Tensor | None,    # (B*S, extra_topk) or None
+    extra_topk_length: torch.Tensor | None,
+    nope_dim: int,
+    rope_dim: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run gather + invalid-mask production for SWA and (optionally) extra
+    KV in two kernel launches that write into a single pre-allocated
+    merged buffer. Replaces the two gather wrappers + ``indices == -1`` +
+    ``arange >= topk_lens`` + ``invalid_mask |=`` + two ``torch.cat``s
+    (8 launches in the dual-scope case, 4 in the SWA-only case) with
+    just one or two launches.
+
+    Both indices tensors must be (..., per-scope-topk); the leading dims
+    flatten to a per-token batch B (= b * s_q on the caller side).
+    Returns ``(gathered_merged (B, total_topk, head_dim) bf16,
+    invalid_mask (B, total_topk) bool)``."""
+    assert nope_dim % 64 == 0
+    assert head_dim == nope_dim + rope_dim
+    n_quant_blocks = nope_dim // 64
+
+    swa_indices_flat = swa_indices.reshape(swa_indices.shape[0], -1)
+    n_tokens, swa_topk = swa_indices_flat.shape
+
+    if extra_indices is not None and extra_kv_cache is not None:
+        extra_indices_flat = extra_indices.reshape(extra_indices.shape[0], -1)
+        assert extra_indices_flat.shape[0] == n_tokens
+        extra_topk = extra_indices_flat.shape[1]
+    else:
+        extra_indices_flat = None
+        extra_topk = 0
+
+    total_topk = swa_topk + extra_topk
+
+    device = swa_kv_cache.device
+    gathered = torch.empty(
+        (n_tokens, total_topk, head_dim), dtype=torch.bfloat16, device=device
+    )
+    invalid_mask = torch.empty(
+        (n_tokens, total_topk), dtype=torch.bool, device=device
+    )
+
+    if n_tokens == 0:
+        return gathered, invalid_mask
+
+    def _to_i64(t: torch.Tensor) -> torch.Tensor:
+        return t if t.dtype == torch.int64 else t.to(torch.int64)
+
+    swa_cache_u8 = (
+        swa_kv_cache.view(torch.uint8)
+        if swa_kv_cache.dtype != torch.uint8
+        else swa_kv_cache
+    )
+    swa_block_stride = swa_cache_u8.stride(0)
+    swa_n_blocks = swa_cache_u8.shape[0]
+    swa_idx64 = _to_i64(swa_indices_flat).reshape(-1)
+
+    swa_lens = swa_topk_length
+    has_swa_lens = swa_lens is not None
+    if has_swa_lens:
+        swa_lens = swa_lens.reshape(n_tokens)
+        if swa_lens.dtype != torch.int32:
+            swa_lens = swa_lens.to(torch.int32)
+    else:
+        swa_lens = torch.empty(0, dtype=torch.int32, device=device)
+
+    _gather_with_mask_kernel[(n_tokens * swa_topk,)](
+        swa_cache_u8,
+        swa_idx64,
+        swa_lens,
+        gathered,
+        invalid_mask,
+        swa_n_blocks,
+        block_stride=swa_block_stride,
+        cache_block_size=swa_block_size,
+        fp8_dim=nope_dim,
+        rope_bytes=rope_dim * 2,
+        head_dim=head_dim,
+        topk_in=swa_topk,
+        total_topk=total_topk,
+        slot_offset=0,
+        n_quant_blocks=n_quant_blocks,
+        quant_block=64,
+        HAS_TOPK_LENS=has_swa_lens,
+    )
+
+    if extra_topk > 0:
+        assert extra_indices_flat is not None
+        assert extra_kv_cache is not None
+        extra_cache_u8 = (
+            extra_kv_cache.view(torch.uint8)
+            if extra_kv_cache.dtype != torch.uint8
+            else extra_kv_cache
+        )
+        extra_block_stride = extra_cache_u8.stride(0)
+        extra_n_blocks = extra_cache_u8.shape[0]
+        extra_idx64 = _to_i64(extra_indices_flat).reshape(-1)
+
+        extra_lens = extra_topk_length
+        has_extra_lens = extra_lens is not None
+        if has_extra_lens:
+            extra_lens = extra_lens.reshape(n_tokens)
+            if extra_lens.dtype != torch.int32:
+                extra_lens = extra_lens.to(torch.int32)
+        else:
+            extra_lens = torch.empty(0, dtype=torch.int32, device=device)
+
+        _gather_with_mask_kernel[(n_tokens * extra_topk,)](
+            extra_cache_u8,
+            extra_idx64,
+            extra_lens,
+            gathered,
+            invalid_mask,
+            extra_n_blocks,
+            block_stride=extra_block_stride,
+            cache_block_size=extra_block_size,
+            fp8_dim=nope_dim,
+            rope_bytes=rope_dim * 2,
+            head_dim=head_dim,
+            topk_in=extra_topk,
+            total_topk=total_topk,
+            slot_offset=swa_topk,
+            n_quant_blocks=n_quant_blocks,
+            quant_block=64,
+            HAS_TOPK_LENS=has_extra_lens,
+        )
+
+    return gathered, invalid_mask
+
+
+def compute_global_topk_indices_and_lens(
+    topk_indices: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    is_valid_token: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map local topk indices to global KV cache slots and count valid entries.
+
+    Fuses three operations into a single kernel:
+    1. Block-table lookup (local index → global slot id)
+    2. Valid-entry counting (topk_lens per token)
+    3. Masking padding tokens to length 0
+    """
+    num_tokens = topk_indices.shape[0]
+    global_topk_indices = torch.empty_like(topk_indices)
+    topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
+    _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
+        global_topk_indices,
+        global_topk_indices.stride(0),
+        topk_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        topk_indices.shape[-1],
+        token_to_req_indices,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        is_valid_token,
+        TRITON_BLOCK_SIZE=1024,
+    )
+    return global_topk_indices, topk_lens
+
+
+@triton.jit
+def _compute_global_topk_indices_and_lens_kernel(
+    global_topk_indices_ptr,
+    global_topk_indices_stride,
+    topk_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    topk,
+    token_to_req_indices_ptr,
+    block_table_ptr,
+    block_table_stride,
+    block_size,
+    is_valid_token_ptr,
+    TRITON_BLOCK_SIZE: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    is_valid_token = tl.load(is_valid_token_ptr + token_idx)
+    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
+
+    count = tl.zeros((), dtype=tl.int32)
+    for i in range(0, topk, TRITON_BLOCK_SIZE):
+        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
+        mask = offset < topk
+
+        local_idx = tl.load(
+            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            mask=mask,
+            other=-1,
+        )
+        is_valid = local_idx >= 0
+
+        block_indices = local_idx // block_size
+        block_numbers = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_indices,
+            mask=mask & is_valid,
+        )
+        block_offsets = local_idx % block_size
+
+        slot_ids = block_numbers * block_size + block_offsets
+        slot_ids = tl.where(is_valid, slot_ids, -1)
+        tl.store(
+            global_topk_indices_ptr + token_idx * global_topk_indices_stride + offset,
+            slot_ids,
+            mask=mask,
+        )
+        count += tl.sum(is_valid.to(tl.int32), axis=0)
+
+    # Zero out length for padding tokens.
+    tl.store(topk_lens_ptr + token_idx, tl.where(is_valid_token, count, 0))
+
+
+# FlashMLA sparse prefill asserts `params.topk % B_TOPK == 0` (see
+# flashmla/csrc/sm100/prefill/sparse/fwd/head{64,128}/phase1.cuh). B_TOPK is
+# 64 for the h_q=64 kernel and 128 for h_q=128; pad to 128 to satisfy both.
+# The extra slots stay as -1 sentinels and `combined_lens` caps the valid
+# range via `topk_length`, so padding is a no-op at kernel level.
+_SPARSE_PREFILL_TOPK_ALIGNMENT = 128
+
+
+def combine_topk_swa_indices(
+    topk_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens: torch.Tensor,
+    gather_lens: torch.Tensor,
+    window_size: int,
+    compress_ratio: int,
+    topk: int,
+    M: int,
+    N: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = topk_indices.shape[0]
+    num_reqs = seq_lens.shape[0]
+    combined_topk = (
+        (topk + window_size + _SPARSE_PREFILL_TOPK_ALIGNMENT - 1)
+        // _SPARSE_PREFILL_TOPK_ALIGNMENT
+        * _SPARSE_PREFILL_TOPK_ALIGNMENT
+    )
+    combined_indices = torch.full(
+        (num_tokens, combined_topk),
+        fill_value=-1,
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    combined_lens = torch.empty(
+        num_tokens, dtype=torch.int32, device=topk_indices.device
+    )
+
+    NUM_WORKERS = 128
+    _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
+        combined_indices,
+        combined_indices.stride(0),
+        combined_lens,
+        topk_indices,
+        topk_indices.stride(0),
+        query_start_loc,
+        seq_lens,
+        gather_lens,
+        M,
+        N,
+        TOP_K=topk,
+        COMPRESS_RATIO=compress_ratio,
+        WINDOW_SIZE=window_size,
+        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+    )
+    return combined_indices, combined_lens
+
+
+@triton.jit
+def _combine_topk_swa_indices_kernel(
+    combined_indices_ptr,
+    combined_indices_stride,
+    combined_lens_ptr,
+    topk_indices_ptr,
+    topk_indices_stride,
+    query_start_loc_ptr,
+    seq_lens_ptr,
+    gather_lens_ptr,
+    M,
+    N,
+    TOP_K: tl.constexpr,
+    COMPRESS_RATIO: tl.constexpr,
+    WINDOW_SIZE: tl.constexpr,
+    PADDED_TOP_K: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    worker_id = tl.program_id(1)
+    num_workers = tl.num_programs(1)
+
+    # query_start_loc is a global tensor; rebase to chunk-local offsets
+    # by subtracting the chunk's starting value.
+    base = tl.load(query_start_loc_ptr)
+    query_start = tl.load(query_start_loc_ptr + batch_idx) - base
+    query_end = tl.load(query_start_loc_ptr + batch_idx + 1) - base
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + batch_idx)
+    gather_len = tl.load(gather_lens_ptr + batch_idx)
+    start_pos = seq_len - query_len
+    # The SWA portion of the gathered buffer starts from position
+    # (seq_len - gather_len), not position 0. We need this offset
+    # to correctly index into the gathered buffer.
+    gather_start = seq_len - gather_len
+
+    for token_idx in range(query_start + worker_id, query_end, num_workers):
+        # topk_len is fully determined by the query token's absolute position:
+        # both the C4A indexer and the C128A metadata builder emit
+        # min((pos + 1) // compress_ratio, topk_tokens) valid entries.
+        # Caller passes TOP_K=0 for SWA-only layers to zero this out.
+        token_idx_in_query = token_idx - query_start
+        pos = start_pos + token_idx_in_query
+        topk_len = tl.minimum((pos + 1) // COMPRESS_RATIO, TOP_K)
+        swa_len = tl.minimum(pos + 1, WINDOW_SIZE)
+
+        offset = tl.arange(0, PADDED_TOP_K)
+        mask = offset < topk_len
+        topk_indices = tl.load(
+            topk_indices_ptr + token_idx * topk_indices_stride + offset,
+            mask=mask,
+        )
+        tl.store(
+            combined_indices_ptr + token_idx * combined_indices_stride + offset,
+            topk_indices + M * batch_idx,
+            mask=mask,
+        )
+        offset = tl.arange(0, WINDOW_SIZE)
+        # Index into gathered buffer: N + (position - gather_start)
+        # For positions [pos - swa_len + 1, pos], the buffer indices are:
+        # [N + pos - swa_len + 1 - gather_start, N + pos - gather_start]
+        tl.store(
+            combined_indices_ptr
+            + token_idx * combined_indices_stride
+            + topk_len
+            + offset,
+            M * batch_idx + N + offset + pos - swa_len + 1 - gather_start,
+            mask=offset < swa_len,
+        )
+
+        combined_len = topk_len + swa_len
+        tl.store(combined_lens_ptr + token_idx, combined_len)
