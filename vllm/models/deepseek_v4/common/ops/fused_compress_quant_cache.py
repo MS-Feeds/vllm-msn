@@ -19,14 +19,329 @@ even/odd halves, producing (N_QUANT_BLOCKS, MXFP4_BLOCK/2) packed nibbles
 and N_QUANT_BLOCKS ue8m0 bytes.
 """
 
-from vllm.triton_utils import tl, triton
+import torch
 
-from .fused_indexer_q import _fp32x2_to_fp4x2
+from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
+
+from .fused_indexer_q import _e2m1_nibble
+
+
+# =============================================================================
+# Software FP8-e4m3fn encoder for SM80 (Triton 3.6 has no tl.float8e4nv there)
+# =============================================================================
+@triton.jit
+def _encode_e4m3fn_sw(x):
+    """fp32 -> uint8 byte matching torch.float8_e4m3fn.
+
+    Bit layout: 1 sign | 4 exp (bias 7) | 3 mantissa. 0x7F/0xFF = NaN;
+    0x7E/0xFE = ±max finite (=448). Round-to-nearest, ties-to-even on
+    both normal and subnormal paths. Caller must clamp |x| <= 448 (NaN
+    inputs encode to 0x7F sign-extended)."""
+    bits = x.to(tl.uint32, bitcast=True)
+    sign = (bits >> 31) & 1
+    abs_bits = bits & 0x7FFFFFFF
+    exp_fp32 = (abs_bits >> 23).to(tl.int32)
+    mant_fp32 = abs_bits & 0x7FFFFF
+
+    is_zero = abs_bits == 0
+    is_inf_or_nan = exp_fp32 == 0xFF
+    is_nan = is_inf_or_nan & (mant_fp32 != 0)
+
+    exp_fp8 = exp_fp32 - 120  # exp_unbiased + 7
+
+    # Normal path: top-3 mantissa bits with RNE.
+    mant_extracted = mant_fp32 >> 20
+    round_bit = (mant_fp32 >> 19) & 1
+    sticky = (mant_fp32 & 0x7FFFF) != 0
+    odd = (mant_extracted & 1) == 1
+    round_up = round_bit & (sticky.to(tl.uint32) | odd.to(tl.uint32))
+    mant_rounded = mant_extracted + round_up
+    carry = mant_rounded == 8
+    exp_after = exp_fp8 + carry.to(tl.int32)
+    mant_after = tl.where(carry, 0, mant_rounded)
+    packed_normal = ((exp_after.to(tl.uint32) & 0xF) << 3) | (mant_after & 0x7)
+
+    # Subnormal path: align implicit-1.m mantissa to fp8 exp=0 (value scale 2^-9).
+    impl_mant = (tl.full((), 1, tl.uint32) << 23) | mant_fp32
+    sub_shift = (141 - exp_fp32).to(tl.uint32)
+    safe_shift = tl.minimum(sub_shift, 31)
+    sub_m_int = impl_mant >> safe_shift
+    sub_round_bit = tl.where(
+        safe_shift >= 1,
+        (impl_mant >> (safe_shift - 1)) & 1,
+        tl.zeros_like(impl_mant),
+    )
+    sticky_mask = tl.where(
+        safe_shift >= 2,
+        (tl.full((), 1, tl.uint32) << (safe_shift - 1)) - 1,
+        tl.zeros_like(impl_mant),
+    )
+    sub_sticky = (impl_mant & sticky_mask) != 0
+    sub_odd = (sub_m_int & 1) == 1
+    sub_round_up = sub_round_bit & (sub_sticky.to(tl.uint32) | sub_odd.to(tl.uint32))
+    sub_m_rounded = sub_m_int + sub_round_up
+    sub_promotes = sub_m_rounded == 8  # rounded up into normal exp=1
+    sub_packed = tl.where(
+        sub_promotes,
+        tl.full((), 0x08, tl.uint32),  # exp=1, mant=0
+        sub_m_rounded & 0x7,            # exp=0, mant=sub_m_rounded
+    )
+
+    # Cap normals at 0x7E (0x7F is NaN).
+    over_max_finite = (exp_after >= 16) | ((exp_after == 15) & (mant_after == 7))
+    packed_normal = tl.where(over_max_finite, 0x7E, packed_normal)
+
+    is_subnormal = exp_fp8 <= 0
+    encoded = tl.where(is_subnormal, sub_packed, packed_normal)
+    encoded = tl.where(is_zero, tl.zeros_like(encoded), encoded)
+    encoded = tl.where(is_nan, tl.full((), 0x7F, tl.uint32), encoded)
+    encoded = encoded | (sign << 7)
+    return encoded.to(tl.uint8)
 
 
 # =============================================================================
 # DeepseekV4 Attention path (head=512, nope=448 FP8 + rope=64 bf16)
 # =============================================================================
+def _gather_compressor_state(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    valid_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    head_size: int,
+    state_width: int,
+    span: int,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorised gather of (kv, score) rows from the paged compressor
+    state cache. Returns (kv_rows, score_rows) of shape (N, span, head_size)
+    with -inf score and zero kv for out-of-range positions.
+
+    State cache last-dim layout:  [kv_curr | kv_overlap | score_curr | score_overlap]
+    each of width head_size. For C4A (overlap=True), span=8 with first 4
+    tokens reading the [_curr] regions and last 4 reading the [_overlap]
+    regions; for C128A, span=128 and head_offset is uniformly 0.
+    """
+    device = state_cache.device
+    pos_offsets = torch.arange(span, device=device, dtype=torch.int64) - span + 1
+    abs_pos = positions[valid_indices].to(torch.int64).unsqueeze(-1) + pos_offsets
+    mask_pos = abs_pos >= 0
+    pos_safe = abs_pos.clamp_min(0)
+    block_indices = pos_safe // block_size
+    block_offsets = pos_safe % block_size
+    req_idx = token_to_req_indices[valid_indices].to(torch.int64)
+    block_numbers = block_table[req_idx.unsqueeze(-1), block_indices]  # (N, span)
+
+    # Single batched gather: (N, span, 2 * state_width).
+    gathered = state_cache[block_numbers, block_offsets].to(torch.float32)
+
+    # Split kv/score halves: state_cache[..., :state_width] is kv, the rest is score.
+    kv_half = gathered[..., :state_width]
+    score_half = gathered[..., state_width : 2 * state_width]
+
+    if span == compress_ratio:
+        kv_rows = kv_half[..., :head_size]
+        score_rows = score_half[..., :head_size]
+    else:
+        # span = 2 * compress_ratio (C4A): first half from offset 0,
+        # second half from offset head_size.
+        kv_rows = torch.cat(
+            [
+                kv_half[:, :compress_ratio, :head_size],
+                kv_half[:, compress_ratio:, head_size : 2 * head_size],
+            ],
+            dim=1,
+        )
+        score_rows = torch.cat(
+            [
+                score_half[:, :compress_ratio, :head_size],
+                score_half[:, compress_ratio:, head_size : 2 * head_size],
+            ],
+            dim=1,
+        )
+
+    invalid = ~mask_pos.unsqueeze(-1)
+    kv_rows = torch.where(invalid, torch.zeros_like(kv_rows), kv_rows)
+    score_rows = torch.where(
+        invalid,
+        torch.full_like(score_rows, float("-inf")),
+        score_rows,
+    )
+    return kv_rows, score_rows
+
+
+def _scatter_packed_kv_cache(
+    k_cache: torch.Tensor,
+    fp8_bytes: torch.Tensor,
+    bf16_bytes: torch.Tensor | None,
+    scale_bytes: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    valid_indices: torch.Tensor,
+    kv_cache_block_size: int,
+    token_stride: int,
+    scale_dim: int,
+    fp8_dim: int,
+) -> None:
+    """Vectorised scatter of (FP8 nope | bf16 rope | UE8M0 scales) bytes
+    into the paged uint8 KV cache."""
+    k_cache_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
+    n_blocks = k_cache_u8.shape[0]
+    block_stride = k_cache_u8[0].numel()  # bytes per block
+    flat = k_cache_u8.view(n_blocks, block_stride)
+
+    slots = kv_slot_mapping[valid_indices].to(torch.int64)
+    block_idx = slots // kv_cache_block_size
+    pos_in_block = slots % kv_cache_block_size
+
+    token_offsets = pos_in_block * token_stride
+    scale_offsets = kv_cache_block_size * token_stride + pos_in_block * scale_dim
+
+    # FP8 nope byte scatter: flat[block_idx, token_offsets+0..fp8_dim] = fp8_bytes
+    fp8_idx = token_offsets.unsqueeze(-1) + torch.arange(
+        fp8_dim, device=k_cache_u8.device, dtype=torch.int64
+    )
+    flat[block_idx.unsqueeze(-1), fp8_idx] = fp8_bytes
+
+    # Optional bf16 rope byte scatter
+    if bf16_bytes is not None:
+        bf16_n = bf16_bytes.shape[-1]
+        bf16_off = (
+            token_offsets.unsqueeze(-1)
+            + fp8_dim
+            + torch.arange(bf16_n, device=k_cache_u8.device, dtype=torch.int64)
+        )
+        flat[block_idx.unsqueeze(-1), bf16_off] = bf16_bytes
+
+    # Scales scatter
+    s_idx = scale_offsets.unsqueeze(-1) + torch.arange(
+        scale_dim, device=k_cache_u8.device, dtype=torch.int64
+    )
+    flat[block_idx.unsqueeze(-1), s_idx] = scale_bytes
+
+
+def _fused_kv_compress_norm_rope_insert_sparse_attn_torch(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    """SM80 PyTorch fallback for the V4 K-cache compressor (head_dim=512).
+    Vectorised: single batched gather + matmul softmax + RMSNorm + RoPE +
+    UE8M0 FP8 quant + scattered cache write. No per-token Python loop or
+    `.item()` calls."""
+    device = state_cache.device
+    nope_head_dim = head_size - rope_head_dim
+    n_nope_blocks = nope_head_dim // quant_block
+    half_rope = rope_head_dim // 2
+    span = (1 + int(overlap)) * compress_ratio
+
+    # cudagraph dummy runs may pass kv_slot_mapping with different padding
+    # than slot_mapping; align to the smaller (state-side) length.
+    n_match = min(slot_mapping.shape[0], kv_slot_mapping.shape[0])
+    slot_mapping = slot_mapping[:n_match]
+    kv_slot_mapping = kv_slot_mapping[:n_match]
+    positions = positions[:n_match]
+    token_to_req_indices = token_to_req_indices[:n_match]
+    valid_mask = (
+        (slot_mapping >= 0)
+        & ((positions + 1) % compress_ratio == 0)
+        & (kv_slot_mapping >= 0)
+    )
+    if not valid_mask.any():
+        return
+    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    kv_rows, score_rows = _gather_compressor_state(
+        state_cache,
+        token_to_req_indices,
+        positions,
+        valid_indices,
+        block_table,
+        block_size,
+        head_size,
+        state_width,
+        span,
+        compress_ratio,
+    )
+
+    # Softmax over the span axis per (token, feature), then weighted sum.
+    weights = torch.softmax(score_rows, dim=1)
+    compressed_kv = (kv_rows * weights).sum(dim=1)  # (N, head_size)
+
+    # RMSNorm
+    variance = (compressed_kv * compressed_kv).mean(dim=-1, keepdim=True)
+    rrms = torch.rsqrt(variance + rms_norm_eps)
+    normed = compressed_kv * rrms * rms_norm_weight.to(torch.float32)
+
+    # FP8 quant on NoPE region (block-wise UE8M0).
+    nope = normed[:, :nope_head_dim].view(-1, n_nope_blocks, quant_block)
+    nope_bf16 = nope.to(torch.bfloat16).to(torch.float32)
+    block_absmax = nope_bf16.abs().amax(dim=-1).clamp_min(1e-4)
+    raw_scale = block_absmax / fp8_max
+    exponents = torch.ceil(torch.log2(raw_scale))
+    inv_scale = torch.pow(2.0, -exponents).unsqueeze(-1)
+    quantized = (nope_bf16 * inv_scale).clamp(-fp8_max, fp8_max)
+    fp8_nope = quantized.to(torch.float8_e4m3fn).view(-1, nope_head_dim)
+    fp8_nope_bytes = fp8_nope.view(torch.uint8)
+
+    encoded_scales = (exponents + 127.0).clamp(0.0, 255.0).to(torch.uint8)
+    pad_col = torch.zeros(
+        encoded_scales.shape[0],
+        scale_dim - n_nope_blocks,
+        device=device,
+        dtype=torch.uint8,
+    )
+    scales_full = torch.cat([encoded_scales, pad_col], dim=-1)
+
+    # Forward GPT-J RoPE on the RoPE region.
+    rope_part = normed[:, nope_head_dim:]
+    even = rope_part[:, 0::2]
+    odd = rope_part[:, 1::2]
+    valid_positions = positions[valid_indices].to(torch.long)
+    compressed_pos = (valid_positions // compress_ratio) * compress_ratio
+    cs = cos_sin_cache.index_select(0, compressed_pos)
+    cos = cs[:, :half_rope].to(torch.float32)
+    sin = cs[:, half_rope : 2 * half_rope].to(torch.float32)
+    new_even = even * cos - odd * sin
+    new_odd = odd * cos + even * sin
+    rope_out = torch.empty_like(rope_part)
+    rope_out[:, 0::2] = new_even
+    rope_out[:, 1::2] = new_odd
+    rope_bytes = rope_out.to(torch.bfloat16).view(torch.uint8)
+
+    _scatter_packed_kv_cache(
+        k_cache,
+        fp8_nope_bytes,
+        rope_bytes,
+        scales_full,
+        kv_slot_mapping,
+        valid_indices,
+        kv_cache_block_size,
+        token_stride,
+        scale_dim,
+        fp8_dim=nope_head_dim,
+    )
+
+
 @triton.jit
 def _fused_kv_compress_norm_rope_insert_sparse_attn(
     # ── state cache (compressor internal state) ──
@@ -62,6 +377,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     TOKEN_STRIDE: tl.constexpr,  # 576 for DeepseekV4
     SCALE_DIM: tl.constexpr,  # 8 for DeepseekV4 (7 real + 1 pad)
     KV_BLOCK_STRIDE: tl.constexpr,
+    SOFTWARE_FP8: tl.constexpr = False,  # SM80 path — Triton has no native fp8e4nv
 ):
     """Fused compress → RMSNorm → FP8 quant (nope) → RoPE → bf16 store (rope).
 
@@ -169,9 +485,12 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     inv_scales_col = tl.reshape(inv_scales, (N_QUANT_BLOCKS, 1))
     x_scaled = quant_2d * inv_scales_col
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
-    x_uint8_flat = tl.reshape(x_uint8, (TRITON_BLOCK_SIZE,))
+    x_clamped_flat = tl.reshape(x_clamped, (TRITON_BLOCK_SIZE,))
+    if SOFTWARE_FP8:
+        x_uint8_flat = _encode_e4m3fn_sw(x_clamped_flat)
+    else:
+        x_fp8_flat = x_clamped_flat.to(tl.float8e4nv)
+        x_uint8_flat = x_fp8_flat.to(tl.uint8, bitcast=True)
 
     nope_mask = block < NOPE_HEAD_DIM
     tl.store(fp8_ptr + block, x_uint8_flat, mask=nope_mask)
@@ -214,6 +533,116 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     tl.store(bf16_ptr + rope_local, result.to(tl.bfloat16), mask=is_rope)
 
 
+def _fused_kv_compress_norm_rope_insert_indexer_attn_torch(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    rms_norm_weight: torch.Tensor,
+    rms_norm_eps: float,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    """SM80 PyTorch fallback for the indexer K-cache FP8 compressor
+    (head_dim=128). Vectorised — no per-token Python loop."""
+    nope_head_dim = head_size - rope_head_dim
+    half_rope = rope_head_dim // 2
+    span = (1 + int(overlap)) * compress_ratio
+    assert head_size == quant_block, (
+        "Indexer compressor expects QUANT_BLOCK == HEAD_SIZE"
+    )
+
+    # cudagraph dummy runs may pass kv_slot_mapping with different padding
+    # than slot_mapping; align to the smaller (state-side) length.
+    n_match = min(slot_mapping.shape[0], kv_slot_mapping.shape[0])
+    slot_mapping = slot_mapping[:n_match]
+    kv_slot_mapping = kv_slot_mapping[:n_match]
+    positions = positions[:n_match]
+    token_to_req_indices = token_to_req_indices[:n_match]
+    valid_mask = (
+        (slot_mapping >= 0)
+        & ((positions + 1) % compress_ratio == 0)
+        & (kv_slot_mapping >= 0)
+    )
+    if not valid_mask.any():
+        return
+    valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+
+    kv_rows, score_rows = _gather_compressor_state(
+        state_cache,
+        token_to_req_indices,
+        positions,
+        valid_indices,
+        block_table,
+        block_size,
+        head_size,
+        state_width,
+        span,
+        compress_ratio,
+    )
+
+    weights = torch.softmax(score_rows, dim=1)
+    compressed_kv = (kv_rows * weights).sum(dim=1)  # (N, head_size)
+    variance = (compressed_kv * compressed_kv).mean(dim=-1, keepdim=True)
+    rrms = torch.rsqrt(variance + rms_norm_eps)
+    normed = compressed_kv * rrms * rms_norm_weight.to(torch.float32)
+
+    # Forward GPT-J RoPE on the last rope_head_dim elements.
+    nope = normed[:, :nope_head_dim]
+    rope_part = normed[:, nope_head_dim:]
+    even = rope_part[:, 0::2]
+    odd = rope_part[:, 1::2]
+    valid_positions = positions[valid_indices].to(torch.long)
+    compressed_pos = (valid_positions // compress_ratio) * compress_ratio
+    cs = cos_sin_cache.index_select(0, compressed_pos)
+    cos = cs[:, :half_rope].to(torch.float32)
+    sin = cs[:, half_rope : 2 * half_rope].to(torch.float32)
+    new_even = even * cos - odd * sin
+    new_odd = odd * cos + even * sin
+    rope_out = torch.empty_like(rope_part)
+    rope_out[:, 0::2] = new_even
+    rope_out[:, 1::2] = new_odd
+
+    full = torch.cat([nope, rope_out], dim=-1)
+    full_bf16 = full.to(torch.bfloat16).to(torch.float32)
+    absmax = full_bf16.abs().amax(dim=-1).clamp_min(1e-4)
+    raw_scale = absmax / fp8_max
+    exponents = torch.ceil(torch.log2(raw_scale))
+    inv_scale = torch.pow(2.0, -exponents).unsqueeze(-1)
+    quantized = (full_bf16 * inv_scale).clamp(-fp8_max, fp8_max)
+    fp8_full = quantized.to(torch.float8_e4m3fn)
+    fp8_bytes = fp8_full.view(torch.uint8)
+
+    scale_vals = torch.pow(2.0, exponents).to(torch.float32)
+    scale_bytes = scale_vals.view(-1, 1).view(torch.uint8)  # (N, 4)
+
+    _scatter_packed_kv_cache(
+        k_cache,
+        fp8_bytes,
+        bf16_bytes=None,
+        scale_bytes=scale_bytes,
+        kv_slot_mapping=kv_slot_mapping,
+        valid_indices=valid_indices,
+        kv_cache_block_size=kv_cache_block_size,
+        token_stride=token_stride,
+        scale_dim=scale_dim,
+        fp8_dim=head_size,
+    )
+
+
 # =============================================================================
 # Indexer path (head=128, all FP8, single quant block)
 # =============================================================================
@@ -252,6 +681,7 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
     TOKEN_STRIDE: tl.constexpr,  # 128 for indexer
     SCALE_DIM: tl.constexpr,  # 4 for indexer (1 float32)
     KV_BLOCK_STRIDE: tl.constexpr,
+    SOFTWARE_FP8: tl.constexpr = False,  # SM80 path — Triton has no native fp8e4nv
 ):
     """Fused compress → RMSNorm → RoPE → FP8 quant → store.
 
@@ -381,8 +811,11 @@ def _fused_kv_compress_norm_rope_insert_indexer_attn(
 
     x_scaled = result_bf16 * inv_scale
     x_clamped = tl.clamp(x_scaled, -FP8_MAX, FP8_MAX)
-    x_fp8 = x_clamped.to(tl.float8e4nv)
-    x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
+    if SOFTWARE_FP8:
+        x_uint8 = _encode_e4m3fn_sw(x_clamped)
+    else:
+        x_fp8 = x_clamped.to(tl.float8e4nv)
+        x_uint8 = x_fp8.to(tl.uint8, bitcast=True)
 
     tl.store(fp8_ptr + block, x_uint8, mask=mask)
 
@@ -566,19 +999,166 @@ def _fused_kv_compress_norm_rope_insert_indexer_mxfp4_attn(
         tl.max(tl.abs(even_2d), axis=1),
         tl.max(tl.abs(odd_2d), axis=1),
     )
-    amax = tl.maximum(amax, 6.0 * (2**-126))
+    amax = tl.maximum(amax, 1e-4)
 
     # ue8m0 block scale: 2^ceil(log2(amax / 6.0)), stored as (exp + 127) byte.
-    log2_ratio = tl.ceil(tl.log2(amax * (1.0 / 6.0)))
+    log2_ratio = tl.ceil(tl.log2(amax / 6.0))
     log2_ratio = tl.minimum(tl.maximum(log2_ratio, -127.0), 127.0)
     inv_scale = tl.exp2(-log2_ratio)
     ue8m0 = (log2_ratio + 127.0).to(tl.uint8)  # [N_QUANT_BLOCKS]
 
     inv_scale_col = tl.reshape(inv_scale, (N_QUANT_BLOCKS, 1))
-    packed = _fp32x2_to_fp4x2(
-        even_2d * inv_scale_col, odd_2d * inv_scale_col
-    )  # (N_BLOCKS, HALF_BLOCK) uint8
+    lo_nib = _e2m1_nibble(even_2d * inv_scale_col)  # (N_BLOCKS, HALF_BLOCK) uint8
+    hi_nib = _e2m1_nibble(odd_2d * inv_scale_col)
+    packed = lo_nib | (hi_nib << 4)
     packed_flat = tl.reshape(packed, (TOKEN_STRIDE,))
 
     tl.store(val_ptr + tl.arange(0, TOKEN_STRIDE), packed_flat)
     tl.store(scale_ptr + tl.arange(0, SCALE_DIM), ue8m0)
+
+
+# =============================================================================
+# Custom-op wrappers for cudagraph splitting on SM80 reference paths.
+#
+# The compressor PyTorch fallbacks use .any() / .nonzero() / .item() — all of
+# which are illegal during cudagraph capture (data-dependent control flow).
+# Registering them as vllm:: custom ops + listing them in CompilationConfig.
+# _attention_ops makes vllm split the cudagraph at the call site so the
+# fallback body runs eager outside the captured replay.
+# =============================================================================
+
+
+def _compressor_sparse_attn_torch_op(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    block_size: int,
+    rms_norm_eps: float,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    _fused_kv_compress_norm_rope_insert_sparse_attn_torch(
+        state_cache=state_cache,
+        token_to_req_indices=token_to_req_indices,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        block_size=block_size,
+        rms_norm_weight=rms_norm_weight,
+        rms_norm_eps=rms_norm_eps,
+        cos_sin_cache=cos_sin_cache,
+        k_cache=k_cache,
+        kv_slot_mapping=kv_slot_mapping,
+        kv_cache_block_size=kv_cache_block_size,
+        head_size=head_size,
+        state_width=state_width,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rope_head_dim=rope_head_dim,
+        fp8_max=fp8_max,
+        quant_block=quant_block,
+        token_stride=token_stride,
+        scale_dim=scale_dim,
+    )
+
+
+def _compressor_sparse_attn_torch_op_fake(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    block_size: int,
+    rms_norm_eps: float,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    return None
+
+
+def _compressor_indexer_attn_torch_op(
+    state_cache: torch.Tensor,
+    token_to_req_indices: torch.Tensor,
+    positions: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    rms_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_slot_mapping: torch.Tensor,
+    block_size: int,
+    rms_norm_eps: float,
+    kv_cache_block_size: int,
+    head_size: int,
+    state_width: int,
+    compress_ratio: int,
+    overlap: bool,
+    rope_head_dim: int,
+    fp8_max: float,
+    quant_block: int,
+    token_stride: int,
+    scale_dim: int,
+) -> None:
+    _fused_kv_compress_norm_rope_insert_indexer_attn_torch(
+        state_cache=state_cache,
+        token_to_req_indices=token_to_req_indices,
+        positions=positions,
+        slot_mapping=slot_mapping,
+        block_table=block_table,
+        block_size=block_size,
+        rms_norm_weight=rms_norm_weight,
+        rms_norm_eps=rms_norm_eps,
+        cos_sin_cache=cos_sin_cache,
+        k_cache=k_cache,
+        kv_slot_mapping=kv_slot_mapping,
+        kv_cache_block_size=kv_cache_block_size,
+        head_size=head_size,
+        state_width=state_width,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rope_head_dim=rope_head_dim,
+        fp8_max=fp8_max,
+        quant_block=quant_block,
+        token_stride=token_stride,
+        scale_dim=scale_dim,
+    )
+
+
+direct_register_custom_op(
+    op_name="deepseek_v4_compressor_sparse_sm80",
+    op_func=_compressor_sparse_attn_torch_op,
+    mutates_args=["k_cache", "state_cache"],
+    fake_impl=_compressor_sparse_attn_torch_op_fake,
+)
+direct_register_custom_op(
+    op_name="deepseek_v4_compressor_indexer_sm80",
+    op_func=_compressor_indexer_attn_torch_op,
+    mutates_args=["k_cache", "state_cache"],
+    fake_impl=_compressor_sparse_attn_torch_op_fake,
+)

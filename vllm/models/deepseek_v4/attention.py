@@ -27,7 +27,12 @@ from vllm.models.deepseek_v4.common.ops import (
     fused_inv_rope_fp8_quant,
     fused_q_kv_rmsnorm,
 )
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.models.deepseek_v4.sm80_einsum import _deepseek_v4_fp8_einsum_fallback
+from vllm.models.deepseek_v4.sm80_mla import (
+    ref_sparse_attn_decode_gather,
+    ref_sparse_attn_prefill,
+)
+from vllm.utils.deep_gemm import fp8_einsum, use_dsv4_reference_kernels
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
 
@@ -305,8 +310,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # Keep ROCm on the BF16 reference wo_a path util kernel ready.
-        if current_platform.is_rocm():
+        # SM80/ROCm: bf16 inv-RoPE + wo_a (DeepGEMM fp8_einsum unavailable).
+        if current_platform.is_rocm() or use_dsv4_reference_kernels():
             z = rocm_inv_rope_einsum(
                 self.rotary_emb,
                 o,
@@ -508,14 +513,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             out.zero_()
             return
 
-        # Pad q to FlashMLA-required head count (64 or 128)
-        if self.n_local_heads < self.padded_heads:
-            pad_size = self.padded_heads - self.n_local_heads
-            q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
-
-        # MLA attention writes into the pre-allocated `out` buffer
-        # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        if use_dsv4_reference_kernels():
+            self.mla_attn(q, kv, positions, output=out[:, : self.n_local_heads, :])
+        else:
+            # Pad q to FlashMLA-required head count (64 or 128)
+            if self.n_local_heads < self.padded_heads:
+                pad_size = self.padded_heads - self.n_local_heads
+                q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
+            self.mla_attn(q, kv, positions, output=out)
 
     def _fused_qnorm_rope_kv_insert(
         self,
@@ -592,6 +597,9 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
+    if use_dsv4_reference_kernels():
+        _deepseek_v4_fp8_einsum_fallback(a, a_scale, b, b_scale, out, equation)
+        return
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 
 
@@ -887,6 +895,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             "allocate one for this layer type."
         )
 
+        if use_dsv4_reference_kernels():
+            swa_block_size = self.swa_cache_layer.kv_cache.shape[1]
+            extra_kv = None if swa_only else kv_cache
+            attn_out = ref_sparse_attn_decode_gather(
+                self,
+                q=q,
+                swa_kv_cache=self.swa_cache_layer.kv_cache,
+                swa_block_size=swa_block_size,
+                swa_indices=swa_indices.unsqueeze(1),
+                swa_topk_length=swa_lens,
+                attn_sink=self.attn_sink[: q.shape[2]],
+                extra_kv_cache=extra_kv.squeeze(-2) if extra_kv is not None else None,
+                extra_block_size=extra_kv.shape[1] if extra_kv is not None else 0,
+                extra_indices=topk_indices,
+                extra_topk_length=topk_lens,
+            )
+            output.copy_(attn_out.to(output.dtype))
+            return
+
         out, _ = flash_mla_with_kvcache(
             q=q,
             k_cache=swa_cache,
@@ -1014,15 +1041,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 M,
                 N,
             )
-            flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            if use_dsv4_reference_kernels():
+                output_chunk = ref_sparse_attn_prefill(
+                    self,
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    topk_length=combined_lens,
+                )
+                output[query_start:query_end].copy_(output_chunk.to(output.dtype))
+            else:
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

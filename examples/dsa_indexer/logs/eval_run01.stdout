@@ -1,0 +1,7 @@
+Sending 15 prompts to http://localhost:8000 as model=glm-5.1 (max_tokens=6000, T=0.0, concurrency=2)
+[1/15] gpqa_diamond/recJJcOHhFeSaRpl4 FAIL: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=6  | rate=0.00/s eta=140.0m
+[2/15] aime/2024-I-10 FAIL: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=6  | rate=0.00/s eta=65.0m
+[3/15] aime/2024-II-11 FAIL: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=6  | rate=0.00/s eta=80.0m
+[4/15] aime/2024-I-15 FAIL: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=6  | rate=0.00/s eta=55.0m
+[5/15] gpqa_diamond/recI1ls9OXdxatHQn FAIL: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=6  | rate=0.00/s eta=60.0m
+[6/15] gpqa_diamond/recnGEpF1srQpaqWq FAIL: HTTPConnectionPool(host='localhost', port=8000): Read timed out. (read timeout=6  | rate=0.00/s eta=45.0m

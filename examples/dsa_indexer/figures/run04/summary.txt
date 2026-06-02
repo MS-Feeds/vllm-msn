@@ -1,0 +1,46 @@
+k_index_topk=2048  gap_window=8  gap_eps_norm=1.0e-06
+layers: 78  prefill rows total: 0  decode rows total: 11763514
+
+--- prefill: no data captured
+--- decode ---
+  p1 of relative_gap across layers: min=9.451e-08 (layer 11)   median=2.961e-07   max=2.894e-06
+  Format safety (p1_min / ε; >3 safe, 1-3 marginal, <1 unsafe):
+    BF16         ε=0.0078   p1_min/ε=   0.00   UNSAFE
+    FP16         ε=0.0010   p1_min/ε=   0.00   UNSAFE
+    FP8 e4m3     ε=0.1250   p1_min/ε=   0.00   UNSAFE
+    FP8 e5m2     ε=0.2500   p1_min/ε=   0.00   UNSAFE
+    4-bit radix  ε=0.0625   p1_min/ε=   0.00   UNSAFE
+    8-bit radix  ε=0.0039   p1_min/ε=   0.00   UNSAFE
+  Winner |value| max across layers: 374.27
+    FP8 e4m3     max=     448    MARGINAL
+    FP8 e5m2     max=   57344    SAFE
+    FP16         max=   65504    SAFE
+
+--- Cascade-TopD stream — cascade dial (P(boundary bucket ≤ kNumFinalItems=2048)) ---
+  decode:
+    d= 4 (    16 buckets):  P(fits)=0.245 mean   0.003 worst-layer   4/78 layers ≥99%
+    d= 8 (   256 buckets):  P(fits)=0.637 mean   0.061 worst-layer   14/78 layers ≥99%
+    d=12 (  4096 buckets):  P(fits)=1.000 mean   1.000 worst-layer   78/78 layers ≥99%
+    d=16 ( 65536 buckets):  P(fits)=1.000 mean   1.000 worst-layer   78/78 layers ≥99%
+
+--- BitEntropy stream — bit allocation (sortable-uint32 form) ---
+  prefill:  layer-mean informative bits (entropy > 0.05): 27.8/32  min=24  max=32
+    d   Σ(top-d)  Σ(best-d)   gap
+    4    0.352     2.000    +1.648
+    6    0.531     2.999    +2.468
+    8    1.028     3.999    +2.971
+   11    2.298     5.498    +3.200
+   16    4.762     7.995    +3.232
+  decode:  layer-mean informative bits (entropy > 0.05): 26.9/32  min=23  max=32
+    d   Σ(top-d)  Σ(best-d)   gap
+    4    0.273     2.000    +1.727
+    6    0.412     3.000    +2.588
+    8    0.799     4.000    +3.201
+   11    2.031     5.500    +3.469
+   16    4.492     7.997    +3.505
+
+--- Cascade-BestD stream — boundary fits at custom bit windows ---
+  decode:
+    bits  9..12 (   16 buckets):  P(fits)=1.000 mean   1.000 worst-layer   78/78 layers >=99%
+    bits  5..12 (  256 buckets):  P(fits)=1.000 mean   1.000 worst-layer   78/78 layers >=99%
+    bits  1..12 ( 4096 buckets):  P(fits)=1.000 mean   1.000 worst-layer   78/78 layers >=99%

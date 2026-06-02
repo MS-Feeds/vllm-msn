@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.utils.import_utils import has_cutedsl
+from vllm.utils.deep_gemm import use_dsv4_reference_kernels
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
 MXFP4_BLOCK_SIZE = 32
@@ -26,22 +25,36 @@ def _get_cos_sin(
 
 
 @triton.jit
-def _fp32x2_to_fp4x2(x_lo, x_hi):
-    # NOTE: $1 is high nibble, $2 is low nibble
-    return tl.inline_asm_elementwise(
-        """
-        {
-            .reg .b8 tmp;
-            cvt.rn.satfinite.e2m1x2.f32 tmp, $1, $2;
-            cvt.u32.u8 $0, tmp;
-        }
-        """,
-        constraints="=r,f,f",
-        args=[x_hi, x_lo],
-        dtype=tl.uint32,
-        is_pure=True,
-        pack=1,
-    ).to(tl.uint8)
+def _e2m1_nibble(x):
+    """Quantize fp32 x (already scale-divided) to E2M1 4-bit nibble in uint8.
+    Matches torch.bucketize with boundaries
+    [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] and right=False (each boundary
+    belongs to the lower bucket), plus sign bit."""
+    abs_x = tl.minimum(tl.abs(x), 6.0)
+    code = tl.where(
+        abs_x <= 0.25,
+        0.0,
+        tl.where(
+            abs_x <= 0.75,
+            1.0,
+            tl.where(
+                abs_x <= 1.25,
+                2.0,
+                tl.where(
+                    abs_x <= 1.75,
+                    3.0,
+                    tl.where(
+                        abs_x <= 2.5,
+                        4.0,
+                        tl.where(abs_x <= 3.5, 5.0, tl.where(abs_x <= 5.0, 6.0, 7.0)),
+                    ),
+                ),
+            ),
+        ),
+    )
+    code_u8 = code.to(tl.uint8)
+    sign = ((x < 0) & (code_u8 != 0)).to(tl.uint8)
+    return code_u8 | (sign << 3)
 
 
 @triton.jit
@@ -53,17 +66,95 @@ def _quantize_mxfp4_pair(x_lo, x_hi):
         - ue8m0  : scalar uint8    (block scale = 2^(ue8m0 - 127))
     """
     amax = tl.maximum(tl.max(tl.abs(x_lo)), tl.max(tl.abs(x_hi)))
-    # 6 * 2^-126 is from https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/inference/kernel.py#L163
-    amax = tl.maximum(amax, 6.0 * (2**-126))
+    amax = tl.maximum(amax, 1e-4)
     # ue8m0 block scale: 2^ceil(log2(amax/6.0)).
-    log2_ratio = tl.math.ceil(tl.math.log2(amax * (1.0 / 6.0)))
+    log2_ratio = tl.math.ceil(tl.math.log2(amax / 6.0))
     log2_ratio = tl.minimum(tl.maximum(log2_ratio, -127.0), 127.0)
     scale = tl.math.exp2(log2_ratio)
     ue8m0 = (log2_ratio + 127.0).to(tl.uint8)
 
     inv_scale = 1.0 / scale
-    packed = _fp32x2_to_fp4x2(x_lo * inv_scale, x_hi * inv_scale)
+    lo_nib = _e2m1_nibble(x_lo * inv_scale)
+    hi_nib = _e2m1_nibble(x_hi * inv_scale)
+    packed = lo_nib | (hi_nib << 4)
     return packed, ue8m0
+
+
+@triton.jit
+def _fused_indexer_q_rope_fp32_kernel(
+    pos_ptr,
+    index_q_ptr,
+    index_q_stride0,
+    index_q_stride1,
+    index_q_cos_sin_ptr,
+    index_q_cos_sin_stride,
+    INDEX_Q_HALF_ROT_DIM: tl.constexpr,
+    out_fp32_ptr,
+    out_stride0,
+    out_stride1,
+    INDEX_Q_HEAD_DIM: tl.constexpr,
+    index_weights_ptr,
+    index_weights_stride,
+    index_weights_softmax_scale,
+    index_weights_head_scale,
+    index_weights_out_ptr,
+    index_weights_out_stride,
+):
+    """SM80 variant of `_fused_indexer_q_rope_quant_kernel`. Outputs the
+    scaled-and-clamped fp32 Q (which the wrapper casts to fp8 in PyTorch
+    via .to(torch.float8_e4m3fn)). Triton on SM80 cannot compile
+    `tl.float8e4nv`, so the cast happens outside Triton."""
+    INDEX_Q_ROT_DIM: tl.constexpr = 2 * INDEX_Q_HALF_ROT_DIM
+    INDEX_Q_NOPE_DIM: tl.constexpr = INDEX_Q_HEAD_DIM - INDEX_Q_ROT_DIM
+    tl.static_assert(INDEX_Q_NOPE_DIM >= 0)
+
+    tok_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    pos = tl.load(pos_ptr + tok_idx)
+    cos, sin = _get_cos_sin(
+        index_q_cos_sin_ptr,
+        index_q_cos_sin_stride,
+        pos,
+        INDEX_Q_HALF_ROT_DIM,
+    )
+    half_offset = tl.arange(0, INDEX_Q_HALF_ROT_DIM)
+    base_ptr = index_q_ptr + tok_idx * index_q_stride0 + head_idx * index_q_stride1
+
+    rot_base = base_ptr + INDEX_Q_NOPE_DIM
+    x_even = tl.load(rot_base + half_offset * 2).to(tl.float32)
+    x_odd = tl.load(rot_base + half_offset * 2 + 1).to(tl.float32)
+    r_even = x_even * cos - x_odd * sin
+    r_odd = x_odd * cos + x_even * sin
+    r_even = r_even.to(tl.bfloat16).to(tl.float32)
+    r_odd = r_odd.to(tl.bfloat16).to(tl.float32)
+
+    amax = tl.maximum(tl.max(tl.abs(r_even)), tl.max(tl.abs(r_odd)))
+    if INDEX_Q_NOPE_DIM > 0:
+        nope_offset = tl.arange(0, INDEX_Q_NOPE_DIM)
+        x_nope = tl.load(base_ptr + nope_offset).to(tl.float32)
+        amax = tl.maximum(amax, tl.max(tl.abs(x_nope)))
+    index_q_scale = tl.div_rn(tl.maximum(amax, 1e-4), 448.0)
+    index_q_scale = tl.math.exp2(tl.math.ceil(tl.math.log2(index_q_scale)))
+
+    out_base_ptr = out_fp32_ptr + tok_idx * out_stride0 + head_idx * out_stride1
+    if INDEX_Q_NOPE_DIM > 0:
+        tl.store(out_base_ptr + nope_offset, tl.div_rn(x_nope, index_q_scale))
+    out_rot_base = out_base_ptr + INDEX_Q_NOPE_DIM
+    tl.store(out_rot_base + half_offset * 2, tl.div_rn(r_even, index_q_scale))
+    tl.store(out_rot_base + half_offset * 2 + 1, tl.div_rn(r_odd, index_q_scale))
+
+    index_weights = tl.load(
+        index_weights_ptr + tok_idx * index_weights_stride + head_idx
+    )
+    index_weights = index_weights.to(tl.float32)
+    index_weights *= index_q_scale
+    index_weights *= index_weights_softmax_scale
+    index_weights *= index_weights_head_scale
+    tl.store(
+        index_weights_out_ptr + tok_idx * index_weights_out_stride + head_idx,
+        index_weights,
+    )
 
 
 @triton.jit
@@ -281,6 +372,62 @@ def _fused_indexer_q_rope_mxfp4_kernel(
     )
 
 
+def _fused_indexer_q_rope_quant_torch(
+    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_q_cos_sin_cache: torch.Tensor,
+    index_weights: torch.Tensor,
+    index_weights_softmax_scale: float,
+    index_weights_head_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SM80 PyTorch fallback for the FP8 path. Matches kernel numerics:
+    forward GPT-J RoPE on the last `rope_dim` of each head, fp32→bf16→fp32
+    intermediate, per-(token, head) UE8M0 q_scale folded into weights."""
+    num_tokens, num_heads, head_dim = index_q.shape
+    rope_dim = index_q_cos_sin_cache.shape[-1]
+    half_rot = rope_dim // 2
+    nope_dim = head_dim - rope_dim
+
+    cos_sin = index_q_cos_sin_cache.index_select(0, positions.to(torch.long))
+    cos = cos_sin[..., :half_rot].view(num_tokens, 1, half_rot).to(torch.float32)
+    sin = (
+        cos_sin[..., half_rot : 2 * half_rot]
+        .view(num_tokens, 1, half_rot)
+        .to(torch.float32)
+    )
+
+    q = index_q.to(torch.float32)
+    nope = q[..., :nope_dim] if nope_dim > 0 else None
+    rope = q[..., nope_dim:]
+
+    even = rope[..., 0::2]
+    odd = rope[..., 1::2]
+    r_even = (even * cos - odd * sin).to(torch.bfloat16).to(torch.float32)
+    r_odd = (odd * cos + even * sin).to(torch.bfloat16).to(torch.float32)
+
+    rotated = torch.empty_like(rope)
+    rotated[..., 0::2] = r_even
+    rotated[..., 1::2] = r_odd
+
+    parts = [rotated]
+    if nope is not None:
+        parts = [nope, rotated]
+    full = torch.cat(parts, dim=-1)
+
+    amax = full.abs().amax(dim=-1).clamp_min(1e-4)
+    q_scale = torch.pow(2.0, torch.ceil(torch.log2(amax / 448.0)))
+    q_quant = (full / q_scale.unsqueeze(-1)).clamp(-448.0, 448.0)
+    index_q_fp8 = q_quant.to(torch.float8_e4m3fn)
+
+    weights = (
+        index_weights.to(torch.float32)
+        * q_scale
+        * index_weights_softmax_scale
+        * index_weights_head_scale
+    )
+    return index_q_fp8, weights
+
+
 def fused_indexer_q_rope_quant(
     positions: torch.Tensor,
     index_q: torch.Tensor,
@@ -322,6 +469,43 @@ def fused_indexer_q_rope_quant(
     assert index_q.ndim == 3
     assert index_q_cos_sin_cache.ndim == 2
 
+    if not use_fp4 and use_dsv4_reference_kernels():
+        # SM80/ROCm hybrid: Triton kernel emits scaled fp32 Q + fp32
+        # weights_out, then PyTorch casts Q to fp8_e4m3fn (Triton on SM80
+        # cannot compile `tl.float8e4nv`). MXFP4 path is unchanged because
+        # it uses uint8 + ue8m0 (no fp8e4nv).
+        num_tokens = positions.shape[0]
+        num_index_q_heads = index_q.shape[1]
+        index_q_head_dim = index_q.shape[2]
+        out_fp32 = torch.empty(
+            (num_tokens, num_index_q_heads, index_q_head_dim),
+            dtype=torch.float32,
+            device=index_q.device,
+        )
+        weights_out = torch.empty_like(index_weights, dtype=torch.float32)
+        _fused_indexer_q_rope_fp32_kernel[(num_tokens, num_index_q_heads)](
+            positions,
+            index_q,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.stride(0),
+            index_q_cos_sin_cache.shape[-1] // 2,
+            out_fp32,
+            out_fp32.stride(0),
+            out_fp32.stride(1),
+            index_q_head_dim,
+            index_weights,
+            index_weights.stride(0),
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            weights_out,
+            weights_out.stride(0),
+            num_warps=1,
+        )
+        index_q_fp8 = out_fp32.to(torch.float8_e4m3fn)
+        return index_q_fp8, weights_out
+
     num_tokens = positions.shape[0]
     num_index_q_heads = index_q.shape[1]
     index_q_head_dim = index_q.shape[2]
@@ -344,49 +528,30 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
-            # lazily import, otherwise some tests fail due to CUDA driver init failure.
-            from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
-                fused_indexer_q_rope_quant_mxfp4_cutedsl,
-            )
-
-            fused_indexer_q_rope_quant_mxfp4_cutedsl(
-                positions,
-                index_q,
-                index_q_cos_sin_cache,
-                index_weights,
-                index_weights_softmax_scale,
-                index_weights_head_scale,
-                index_q_packed,
-                index_q_scale,
-                index_weights_out,
-            )
-        else:
-            _fused_indexer_q_rope_mxfp4_kernel[(num_tokens, num_index_q_heads)](
-                positions,
-                index_q,
-                index_q.stride(0),
-                index_q.stride(1),
-                index_q_cos_sin_cache,
-                index_q_cos_sin_cache.stride(0),
-                index_q_cos_sin_cache.shape[-1] // 2,
-                index_q_packed,
-                index_q_packed.stride(0),
-                index_q_packed.stride(1),
-                index_q_scale,
-                index_q_scale.stride(0),
-                index_q_scale.stride(1),
-                index_q_head_dim,
-                MXFP4_BLOCK_SIZE,
-                index_weights,
-                index_weights.stride(0),
-                index_weights_softmax_scale,
-                index_weights_head_scale,
-                index_weights_out,
-                index_weights_out.stride(0),
-                num_warps=1,  # TODO: Tune this
-            )
-
+        _fused_indexer_q_rope_mxfp4_kernel[(num_tokens, num_index_q_heads)](
+            positions,
+            index_q,
+            index_q.stride(0),
+            index_q.stride(1),
+            index_q_cos_sin_cache,
+            index_q_cos_sin_cache.stride(0),
+            index_q_cos_sin_cache.shape[-1] // 2,
+            index_q_packed,
+            index_q_packed.stride(0),
+            index_q_packed.stride(1),
+            index_q_scale,
+            index_q_scale.stride(0),
+            index_q_scale.stride(1),
+            index_q_head_dim,
+            MXFP4_BLOCK_SIZE,
+            index_weights,
+            index_weights.stride(0),
+            index_weights_softmax_scale,
+            index_weights_head_scale,
+            index_weights_out,
+            index_weights_out.stride(0),
+            num_warps=1,  # TODO: Tune this
+        )
         # Values stay uint8 (2 E2M1 nibbles per byte). Scales are 4 ue8m0
         # bytes per (token, head) reinterpreted as one int32, then squeezed
         # from (T, H, 1) to (T, H) to match DeepGEMM's expected q_sf rank
@@ -398,41 +563,24 @@ def fused_indexer_q_rope_quant(
         ), index_weights_out
 
     index_q_fp8 = torch.empty_like(index_q, dtype=torch.float8_e4m3fn)
-    if has_cutedsl():
-        # lazily import, otherwise some tests fail due to CUDA driver init failure.
-        from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
-            fused_indexer_q_rope_quant_fp8_cutedsl,
-        )
-
-        fused_indexer_q_rope_quant_fp8_cutedsl(
-            positions,
-            index_q,
-            index_q_cos_sin_cache,
-            index_weights,
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-            index_q_fp8,
-            index_weights_out,
-        )
-    else:
-        _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
-            positions,
-            index_q,
-            index_q.stride(0),
-            index_q.stride(1),
-            index_q_cos_sin_cache,
-            index_q_cos_sin_cache.stride(0),
-            index_q_cos_sin_cache.shape[-1] // 2,
-            index_q_fp8,
-            index_q_fp8.stride(0),
-            index_q_fp8.stride(1),
-            index_q_head_dim,
-            index_weights,
-            index_weights.stride(0),
-            index_weights_softmax_scale,
-            index_weights_head_scale,
-            index_weights_out,
-            index_weights_out.stride(0),
-            num_warps=1,  # TODO: Tune this
-        )
+    _fused_indexer_q_rope_quant_kernel[(num_tokens, num_index_q_heads)](
+        positions,
+        index_q,
+        index_q.stride(0),
+        index_q.stride(1),
+        index_q_cos_sin_cache,
+        index_q_cos_sin_cache.stride(0),
+        index_q_cos_sin_cache.shape[-1] // 2,
+        index_q_fp8,
+        index_q_fp8.stride(0),
+        index_q_fp8.stride(1),
+        index_q_head_dim,
+        index_weights,
+        index_weights.stride(0),
+        index_weights_softmax_scale,
+        index_weights_head_scale,
+        index_weights_out,
+        index_weights_out.stride(0),
+        num_warps=1,  # TODO: Tune this
+    )
     return index_q_fp8, index_weights_out
