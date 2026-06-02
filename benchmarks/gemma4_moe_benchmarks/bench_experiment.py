@@ -424,6 +424,7 @@ def run_experiment(
     reps: int,
 ) -> list[dict]:
     """Build engine for one experiment config, run `reps` generations."""
+    import torch
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
@@ -466,6 +467,25 @@ def run_experiment(
             f"{gpu_mem_util:.3f} (planned {exp_cfg['gpu_memory_utilization']})",
             flush=True,
         )
+
+    # Strict physical-memory emulation cap for this process.
+    # Example: GPU_MEM_SCALE=0.5 on an 80 GB card -> ~40 GB process cap.
+    process_mem_cap = max(0.0, min(1.0, mem_scale))
+    if torch.cuda.is_available() and process_mem_cap > 0.0:
+        try:
+            dev_idx = torch.cuda.current_device()
+            torch.cuda.set_per_process_memory_fraction(process_mem_cap,
+                                                       device=dev_idx)
+            print(
+                f"  torch.cuda.set_per_process_memory_fraction="
+                f"{process_mem_cap:.3f} on cuda:{dev_idx}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"  WARNING: failed to set torch per-process memory cap: {e}",
+                flush=True,
+            )
 
     # Build LLM kwargs
     llm_kwargs: dict = dict(
