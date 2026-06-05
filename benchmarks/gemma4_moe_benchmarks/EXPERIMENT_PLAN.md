@@ -8,6 +8,20 @@
 
 ---
 
+## Operational guardrails (must-pass preflight)
+
+- Use the intended Python environment explicitly. This benchmark shell wrapper now
+    checks `vllm`, `numpy`, and `scipy` imports before running any experiment.
+- On this A100 setup, a known compatible stack is `vllm==0.22.0`, `numpy<2`,
+    and `scipy>=1.14,<2`.
+- If `GEMMA4_TEXT_ONLY_MODEL_PATH` equals `GEMMA4_MODEL_PATH`, text-only
+    experiments silently become full-model runs. Build a dedicated text-only
+    checkpoint first (for example via `examples/create_text_only_model.py`).
+- Treat shell "PASSED" as valid only when `bench_experiment.py` exits 0. The
+    driver now returns non-zero when any experiment throws.
+
+---
+
 ## Fixed scenario parameters (sc1)
 
 | Parameter | Value | Source |

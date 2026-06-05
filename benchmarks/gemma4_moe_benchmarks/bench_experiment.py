@@ -673,6 +673,7 @@ def main() -> int:
     ensure_csv_header()
     sc_cfg = SCENARIOS[args.scenario]
     exp_ids = [x.strip() for x in args.exp.split(",")]
+    failed_exp_ids: list[str] = []
 
     for exp_id in exp_ids:
         if exp_id not in EXPERIMENTS:
@@ -704,6 +705,14 @@ def main() -> int:
             print(f"!!! experiment {exp_id} FAILED: {e}", flush=True)
             import traceback
             traceback.print_exc()
+            failed_exp_ids.append(exp_id)
+
+    if failed_exp_ids:
+        print(
+            f"\nDone with failures. failed={','.join(failed_exp_ids)}",
+            flush=True,
+        )
+        return 1
 
     print("\nDone.", flush=True)
     return 0

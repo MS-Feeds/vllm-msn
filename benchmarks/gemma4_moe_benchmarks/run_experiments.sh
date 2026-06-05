@@ -19,13 +19,20 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Python interpreter used for helper probes and benchmark execution.
+: "${PYTHON_BIN:=python3}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "ERROR: PYTHON_BIN '$PYTHON_BIN' not found in PATH"
+  exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # CUDA runtime library path (required for precompiled vLLM binaries)
 # ---------------------------------------------------------------------------
 # Precompiled vLLM binaries need CUDA runtime libs from the active env's
 # nvidia-* site-packages. Auto-detect from the current python's site-packages
 # so this works under different conda/venv locations.
-_NVIDIA_LIB_GLOBS=$(python3 - <<'PY' 2>/dev/null || true
+_NVIDIA_LIB_GLOBS=$($PYTHON_BIN - <<'PY' 2>/dev/null || true
 import glob, os, sysconfig
 sp = sysconfig.get_paths()["purelib"]
 roots = []
@@ -74,7 +81,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --list)
-      python3 bench_experiment.py --exp E001 --list
+      "$PYTHON_BIN" bench_experiment.py --exp E001 --list
       exit 0
       ;;
     -h|--help)
@@ -92,6 +99,24 @@ fi
 if [[ ${#EXP_IDS[@]} -eq 0 ]]; then
   echo "ERROR: no experiment ID provided. Use --all or specify e.g. E001"
   exit 1
+fi
+
+# Fail fast if the selected Python env cannot import benchmark dependencies.
+echo "Python executable: $($PYTHON_BIN -c 'import sys; print(sys.executable)')"
+echo "Python version   : $($PYTHON_BIN -V 2>&1)"
+if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1; then
+import vllm
+import numpy
+import scipy
+PY
+  echo "ERROR: Python preflight failed. '$PYTHON_BIN' must import vllm, numpy, and scipy."
+  echo "Hint: prepend the intended env to PATH, e.g. 'export PATH=/opt/conda/envs/ptca/bin:$PATH'"
+  exit 1
+fi
+
+if [[ "${GEMMA4_TEXT_ONLY_MODEL_PATH}" == "${GEMMA4_MODEL_PATH}" ]]; then
+  echo "WARNING: GEMMA4_TEXT_ONLY_MODEL_PATH equals GEMMA4_MODEL_PATH."
+  echo "         Text-only experiments will run against full model weights."
 fi
 
 # Normalize: allow both comma-separated and space-separated experiment IDs.
@@ -128,7 +153,7 @@ set_env_for_exp() {
       ;;
     E002|E003|E004|E005|E006|E007|E008|E009|E010|E011|E012|E013|E017|E018)
       # FP8 weights: enable FlashInfer FP8 MoE on H100, keep off on A100
-      COMPUTE_CAP=$(python3 -c "import torch; cc=torch.cuda.get_device_capability(); print(cc[0]*10+cc[1])" 2>/dev/null || echo "0")
+      COMPUTE_CAP=$($PYTHON_BIN -c "import torch; cc=torch.cuda.get_device_capability(); print(cc[0]*10+cc[1])" 2>/dev/null || echo "0")
       if [[ "$COMPUTE_CAP" -ge 90 ]]; then
         export VLLM_USE_FLASHINFER_MOE_FP8="1"
         echo "  → H100 detected (sm_${COMPUTE_CAP}): enabling VLLM_USE_FLASHINFER_MOE_FP8=1"
@@ -169,7 +194,7 @@ for EXP in "${EXPS[@]}"; do
   set_env_for_exp "$EXP"
 
   echo ">>> Launching bench_experiment.py --exp ${EXP} --scenario ${SCENARIO} --reps ${REPS}"
-  if python3 bench_experiment.py \
+  if "$PYTHON_BIN" bench_experiment.py \
       --exp "${EXP}" \
       --scenario "${SCENARIO}" \
       --reps "${REPS}"; then
