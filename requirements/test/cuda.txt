@@ -121,7 +121,7 @@ coverage==7.14.1
     # via pytest-cov
 cramjam==2.11.0
     # via fastparquet
-cryptography==46.0.5
+cryptography==48.0.0
     # via
     #   azure-identity
     #   azure-storage-blob
