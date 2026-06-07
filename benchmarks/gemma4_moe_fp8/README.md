@@ -1068,3 +1068,33 @@ is amortized for sc1. To measure cold prefill, pass
   campaign in
   [`../../examples/gemma4/ablation_study_async_engine.md`](../../examples/gemma4/ablation_study_async_engine.md)
   for per-request latency measurements.
+
+---
+
+## Open questions / TODO
+
+- [ ] **Does MTP (speculative decoding) actually help on every workload?**
+  Observed evidence says *no — it is dataset-dependent*. On stock vLLM 0.22
+  (A100, sc1, 1000 prompts, k=5, `max_num_seqs=128`):
+  - Artificial fixed-text data (identical Shakespeare body, only a
+    `[sample N]` tag differs): MTP was **~14% slower** (E004 1133 → E005 976
+    output tok/s).
+  - Realistic `[SYSTEM]` MAI personalization data (varied, structured
+    output): MTP was **~34% faster** (E004 1483 → E005 1989 output tok/s).
+  The deciding factor is the **draft acceptance rate**: MTP only wins when
+  the small draft model's proposed tokens match the target model's. On
+  out-of-distribution / unseen-distribution data the draft mispredicts,
+  acceptance collapses, and MTP becomes pure overhead (extra draft forwards
+  with no token savings).
+  - [ ] Instrument and log the per-run **acceptance rate**
+    (`spec_decode_num_accepted_tokens / num_draft_tokens` via
+    `llm.get_metrics()`) — currently not captured because runs use
+    `disable_log_stats=True`.
+  - [ ] Run a controlled distribution sweep: same MTP config across several
+    datasets spanning in-distribution → OOD, and correlate acceptance rate
+    with the MTP speedup/slowdown.
+  - [ ] Sweep `num_speculative_tokens` (k) per dataset — optimal k likely
+    drops as acceptance falls; high k on low-acceptance data amplifies the
+    penalty.
+  - [ ] Quantify the break-even acceptance threshold below which MTP should
+    be auto-disabled for a given workload.
