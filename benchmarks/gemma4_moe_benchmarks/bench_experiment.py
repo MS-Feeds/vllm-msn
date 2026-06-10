@@ -77,6 +77,13 @@ SCENARIOS = {
     ),
 }
 
+# Optional override of the per-scenario prompt count (e.g. to use a larger
+# dataset). Applies to every scenario so fork/stock runs stay consistent.
+_BENCH_NUM_PROMPTS = os.environ.get("BENCH_NUM_PROMPTS")
+if _BENCH_NUM_PROMPTS:
+    for _sc in SCENARIOS.values():
+        _sc["num_prompts"] = int(_BENCH_NUM_PROMPTS)
+
 # ---------------------------------------------------------------------------
 # Model paths
 # Adjust MODEL_BASE and MODEL_TEXT_ONLY to your local checkpoint locations.
