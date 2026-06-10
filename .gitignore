@@ -223,7 +223,7 @@ _build/
 hip_compat.h
 
 # Benchmark dataset
-benchmarks/**/*.json
+# benchmarks/**/*.json
 
 # Linting
 actionlint
@@ -250,3 +250,4 @@ outputs/
 .deps/
 examples/experiment_results/
 benchmarks/gemma4_moe_fp8/datasets/
+.deps/cutlass-src
