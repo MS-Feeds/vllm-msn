@@ -1120,7 +1120,7 @@ vocos==0.1.0
     # via -r requirements/test/cuda.in
 wcwidth==0.7.0
     # via ftfy
-webcolors==24.11.1
+webcolors==25.10.0
     # via jsonschema
 werkzeug==3.1.3
     # via schemathesis
