@@ -25,7 +25,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .config_space import (
+from config_space import (
     config_summary,
     config_to_env_vars,
     config_to_llm_kwargs,
