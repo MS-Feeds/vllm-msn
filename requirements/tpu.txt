@@ -11,4 +11,4 @@ ray[default]
 ray[data]
 setuptools==78.1.1
 nixl==0.3.0
-tpu-inference==0.20.0
+tpu-inference==0.23.0

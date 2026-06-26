@@ -2,7 +2,7 @@
 #    uv pip compile requirements/test/cuda.in -c requirements/cuda.txt -o requirements/test/cuda.txt --index-strategy unsafe-best-match --torch-backend cu130 --python-platform x86_64-manylinux_2_28 --python-version 3.12
 absl-py==2.4.0
     # via rouge-score
-accelerate==1.13.0
+accelerate==1.14.0
     # via peft
 aiohappyeyeballs==2.6.1
     # via aiohttp
@@ -27,7 +27,7 @@ annotated-doc==0.0.4
     # via fastapi
 annotated-types==0.7.0
     # via pydantic
-anyio==4.13.0
+anyio==4.14.1
     # via
     #   httpx
     #   starlette
@@ -54,7 +54,7 @@ azure-core==1.41.0
     #   azure-storage-blob
 azure-identity==1.25.2
     # via runai-model-streamer-azure
-azure-storage-blob==12.29.0
+azure-storage-blob==12.30.0
     # via runai-model-streamer-azure
 backoff==2.2.1
     # via
@@ -137,7 +137,7 @@ cupy-cuda12x==13.6.0
     # via ray
 cycler==0.12.1
     # via matplotlib
-datamodel-code-generator==0.60.0
+datamodel-code-generator==0.65.1
     # via -r requirements/test/cuda.in
 dataproperty==1.1.1
     # via
@@ -183,7 +183,7 @@ et-xmlfile==2.0.0
     # via openpyxl
 evaluate==0.4.3
     # via lm-eval
-fastapi==0.136.3
+fastapi==0.138.1
     # via
     #   -c requirements/common.txt
     #   gpt-oss
@@ -232,7 +232,7 @@ google-api-core==2.31.0
     #   google-cloud-core
     #   google-cloud-storage
     #   opencensus
-google-auth==2.53.0
+google-auth==2.55.1
     # via
     #   google-api-core
     #   google-cloud-core
@@ -240,7 +240,7 @@ google-auth==2.53.0
     #   runai-model-streamer-gcs
 google-cloud-core==2.6.0
     # via google-cloud-storage
-google-cloud-storage==3.11.0
+google-cloud-storage==3.12.0
     # via runai-model-streamer-gcs
 google-crc32c==1.8.0
     # via
@@ -275,7 +275,7 @@ hf-xet==1.5.0
     # via huggingface-hub
 hiredis==3.4.0
     # via tensorizer
-hpack==4.1.0
+hpack==4.2.0
     # via h2
 html2text==2025.4.15
     # via gpt-oss
@@ -287,7 +287,7 @@ httpx==0.28.1
     #   huggingface-hub
     #   perceptron
     #   schemathesis
-huggingface-hub==1.17.0
+huggingface-hub==1.21.0
     # via
     #   accelerate
     #   datasets
@@ -423,11 +423,11 @@ msal==1.37.0
     #   msal-extensions
 msal-extensions==1.3.1
     # via azure-identity
-msgpack==1.1.0
+msgpack==1.2.1
     # via
     #   librosa
     #   ray
-mteb==2.12.30
+mteb==2.16.1
     # via -r requirements/test/cuda.in
 multidict==6.7.1
     # via
@@ -533,7 +533,7 @@ nvidia-nvjitlink==13.3.33
     #   nvidia-cufft
     #   nvidia-cusolver
     #   nvidia-cusparse
-nvidia-nvshmem-cu13==3.6.5
+nvidia-nvshmem-cu13==3.7.0
     # via torch
 nvidia-nvtx==13.3.29
     # via cuda-toolkit
@@ -555,22 +555,22 @@ opencv-python-headless==4.13.0.90
     #   mistral-common
 openpyxl==3.1.5
     # via -r requirements/test/cuda.in
-opentelemetry-api==1.42.1
+opentelemetry-api==1.43.0
     # via
     #   -c requirements/common.txt
     #   opentelemetry-exporter-prometheus
     #   opentelemetry-sdk
     #   opentelemetry-semantic-conventions
-opentelemetry-exporter-prometheus==0.63b1
+opentelemetry-exporter-prometheus==0.64b0
     # via ray
-opentelemetry-proto==1.42.1
+opentelemetry-proto==1.43.0
     # via ray
-opentelemetry-sdk==1.42.1
+opentelemetry-sdk==1.43.0
     # via
     #   -c requirements/common.txt
     #   opentelemetry-exporter-prometheus
     #   ray
-opentelemetry-semantic-conventions==0.63b1
+opentelemetry-semantic-conventions==0.64b0
     # via opentelemetry-sdk
 optuna==3.6.1
     # via genai-perf
@@ -642,7 +642,7 @@ pluggy==1.6.0
     # via
     #   pytest
     #   pytest-cov
-polars==1.41.2
+polars==1.42.0
     # via mteb
 pooch==1.9.0
     # via librosa
@@ -854,11 +854,11 @@ runai-model-streamer-gcs==0.16.0
     # via runai-model-streamer
 runai-model-streamer-s3==0.16.0
     # via runai-model-streamer
-s3transfer==0.18.0
+s3transfer==0.19.0
     # via boto3
 sacrebleu==2.6.0
     # via lm-eval
-safetensors==0.7.0
+safetensors==0.8.0
     # via
     #   accelerate
     #   open-clip-torch
@@ -891,7 +891,7 @@ scipy==1.15.3
     #   vocos
 segmentation-models-pytorch==0.5.0
     # via -r requirements/test/cuda.in
-sentence-transformers==5.5.1
+sentence-transformers==5.6.0
     # via
     #   -r requirements/test/cuda.in
     #   mteb
@@ -920,7 +920,7 @@ sniffio==1.3.1
     #   httpx
 sortedcontainers==2.4.0
     # via hypothesis
-soundfile==0.13.1
+soundfile==0.14.0
     # via
     #   -r requirements/test/cuda.in
     #   genai-perf
@@ -1024,7 +1024,7 @@ torchvision==0.26.0+cu130
     #   open-clip-torch
     #   segmentation-models-pytorch
     #   timm
-tqdm==4.67.3
+tqdm==4.68.3
     # via
     #   datasets
     #   evaluate
@@ -1039,7 +1039,7 @@ tqdm==4.67.3
     #   segmentation-models-pytorch
     #   sentence-transformers
     #   transformers
-transformers==5.10.2
+transformers==5.12.1
     # via
     #   -c requirements/common.txt
     #   -r requirements/test/cuda.in
@@ -1118,7 +1118,7 @@ virtualenv==20.31.2
     # via ray
 vocos==0.1.0
     # via -r requirements/test/cuda.in
-wcwidth==0.7.0
+wcwidth==0.8.1
     # via ftfy
 webcolors==24.11.1
     # via jsonschema
