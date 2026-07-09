@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Prepares an AIME sample subset for the evaluation pipeline.
 
+This pipeline measures throughput/spec-decode metrics only (see
+../README.md) -- there is no accuracy scoring. AIME is used purely as a
+source of realistic, varied-length reasoning prompts.
+
 Downloads the AIME 1983-2024 problem set (933 problems; no single year has
 enough problems on its own, so this pools across years) from the
 `gneubig/aime-1983-2024` Hugging Face dataset, normalizes it, and writes
 datasets/aime_samples.jsonl as {"id", "year", "prompt", "answer": <int>} rows.
+"answer" is kept as optional provenance metadata (harmless, already
+extracted) but is not consumed by anything downstream in this pipeline.
 
-AIME answers are integers 0-999, so scoring (see ../scorers/aime_scorer.py)
-is exact-match, no code execution needed. This script writes the raw
-problem statement as "prompt" (not chat-template-rendered) -- rendering
-happens in run_pipeline.py at eval time, matching the convention in
-../../gemma4_moe_benchmarks/prep_dataset.py.
+This script writes the raw problem statement as "prompt" (not
+chat-template-rendered) -- rendering happens in run_pipeline.py at eval
+time, matching the convention in ../../gemma4_moe_benchmarks/prep_dataset.py.
 
 Usage:
     python3 prep_aime.py --max-keep 300
@@ -28,7 +32,8 @@ import requests
 
 # This CSV is text-only -- diagrams referenced by the original PDF are not
 # carried over. Rows matching this pattern depend on a visual the model
-# never receives, so they're excluded rather than silently scored unfairly.
+# never receives, so they're excluded to keep the prompt set realistic
+# (an unanswerable prompt isn't a representative throughput workload).
 DIAGRAM_DEPENDENCY_PATTERN = re.compile(
     r"\b(figure|diagram|shown below|shown above|picture)\b"
     r"|\.(png|jpe?g|gif)\b|pdfresizer",

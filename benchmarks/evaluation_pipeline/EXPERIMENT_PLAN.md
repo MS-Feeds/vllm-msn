@@ -11,7 +11,9 @@ Status: stub. To be filled in alongside `run_pipeline.py`'s `EXPERIMENTS` dict.
 
 ## Metrics captured per run
 
-- Task accuracy (per-dataset scorer in `scorers/`)
+No accuracy/correctness scoring -- throughput and spec-decode behavior
+only:
+
 - Requests per second (QPS)
 - End-to-end wall time
 - Draft token acceptance rate (`metrics.py`)
@@ -21,14 +23,14 @@ Status: stub. To be filled in alongside `run_pipeline.py`'s `EXPERIMENTS` dict.
 
 Higher k should increase draft length but generally lower per-token
 acceptance rate; net QPS effect at each k, per dataset, is the primary
-thing this pipeline measures. Accuracy is expected to be ~unchanged by
-speculative decoding (it should be a lossless sampling equivalent) —
-any accuracy delta across spec-decode on/off is itself a signal worth
-flagging.
+thing this pipeline measures. The three datasets are included to see
+whether that tradeoff differs by prompt/response shape (e.g. long
+reasoning chains for AIME vs. code generation vs. short multiple-choice
+answers for GPQA), not to grade correctness.
 
 ## Relationship to `../gemma4_moe_benchmarks/EXPERIMENT_PLAN.md`
 
 That plan's E001-E018 IDs cover throughput-only ablations (FP8, CUDA
 graphs, batch size, gpu-mem). This plan is scoped narrowly to the
-spec-decode/k/dataset axes relevant to accuracy + acceptance rate and
+spec-decode/k/dataset axes relevant to throughput + acceptance rate and
 does not reuse those experiment IDs.

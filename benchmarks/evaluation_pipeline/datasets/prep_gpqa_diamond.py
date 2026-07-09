@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """Prepares a GPQA Diamond sample subset for the evaluation pipeline.
 
+This pipeline measures throughput/spec-decode metrics only (see
+../README.md) -- there is no accuracy scoring. GPQA Diamond is used
+purely as a source of realistic, short multiple-choice-style prompts
+(a useful contrast to AIME's long reasoning chains and LiveCodeBench's
+code-generation prompts).
+
 Downloads gpqa_diamond.csv (~198 expert-written multiple-choice science
 questions) from https://huggingface.co/datasets/Idavidrein/gpqa, shuffles
 each question's 4 answer choices into a random order (the source data
 always lists the correct answer first/separately -- using that order
-verbatim would leak a positional bias), and writes
-datasets/gpqa_diamond_samples.jsonl as
+verbatim would leak a positional bias if this were ever used for scoring
+later), and writes datasets/gpqa_diamond_samples.jsonl as
 {"id", "subdomain", "prompt", "choices": [...], "answer": "A"} rows.
+"choices"/"answer" are kept as harmless provenance metadata but nothing
+downstream in this pipeline consumes them.
 
 NOTE: this dataset is gated on Hugging Face -- you must (1) accept its
 terms at https://huggingface.co/datasets/Idavidrein/gpqa while logged in,
@@ -15,9 +23,8 @@ and (2) have HF_TOKEN (or HUGGINGFACE_HUB_TOKEN) set in the environment,
 same as gemma4_moe_benchmarks/.env_exports.sh already does for model
 downloads. Anonymous requests get a 401.
 
-Scoring is exact-match on the letter (see ../scorers/gpqa_scorer.py). This
-script writes the raw question text as "prompt" (not chat-rendered, and
-not pre-formatted with lettered options) -- rendering the final
+This script writes the raw question text as "prompt" (not chat-rendered,
+and not pre-formatted with lettered options) -- rendering the final
 multiple-choice prompt happens in run_pipeline.py at eval time, matching
 the convention in ../../gemma4_moe_benchmarks/prep_dataset.py.
 
