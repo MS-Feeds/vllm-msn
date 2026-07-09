@@ -150,6 +150,11 @@ def initialize_engine(exp_cfg: dict):
         model=MODEL_BASE,
         trust_remote_code=True,
         seed=0,
+        # LLM.__init__ defaults disable_log_stats=True (see
+        # vllm/entrypoints/llm.py:253-254) unless explicitly overridden,
+        # which makes llm.get_metrics() raise "Stat logging disabled" --
+        # metrics.py needs this on to read spec-decode counters.
+        disable_log_stats=False,
     )
     if exp_cfg["spec_decode"]:
         llm_kwargs["spec_model"] = MODEL_ASSISTANT
