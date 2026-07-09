@@ -1,0 +1,12 @@
+# Keep LF line endings for all text files in this directory.
+# Required because core.safecrlf=true on Windows refuses to stage LF files
+# without an explicit eol override.
+*.sh    eol=lf
+*.bash  eol=lf
+*.py    eol=lf
+*.md    eol=lf
+*.json  eol=lf
+*.jsonl eol=lf
+*.txt   eol=lf
+*.yaml  eol=lf
+*.yml   eol=lf
