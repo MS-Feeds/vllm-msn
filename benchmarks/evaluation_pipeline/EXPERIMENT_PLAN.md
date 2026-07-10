@@ -6,7 +6,7 @@ Status: stub. To be filled in alongside `run_pipeline.py`'s `EXPERIMENTS` dict.
 
 - **Dataset** x **{aime, livecodebench, gpqa_diamond}**
 - **Speculative decoding** x **{off, on}** (on = `spec_model=GEMMA4_ASSISTANT_MODEL_PATH`)
-- **MTP draft length k** x **{1, 3, 5, 8}** (only applies when spec_decode=on)
+- **MTP draft length k** x **{1, 2, 3, 4, 5}** (only applies when spec_decode=on)
 - **Samples per dataset**: ~200-300 (exact count TBD, see README open questions)
 
 ## Metrics captured per run

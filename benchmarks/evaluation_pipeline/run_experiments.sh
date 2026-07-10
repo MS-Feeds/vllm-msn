@@ -5,7 +5,7 @@
 # Usage:
 #   ./run_experiments.sh S000                    # single experiment, all datasets, 2 reps
 #   ./run_experiments.sh S001,S003                # comma-separated list
-#   ./run_experiments.sh --all                     # all 5 experiments (S000-S004)
+#   ./run_experiments.sh --all                     # all 6 experiments (S000-S005)
 #   ./run_experiments.sh S003 --datasets aime,gpqa_diamond --reps 3
 #   ./run_experiments.sh --list                    # print the experiment matrix and exit
 #
@@ -83,7 +83,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $RUN_ALL -eq 1 ]]; then
-  EXP_IDS_CSV="S000,S001,S002,S003,S004"
+  EXP_IDS_CSV="S000,S001,S002,S003,S004,S005"
 else
   EXP_IDS_CSV=$(IFS=','; echo "${EXP_IDS[*]}")
 fi
