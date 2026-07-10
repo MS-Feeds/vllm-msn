@@ -247,7 +247,23 @@ def evaluate(
         # token instead of one per step -- that's what was producing
         # MBU >> 100% (physically impossible; you cannot sustain more than
         # the hardware's rated peak bandwidth).
-        decode_steps_per_second = (output_total / max(len(prompts), 1)) / elapsed
+        #
+        # Under speculative decoding this needs a second correction: one
+        # target-model verification pass (one weight-read) doesn't yield
+        # one accepted token per sequence, it yields mean_accept_length of
+        # them on average (that value already includes the guaranteed
+        # "bonus" token every round produces regardless of draft
+        # acceptance -- see metrics.py). Dividing by num_prompts alone
+        # still counts every accepted token as its own weight-read, which
+        # overcounts verification passes by mean_accept_length -- the same
+        # category of bug as the original one, just a smaller multiplier
+        # (mean_accept_length instead of concurrent batch size). When
+        # spec_decode is off there's no drafting at all, so 1 token really
+        # is 1 step -- mean_accept_length is defined as 1 in that case.
+        accept_len_divisor = spec["mean_accept_length"] if spec else 1.0
+        decode_steps_per_second = (
+            output_total / max(len(prompts), 1) / accept_len_divisor
+        ) / elapsed
         mbu = hardware_metrics.compute_mbu(
             decode_steps_per_second, bytes_per_tok, gpu_specs["peak_bandwidth_gbps"]
         )
