@@ -18,6 +18,11 @@ metrics:
       motivating question here (EXPERIMENT_PLAN.md) is whether the
       draft-length/acceptance-rate tradeoff differs by prompt/response
       shape (long AIME reasoning vs. code vs. short GPQA answers)
+    - MFU/MBU columns (see hardware_metrics.py) -- "n/a" for any run on
+      unrecognized hardware. For spec_decode=True rows these are a lower
+      bound, not exact: they count only the target model's FLOPs/bytes,
+      not the MTP assistant/draft model's additional forward pass (see
+      hardware_metrics.py module docstring for why that's excluded).
 
 Usage:
     python3 analyze_results.py [--csv results/all_runs.csv]
@@ -74,6 +79,8 @@ def summarize_group(rows: list[dict]) -> dict:
     qps_mean, qps_stdev = _stat(rows, "requests_per_second")
     acc_mean, acc_stdev = _stat(rows, "acceptance_rate")
     accept_len_mean, _ = _stat(rows, "mean_accept_length")
+    mfu_mean, _ = _stat(rows, "mfu")
+    mbu_mean, _ = _stat(rows, "mbu")
     return {
         "exp_id": first["exp_id"],
         "label": first["label"],
@@ -88,6 +95,8 @@ def summarize_group(rows: list[dict]) -> dict:
         "acceptance_rate_mean": acc_mean,
         "acceptance_rate_stdev": acc_stdev,
         "mean_accept_length_mean": accept_len_mean,
+        "mfu_mean": mfu_mean,
+        "mbu_mean": mbu_mean,
     }
 
 
@@ -103,9 +112,9 @@ def render_table(summaries: list[dict], dataset: str) -> str:
     lines.append(f"### Dataset: {dataset}\n")
     lines.append(
         "| Exp | Label | k | out tok/s | +/-sigma | QPS | vs S000 | "
-        "acceptance rate | mean accept len |"
+        "acceptance rate | mean accept len | MFU | MBU |"
     )
-    lines.append("|-----|-------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
+    lines.append("|-----|-------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|")
 
     for r in rows:
         otps = r["output_tps_mean"]
@@ -119,10 +128,14 @@ def render_table(summaries: list[dict], dataset: str) -> str:
         accept_len = r["mean_accept_length_mean"]
         accept_len_str = f"{accept_len:.2f}" if accept_len is not None else "n/a"
         k_str = r["mtp_k"] if r["spec_decode"] else "-"
+        mfu = r["mfu_mean"]
+        mfu_str = f"{mfu * 100:.1f}%" if mfu is not None else "n/a"
+        mbu = r["mbu_mean"]
+        mbu_str = f"{mbu * 100:.1f}%" if mbu is not None else "n/a"
 
         lines.append(
             f"| {r['exp_id']} | {r['label'][:45]} | {k_str} | {otps_str} | {otps_sig} | "
-            f"{qps_str} | {vs_base} | {acc_str} | {accept_len_str} |"
+            f"{qps_str} | {vs_base} | {acc_str} | {accept_len_str} | {mfu_str} | {mbu_str} |"
         )
 
     best = max((r for r in rows if r["output_tps_mean"]), key=lambda r: r["output_tps_mean"], default=None)

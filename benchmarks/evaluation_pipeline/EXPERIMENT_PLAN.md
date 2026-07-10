@@ -18,6 +18,10 @@ only:
 - End-to-end wall time
 - Draft token acceptance rate (`metrics.py`)
 - Mean draft acceptance length (`metrics.py`)
+- Model FLOP Utilization / Model Bandwidth Utilization (`hardware_metrics.py`)
+  -- "n/a" on unrecognized GPUs (see `hardware_metrics.GPU_SPECS`); for
+  spec_decode=True rows these are a lower bound, since the MTP draft
+  model's own forward pass isn't counted (see module docstring)
 
 ## Expected signal
 

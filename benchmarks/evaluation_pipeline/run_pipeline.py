@@ -35,6 +35,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import hardware_metrics
 from metrics import diff_spec_decode_counters, snapshot_spec_decode_counters
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,7 @@ CSV_FIELDS = [
     "prompt_tokens_total", "output_tokens_total", "output_tps",
     "acceptance_rate", "mean_accept_length",
     "num_draft_tokens", "num_accepted_tokens", "num_drafts",
+    "mfu", "mbu",
 ]
 
 # ---------------------------------------------------------------------------
@@ -180,11 +182,18 @@ def evaluate(
     exp_id: str,
     exp_cfg: dict,
     rep: int,
+    hf_config,
+    active_params: dict[str, int],
+    gpu_specs: dict[str, float] | None,
 ) -> dict:
     """Runs one (experiment x dataset x rep) generation pass: loads
     prompts, renders the chat template, calls llm.generate(), times it,
     and diffs spec-decode counters before/after. No scoring step -- see
-    module docstring."""
+    module docstring.
+
+    hf_config/active_params/gpu_specs are computed once per experiment
+    (see run_one_experiment) and passed in rather than recomputed here --
+    they don't depend on the dataset or rep, only on the model/hardware."""
     from vllm import SamplingParams
 
     raw_prompts = load_prompts(ds_cfg["path"])
@@ -211,6 +220,26 @@ def evaluate(
     prompt_total = sum(len(o.prompt_token_ids) for o in outputs)
     output_total = sum(len(o.outputs[0].token_ids) for o in outputs)
 
+    # MFU uses total tokens (prefill + decode both consume FLOPs); MBU
+    # uses output tokens only (it's specifically the decode-phase,
+    # memory-bound metric -- see hardware_metrics.py module docstring).
+    # gpu_specs is None on unrecognized hardware -- report n/a rather
+    # than a number computed against a guessed peak spec.
+    mfu = mbu = None
+    if gpu_specs is not None and elapsed > 0:
+        avg_context_len = (prompt_total + output_total) / max(len(prompts), 1)
+        flops_per_tok = hardware_metrics.flops_per_token(
+            active_params, avg_context_len, hf_config
+        )
+        bytes_per_tok = hardware_metrics.bytes_per_token(active_params)
+        total_tokens = prompt_total + output_total
+        mfu = hardware_metrics.compute_mfu(
+            total_tokens / elapsed, flops_per_tok, gpu_specs["peak_tflops_bf16"]
+        )
+        mbu = hardware_metrics.compute_mbu(
+            output_total / elapsed, bytes_per_tok, gpu_specs["peak_bandwidth_gbps"]
+        )
+
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "exp_id": exp_id,
@@ -231,12 +260,17 @@ def evaluate(
         "num_draft_tokens": spec["num_draft_tokens"] if spec else None,
         "num_accepted_tokens": spec["num_accepted_tokens"] if spec else None,
         "num_drafts": spec["num_drafts"] if spec else None,
+        "mfu": round(mfu, 4) if mfu is not None else None,
+        "mbu": round(mbu, 4) if mbu is not None else None,
     }
 
     acc_str = f"{row['acceptance_rate']:.3f}" if row["acceptance_rate"] is not None else "n/a"
+    mfu_str = f"{row['mfu']:.3f}" if row["mfu"] is not None else "n/a (unrecognized GPU)"
+    mbu_str = f"{row['mbu']:.3f}" if row["mbu"] is not None else "n/a (unrecognized GPU)"
     print(
         f"  elapsed={elapsed:.1f}s  req/s={row['requests_per_second']:.3f}  "
-        f"out_tok/s={row['output_tps']:.0f}  acceptance_rate={acc_str}",
+        f"out_tok/s={row['output_tps']:.0f}  acceptance_rate={acc_str}  "
+        f"MFU={mfu_str}  MBU={mbu_str}",
         flush=True,
     )
     return row
@@ -286,9 +320,14 @@ def summarize(exp_id: str, label: str, rows: list[dict]) -> None:
         )
         acc_vals = [x["acceptance_rate"] for x in ds_rows if x["acceptance_rate"] is not None]
         acc_str = f"{statistics.mean(acc_vals):.3f}" if acc_vals else "n/a"
+        mfu_vals = [x["mfu"] for x in ds_rows if x["mfu"] is not None]
+        mbu_vals = [x["mbu"] for x in ds_rows if x["mbu"] is not None]
+        mfu_str = f"{statistics.mean(mfu_vals):.3f}" if mfu_vals else "n/a"
+        mbu_str = f"{statistics.mean(mbu_vals):.3f}" if mbu_vals else "n/a"
         print(
             f"  {dataset:<14} reps={len(ds_rows)}  "
-            f"requests/sec={r_m:.4f}+/-{r_s:.4f}  acceptance_rate={acc_str}",
+            f"requests/sec={r_m:.4f}+/-{r_s:.4f}  acceptance_rate={acc_str}  "
+            f"MFU={mfu_str}  MBU={mbu_str}",
             flush=True,
         )
 
@@ -298,9 +337,29 @@ def summarize(exp_id: str, label: str, rows: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], reps: int) -> list[dict]:
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL_BASE, trust_remote_code=True)
+
+    # Model-architecture and hardware facts are constant across every
+    # dataset/rep in this experiment -- compute once, not per evaluate() call.
+    hf_config = AutoConfig.from_pretrained(MODEL_BASE, trust_remote_code=True)
+    active_params = hardware_metrics.compute_active_params(hf_config)
+    gpu_specs = hardware_metrics.detect_gpu_specs()
+    if gpu_specs is None:
+        print(
+            "[run_pipeline] WARNING: unrecognized GPU for MFU/MBU -- "
+            "see hardware_metrics.GPU_SPECS. Reporting mfu/mbu as n/a.",
+            flush=True,
+        )
+    else:
+        print(
+            f"[run_pipeline] active_params="
+            f"{active_params['total_active_params']/1e9:.2f}B  "
+            f"gpu_specs={gpu_specs}",
+            flush=True,
+        )
+
     llm = initialize_engine(exp_cfg)
 
     rows: list[dict] = []
@@ -308,7 +367,10 @@ def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], rep
         for dataset_name in dataset_names:
             ds_cfg = DATASETS[dataset_name]
             for rep in range(1, reps + 1):
-                row = evaluate(llm, tok, dataset_name, ds_cfg, exp_id, exp_cfg, rep)
+                row = evaluate(
+                    llm, tok, dataset_name, ds_cfg, exp_id, exp_cfg, rep,
+                    hf_config, active_params, gpu_specs,
+                )
                 rows.append(row)
     finally:
         present(rows)
