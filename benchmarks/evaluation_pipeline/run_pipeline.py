@@ -236,8 +236,20 @@ def evaluate(
         mfu = hardware_metrics.compute_mfu(
             total_tokens / elapsed, flops_per_tok, gpu_specs["peak_tflops_bf16"]
         )
+        # NOT output_total / elapsed. Weights are read from HBM once per
+        # scheduler step, and one step produces one token for every
+        # concurrently-running request -- so "bytes moved" scales with
+        # decode *steps*, not with raw output-token count. Dividing by
+        # num_prompts (an approximation for concurrent batch size, since
+        # all prompts are submitted in a single generate() call) converts
+        # aggregate tokens/sec back into steps/sec. Using output_total/elapsed
+        # directly effectively counts one full weight-read per request per
+        # token instead of one per step -- that's what was producing
+        # MBU >> 100% (physically impossible; you cannot sustain more than
+        # the hardware's rated peak bandwidth).
+        decode_steps_per_second = (output_total / max(len(prompts), 1)) / elapsed
         mbu = hardware_metrics.compute_mbu(
-            output_total / elapsed, bytes_per_tok, gpu_specs["peak_bandwidth_gbps"]
+            decode_steps_per_second, bytes_per_tok, gpu_specs["peak_bandwidth_gbps"]
         )
 
     row = {

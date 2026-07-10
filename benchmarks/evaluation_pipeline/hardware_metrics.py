@@ -190,13 +190,19 @@ def flops_per_token(
 
 
 def bytes_per_token(active_params: dict[str, int], bytes_per_param: int = BYTES_PER_PARAM_BF16) -> int:
-    """Bytes read from HBM per token for the active weights (attention +
-    dense MLP + router + selected experts + embedding/lm_head). This is
-    the standard single-stream MBU definition; under batching, the
-    aggregate achieved-bandwidth figure can legitimately exceed this
-    single-token baseline (weights are read once per step but serve the
-    whole batch) -- that's a real signal of moving from memory-bound to
-    compute-bound, not a bug. See module docstring."""
+    """Bytes read from HBM for the active weights (attention + dense MLP
+    + router + selected experts + embedding/lm_head) for ONE decode
+    STEP -- not one output token. A step reads the weights once and
+    produces one token for every concurrently-running request, so
+    callers computing MBU under batching must divide by the concurrent
+    batch size before multiplying by this value (see run_pipeline.py's
+    decode_steps_per_second) -- multiplying by raw aggregate tokens/sec
+    instead counts one full weight-read per request per token rather
+    than one per step, and reports MBU > 100%, which is physically
+    impossible (you cannot exceed the hardware's rated peak bandwidth).
+    An earlier version of this docstring claimed >100% was an expected
+    batching effect -- that was wrong; fixed after real GPU runs
+    reported MBU in the 500-1500% range, which was the tell."""
     return active_params["total_active_params"] * bytes_per_param
 
 
