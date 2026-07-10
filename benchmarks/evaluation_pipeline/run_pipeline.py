@@ -80,9 +80,10 @@ DATASETS: dict[str, dict] = {
 EXPERIMENTS: dict[str, dict] = {
     "S000": dict(label="No speculative decoding (baseline)", spec_decode=False, mtp_k=0),
     "S001": dict(label="MTP k=1", spec_decode=True, mtp_k=1),
-    "S002": dict(label="MTP k=3", spec_decode=True, mtp_k=3),
-    "S003": dict(label="MTP k=5", spec_decode=True, mtp_k=5),
-    "S004": dict(label="MTP k=8", spec_decode=True, mtp_k=8),
+    "S002": dict(label="MTP k=2", spec_decode=True, mtp_k=2),
+    "S003": dict(label="MTP k=3", spec_decode=True, mtp_k=3),
+    "S004": dict(label="MTP k=4", spec_decode=True, mtp_k=4),
+    "S005": dict(label="MTP k=5", spec_decode=True, mtp_k=5),
 }
 
 
