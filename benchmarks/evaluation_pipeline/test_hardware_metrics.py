@@ -130,21 +130,27 @@ def test_kv_cache_bytes_respects_text_config_nesting():
 # ---------------------------------------------------------------------------
 
 def test_bytes_per_decode_step_scales_kv_term_by_batch_not_weights():
+    """bytes_per_decode_step includes both the KV READ term (existing
+    cached context, at ctx) and the KV WRITE term (this step's own new
+    token, at ctx=1 -- see the CLOSED GAPS module docstring section),
+    both batch_size-scaled; only weight_bytes is batch-invariant."""
     cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
     active_params = hm.compute_active_params(cfg)
     ctx = 64
 
     weight_bytes = hm.bytes_per_token(active_params)
-    kv_bytes = hm.kv_cache_bytes_per_token(ctx, cfg)
+    kv_read_bytes = hm.kv_cache_bytes_per_token(ctx, cfg)
+    kv_write_bytes = hm.kv_cache_bytes_per_token(1.0, cfg)
 
     for batch_size in (1, 8, 64):
         total = hm.bytes_per_decode_step(active_params, ctx, cfg, batch_size)
-        assert total == weight_bytes + batch_size * kv_bytes
-        # Flat-summing (the bug) would give weight_bytes + kv_bytes
+        assert total == weight_bytes + batch_size * (kv_read_bytes + kv_write_bytes)
+        # Flat-summing (the bug) would give weight_bytes + kv_read_bytes
         # regardless of batch_size -- confirm we're not doing that except
-        # trivially at batch_size=1.
+        # trivially at batch_size=1 (and even then the write term still
+        # needs to be present).
         if batch_size > 1:
-            assert total != weight_bytes + kv_bytes
+            assert total != weight_bytes + kv_read_bytes + kv_write_bytes
 
 
 def test_short_context_batch_one_kv_term_is_small_relative_to_weights():
@@ -378,6 +384,10 @@ def test_flops_per_token_spec_decode_k0_matches_target_only_exactly():
 
 
 def test_flops_per_token_spec_decode_adds_draft_passes_exactly():
+    """The target's own contribution scales by (mtp_k+1) -- its single
+    verification pass actually processes mtp_k+1 candidate positions at
+    once, not the 1 position flops_per_token() alone accounts for (see
+    CLOSED GAPS in the module docstring) -- plus mtp_k draft passes."""
     target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
     target_params = hm.compute_active_params(target_cfg)
     draft_cfg = make_draft_config(DRAFT_LAYERS)
@@ -385,15 +395,15 @@ def test_flops_per_token_spec_decode_adds_draft_passes_exactly():
     ctx = 64
     mtp_k = 5
 
-    base = hm.flops_per_token(target_params, ctx, target_cfg)
+    target_pass_flops = hm.flops_per_token(target_params, ctx, target_cfg)
     draft_flops_per_pass = hm.flops_per_token(draft_params, ctx, draft_cfg)
-    expected = base + mtp_k * draft_flops_per_pass
+    expected = (mtp_k + 1) * target_pass_flops + mtp_k * draft_flops_per_pass
 
     actual = hm.flops_per_token_spec_decode(
         target_params, ctx, target_cfg, mtp_k, draft_cfg, draft_params
     )
     assert actual == expected
-    assert actual > base  # draft's contribution is nonzero
+    assert actual > (mtp_k + 1) * target_pass_flops  # draft's contribution is nonzero
 
 
 def test_bytes_per_decode_step_spec_decode_k0_matches_base_exactly():
@@ -418,12 +428,12 @@ def test_bytes_per_decode_step_spec_decode_k0_matches_base_exactly():
 
 
 def test_bytes_per_decode_step_spec_decode_k5_matches_closed_form():
-    """k=5: verify the combined total matches the exact closed-form sum
-    of base + target KV write bytes ((k+1)*batch_size scaled) + draft
-    weight bytes (k scaled, NOT batch-scaled) + draft KV read bytes (k
-    AND batch scaled) -- this is BUG 5 (write bytes) plus the k/batch_size
-    threading, checked as one precise equality rather than just a
-    monotonicity check."""
+    """k=5: verify the combined total matches the exact closed-form sum.
+    base already includes ONE target write (bytes_per_decode_step's own
+    write term, correct for ordinary decoding); reaching the full
+    mtp_k+1 total needs mtp_k MORE writes here, not mtp_k+1 -- plus
+    draft weight bytes (k scaled, NOT batch-scaled) and draft KV read
+    bytes (k AND batch scaled)."""
     target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
     target_params = hm.compute_active_params(target_cfg)
     draft_cfg = make_draft_config(DRAFT_LAYERS)
@@ -439,7 +449,7 @@ def test_bytes_per_decode_step_spec_decode_k5_matches_closed_form():
 
     expected = (
         base
-        + (mtp_k + 1) * target_write_unit * batch_size
+        + mtp_k * target_write_unit * batch_size
         + mtp_k * draft_weight_unit
         + mtp_k * draft_kv_unit * batch_size
     )
@@ -449,6 +459,11 @@ def test_bytes_per_decode_step_spec_decode_k5_matches_closed_form():
     )
     assert actual == expected
     assert actual > base
+
+    # Total writes across the round should be mtp_k+1: the 1 baked into
+    # base plus the mtp_k additional ones asserted above.
+    total_write_bytes_this_round = target_write_unit * batch_size + mtp_k * target_write_unit * batch_size
+    assert total_write_bytes_this_round == (mtp_k + 1) * target_write_unit * batch_size
 
 
 def test_bytes_per_decode_step_spec_decode_write_term_scales_with_k():
@@ -476,6 +491,74 @@ def test_bytes_per_decode_step_spec_decode_write_term_scales_with_k():
 
     assert totals[1] - totals[0] == per_k_increment
     assert totals[2] - totals[1] == per_k_increment
+
+
+# ---------------------------------------------------------------------------
+# MFU prefill/decode split (see CLOSED GAPS in the module docstring).
+# ---------------------------------------------------------------------------
+
+def test_mfu_split_prefill_decode_matches_true_flops_not_blended():
+    """Regression test for the MFU prefill-contamination bug: applying a
+    single decode-shaped, mean_accept_length-divided flops_per_tok to
+    total_tokens (prefill+decode combined) via one compute_mfu() call
+    silently attributes decode-only costs (the /mean_accept_length
+    division AND the draft model's FLOPs) to prefill tokens, which never
+    go through a verification round or draft model at all.
+
+    The fix (implemented in run_pipeline.py's evaluate(), replicated
+    here since it's plain arithmetic over hardware_metrics primitives):
+    two separate compute_mfu() calls -- prefill tokens against
+    prefill-only target FLOPs (no division, no draft), decode/accepted
+    tokens against the full spec-decode round FLOPs divided by
+    mean_accept_length -- summed. This must match a directly-computed
+    ground truth; a single blended call must NOT, and must OVERSTATE it:
+    decode_flops_per_tok's numerator scales by (mtp_k+1) (the target's
+    own verification pass processes mtp_k+1 positions -- see CLOSED GAPS)
+    but is only divided by mean_accept_length, which is always <= mtp_k+1
+    (not every candidate position gets accepted) -- so decode_flops_per_tok
+    is systematically >= a single prefill token's true cost, and blending
+    it onto prefill tokens (which should cost exactly one undivided
+    target pass each) inflates the total."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    draft_cfg = make_draft_config(DRAFT_LAYERS)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+
+    prompt_total = 1000
+    output_total = 1000
+    batch_size = 10
+    elapsed = 20.0
+    mtp_k = 3
+    accept_len_divisor = 2.0
+    peak_tflops = 500.0
+
+    prefill_ctx = (prompt_total / batch_size) / 2
+    decode_ctx = (prompt_total + output_total / 2) / batch_size
+
+    prefill_flops_per_tok = hm.flops_per_token(target_params, prefill_ctx, target_cfg)
+    decode_flops_per_round = hm.flops_per_token_spec_decode(
+        target_params, decode_ctx, target_cfg, mtp_k, draft_cfg, draft_params
+    )
+    decode_flops_per_tok = decode_flops_per_round / accept_len_divisor
+
+    split_mfu = hm.compute_mfu(
+        prompt_total / elapsed, prefill_flops_per_tok, peak_tflops
+    ) + hm.compute_mfu(
+        output_total / elapsed, decode_flops_per_tok, peak_tflops
+    )
+
+    total_tokens = prompt_total + output_total
+    blended_mfu = hm.compute_mfu(total_tokens / elapsed, decode_flops_per_tok, peak_tflops)
+
+    true_achieved_flops = (
+        prompt_total * prefill_flops_per_tok
+        + (output_total / accept_len_divisor) * decode_flops_per_round
+    ) / elapsed
+    true_mfu = true_achieved_flops / (peak_tflops * 1e12)
+
+    assert abs(split_mfu - true_mfu) < 1e-9
+    assert abs(blended_mfu - true_mfu) > 1e-9
+    assert blended_mfu > split_mfu
 
 
 if __name__ == "__main__":

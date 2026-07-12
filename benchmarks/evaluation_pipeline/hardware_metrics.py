@@ -27,38 +27,56 @@ Computed this way for google/gemma-4-26B-A4B-it, active params come out
 to ~3.82B, matching the model's own "A4B" (Active 4B) name -- a useful
 sanity check that this is structurally correct, not just plausible.
 
+CLOSED GAPS (previously documented simplifications, now fixed -- kept here
+so the history of what was wrong and why is not lost):
+
+- MFU no longer blends prefill and decode tokens into one rate. Decode's
+  per-token FLOPs figure is divided by mean_accept_length and (under
+  spec decode) includes the draft model's FLOPs -- both are decode-only
+  corrections. Multiplying that single figure by (prompt+output)/elapsed
+  (run_pipeline.py's old approach) silently attributed both corrections
+  to prefill tokens too, which never go through a verification round or
+  a draft model at all. Fixed by computing prefill and decode achieved-
+  FLOPs as two separate compute_mfu() calls, summed (see
+  run_pipeline.py's evaluate()) -- prefill tokens are charged one full,
+  undivided target forward pass each, at a prefill-shaped context length
+  (average L/2 for a length-L prompt processed in one causal pass, not
+  the decode side's prompt_len+output_len/2, which assumes the whole
+  prompt is already cached). Confirmed by a hand-worked example
+  (test_mfu_split_prefill_decode_matches_true_flops_not_blended) that the
+  old blended approach OVERSTATED true MFU under spec decode:
+  decode_flops_per_tok's numerator scales by (mtp_k+1) (see the next
+  bullet) but is only divided by mean_accept_length, which is always
+  <= mtp_k+1 since not every candidate position gets accepted -- so
+  decode_flops_per_tok is systematically >= a single prefill token's
+  true cost, and blending it onto prefill tokens (which should cost
+  exactly one undivided target pass each) inflated the total.
+- The target model's own per-round FLOPs (flops_per_token_spec_decode)
+  now scales by (mtp_k + 1) when mtp_k >= 1: the target's single
+  verification pass actually processes mtp_k+1 candidate positions at
+  once, not the 1 position flops_per_token() alone accounts for. Was
+  previously left at 1x, undercounting the target's own contribution
+  under spec decode. At mtp_k <= 0 this is a no-op (flops_per_token()'s
+  1-position convention is already exact there -- no verification round
+  exists).
+- bytes_per_decode_step() now includes a KV WRITE term (one new token's
+  K/V written per step), not just the read term -- this applies to
+  EVERY decode step, spec decode or not (an ordinary autoregressive step
+  also writes exactly one new token's K/V). Previously uncounted
+  entirely. bytes_per_decode_step_spec_decode()'s own write term is
+  mtp_k additional writes on top of the 1 already included in the base,
+  reaching the correct mtp_k+1 total.
+
 KNOWN SIMPLIFICATIONS (documented, not hidden):
 
-- Draft-model (speculative decoding) accounting is now REAL, not a
-  documented lower bound, PROVIDED callers use the *_spec_decode
-  variants (bytes_per_decode_step_spec_decode, flops_per_token_spec_decode)
-  with a real draft_config/draft_active_params -- see the DRAFT MODEL
-  section below compute_active_params for the full, source-verified
-  architecture (compute_active_params/flops_per_token/bytes_per_token/
-  kv_cache_bytes_per_token themselves remain target-only and unchanged;
-  callers that don't pass draft_config get exactly the old target-only
-  numbers back, silently, which IS still a lower bound in that case).
-  One gap remains even with the *_spec_decode variants: flops_per_token()'s
-  "2 * active_params" convention assumes one forward pass processes
-  exactly one token, but the target's single verification pass actually
-  processes mtp_k+1 positions at once -- flops_per_token_spec_decode
-  does not correct the TARGET's own contribution for this (only adds the
-  draft's, correctly), since fixing it would require changing
-  flops_per_token()'s existing target-model logic or the tokens_per_second
-  call site's semantics, both out of scope for that change. So MFU
-  under spec_decode=True is closer to the true figure than before (draft
-  FLOPs are no longer missing) but the target's own FLOPs are still
-  mildly undercounted by a factor related to mtp_k+1 vs 1. MBU has no
-  such residual gap: weight-bytes-per-step and KV-read-bytes-per-step
-  are both step-level (not position-level) quantities that don't have
-  this problem, and KV-write-bytes-per-step is explicitly scaled by
-  mtp_k+1 (see bytes_per_decode_step_spec_decode).
 - The attention FLOPs term (quadratic in context length) and the KV
   cache bytes term both take a single avg_context_len figure, not the
   true per-step, per-request distribution. The caller (run_pipeline.py)
   passes the batch's MIDPOINT context length (prompt_len +
-  output_len/2, not the final prompt_len+output_len) since FLOPs/bytes
-  are step-level quantities averaged over every decode step, and context
+  output_len/2, not the final prompt_len+output_len) for the decode
+  side (a separate, smaller prefill-shaped context length is used for
+  MFU's prefill term -- see CLOSED GAPS above) since FLOPs/bytes are
+  step-level quantities averaged over every decode step, and context
   grows from prompt_len up to prompt_len+output_len over the course of
   generation -- using the final length instead would overestimate both
   terms by close to 2x for long generations. This midpoint approximation
@@ -67,6 +85,24 @@ KNOWN SIMPLIFICATIONS (documented, not hidden):
   sequence; neither is tracked precisely here. Sliding-attention layers
   cap this at sliding_window tokens regardless of true context length
   (Gemma4Attention only attends within the window).
+- batch_size (used throughout for weight-read sharing and KV-term
+  scaling) is num_prompts, a flat constant for the whole decode window --
+  it assumes every request submitted in one generate() call stays
+  concurrently active for the WHOLE window. Real vLLM continuous
+  batching lets faster-finishing requests drop out mid-call, so this is
+  an upper bound on true concurrency whenever output-length variance
+  within a batch is high (unaffected by any fix in this file; noted here
+  since it's the other major "batching" approximation alongside
+  avg_context_len).
+- Draft-model (speculative decoding) accounting is REAL, not a lower
+  bound, PROVIDED callers use the *_spec_decode variants
+  (bytes_per_decode_step_spec_decode, flops_per_token_spec_decode) with a
+  real draft_config/draft_active_params -- see the DRAFT MODEL section
+  below compute_active_params for the full, source-verified architecture.
+  compute_active_params/flops_per_token/bytes_per_token/
+  kv_cache_bytes_per_token themselves remain target-only; callers that
+  don't pass draft_config silently get target-only numbers back, which
+  IS still a lower bound in that case.
 
 Published hardware peak specs (BF16 tensor core, dense/no-sparsity,
 NVIDIA's own datasheets) -- add entries here for other GPUs as needed.
@@ -340,18 +376,31 @@ def bytes_per_decode_step(
 ) -> float:
     """Total HBM bytes moved for ONE decode step across the whole batch --
     the correct "bytes moved" figure for compute_mbu(), combining
-    bytes_per_token() and kv_cache_bytes_per_token() with the right scaling
-    for each: weights are read ONCE per step and shared by every
-    concurrently-running request, but each of those requests has its own
-    KV cache that must be read separately, so the KV term -- unlike the
-    weight term -- scales with batch_size. Flat-summing the two
-    (weight_bytes + kv_bytes_per_token, no batch_size factor) undercounts
-    KV traffic by exactly batch_size and, for long-context/large-batch
-    runs where KV traffic dominates, was undercounting *total* MBU bytes
-    for such runs, not just missing a small term."""
+    bytes_per_token() (weights) and kv_cache_bytes_per_token() for both
+    the READ (existing cached context) and WRITE (this step's own new
+    token) sides of the KV cache, with the right scaling for each:
+    weights are read ONCE per step and shared by every concurrently-
+    running request, but each request has its own KV cache that must be
+    read AND written separately, so both KV terms -- unlike the weight
+    term -- scale with batch_size.
+
+    The WRITE term applies here too, not just under speculative decoding:
+    every ordinary decode step writes exactly one new token's K/V into
+    the cache, same as the speculative-decoding case reduces to at
+    mtp_k=0 (see bytes_per_decode_step_spec_decode). It was uncounted
+    entirely before -- a real, if usually small, omission (see the
+    module docstring) that grows in relative significance at large batch
+    sizes / long context where KV traffic dominates weight bytes, same
+    dynamic as the read term.
+
+    Flat-summing weight+KV (no batch_size factor on the KV terms)
+    undercounts KV traffic by exactly batch_size and, for long-context/
+    large-batch runs where KV traffic dominates, was undercounting
+    *total* MBU bytes for such runs, not just missing a small term."""
     weight_bytes = bytes_per_token(active_params, bytes_per_param)
-    kv_bytes = kv_cache_bytes_per_token(avg_context_len, config, bytes_per_param)
-    return weight_bytes + batch_size * kv_bytes
+    kv_read_bytes = kv_cache_bytes_per_token(avg_context_len, config, bytes_per_param)
+    kv_write_bytes = kv_cache_bytes_per_token(1.0, config, bytes_per_param)
+    return weight_bytes + batch_size * (kv_read_bytes + kv_write_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -602,9 +651,12 @@ def bytes_per_decode_step_spec_decode(
     Adds three terms on top of the existing target-only base (see DRAFT
     MODEL facts #1-#8 above for why each is shaped this way):
 
-    - Target KV WRITE bytes: (mtp_k + 1) candidate positions get K/V
-      written every round regardless of acceptance (fact #8), scaled by
-      batch_size like the existing read term. Reuses
+    - Target KV WRITE bytes: mtp_k+1 candidate positions get K/V written
+      every round regardless of acceptance (fact #8), scaled by
+      batch_size like the existing read term. base already includes ONE
+      write (bytes_per_decode_step's own write term, correct for the
+      mtp_k=0/ordinary-decode case), so only mtp_k MORE writes are added
+      here to reach the full mtp_k+1 total. Reuses
       kv_cache_bytes_per_token(1.0, target_config, ...) -- ctx=1 gives
       exactly the per-position write footprint, since a write's
       per-layer-type shape/multiplier is identical to a read's.
@@ -627,7 +679,7 @@ def bytes_per_decode_step_spec_decode(
     target_kv_write_bytes_per_position = kv_cache_bytes_per_token(
         1.0, target_config, bytes_per_param
     )
-    target_write_bytes = (mtp_k + 1) * target_kv_write_bytes_per_position * batch_size
+    additional_target_write_bytes = mtp_k * target_kv_write_bytes_per_position * batch_size
 
     draft_weight_bytes = mtp_k * bytes_per_token(draft_active_params, bytes_per_param)
 
@@ -636,7 +688,7 @@ def bytes_per_decode_step_spec_decode(
     )
     draft_kv_read_bytes = mtp_k * draft_kv_read_bytes_per_pass * batch_size
 
-    return base + target_write_bytes + draft_weight_bytes + draft_kv_read_bytes
+    return base + additional_target_write_bytes + draft_weight_bytes + draft_kv_read_bytes
 
 
 def flops_per_token_spec_decode(
@@ -651,38 +703,54 @@ def flops_per_token_spec_decode(
     the draft's mtp_k passes) -- a PER-ROUND figure, matching
     bytes_per_decode_step_spec_decode's framing, NOT a per-accepted-token
     figure. Returns EXACTLY flops_per_token()'s output, unchanged,
-    whenever mtp_k <= 0 or draft_config is None.
+    whenever mtp_k <= 0 or draft_config is None (flops_per_token()'s
+    "2 * active_params" convention is exactly correct there: at mtp_k=0
+    there is no verification round, one forward pass really does process
+    exactly one token).
 
     Callers feeding this into compute_mfu (which expects FLOPs per
     accepted output token, multiplied by aggregate tokens/sec) must
     divide by mean_accept_length themselves -- the same round-to-
     accepted-token conversion run_pipeline.py already applies for MBU's
     decode_steps_per_second -- since this function only knows the
-    architecture, not runtime-measured acceptance statistics.
+    architecture, not runtime-measured acceptance statistics. Callers
+    must also NOT multiply this (already divided) per-accepted-token
+    figure by a token rate that includes PREFILL tokens (total_tokens/
+    elapsed) -- prefill tokens never go through a verification round or
+    draft model at all, so blending them into the same rate silently
+    misattributes the mean_accept_length division and the draft's FLOPs
+    to tokens that shouldn't carry either. See run_pipeline.py's
+    evaluate(), which computes prefill and decode MFU contributions
+    separately for exactly this reason.
+
+    When mtp_k >= 1, the TARGET's own contribution is scaled by
+    (mtp_k + 1), not left at flops_per_token()'s 1-position figure:
+    the target's single verification pass actually processes mtp_k+1
+    candidate positions at once (fact #1), so its real FLOPs are
+    (mtp_k+1) times what flops_per_token() computes for one position --
+    both the "2 * active_params" term (batched matmul FLOPs scale with
+    the number of positions in the batch) and the attention term (each
+    of the mtp_k+1 positions independently attends to the cached
+    context; attending among the mtp_k+1 positions themselves is a much
+    smaller additional quadratic term, not modeled separately here,
+    since avg_context_len is typically >> mtp_k+1).
 
     Draft FLOPs reuse flops_per_token() verbatim against the draft's own
     active params/config: the attention FLOPs term only needs n_heads/
     head_dim (both the draft's own), not kv_heads, so this reuse is
     exact, not approximate (see DRAFT MODEL fact #2 -- the draft has no
-    kv_heads of its own to begin with).
-
-    NOTE: this does NOT correct a separate, pre-existing gap in the
-    TARGET's own contribution: flops_per_token()'s "2 * active_params"
-    convention assumes one forward pass processes exactly one token, but
-    the target's single verification pass actually processes mtp_k+1
-    positions at once. Fixing that would require changing
-    flops_per_token()'s existing target-model logic (out of scope here)
-    or the tokens_per_second call site's semantics -- left as a
-    documented, still-open gap; see the module docstring."""
-    base = flops_per_token(target_active_params, avg_context_len, target_config)
+    kv_heads of its own to begin with)."""
+    target_pass_flops = flops_per_token(target_active_params, avg_context_len, target_config)
     if mtp_k <= 0 or draft_config is None:
-        return base
+        return target_pass_flops
+
+    target_round_flops = (mtp_k + 1) * target_pass_flops
 
     if draft_active_params is None:
         draft_active_params = compute_draft_active_params(draft_config)
 
     draft_flops_per_pass = flops_per_token(draft_active_params, avg_context_len, draft_config)
-    return base + mtp_k * draft_flops_per_pass
+    return target_round_flops + mtp_k * draft_flops_per_pass
 
 
 def compute_mfu(tokens_per_second: float, flops_per_tok: float, peak_tflops_bf16: float) -> float:

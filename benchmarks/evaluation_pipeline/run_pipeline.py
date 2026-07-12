@@ -244,11 +244,11 @@ def evaluate(
     prompt_total = sum(len(o.prompt_token_ids) for o in outputs)
     output_total = sum(len(o.outputs[0].token_ids) for o in outputs)
 
-    # MFU uses total tokens (prefill + decode both consume FLOPs); MBU
-    # uses output tokens only (it's specifically the decode-phase,
-    # memory-bound metric -- see hardware_metrics.py module docstring).
-    # gpu_specs is None on unrecognized hardware -- report n/a rather
-    # than a number computed against a guessed peak spec.
+    # MFU covers prefill + decode (both consume FLOPs); MBU uses output
+    # tokens only (it's specifically the decode-phase, memory-bound
+    # metric -- see hardware_metrics.py module docstring). gpu_specs is
+    # None on unrecognized hardware -- report n/a rather than a number
+    # computed against a guessed peak spec.
     mfu = mbu = None
     if gpu_specs is not None and elapsed > 0:
         # Midpoint, not endpoint: context grows from prompt_len up to
@@ -278,18 +278,49 @@ def evaluate(
         # bytes_per_decode_step_spec_decode) returns a per-round figure -- see
         # hardware_metrics.py's flops_per_token_spec_decode docstring.
         accept_len_divisor = spec["mean_accept_length"] if spec else 1.0
-        flops_per_round = hardware_metrics.flops_per_token_spec_decode(
+        decode_flops_per_round = hardware_metrics.flops_per_token_spec_decode(
             active_params, avg_context_len, hf_config, mtp_k,
             draft_hf_config, draft_active_params,
         )
-        flops_per_tok = flops_per_round / accept_len_divisor
+        decode_flops_per_tok = decode_flops_per_round / accept_len_divisor
         bytes_per_step = hardware_metrics.bytes_per_decode_step_spec_decode(
             active_params, avg_context_len, hf_config, batch_size, mtp_k,
             draft_hf_config, draft_active_params,
         )
-        total_tokens = prompt_total + output_total
+
+        # MFU is computed as two SEPARATE achieved-FLOPs terms, summed --
+        # NOT one blended (prompt_total+output_total)/elapsed *
+        # flops_per_tok multiplication. decode_flops_per_tok is a
+        # decode-round-derived, per-ACCEPTED-token quantity: it's already
+        # divided by mean_accept_length and (under spec decode) already
+        # includes the draft model's FLOPs. Multiplying that by a token
+        # rate that also includes PREFILL tokens would silently
+        # attribute both of those decode-only corrections to prefill
+        # tokens, which never go through a verification round or draft
+        # model at all -- prefill tokens should be charged one full,
+        # undivided target forward pass each, nothing else. (Confirmed by
+        # hand-worked example: this bug OVERSTATES MFU under spec decode --
+        # decode_flops_per_tok's numerator scales by (mtp_k+1), the
+        # target's verification pass processing mtp_k+1 positions at
+        # once, but is only divided by mean_accept_length, which is
+        # always <= mtp_k+1 since not every candidate gets accepted, so
+        # decode_flops_per_tok is systematically >= a prefill token's
+        # true cost -- blending it onto prefill inflates the total.)
+        #
+        # prefill_avg_context_len approximates each prefill token's own
+        # (much smaller, growing-within-the-prompt) attention context: a
+        # length-L prompt processed in one causal forward pass has tokens
+        # attending to 1..L positions, averaging L/2 -- NOT the decode
+        # side's prompt_len+output_len/2 (which assumes the full prompt
+        # is already cached, true only once decoding has started).
+        prefill_avg_context_len = (prompt_total / batch_size) / 2
+        prefill_flops_per_tok = hardware_metrics.flops_per_token(
+            active_params, prefill_avg_context_len, hf_config
+        )
         mfu = hardware_metrics.compute_mfu(
-            total_tokens / elapsed, flops_per_tok, gpu_specs["peak_tflops_bf16"]
+            prompt_total / elapsed, prefill_flops_per_tok, gpu_specs["peak_tflops_bf16"]
+        ) + hardware_metrics.compute_mfu(
+            output_total / elapsed, decode_flops_per_tok, gpu_specs["peak_tflops_bf16"]
         )
         # NOT output_total / elapsed. Weights are read from HBM once per
         # scheduler step, and one step produces one token for every
@@ -332,7 +363,7 @@ def evaluate(
         # metrics.py) -- None (log_stats disabled, or every generation was
         # a single bonus token) means MBU can't be computed, not that it's
         # zero. accept_len_divisor was already computed above (also needed
-        # by flops_per_tok now).
+        # by decode_flops_per_tok now).
         decode_elapsed = decode_window_seconds(outputs)
         if decode_elapsed is not None:
             decode_steps_per_second = (
