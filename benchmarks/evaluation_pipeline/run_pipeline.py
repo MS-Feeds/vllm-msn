@@ -202,6 +202,8 @@ def evaluate(
     hf_config,
     active_params: dict[str, int],
     gpu_specs: dict[str, float] | None,
+    draft_hf_config=None,
+    draft_active_params: dict[str, int] | None = None,
 ) -> dict:
     """Runs one (experiment x dataset x rep) generation pass: loads
     prompts, renders the chat template, calls llm.generate(), times it,
@@ -210,7 +212,12 @@ def evaluate(
 
     hf_config/active_params/gpu_specs are computed once per experiment
     (see run_one_experiment) and passed in rather than recomputed here --
-    they don't depend on the dataset or rep, only on the model/hardware."""
+    they don't depend on the dataset or rep, only on the model/hardware.
+    draft_hf_config/draft_active_params are None when exp_cfg["spec_decode"]
+    is False (no draft model at all); when set, they feed the
+    *_spec_decode hardware_metrics functions so MFU/MBU include the
+    draft model's own FLOPs/bytes -- see hardware_metrics.py's DRAFT
+    MODEL section."""
     from vllm import SamplingParams
 
     raw_prompts = load_prompts(ds_cfg["path"])
@@ -244,13 +251,41 @@ def evaluate(
     # than a number computed against a guessed peak spec.
     mfu = mbu = None
     if gpu_specs is not None and elapsed > 0:
-        avg_context_len = (prompt_total + output_total) / max(len(prompts), 1)
-        flops_per_tok = hardware_metrics.flops_per_token(
-            active_params, avg_context_len, hf_config
-        )
+        # Midpoint, not endpoint: context grows from prompt_len up to
+        # prompt_len+output_len over the course of decoding, so the
+        # STEP-AVERAGED context length (what actually matters -- FLOPs/
+        # KV-bytes are per-step quantities, summed/averaged over every
+        # step, not just the last one) is close to prompt_len +
+        # output_len/2 for roughly linear growth, not the final length.
+        # Using the final length here overestimated both the attention
+        # FLOPs term and (once KV cache bytes were added) the KV-bytes
+        # term by close to 2x for long generations. This holds under
+        # speculative decoding too: decode_steps_per_second below already
+        # converts to rounds/sec via mean_accept_length, so as long as
+        # acceptance behavior is roughly stationary across the sequence,
+        # the round-averaged cache length is still ~output_len/2 past the
+        # prompt, just reached via fewer/larger jumps instead of many +1
+        # steps -- there's no per-round accept-length data available here
+        # to correct for non-stationary acceptance (e.g. degrading at
+        # longer contexts), so this remains a first-order approximation.
+        avg_context_len = (prompt_total + output_total / 2) / max(len(prompts), 1)
         batch_size = max(len(prompts), 1)
-        bytes_per_step = hardware_metrics.bytes_per_decode_step(
-            active_params, avg_context_len, hf_config, batch_size
+        mtp_k = exp_cfg["mtp_k"] if exp_cfg["spec_decode"] else 0
+        # Needed before flops_per_tok now too (not just decode_steps_per_second
+        # below): the draft model's per-round FLOPs/bytes contribution must be
+        # converted from "per verification round" into "per accepted output
+        # token" units the same way, since flops_per_token_spec_decode (like
+        # bytes_per_decode_step_spec_decode) returns a per-round figure -- see
+        # hardware_metrics.py's flops_per_token_spec_decode docstring.
+        accept_len_divisor = spec["mean_accept_length"] if spec else 1.0
+        flops_per_round = hardware_metrics.flops_per_token_spec_decode(
+            active_params, avg_context_len, hf_config, mtp_k,
+            draft_hf_config, draft_active_params,
+        )
+        flops_per_tok = flops_per_round / accept_len_divisor
+        bytes_per_step = hardware_metrics.bytes_per_decode_step_spec_decode(
+            active_params, avg_context_len, hf_config, batch_size, mtp_k,
+            draft_hf_config, draft_active_params,
         )
         total_tokens = prompt_total + output_total
         mfu = hardware_metrics.compute_mfu(
@@ -296,8 +331,8 @@ def evaluate(
         # from each request's own first/last-token timestamps instead (see
         # metrics.py) -- None (log_stats disabled, or every generation was
         # a single bonus token) means MBU can't be computed, not that it's
-        # zero.
-        accept_len_divisor = spec["mean_accept_length"] if spec else 1.0
+        # zero. accept_len_divisor was already computed above (also needed
+        # by flops_per_tok now).
         decode_elapsed = decode_window_seconds(outputs)
         if decode_elapsed is not None:
             decode_steps_per_second = (
@@ -431,6 +466,24 @@ def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], rep
             flush=True,
         )
 
+    # Draft ("assistant") model architecture facts, only needed when this
+    # experiment actually runs speculative decoding -- feeds the
+    # *_spec_decode hardware_metrics functions so MFU/MBU include the
+    # draft model's own FLOPs/bytes instead of silently staying
+    # target-only (see hardware_metrics.py's DRAFT MODEL section).
+    draft_hf_config = None
+    draft_active_params = None
+    if exp_cfg["spec_decode"]:
+        draft_hf_config = AutoConfig.from_pretrained(MODEL_ASSISTANT, trust_remote_code=True)
+        draft_active_params = hardware_metrics.compute_draft_active_params(draft_hf_config)
+        if gpu_specs is not None:
+            print(
+                f"[run_pipeline] draft_active_params="
+                f"{draft_active_params['total_active_params']/1e9:.3f}B "
+                f"(per forward pass, x{exp_cfg['mtp_k']} passes/round)",
+                flush=True,
+            )
+
     llm = initialize_engine(exp_cfg)
 
     rows: list[dict] = []
@@ -441,6 +494,7 @@ def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], rep
                 row = evaluate(
                     llm, tok, dataset_name, ds_cfg, exp_id, exp_cfg, rep,
                     hf_config, active_params, gpu_specs,
+                    draft_hf_config, draft_active_params,
                 )
                 rows.append(row)
     finally:

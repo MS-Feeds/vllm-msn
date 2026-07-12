@@ -223,6 +223,261 @@ def test_mbu_with_kv_term_is_higher_than_weights_only_mbu():
     assert mbu_combined <= 1.0
 
 
+# ---------------------------------------------------------------------------
+# DRAFT MODEL (speculative decoding) -- Gemma4 MTP, see hardware_metrics.py's
+# DRAFT MODEL section (verified against vllm/model_executor/models/
+# gemma4_mtp.py + vllm/v1/spec_decode/{gemma4,llm_base_proposer}.py).
+# ---------------------------------------------------------------------------
+
+def make_draft_config(
+    layer_types,
+    backbone_hidden_size: int = 128,
+    use_ordered_embeddings: bool = False,
+    num_centroids: int = 8,
+    centroid_intermediate_top_k: int = 2,
+    sliding_window: int | None = 16,
+) -> SimpleNamespace:
+    """A small 32-hidden-dim (draft's own, deliberately smaller than the
+    128-dim target fixture's hidden_size) fake Gemma4 MTP config. No
+    num_key_value_heads/global_head_dim K/V fields needed for
+    compute_draft_active_params itself (Q-only, no K/V projections) --
+    only draft_kv_read_bytes_per_forward_pass needs the TARGET's config
+    for KV shape, not the draft's own."""
+    return SimpleNamespace(
+        hidden_size=32,
+        backbone_hidden_size=backbone_hidden_size,
+        num_attention_heads=4,
+        layer_types=layer_types,
+        num_hidden_layers=len(layer_types),
+        head_dim=8,
+        global_head_dim=16,
+        intermediate_size=64,
+        vocab_size=1000,
+        use_ordered_embeddings=use_ordered_embeddings,
+        num_centroids=num_centroids,
+        centroid_intermediate_top_k=centroid_intermediate_top_k,
+        sliding_window=sliding_window,
+    )
+
+
+DRAFT_LAYERS = ["sliding_attention", "full_attention"]
+
+
+def test_draft_active_params_matches_manual_calc_no_centroids():
+    """use_ordered_embeddings=False: lm_head is a full [vocab_size,
+    hidden_size] matmul, no centroids term."""
+    cfg = make_draft_config(DRAFT_LAYERS, use_ordered_embeddings=False)
+    params = hm.compute_draft_active_params(cfg)
+
+    # Q-only attn: q=hidden*(n_heads*head_dim), o=(n_heads*head_dim)*hidden, no k/v.
+    sliding_attn = 32 * (4 * 8) + (4 * 8) * 32       # head_dim=8
+    full_attn = 32 * (4 * 16) + (4 * 16) * 32        # global_head_dim=16
+    attn_total = sliding_attn + full_attn
+    assert attn_total == 6144
+
+    dense_mlp = 32 * (2 * 64) + 64 * 32
+    mlp_total = 2 * dense_mlp
+    assert mlp_total == 12288
+
+    pre_projection = 2 * 128 * 32
+    post_projection = 32 * 128
+    assert pre_projection == 8192
+    assert post_projection == 4096
+
+    lm_head = 1000 * 32  # full vocab, no centroids
+    assert lm_head == 32000
+
+    expected_total = attn_total + mlp_total + pre_projection + post_projection + 0 + lm_head + 0
+    assert params["total_active_params"] == expected_total == 62720
+    assert params["centroids_params"] == 0
+    assert params["embedding_params"] == 0  # shared with target, zero marginal cost
+
+
+def test_draft_active_params_centroids_shrink_lm_head():
+    """use_ordered_embeddings=True: lm_head active bytes shrink to a
+    sparse gather (num_selected rows), not the full vocab -- and a small
+    always-read centroids Linear is added. Net effect should be a
+    SMALLER total than the no-centroids variant, since the lm_head
+    savings dwarf the small centroids addition."""
+    cfg_no_centroids = make_draft_config(DRAFT_LAYERS, use_ordered_embeddings=False)
+    cfg_centroids = make_draft_config(
+        DRAFT_LAYERS, use_ordered_embeddings=True, num_centroids=8, centroid_intermediate_top_k=2
+    )
+
+    params_no_centroids = hm.compute_draft_active_params(cfg_no_centroids)
+    params_centroids = hm.compute_draft_active_params(cfg_centroids)
+
+    vocab_size_per_centroid = 1000 // 8
+    num_selected = 2 * vocab_size_per_centroid
+    expected_lm_head = num_selected * 32
+    expected_centroids = 32 * 8
+
+    assert params_centroids["lm_head_active_params"] == expected_lm_head == 8000
+    assert params_centroids["centroids_params"] == expected_centroids == 256
+    assert params_centroids["total_active_params"] == 38976
+    assert params_centroids["total_active_params"] < params_no_centroids["total_active_params"]
+
+
+def test_draft_active_params_is_lightweight_relative_to_target():
+    """The draft model should be meaningfully smaller than the target --
+    matches the module docstring's "lightweight decoder" framing -- but
+    not vanishingly small either."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    draft_cfg = make_draft_config(DRAFT_LAYERS, use_ordered_embeddings=False)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+
+    assert 0 < draft_params["total_active_params"] < target_params["total_active_params"]
+    ratio = draft_params["total_active_params"] / target_params["total_active_params"]
+    assert 0.01 < ratio < 0.5
+
+
+def test_draft_kv_read_bytes_uses_target_shape_but_draft_cap():
+    """Shape (head_dim/kv_heads/multiplier) must come from the TARGET
+    config (that's the physical tensor being read); the sliding_window
+    CAP must come from the DRAFT's own config (that's what the draft's
+    own attention module is configured with) -- deliberately using
+    different sliding_window values on target (16) vs draft (4) to
+    prove the cap doesn't leak from the wrong config."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False, sliding_window=16)
+    draft_cfg = make_draft_config(DRAFT_LAYERS, sliding_window=4)
+    ctx = 100
+
+    # sliding layer: target kv_heads=2, head_dim=32, multiplier=2 -> unit=256/token,
+    # capped at DRAFT's sliding_window=4 (not target's 16).
+    sliding_contribution = 2 * 2 * 32 * 2 * 4  # kv_multiplier*kv_heads*head_dim*bytes*ctx
+    # full layer: target kv_heads=2, global_head_dim=64, multiplier=2 (k_eq_v=False),
+    # uncapped (full_attention layers are never capped).
+    full_contribution = 2 * 2 * 64 * 2 * 100
+
+    expected = sliding_contribution + full_contribution
+    assert hm.draft_kv_read_bytes_per_forward_pass(ctx, target_cfg, draft_cfg) == expected
+
+    # Sanity: capping at draft's smaller window must give LESS than an
+    # uncapped draft config would, proving the cap is actually applied.
+    draft_cfg_uncapped = make_draft_config(DRAFT_LAYERS, sliding_window=None)
+    uncapped = hm.draft_kv_read_bytes_per_forward_pass(ctx, target_cfg, draft_cfg_uncapped)
+    assert uncapped > expected
+
+
+def test_flops_per_token_spec_decode_k0_matches_target_only_exactly():
+    """Regression test: mtp_k=0 (or draft_config=None) must return
+    EXACTLY flops_per_token()'s own output -- the non-spec-decode path
+    must not change numerically."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    ctx = 64
+
+    base = hm.flops_per_token(target_params, ctx, target_cfg)
+
+    draft_cfg = make_draft_config(DRAFT_LAYERS)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+
+    assert hm.flops_per_token_spec_decode(target_params, ctx, target_cfg, 0, draft_cfg, draft_params) == base
+    assert hm.flops_per_token_spec_decode(target_params, ctx, target_cfg, 5, None, None) == base
+
+
+def test_flops_per_token_spec_decode_adds_draft_passes_exactly():
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    draft_cfg = make_draft_config(DRAFT_LAYERS)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+    ctx = 64
+    mtp_k = 5
+
+    base = hm.flops_per_token(target_params, ctx, target_cfg)
+    draft_flops_per_pass = hm.flops_per_token(draft_params, ctx, draft_cfg)
+    expected = base + mtp_k * draft_flops_per_pass
+
+    actual = hm.flops_per_token_spec_decode(
+        target_params, ctx, target_cfg, mtp_k, draft_cfg, draft_params
+    )
+    assert actual == expected
+    assert actual > base  # draft's contribution is nonzero
+
+
+def test_bytes_per_decode_step_spec_decode_k0_matches_base_exactly():
+    """Regression test: mtp_k=0 (or draft_config=None) must return
+    EXACTLY bytes_per_decode_step()'s own output."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    ctx = 64
+    batch_size = 8
+
+    base = hm.bytes_per_decode_step(target_params, ctx, target_cfg, batch_size)
+
+    draft_cfg = make_draft_config(DRAFT_LAYERS)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+
+    assert hm.bytes_per_decode_step_spec_decode(
+        target_params, ctx, target_cfg, batch_size, 0, draft_cfg, draft_params
+    ) == base
+    assert hm.bytes_per_decode_step_spec_decode(
+        target_params, ctx, target_cfg, batch_size, 5, None, None
+    ) == base
+
+
+def test_bytes_per_decode_step_spec_decode_k5_matches_closed_form():
+    """k=5: verify the combined total matches the exact closed-form sum
+    of base + target KV write bytes ((k+1)*batch_size scaled) + draft
+    weight bytes (k scaled, NOT batch-scaled) + draft KV read bytes (k
+    AND batch scaled) -- this is BUG 5 (write bytes) plus the k/batch_size
+    threading, checked as one precise equality rather than just a
+    monotonicity check."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    draft_cfg = make_draft_config(DRAFT_LAYERS)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+    ctx = 64
+    batch_size = 8
+    mtp_k = 5
+
+    base = hm.bytes_per_decode_step(target_params, ctx, target_cfg, batch_size)
+    target_write_unit = hm.kv_cache_bytes_per_token(1.0, target_cfg)
+    draft_weight_unit = hm.bytes_per_token(draft_params)
+    draft_kv_unit = hm.draft_kv_read_bytes_per_forward_pass(ctx, target_cfg, draft_cfg)
+
+    expected = (
+        base
+        + (mtp_k + 1) * target_write_unit * batch_size
+        + mtp_k * draft_weight_unit
+        + mtp_k * draft_kv_unit * batch_size
+    )
+
+    actual = hm.bytes_per_decode_step_spec_decode(
+        target_params, ctx, target_cfg, batch_size, mtp_k, draft_cfg, draft_params
+    )
+    assert actual == expected
+    assert actual > base
+
+
+def test_bytes_per_decode_step_spec_decode_write_term_scales_with_k():
+    """The write-byte term specifically (isolated by holding batch_size=1
+    and comparing consecutive k values) must grow by exactly ONE more
+    write-unit per additional k -- (k+1) scaling, not k or k+2."""
+    target_cfg = make_config(MIXED_LAYERS, attention_k_eq_v=False)
+    target_params = hm.compute_active_params(target_cfg)
+    draft_cfg = make_draft_config(DRAFT_LAYERS)
+    draft_params = hm.compute_draft_active_params(draft_cfg)
+    ctx = 64
+    batch_size = 1
+
+    totals = [
+        hm.bytes_per_decode_step_spec_decode(
+            target_params, ctx, target_cfg, batch_size, k, draft_cfg, draft_params
+        )
+        for k in (1, 2, 3)
+    ]
+
+    target_write_unit = hm.kv_cache_bytes_per_token(1.0, target_cfg)
+    draft_weight_unit = hm.bytes_per_token(draft_params)
+    draft_kv_unit = hm.draft_kv_read_bytes_per_forward_pass(ctx, target_cfg, draft_cfg)
+    per_k_increment = target_write_unit + draft_weight_unit + draft_kv_unit
+
+    assert totals[1] - totals[0] == per_k_increment
+    assert totals[2] - totals[1] == per_k_increment
+
+
 if __name__ == "__main__":
     import sys
 
