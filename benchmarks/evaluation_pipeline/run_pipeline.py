@@ -36,7 +36,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import hardware_metrics
-from metrics import diff_spec_decode_counters, snapshot_spec_decode_counters
+from metrics import (
+    decode_window_seconds,
+    diff_spec_decode_counters,
+    snapshot_spec_decode_counters,
+)
 
 # ---------------------------------------------------------------------------
 # Output paths (mirrors gemma4_moe_benchmarks/bench_experiment.py)
@@ -78,6 +82,12 @@ DATASETS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 # Speculative-decoding sweep. spec_decode=False -> no draft model at all;
 # spec_decode=True -> MODEL_ASSISTANT as draft model with the given k.
+#
+# An experiment may optionally set "datasets" to a fixed list of dataset
+# names -- this overrides whatever --datasets was passed on the CLI, for
+# experiments that are only meaningful (or only worth the runtime) against
+# one specific dataset. It may also set "include_in_all=False" to be
+# skipped by --all -- run_one_experiment/main() below honor both.
 # ---------------------------------------------------------------------------
 EXPERIMENTS: dict[str, dict] = {
     "S000": dict(label="No speculative decoding (baseline)", spec_decode=False, mtp_k=0),
@@ -86,6 +96,13 @@ EXPERIMENTS: dict[str, dict] = {
     "S003": dict(label="MTP k=3", spec_decode=True, mtp_k=3),
     "S004": dict(label="MTP k=4", spec_decode=True, mtp_k=4),
     "S005": dict(label="MTP k=5", spec_decode=True, mtp_k=5),
+    "S006": dict(
+        label="MTP k=3, gpqa_diamond only (single-dataset smoke test)",
+        spec_decode=True,
+        mtp_k=3,
+        datasets=["gpqa_diamond"],
+        include_in_all=False,
+    ),
 }
 
 
@@ -231,22 +248,32 @@ def evaluate(
         flops_per_tok = hardware_metrics.flops_per_token(
             active_params, avg_context_len, hf_config
         )
-        bytes_per_tok = hardware_metrics.bytes_per_token(active_params)
+        batch_size = max(len(prompts), 1)
+        bytes_per_step = hardware_metrics.bytes_per_decode_step(
+            active_params, avg_context_len, hf_config, batch_size
+        )
         total_tokens = prompt_total + output_total
         mfu = hardware_metrics.compute_mfu(
             total_tokens / elapsed, flops_per_tok, gpu_specs["peak_tflops_bf16"]
         )
         # NOT output_total / elapsed. Weights are read from HBM once per
         # scheduler step, and one step produces one token for every
-        # concurrently-running request -- so "bytes moved" scales with
-        # decode *steps*, not with raw output-token count. Dividing by
-        # num_prompts (an approximation for concurrent batch size, since
-        # all prompts are submitted in a single generate() call) converts
-        # aggregate tokens/sec back into steps/sec. Using output_total/elapsed
-        # directly effectively counts one full weight-read per request per
-        # token instead of one per step -- that's what was producing
-        # MBU >> 100% (physically impossible; you cannot sustain more than
-        # the hardware's rated peak bandwidth).
+        # concurrently-running request -- so weight bytes scale with
+        # decode *steps*, not with raw output-token count (KV cache bytes
+        # are different -- see bytes_per_decode_step, which already folds
+        # in the batch_size scaling for the KV term above; this
+        # decode_steps_per_second is purely the step-rate half of the
+        # equation, feeding compute_mbu's tokens_per_second arg which it
+        # multiplies by bytes_per_step -- passing raw aggregate tokens/sec
+        # there instead, or the same value used for MFU's aggregate
+        # throughput, effectively counts one full weight-read per request
+        # per token instead of one per step). Dividing by num_prompts (an
+        # approximation for concurrent batch size, since all prompts are
+        # submitted in a single generate() call) converts aggregate
+        # tokens/sec back into steps/sec. Using output_total/elapsed
+        # directly instead was what was producing MBU >> 100% (physically
+        # impossible; you cannot sustain more than the hardware's rated
+        # peak bandwidth).
         #
         # Under speculative decoding this needs a second correction: one
         # target-model verification pass (one weight-read) doesn't yield
@@ -260,13 +287,25 @@ def evaluate(
         # (mean_accept_length instead of concurrent batch size). When
         # spec_decode is off there's no drafting at all, so 1 token really
         # is 1 step -- mean_accept_length is defined as 1 in that case.
+        #
+        # The time denominator ALSO must not be the whole generate() call's
+        # `elapsed` -- that includes prefill, which is compute-bound and
+        # produces zero decode steps, so it dilutes decode_steps_per_second
+        # (and therefore MBU) below what was actually achieved during
+        # decode. decode_window_seconds() derives the decode-only wall time
+        # from each request's own first/last-token timestamps instead (see
+        # metrics.py) -- None (log_stats disabled, or every generation was
+        # a single bonus token) means MBU can't be computed, not that it's
+        # zero.
         accept_len_divisor = spec["mean_accept_length"] if spec else 1.0
-        decode_steps_per_second = (
-            output_total / max(len(prompts), 1) / accept_len_divisor
-        ) / elapsed
-        mbu = hardware_metrics.compute_mbu(
-            decode_steps_per_second, bytes_per_tok, gpu_specs["peak_bandwidth_gbps"]
-        )
+        decode_elapsed = decode_window_seconds(outputs)
+        if decode_elapsed is not None:
+            decode_steps_per_second = (
+                output_total / batch_size / accept_len_divisor
+            ) / decode_elapsed
+            mbu = hardware_metrics.compute_mbu(
+                decode_steps_per_second, bytes_per_step, gpu_specs["peak_bandwidth_gbps"]
+            )
 
     row = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -367,6 +406,10 @@ def summarize(exp_id: str, label: str, rows: list[dict]) -> None:
 def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], reps: int) -> list[dict]:
     from transformers import AutoConfig, AutoTokenizer
 
+    # An experiment's own "datasets" (if set) overrides whatever
+    # --datasets was passed on the CLI -- see EXPERIMENTS above.
+    dataset_names = exp_cfg.get("datasets", dataset_names)
+
     tok = AutoTokenizer.from_pretrained(MODEL_BASE, trust_remote_code=True)
 
     # Model-architecture and hardware facts are constant across every
@@ -445,7 +488,11 @@ def main() -> int:
         print("ERROR: pass --exp <IDs> or --all", file=sys.stderr)
         return 1
 
-    exp_ids = list(EXPERIMENTS.keys()) if args.all else [x.strip() for x in args.exp.split(",")]
+    exp_ids = (
+        [eid for eid, ecfg in EXPERIMENTS.items() if ecfg.get("include_in_all", True)]
+        if args.all
+        else [x.strip() for x in args.exp.split(",")]
+    )
     dataset_names = [x.strip() for x in args.datasets.split(",")]
     for d in dataset_names:
         if d not in DATASETS:

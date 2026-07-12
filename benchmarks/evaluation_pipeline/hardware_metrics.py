@@ -190,8 +190,8 @@ def flops_per_token(
 
 
 def bytes_per_token(active_params: dict[str, int], bytes_per_param: int = BYTES_PER_PARAM_BF16) -> int:
-    """Bytes read from HBM for the active weights (attention + dense MLP
-    + router + selected experts + embedding/lm_head) for ONE decode
+    """Bytes read from HBM for the active WEIGHTS ONLY (attention + dense
+    MLP + router + selected experts + embedding/lm_head) for ONE decode
     STEP -- not one output token. A step reads the weights once and
     produces one token for every concurrently-running request, so
     callers computing MBU under batching must divide by the concurrent
@@ -200,10 +200,104 @@ def bytes_per_token(active_params: dict[str, int], bytes_per_param: int = BYTES_
     instead counts one full weight-read per request per token rather
     than one per step, and reports MBU > 100%, which is physically
     impossible (you cannot exceed the hardware's rated peak bandwidth).
-    An earlier version of this docstring claimed >100% was an expected
-    batching effect -- that was wrong; fixed after real GPU runs
-    reported MBU in the 500-1500% range, which was the tell."""
+
+    This does NOT include KV cache bytes -- see kv_cache_bytes_per_token()
+    for that term and bytes_per_decode_step() for the combined total that
+    MBU should actually be computed against. Kept as a standalone
+    weights-only function since it's also used to sanity-check active
+    param counts against checkpoint size independent of any KV/context
+    assumption."""
     return active_params["total_active_params"] * bytes_per_param
+
+
+def kv_cache_bytes_per_token(
+    avg_context_len: float,
+    config,
+    bytes_per_param: int = BYTES_PER_PARAM_BF16,
+) -> float:
+    """Bytes read from the KV cache for ONE request's attention at one
+    decode step, at avg_context_len context length. Companion to
+    bytes_per_token() (weights only) -- flops_per_token() already
+    accounts for an equivalent attention term on top of param_flops, but
+    bytes_per_token() had no such term, silently undercounting HBM
+    traffic for every layer's K/V reads.
+
+    Mirrors flops_per_token's per-layer-type branching (is_full,
+    sliding_window cap) plus compute_active_params's attention_k_eq_v
+    handling (same getattr defaults, same field names) since KV byte
+    accounting -- unlike the FLOPs term -- depends on the actual KV head
+    count, not just head_dim:
+
+    - sliding_attention layers: always 2x (K and V both read), kv_heads/
+      head_dim, context capped at sliding_window (Gemma4Attention only
+      attends within the window regardless of true context length).
+    - full_attention layers: global_head_dim; if attention_k_eq_v is set,
+      V is derived from K at attention time rather than read from a
+      separate cache -- only K is read (1x, num_global_key_value_heads).
+      Otherwise both K and V are read (2x, num_global_key_value_heads if
+      attention_k_eq_v is set else num_key_value_heads) -- matching
+      compute_active_params's this_kv_heads selection exactly, since a
+      wrong head count here would silently produce a plausible-looking
+      but incorrect byte count.
+
+    This is a PER-REQUEST, per-step figure -- unlike weight bytes (read
+    once per step and shared across the whole batch), every
+    concurrently-running request has its own KV cache and must be read
+    separately, so callers must multiply this by the batch size before
+    adding it to weight bytes (see bytes_per_decode_step() /
+    run_pipeline.py's evaluate())."""
+    cfg = _get_text_config(config)
+    layer_types = cfg.layer_types
+    n_layers = cfg.num_hidden_layers
+    head_dim = cfg.head_dim
+    kv_heads = cfg.num_key_value_heads
+    global_head_dim = getattr(cfg, "global_head_dim", head_dim)
+    global_kv_heads = getattr(cfg, "num_global_key_value_heads", kv_heads)
+    use_k_eq_v_flag = getattr(cfg, "attention_k_eq_v", False)
+    sliding_window = getattr(cfg, "sliding_window", None)
+
+    kv_bytes = 0.0
+    for layer_idx in range(n_layers):
+        is_full = layer_types[layer_idx] == "full_attention"
+        if is_full:
+            this_head_dim = global_head_dim
+            this_kv_heads = global_kv_heads if use_k_eq_v_flag else kv_heads
+            kv_multiplier = 1 if use_k_eq_v_flag else 2
+        else:
+            this_head_dim = head_dim
+            this_kv_heads = kv_heads
+            kv_multiplier = 2
+
+        ctx = avg_context_len
+        if not is_full and sliding_window:
+            ctx = min(ctx, sliding_window)
+
+        kv_bytes += kv_multiplier * this_kv_heads * this_head_dim * ctx * bytes_per_param
+
+    return kv_bytes
+
+
+def bytes_per_decode_step(
+    active_params: dict[str, int],
+    avg_context_len: float,
+    config,
+    batch_size: int,
+    bytes_per_param: int = BYTES_PER_PARAM_BF16,
+) -> float:
+    """Total HBM bytes moved for ONE decode step across the whole batch --
+    the correct "bytes moved" figure for compute_mbu(), combining
+    bytes_per_token() and kv_cache_bytes_per_token() with the right scaling
+    for each: weights are read ONCE per step and shared by every
+    concurrently-running request, but each of those requests has its own
+    KV cache that must be read separately, so the KV term -- unlike the
+    weight term -- scales with batch_size. Flat-summing the two
+    (weight_bytes + kv_bytes_per_token, no batch_size factor) undercounts
+    KV traffic by exactly batch_size and, for long-context/large-batch
+    runs where KV traffic dominates, was undercounting *total* MBU bytes
+    for such runs, not just missing a small term."""
+    weight_bytes = bytes_per_token(active_params, bytes_per_param)
+    kv_bytes = kv_cache_bytes_per_token(avg_context_len, config, bytes_per_param)
+    return weight_bytes + batch_size * kv_bytes
 
 
 def compute_mfu(tokens_per_second: float, flops_per_tok: float, peak_tflops_bf16: float) -> float:

@@ -5,7 +5,9 @@
 # Usage:
 #   ./run_experiments.sh S000                    # single experiment, all datasets, 2 reps
 #   ./run_experiments.sh S001,S003                # comma-separated list
-#   ./run_experiments.sh --all                     # all 6 experiments (S000-S005)
+#   ./run_experiments.sh --all                     # every experiment with include_in_all=True
+#                                                    # (see run_pipeline.py --list; some, like
+#                                                    # single-dataset smoke tests, are excluded)
 #   ./run_experiments.sh S003 --datasets aime,gpqa_diamond --reps 3
 #   ./run_experiments.sh --list                    # print the experiment matrix and exit
 #
@@ -82,16 +84,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $RUN_ALL -eq 1 ]]; then
-  EXP_IDS_CSV="S000,S001,S002,S003,S004,S005"
-else
+if [[ $RUN_ALL -eq 0 ]]; then
   EXP_IDS_CSV=$(IFS=','; echo "${EXP_IDS[*]}")
+  if [[ -z "$EXP_IDS_CSV" ]]; then
+    echo "ERROR: no experiment ID provided. Use --all or specify e.g. S000"
+    exit 1
+  fi
 fi
-
-if [[ -z "$EXP_IDS_CSV" ]]; then
-  echo "ERROR: no experiment ID provided. Use --all or specify e.g. S000"
-  exit 1
-fi
+# When RUN_ALL, --all is forwarded to run_pipeline.py directly below rather
+# than hardcoding the experiment list here -- run_pipeline.py's EXPERIMENTS
+# dict (see its include_in_all flag) is the single source of truth for
+# which experiments --all covers, so a new experiment can't be silently
+# missed on one side but not the other.
 
 # ---------------------------------------------------------------------------
 # Preflight: fail fast if the selected Python env can't import what
@@ -115,7 +119,11 @@ fi
 # ---------------------------------------------------------------------------
 echo "=================================================="
 echo "  Speculative-decoding throughput pipeline"
-echo "  Experiments : ${EXP_IDS_CSV}"
+if [[ $RUN_ALL -eq 1 ]]; then
+  echo "  Experiments : --all (run_pipeline.py --list shows which IDs that covers)"
+else
+  echo "  Experiments : ${EXP_IDS_CSV}"
+fi
 echo "  Datasets    : ${DATASETS}"
 echo "  Reps        : ${REPS}"
 echo "  Model       : ${GEMMA4_MODEL_PATH}"
@@ -125,10 +133,17 @@ echo "  $(date)"
 echo "=================================================="
 
 STATUS=0
-"$PYTHON_BIN" run_pipeline.py \
-    --exp "${EXP_IDS_CSV}" \
-    --datasets "${DATASETS}" \
-    --reps "${REPS}" || STATUS=$?
+if [[ $RUN_ALL -eq 1 ]]; then
+  "$PYTHON_BIN" run_pipeline.py \
+      --all \
+      --datasets "${DATASETS}" \
+      --reps "${REPS}" || STATUS=$?
+else
+  "$PYTHON_BIN" run_pipeline.py \
+      --exp "${EXP_IDS_CSV}" \
+      --datasets "${DATASETS}" \
+      --reps "${REPS}" || STATUS=$?
+fi
 
 echo ""
 echo "=================================================="
