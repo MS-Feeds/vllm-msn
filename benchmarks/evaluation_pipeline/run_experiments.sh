@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # run_experiments.sh — Launch one or more throughput experiments, from
-# either of two independent suites (no accuracy scoring -- see README.md):
+# one of three independent suites (no accuracy scoring -- see README.md):
 #   spec  (default) -- S0xx, spec-decode on/off + MTP draft length k
 #   batch            -- B0xx, max_num_seqs sweep (see EXPERIMENT_PLAN_MAX_NUM_SEQS.md)
-# The two suites are never merged into one --all -- pick one via --suite.
+#   cross            -- X0xx, max_num_seqs x MTP k grid, spec decode on for every
+#                        row (see EXPERIMENT_PLAN_MNS_SPEC_CROSS.md)
+# Suites are never merged into one --all -- pick exactly one via --suite.
 #
 # Usage:
 #   ./run_experiments.sh S000                    # single spec-suite experiment, all datasets, 2 reps
@@ -14,8 +16,11 @@
 #   ./run_experiments.sh S003 --datasets aime,gpqa_diamond --reps 3
 #   ./run_experiments.sh --suite batch --all        # every batch-size (max_num_seqs) experiment
 #   ./run_experiments.sh --suite batch B003         # single batch-size experiment
+#   ./run_experiments.sh --suite cross --all        # every mns x MTP-k cross experiment
+#   ./run_experiments.sh --suite cross X003         # single cross experiment
 #   ./run_experiments.sh --list                    # print the (default suite's) experiment matrix and exit
 #   ./run_experiments.sh --suite batch --list       # print the batch-suite matrix and exit
+#   ./run_experiments.sh --suite cross --list       # print the cross-suite matrix and exit
 #
 # Environment variables (source ../gemma4_moe_benchmarks/.env_exports.sh
 # first -- same file, same variables -- or set these yourself):
@@ -83,7 +88,7 @@ while [[ $# -gt 0 ]]; do
     --reps)      REPS="$2"; shift 2 ;;
     --list)      DO_LIST=1; shift ;;
     -h|--help)
-      sed -n '2,20p' "$0"     # print the usage block at top of script
+      sed -n '2,24p' "$0"     # print the usage block at top of script
       exit 0
       ;;
     *)           EXP_IDS+=("$1"); shift ;;

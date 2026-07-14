@@ -39,11 +39,13 @@ graphs, batch size, gpu-mem). This plan is scoped narrowly to the
 spec-decode/k/dataset axes relevant to throughput + acceptance rate and
 does not reuse those experiment IDs.
 
-## Relationship to `EXPERIMENT_PLAN_MAX_NUM_SEQS.md`
+## Relationship to `EXPERIMENT_PLAN_MAX_NUM_SEQS.md` and `EXPERIMENT_PLAN_MNS_SPEC_CROSS.md`
 
-This is the `spec` suite (`S0xx`) in `run_pipeline.py`'s two-suite
-`--suite {spec,batch}` split. The sibling `batch` suite (`B0xx`, see
-`EXPERIMENT_PLAN_MAX_NUM_SEQS.md`) sweeps `max_num_seqs` instead, with
-spec decode held off, on the same driver/datasets/metrics. The two are
-never merged into one `--all` so a single run can't cross both axes at
-once — pick a suite per invocation.
+This is the `spec` suite (`S0xx`) in `run_pipeline.py`'s three-suite
+`--suite {spec,batch,cross}` split. The sibling `batch` suite (`B0xx`,
+see `EXPERIMENT_PLAN_MAX_NUM_SEQS.md`) sweeps `max_num_seqs` instead,
+with spec decode held off, on the same driver/datasets/metrics. The
+`cross` suite (`X0xx`, see `EXPERIMENT_PLAN_MNS_SPEC_CROSS.md`) crosses
+both axes at once (`max_num_seqs` x MTP `k`, spec decode on). All three
+are mutually exclusive per invocation — pick a suite per invocation, no
+`--all` ever spans more than one.

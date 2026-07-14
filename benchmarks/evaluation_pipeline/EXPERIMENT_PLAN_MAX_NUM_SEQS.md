@@ -55,8 +55,8 @@ below), and the MFU/decode-window/GPU-spec machinery in
 - **Spec decode held off (`spec_decode=False`) for every row.** Crossing
   `max_num_seqs` with the spec-decode/k axis that `EXPERIMENT_PLAN.md`
   (the `S0xx` sweep) already owns would confound two variables at once.
-  If a later cross-sweep (batch size x k) is wanted, that's a separate
-  follow-up plan, not this one.
+  The cross-sweep is now a separate follow-up suite, not this one — see
+  `EXPERIMENT_PLAN_MNS_SPEC_CROSS.md` (suite `cross`, `X0xx`).
 - **`max_model_len` held at whatever `initialize_engine()`'s current
   default resolves to** (today: unset -> vLLM derives it from the model
   config; `run_pipeline.py` never overrides it). Recorded per run for

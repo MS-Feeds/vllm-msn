@@ -18,23 +18,31 @@ Usage (via run_experiments.sh):
     run_experiments.sh S001,S003                   # subset
     run_experiments.sh --suite batch --all          # all max_num_seqs batch-size configs
     run_experiments.sh --suite batch B003           # single batch-size config
+    run_experiments.sh --suite cross --all          # all mns x MTP-k cross configs
+    run_experiments.sh --suite cross X003           # single cross config
 
 Direct call (env vars must already be set):
     python3 run_pipeline.py --exp S003 --reps 2
     python3 run_pipeline.py --suite batch --exp B003 --reps 2
+    python3 run_pipeline.py --suite cross --exp X003 --reps 2
     python3 run_pipeline.py --list
     python3 run_pipeline.py --suite batch --list
+    python3 run_pipeline.py --suite cross --list
 
-Two independent sweep suites share this driver (same initialize_engine/
-evaluate/present/summarize -- see EXPERIMENT_PLAN.md vs.
-EXPERIMENT_PLAN_MAX_NUM_SEQS.md):
+Three independent sweep suites share this driver (same initialize_engine/
+evaluate/present/summarize -- see EXPERIMENT_PLAN.md,
+EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md):
   - "spec"  (default) -- SPEC_EXPERIMENTS (S0xx): spec-decode on/off, MTP
     draft length k, crossed with dataset. max_num_seqs held at
     DEFAULT_MAX_NUM_SEQS for every row.
   - "batch" -- BATCH_EXPERIMENTS (B0xx): max_num_seqs swept, spec decode
-    held off for every row. These are deliberately kept in separate
-    dicts / selected via --suite rather than merged into one matrix, so
-    --all can never silently cross both axes in one run.
+    held off for every row.
+  - "cross" -- CROSS_EXPERIMENTS (X0xx): max_num_seqs in {128, 256} x MTP
+    k in {1, 3, 5}, spec decode on for every row -- the batch x spec-decode
+    combination the other two suites deliberately avoid crossing.
+  These are deliberately kept in separate dicts / selected via --suite
+  rather than merged into one matrix, so --all can never silently cross
+  suites in one run -- --suite picks exactly one.
 """
 
 from __future__ import annotations
@@ -174,10 +182,36 @@ BATCH_EXPERIMENTS: dict[str, dict] = {
     ),
 }
 
-# Suite name -> matrix, for --suite dispatch in main().
+# ---------------------------------------------------------------------------
+# Suite 3/3 -- CROSS_EXPERIMENTS ("cross"). The batch-size x spec-decode
+# cross-sweep BATCH_EXPERIMENTS' own comment above flagged as deliberately
+# deferred (crossing two axes at once there would have confounded
+# BATCH_EXPERIMENTS' isolated max_num_seqs measurement). Full mns x k grid:
+# max_num_seqs in {128, 256} x MTP k in {1, 3, 5} -- 6 experiments, spec
+# decode on for every row (unlike BATCH_EXPERIMENTS, which holds it off).
+#
+# mns=256 against gpqa_diamond (198 prompts) doesn't bind -- same caveat as
+# BATCH_EXPERIMENTS' B005 (see EXPERIMENT_PLAN_MAX_NUM_SEQS.md); left as-is
+# here since 256 vs "uncapped" is still a meaningful comparison against the
+# mns=128 rows for that one dataset, just not a true 256-concurrency test.
+# ---------------------------------------------------------------------------
+CROSS_EXPERIMENTS: dict[str, dict] = {
+    "X001": dict(label="mns=128 x MTP k=1", spec_decode=True, mtp_k=1, max_num_seqs=128),
+    "X002": dict(label="mns=128 x MTP k=3", spec_decode=True, mtp_k=3, max_num_seqs=128),
+    "X003": dict(label="mns=128 x MTP k=5", spec_decode=True, mtp_k=5, max_num_seqs=128),
+    "X004": dict(label="mns=256 x MTP k=1", spec_decode=True, mtp_k=1, max_num_seqs=256),
+    "X005": dict(label="mns=256 x MTP k=3", spec_decode=True, mtp_k=3, max_num_seqs=256),
+    "X006": dict(label="mns=256 x MTP k=5", spec_decode=True, mtp_k=5, max_num_seqs=256),
+}
+
+# Suite name -> matrix, for --suite dispatch in main(). Suites are mutually
+# exclusive by design -- --suite selects exactly one dict, so --all (or an
+# --exp list) can never silently mix experiments from more than one suite
+# in the same run.
 SUITES: dict[str, dict[str, dict]] = {
     "spec": SPEC_EXPERIMENTS,
     "batch": BATCH_EXPERIMENTS,
+    "cross": CROSS_EXPERIMENTS,
 }
 
 
@@ -663,15 +697,18 @@ def main() -> int:
         choices=sorted(SUITES.keys()),
         default="spec",
         help="Which experiment matrix to select IDs from: 'spec' (SPEC_EXPERIMENTS, "
-        "S0xx -- spec-decode/k sweep, default) or 'batch' (BATCH_EXPERIMENTS, B0xx -- "
-        "max_num_seqs sweep, spec decode held off). The two are never merged into one "
-        "--all so a single run can't silently cross both axes -- pick one suite per "
-        "invocation. See EXPERIMENT_PLAN.md vs. EXPERIMENT_PLAN_MAX_NUM_SEQS.md.",
+        "S0xx -- spec-decode/k sweep, default), 'batch' (BATCH_EXPERIMENTS, B0xx -- "
+        "max_num_seqs sweep, spec decode held off), or 'cross' (CROSS_EXPERIMENTS, "
+        "X0xx -- max_num_seqs x MTP k grid, spec decode on for every row). Suites are "
+        "never merged into one --all so a single run can't silently cross suites -- "
+        "pick one per invocation. See EXPERIMENT_PLAN.md, "
+        "EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md.",
     )
     ap.add_argument(
         "--exp",
         help="Experiment ID(s) from the selected --suite, comma-separated "
-        "(e.g. S000 or S000,S003; or with --suite batch, B001 or B001,B003). "
+        "(e.g. S000 or S000,S003; with --suite batch, B001 or B001,B003; "
+        "with --suite cross, X001 or X001,X004). "
         "Omit with --all to run every experiment in the suite.",
     )
     ap.add_argument("--all", action="store_true", help="Run every experiment in the selected --suite")

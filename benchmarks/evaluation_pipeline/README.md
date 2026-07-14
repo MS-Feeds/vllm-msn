@@ -21,6 +21,7 @@ headers for what each component does.
 
 - `EXPERIMENT_PLAN.md` — the dataset x spec-decode x k sweep matrix (suite `spec`, default).
 - `EXPERIMENT_PLAN_MAX_NUM_SEQS.md` — the `max_num_seqs` batch-size sweep (suite `batch`).
+- `EXPERIMENT_PLAN_MNS_SPEC_CROSS.md` — `max_num_seqs` x MTP `k` cross-sweep (suite `cross`).
 - `datasets/` — per-dataset prompt-set preparation (AIME, LiveCodeBench, GPQA Diamond).
 - `metrics.py` — spec-decode acceptance rate / draft length collection.
 - `hardware_metrics.py` — MFU/MBU, derived from the real Gemma4 MoE architecture.
@@ -37,5 +38,6 @@ headers for what each component does.
 source ../gemma4_moe_benchmarks/.env_exports.sh
 ./run_experiments.sh --all                      # spec-decode suite (S0xx, default)
 ./run_experiments.sh --suite batch --all         # max_num_seqs suite (B0xx)
+./run_experiments.sh --suite cross --all         # max_num_seqs x MTP k cross-sweep (X0xx)
 python3 analyze_results.py
 ```
