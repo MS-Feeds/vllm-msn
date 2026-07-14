@@ -19,11 +19,13 @@ headers for what each component does.
 
 ## Contents
 
-- `EXPERIMENT_PLAN.md` — the dataset x spec-decode x k sweep matrix.
+- `EXPERIMENT_PLAN.md` — the dataset x spec-decode x k sweep matrix (suite `spec`, default).
+- `EXPERIMENT_PLAN_MAX_NUM_SEQS.md` — the `max_num_seqs` batch-size sweep (suite `batch`).
 - `datasets/` — per-dataset prompt-set preparation (AIME, LiveCodeBench, GPQA Diamond).
 - `metrics.py` — spec-decode acceptance rate / draft length collection.
 - `hardware_metrics.py` — MFU/MBU, derived from the real Gemma4 MoE architecture.
-- `run_pipeline.py` — the driver: initialize -> evaluate -> present.
+- `run_pipeline.py` — the driver: initialize -> evaluate -> present. Selects between the
+  two suites above via `--suite {spec,batch}` (default `spec`).
 - `analyze_results.py` — aggregates `results/*.json` into `results/summary.md`.
 - `run_experiments.sh` — env setup + entrypoint wrapper.
 - `REPRODUCE.md` — step-by-step reproduction instructions.
@@ -33,6 +35,7 @@ headers for what each component does.
 
 ```bash
 source ../gemma4_moe_benchmarks/.env_exports.sh
-./run_experiments.sh --all
+./run_experiments.sh --all                      # spec-decode suite (S0xx, default)
+./run_experiments.sh --suite batch --all         # max_num_seqs suite (B0xx)
 python3 analyze_results.py
 ```

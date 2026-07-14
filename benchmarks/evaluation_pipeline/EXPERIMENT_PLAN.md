@@ -38,3 +38,12 @@ That plan's E001-E018 IDs cover throughput-only ablations (FP8, CUDA
 graphs, batch size, gpu-mem). This plan is scoped narrowly to the
 spec-decode/k/dataset axes relevant to throughput + acceptance rate and
 does not reuse those experiment IDs.
+
+## Relationship to `EXPERIMENT_PLAN_MAX_NUM_SEQS.md`
+
+This is the `spec` suite (`S0xx`) in `run_pipeline.py`'s two-suite
+`--suite {spec,batch}` split. The sibling `batch` suite (`B0xx`, see
+`EXPERIMENT_PLAN_MAX_NUM_SEQS.md`) sweeps `max_num_seqs` instead, with
+spec decode held off, on the same driver/datasets/metrics. The two are
+never merged into one `--all` so a single run can't cross both axes at
+once — pick a suite per invocation.

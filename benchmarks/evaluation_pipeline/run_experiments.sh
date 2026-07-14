@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
-# run_experiments.sh — Launch one or more speculative-decoding throughput
-# experiments (no accuracy scoring -- see README.md).
+# run_experiments.sh — Launch one or more throughput experiments, from
+# either of two independent suites (no accuracy scoring -- see README.md):
+#   spec  (default) -- S0xx, spec-decode on/off + MTP draft length k
+#   batch            -- B0xx, max_num_seqs sweep (see EXPERIMENT_PLAN_MAX_NUM_SEQS.md)
+# The two suites are never merged into one --all -- pick one via --suite.
 #
 # Usage:
-#   ./run_experiments.sh S000                    # single experiment, all datasets, 2 reps
+#   ./run_experiments.sh S000                    # single spec-suite experiment, all datasets, 2 reps
 #   ./run_experiments.sh S001,S003                # comma-separated list
-#   ./run_experiments.sh --all                     # every experiment with include_in_all=True
+#   ./run_experiments.sh --all                     # every spec-suite experiment with include_in_all=True
 #                                                    # (see run_pipeline.py --list; some, like
 #                                                    # single-dataset smoke tests, are excluded)
 #   ./run_experiments.sh S003 --datasets aime,gpqa_diamond --reps 3
-#   ./run_experiments.sh --list                    # print the experiment matrix and exit
+#   ./run_experiments.sh --suite batch --all        # every batch-size (max_num_seqs) experiment
+#   ./run_experiments.sh --suite batch B003         # single batch-size experiment
+#   ./run_experiments.sh --list                    # print the (default suite's) experiment matrix and exit
+#   ./run_experiments.sh --suite batch --list       # print the batch-suite matrix and exit
 #
 # Environment variables (source ../gemma4_moe_benchmarks/.env_exports.sh
 # first -- same file, same variables -- or set these yourself):
@@ -66,36 +72,44 @@ EXP_IDS=()
 DATASETS="aime,gpqa_diamond,livecodebench"
 REPS=2
 RUN_ALL=0
+SUITE="spec"
+DO_LIST=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --all)       RUN_ALL=1; shift ;;
+    --suite)     SUITE="$2"; shift 2 ;;
     --datasets)  DATASETS="$2"; shift 2 ;;
     --reps)      REPS="$2"; shift 2 ;;
-    --list)
-      "$PYTHON_BIN" run_pipeline.py --list
-      exit 0
-      ;;
+    --list)      DO_LIST=1; shift ;;
     -h|--help)
-      sed -n '2,16p' "$0"     # print the usage block at top of script
+      sed -n '2,20p' "$0"     # print the usage block at top of script
       exit 0
       ;;
     *)           EXP_IDS+=("$1"); shift ;;
   esac
 done
 
+# --list is handled after the full parse (not inline) so --suite batch --list
+# forwards the suite it was actually given, rather than always listing the
+# default suite.
+if [[ $DO_LIST -eq 1 ]]; then
+  "$PYTHON_BIN" run_pipeline.py --suite "$SUITE" --list
+  exit 0
+fi
+
 if [[ $RUN_ALL -eq 0 ]]; then
   EXP_IDS_CSV=$(IFS=','; echo "${EXP_IDS[*]}")
   if [[ -z "$EXP_IDS_CSV" ]]; then
-    echo "ERROR: no experiment ID provided. Use --all or specify e.g. S000"
+    echo "ERROR: no experiment ID provided. Use --all or specify e.g. S000 (or, with --suite batch, B001)"
     exit 1
   fi
 fi
 # When RUN_ALL, --all is forwarded to run_pipeline.py directly below rather
-# than hardcoding the experiment list here -- run_pipeline.py's EXPERIMENTS
-# dict (see its include_in_all flag) is the single source of truth for
-# which experiments --all covers, so a new experiment can't be silently
-# missed on one side but not the other.
+# than hardcoding the experiment list here -- run_pipeline.py's SUITES dict
+# (SPEC_EXPERIMENTS/BATCH_EXPERIMENTS, see each entry's include_in_all flag)
+# is the single source of truth for which experiments --all covers, so a new
+# experiment can't be silently missed on one side but not the other.
 
 # ---------------------------------------------------------------------------
 # Preflight: fail fast if the selected Python env can't import what
@@ -118,9 +132,9 @@ fi
 # Run
 # ---------------------------------------------------------------------------
 echo "=================================================="
-echo "  Speculative-decoding throughput pipeline"
+echo "  Throughput pipeline (suite=${SUITE})"
 if [[ $RUN_ALL -eq 1 ]]; then
-  echo "  Experiments : --all (run_pipeline.py --list shows which IDs that covers)"
+  echo "  Experiments : --all (run_pipeline.py --suite ${SUITE} --list shows which IDs that covers)"
 else
   echo "  Experiments : ${EXP_IDS_CSV}"
 fi
@@ -135,11 +149,13 @@ echo "=================================================="
 STATUS=0
 if [[ $RUN_ALL -eq 1 ]]; then
   "$PYTHON_BIN" run_pipeline.py \
+      --suite "${SUITE}" \
       --all \
       --datasets "${DATASETS}" \
       --reps "${REPS}" || STATUS=$?
 else
   "$PYTHON_BIN" run_pipeline.py \
+      --suite "${SUITE}" \
       --exp "${EXP_IDS_CSV}" \
       --datasets "${DATASETS}" \
       --reps "${REPS}" || STATUS=$?

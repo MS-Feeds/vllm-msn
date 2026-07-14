@@ -13,13 +13,28 @@ first. Mirrors the same convention as
 ../gemma4_moe_benchmarks/bench_experiment.py.
 
 Usage (via run_experiments.sh):
-    run_experiments.sh --all             # all speculative-decoding configs
-    run_experiments.sh S000              # single config (baseline, no spec decode)
-    run_experiments.sh S001,S003         # subset
+    run_experiments.sh --all                       # all spec-decode configs (suite=spec, default)
+    run_experiments.sh S000                        # single config (baseline, no spec decode)
+    run_experiments.sh S001,S003                   # subset
+    run_experiments.sh --suite batch --all          # all max_num_seqs batch-size configs
+    run_experiments.sh --suite batch B003           # single batch-size config
 
 Direct call (env vars must already be set):
     python3 run_pipeline.py --exp S003 --reps 2
+    python3 run_pipeline.py --suite batch --exp B003 --reps 2
     python3 run_pipeline.py --list
+    python3 run_pipeline.py --suite batch --list
+
+Two independent sweep suites share this driver (same initialize_engine/
+evaluate/present/summarize -- see EXPERIMENT_PLAN.md vs.
+EXPERIMENT_PLAN_MAX_NUM_SEQS.md):
+  - "spec"  (default) -- SPEC_EXPERIMENTS (S0xx): spec-decode on/off, MTP
+    draft length k, crossed with dataset. max_num_seqs held at
+    DEFAULT_MAX_NUM_SEQS for every row.
+  - "batch" -- BATCH_EXPERIMENTS (B0xx): max_num_seqs swept, spec decode
+    held off for every row. These are deliberately kept in separate
+    dicts / selected via --suite rather than merged into one matrix, so
+    --all can never silently cross both axes in one run.
 """
 
 from __future__ import annotations
@@ -51,7 +66,7 @@ CSV_PATH = OUT_DIR / "all_runs.csv"
 
 CSV_FIELDS = [
     "ts", "exp_id", "label", "dataset",
-    "spec_decode", "mtp_k",
+    "spec_decode", "mtp_k", "max_num_seqs",
     "rep", "seed", "num_prompts",
     "elapsed_time", "requests_per_second",
     "prompt_tokens_total", "output_tokens_total", "output_tps",
@@ -80,8 +95,22 @@ DATASETS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# Speculative-decoding sweep. spec_decode=False -> no draft model at all;
-# spec_decode=True -> MODEL_ASSISTANT as draft model with the given k.
+# max_num_seqs -- vLLM's own default (see vllm/config/scheduler.py's
+# SchedulerConfig.DEFAULT_MAX_NUM_SEQS). Every experiment in both suites
+# below is run with an EXPLICIT max_num_seqs (never left implicit), set to
+# this constant unless an experiment overrides it, so the batch_size figure
+# fed into hardware_metrics' MBU calculation (see evaluate() below) always
+# matches what the engine actually ran with, rather than assuming it.
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_NUM_SEQS = 128
+
+# ---------------------------------------------------------------------------
+# Suite 1/2 -- SPEC_EXPERIMENTS ("spec", the default suite). Speculative-
+# decoding sweep. spec_decode=False -> no draft model at all; spec_decode=True
+# -> MODEL_ASSISTANT as draft model with the given k. max_num_seqs held at
+# DEFAULT_MAX_NUM_SEQS for every row -- this suite doesn't vary it (see
+# EXPERIMENT_PLAN_MAX_NUM_SEQS.md for why that's a separate suite instead of
+# a crossed axis here).
 #
 # An experiment may optionally set "datasets" to a fixed list of dataset
 # names -- this overrides whatever --datasets was passed on the CLI, for
@@ -89,7 +118,7 @@ DATASETS: dict[str, dict] = {
 # one specific dataset. It may also set "include_in_all=False" to be
 # skipped by --all -- run_one_experiment/main() below honor both.
 # ---------------------------------------------------------------------------
-EXPERIMENTS: dict[str, dict] = {
+SPEC_EXPERIMENTS: dict[str, dict] = {
     "S000": dict(label="No speculative decoding (baseline)", spec_decode=False, mtp_k=0),
     "S001": dict(label="MTP k=1", spec_decode=True, mtp_k=1),
     "S002": dict(label="MTP k=2", spec_decode=True, mtp_k=2),
@@ -103,6 +132,30 @@ EXPERIMENTS: dict[str, dict] = {
         datasets=["gpqa_diamond"],
         include_in_all=False,
     ),
+}
+
+# ---------------------------------------------------------------------------
+# Suite 2/2 -- BATCH_EXPERIMENTS ("batch"). max_num_seqs sweep -- see
+# EXPERIMENT_PLAN_MAX_NUM_SEQS.md. spec_decode held off for every row (kept
+# out of this suite entirely to avoid crossing two axes at once); only
+# max_num_seqs varies. B004 (mns=128) is the same value SPEC_EXPERIMENTS
+# implicitly runs at (DEFAULT_MAX_NUM_SEQS) -- i.e. the true no-op control.
+# ---------------------------------------------------------------------------
+BATCH_EXPERIMENTS: dict[str, dict] = {
+    "B001": dict(label="Batch size sweep: max_num_seqs=16", spec_decode=False, mtp_k=0, max_num_seqs=16),
+    "B002": dict(label="Batch size sweep: max_num_seqs=32", spec_decode=False, mtp_k=0, max_num_seqs=32),
+    "B003": dict(label="Batch size sweep: max_num_seqs=64", spec_decode=False, mtp_k=0, max_num_seqs=64),
+    "B004": dict(
+        label="Batch size sweep: max_num_seqs=128 (control, matches DEFAULT_MAX_NUM_SEQS)",
+        spec_decode=False, mtp_k=0, max_num_seqs=128,
+    ),
+    "B005": dict(label="Batch size sweep: max_num_seqs=256", spec_decode=False, mtp_k=0, max_num_seqs=256),
+}
+
+# Suite name -> matrix, for --suite dispatch in main().
+SUITES: dict[str, dict[str, dict]] = {
+    "spec": SPEC_EXPERIMENTS,
+    "batch": BATCH_EXPERIMENTS,
 }
 
 
@@ -175,6 +228,10 @@ def initialize_engine(exp_cfg: dict):
         # which makes llm.get_metrics() raise "Stat logging disabled" --
         # metrics.py needs this on to read spec-decode counters.
         disable_log_stats=False,
+        # Always explicit, never left to vLLM's own default -- evaluate()'s
+        # batch_size clamp (see below) needs to know exactly what the engine
+        # ran with, not assume it matches vllm's internal default forever.
+        max_num_seqs=exp_cfg.get("max_num_seqs", DEFAULT_MAX_NUM_SEQS),
     )
     if exp_cfg["spec_decode"]:
         llm_kwargs["spec_model"] = MODEL_ASSISTANT
@@ -249,6 +306,11 @@ def evaluate(
     # metric -- see hardware_metrics.py module docstring). gpu_specs is
     # None on unrecognized hardware -- report n/a rather than a number
     # computed against a guessed peak spec.
+    # Hoisted above the gpu_specs branch: needed for the row dict
+    # unconditionally (recorded even when mfu/mbu are n/a on unrecognized
+    # hardware), not just for the batch_size clamp inside it.
+    max_num_seqs = exp_cfg.get("max_num_seqs", DEFAULT_MAX_NUM_SEQS)
+
     mfu = mbu = None
     if gpu_specs is not None and elapsed > 0:
         # Midpoint, not endpoint: context grows from prompt_len up to
@@ -269,7 +331,21 @@ def evaluate(
         # to correct for non-stationary acceptance (e.g. degrading at
         # longer contexts), so this remains a first-order approximation.
         avg_context_len = (prompt_total + output_total / 2) / max(len(prompts), 1)
-        batch_size = max(len(prompts), 1)
+        # NOT max(len(prompts), 1) alone -- that's the number of prompts
+        # SUBMITTED to this generate() call, not the number actually
+        # resident and decoding at once. Once max_num_seqs caps concurrency
+        # below len(prompts) (true today for the default mns=128 against
+        # this pipeline's 198-300-prompt datasets, and the whole point of
+        # the max_num_seqs sweep in EXPERIMENT_PLAN_MAX_NUM_SEQS.md), the
+        # KV-cache byte term below (which batch_size scales -- see
+        # hardware_metrics.bytes_per_decode_step's docstring) would be
+        # overstated by using the submitted count instead of the cap. This
+        # clamp is a static approximation, not a real measurement -- actual
+        # concurrency ramps up at the start of a run and drains unevenly at
+        # the end as shorter responses finish before longer ones, so this
+        # slightly overstates the true time-averaged concurrency too, just
+        # less than using len(prompts) unclamped would.
+        batch_size = max(min(len(prompts), max_num_seqs), 1)
         mtp_k = exp_cfg["mtp_k"] if exp_cfg["spec_decode"] else 0
         # Needed before flops_per_tok now too (not just decode_steps_per_second
         # below): the draft model's per-round FLOPs/bytes contribution must be
@@ -380,6 +456,7 @@ def evaluate(
         "dataset": dataset_name,
         "spec_decode": exp_cfg["spec_decode"],
         "mtp_k": exp_cfg["mtp_k"],
+        "max_num_seqs": max_num_seqs,
         "rep": rep,
         "seed": seed,
         "num_prompts": len(prompts),
@@ -545,27 +622,41 @@ def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], rep
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Run one or more speculative-decoding throughput experiments."
+        description="Run one or more throughput experiments (spec-decode or batch-size suite)."
+    )
+    ap.add_argument(
+        "--suite",
+        choices=sorted(SUITES.keys()),
+        default="spec",
+        help="Which experiment matrix to select IDs from: 'spec' (SPEC_EXPERIMENTS, "
+        "S0xx -- spec-decode/k sweep, default) or 'batch' (BATCH_EXPERIMENTS, B0xx -- "
+        "max_num_seqs sweep, spec decode held off). The two are never merged into one "
+        "--all so a single run can't silently cross both axes -- pick one suite per "
+        "invocation. See EXPERIMENT_PLAN.md vs. EXPERIMENT_PLAN_MAX_NUM_SEQS.md.",
     )
     ap.add_argument(
         "--exp",
-        help="Experiment ID(s), comma-separated (e.g. S000 or S000,S003). "
-        "Omit with --all to run every experiment.",
+        help="Experiment ID(s) from the selected --suite, comma-separated "
+        "(e.g. S000 or S000,S003; or with --suite batch, B001 or B001,B003). "
+        "Omit with --all to run every experiment in the suite.",
     )
-    ap.add_argument("--all", action="store_true", help="Run every experiment in EXPERIMENTS")
+    ap.add_argument("--all", action="store_true", help="Run every experiment in the selected --suite")
     ap.add_argument(
         "--datasets",
         default=",".join(DATASETS.keys()),
         help=f"Comma-separated dataset subset (default: all of {list(DATASETS.keys())})",
     )
     ap.add_argument("--reps", type=int, default=2, help="Repetitions per (experiment, dataset)")
-    ap.add_argument("--list", action="store_true", help="Print the experiment matrix and exit")
+    ap.add_argument("--list", action="store_true", help="Print the selected suite's experiment matrix and exit")
     args = ap.parse_args()
 
+    experiments = SUITES[args.suite]
+
     if args.list:
+        print(f"suite={args.suite}")
         print(f"{'ID':<6}  {'label'}")
         print("-" * 60)
-        for eid, ecfg in EXPERIMENTS.items():
+        for eid, ecfg in experiments.items():
             print(f"{eid:<6}  {ecfg['label']}")
         return 0
 
@@ -574,7 +665,7 @@ def main() -> int:
         return 1
 
     exp_ids = (
-        [eid for eid, ecfg in EXPERIMENTS.items() if ecfg.get("include_in_all", True)]
+        [eid for eid, ecfg in experiments.items() if ecfg.get("include_in_all", True)]
         if args.all
         else [x.strip() for x in args.exp.split(",")]
     )
@@ -586,13 +677,14 @@ def main() -> int:
 
     failed_exp_ids: list[str] = []
     for exp_id in exp_ids:
-        if exp_id not in EXPERIMENTS:
+        if exp_id not in experiments:
             print(
-                f"ERROR: unknown experiment ID '{exp_id}'. Valid: {list(EXPERIMENTS.keys())}",
+                f"ERROR: unknown experiment ID '{exp_id}' for suite '{args.suite}'. "
+                f"Valid: {list(experiments.keys())}",
                 file=sys.stderr,
             )
             return 1
-        exp_cfg = EXPERIMENTS[exp_id]
+        exp_cfg = experiments[exp_id]
 
         try:
             run_one_experiment(exp_id, exp_cfg, dataset_names, args.reps)
