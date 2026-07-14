@@ -92,6 +92,18 @@ DATASETS: dict[str, dict] = {
     "aime": dict(path="datasets/aime_samples.jsonl", max_tokens=8192),
     "gpqa_diamond": dict(path="datasets/gpqa_diamond_samples.jsonl", max_tokens=1024),
     "livecodebench": dict(path="datasets/livecodebench_samples.jsonl", max_tokens=4096),
+    # Dedicated larger sample (not the 300-prompt "livecodebench" set
+    # above) -- exists so max_num_seqs=512 (B006, BATCH_EXPERIMENTS below)
+    # has enough submitted prompts for the cap to actually bind. All three
+    # datasets above (198-300 prompts) are too small for that: batch_size
+    # = min(len(prompts), max_num_seqs) would just clamp to len(prompts)
+    # regardless of the configured cap, making a "mns=512" experiment
+    # against them indistinguishable from an uncapped run. 554 prompts,
+    # not the 600 originally targeted -- prep_livecodebench.py's whole
+    # FALLBACK_FILES chain (test6/test5/test3/test2.jsonl) only had 554
+    # unique valid rows total; still comfortably above 512, so mns=512
+    # binds correctly.
+    "livecodebench_mns512": dict(path="datasets/livecodebench_mns512_samples.jsonl", max_tokens=4096),
 }
 
 # ---------------------------------------------------------------------------
@@ -150,6 +162,16 @@ BATCH_EXPERIMENTS: dict[str, dict] = {
         spec_decode=False, mtp_k=0, max_num_seqs=128,
     ),
     "B005": dict(label="Batch size sweep: max_num_seqs=256", spec_decode=False, mtp_k=0, max_num_seqs=256),
+    "B006": dict(
+        label="Batch size sweep: max_num_seqs=512 (554-prompt LiveCodeBench, dedicated sample)",
+        spec_decode=False,
+        mtp_k=0,
+        max_num_seqs=512,
+        # Overrides --datasets: B001-B005's 198-300-prompt datasets can't
+        # make mns=512 actually bind (see DATASETS' livecodebench_mns512
+        # comment above) -- this experiment needs its own larger sample.
+        datasets=["livecodebench_mns512"],
+    ),
 }
 
 # Suite name -> matrix, for --suite dispatch in main().
@@ -389,7 +411,19 @@ def evaluate(
         # attending to 1..L positions, averaging L/2 -- NOT the decode
         # side's prompt_len+output_len/2 (which assumes the full prompt
         # is already cached, true only once decoding has started).
-        prefill_avg_context_len = (prompt_total / batch_size) / 2
+        #
+        # NOT batch_size -- this is a PER-REQUEST average (mirrors
+        # avg_context_len above, which divides by len(prompts) for the
+        # same reason: a prompt's own attention context depends only on
+        # its own length, not on how many other requests happen to be
+        # running concurrently). batch_size is a concurrency figure
+        # (clamped by max_num_seqs) and using it here was silently
+        # correct only by coincidence before the max_num_seqs clamp was
+        # introduced, back when batch_size always equaled len(prompts);
+        # once max_num_seqs < len(prompts) (exactly what the batch-size
+        # sweep tests), dividing by batch_size instead of len(prompts)
+        # overstates this by a factor of len(prompts)/batch_size.
+        prefill_avg_context_len = (prompt_total / max(len(prompts), 1)) / 2
         prefill_flops_per_tok = hardware_metrics.flops_per_token(
             active_params, prefill_avg_context_len, hf_config
         )

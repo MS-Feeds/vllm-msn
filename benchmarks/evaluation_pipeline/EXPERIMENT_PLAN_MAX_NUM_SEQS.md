@@ -82,6 +82,7 @@ below), and the MFU/decode-window/GPU-spec machinery in
 | B003 | mns=64 | 64 | off | " |
 | B004 | mns=128 (vLLM-ish default control) | 128 | off | " |
 | B005 | mns=256 | 256 | off | " |
+| B006 | mns=512 | 512 | off | livecodebench_mns512 (dedicated) |
 
 Mirrors the value set already explored in `gemma4_moe_benchmarks` Group
 C/D so results are comparable across the two pipelines' workloads, not
@@ -89,6 +90,36 @@ because those exact values are necessarily optimal for this dataset mix
 — worth revisiting once gap #2's real-concurrency measurement exists,
 in case it reveals the effective cap saturates earlier/later than
 128-256 on these particular prompt lengths.
+
+### B006 — mns=512, dedicated LiveCodeBench sample
+
+`max_num_seqs` values above the existing datasets' prompt counts
+(198-300) can't actually bind: `batch_size = min(len(prompts),
+max_num_seqs)` clamps to `len(prompts)` regardless of a higher cap, so
+testing e.g. mns=512 against a 300-prompt dataset would silently measure
+an *uncapped* run, not a real 512-concurrency ceiling. B006 uses a
+dedicated LiveCodeBench sample (`datasets/livecodebench_mns512_samples.jsonl`,
+distinct from the existing 300-prompt `livecodebench_samples.jsonl` used
+by B001-B005/S0xx) specifically so 512 has room to bind.
+
+**Actual sample size: 554, not the 600 originally targeted.**
+`prep_livecodebench.py --max-keep 600` was run, but its whole
+`FALLBACK_FILES` chain (`test6.jsonl` → `test5.jsonl` → `test3.jsonl` →
+`test2.jsonl`) only contained 554 unique valid rows in total (175 + 167
++ 101 + 111) before running out of fallback files entirely — the script
+warns and writes what it found rather than failing. 554 is still
+comfortably above 512, so mns=512 binds correctly; this just wasn't
+enough headroom to also support an mns=1024 experiment.
+
+**mns=1024 was considered and dropped** (user decision): 1024 exceeds
+even this 554-prompt sample, so it would hit the same non-binding
+problem this dataset was built to avoid. A 1024 experiment would need
+its own even larger sample, drawn from beyond `code_generation_lite`'s
+existing `FALLBACK_FILES` list (which is now fully exhausted) — deferred
+rather than built speculatively; add it as a follow-up (`B007`) if
+mns=1024 is wanted later, sourcing from additional release files (e.g.
+`test1.jsonl`/`test4.jsonl`, not currently in `FALLBACK_FILES`) or a
+different dataset entirely.
 
 ## Metrics captured per run
 
