@@ -21,6 +21,12 @@
 #   ./run_experiments.sh --list                    # print the (default suite's) experiment matrix and exit
 #   ./run_experiments.sh --suite batch --list       # print the batch-suite matrix and exit
 #   ./run_experiments.sh --suite cross --list       # print the cross-suite matrix and exit
+#   ./run_experiments.sh --suite batch --all --nsight-exp B003
+#                                                    # run all of B0xx, but only bracket B003's
+#                                                    # generate() calls with cudaProfilerStart/Stop
+#                                                    # for an external nsys/ncu capture -- see
+#                                                    # REPRODUCE.md's Nsight section; this flag
+#                                                    # alone does NOT launch Nsight
 #
 # Environment variables (source ../gemma4_moe_benchmarks/.env_exports.sh
 # first -- same file, same variables -- or set these yourself):
@@ -79,6 +85,7 @@ REPS=2
 RUN_ALL=0
 SUITE="spec"
 DO_LIST=0
+NSIGHT_EXP=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -87,8 +94,9 @@ while [[ $# -gt 0 ]]; do
     --datasets)  DATASETS="$2"; shift 2 ;;
     --reps)      REPS="$2"; shift 2 ;;
     --list)      DO_LIST=1; shift ;;
+    --nsight-exp) NSIGHT_EXP="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,24p' "$0"     # print the usage block at top of script
+      sed -n '2,30p' "$0"     # print the usage block at top of script
       exit 0
       ;;
     *)           EXP_IDS+=("$1"); shift ;;
@@ -151,19 +159,29 @@ echo "  EVAL_RESULTS_DIR: ${EVAL_RESULTS_DIR:-results}"
 echo "  $(date)"
 echo "=================================================="
 
+# Only forwarded when set -- an empty --nsight-exp "" would otherwise
+# fail run_pipeline.py's "must be one of the IDs actually being run"
+# validation spuriously.
+NSIGHT_ARGS=()
+if [[ -n "$NSIGHT_EXP" ]]; then
+  NSIGHT_ARGS=(--nsight-exp "$NSIGHT_EXP")
+fi
+
 STATUS=0
 if [[ $RUN_ALL -eq 1 ]]; then
   "$PYTHON_BIN" run_pipeline.py \
       --suite "${SUITE}" \
       --all \
       --datasets "${DATASETS}" \
-      --reps "${REPS}" || STATUS=$?
+      --reps "${REPS}" \
+      "${NSIGHT_ARGS[@]}" || STATUS=$?
 else
   "$PYTHON_BIN" run_pipeline.py \
       --suite "${SUITE}" \
       --exp "${EXP_IDS_CSV}" \
       --datasets "${DATASETS}" \
-      --reps "${REPS}" || STATUS=$?
+      --reps "${REPS}" \
+      "${NSIGHT_ARGS[@]}" || STATUS=$?
 fi
 
 echo ""

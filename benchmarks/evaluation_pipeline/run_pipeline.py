@@ -124,6 +124,8 @@ DATASETS: dict[str, dict] = {
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_NUM_SEQS = 128
 
+DEFAULT_MAX_NUM_BATCHED_TOKENS = 16384
+
 # ---------------------------------------------------------------------------
 # Suite 1/2 -- SPEC_EXPERIMENTS ("spec", the default suite). Speculative-
 # decoding sweep. spec_decode=False -> no draft model at all; spec_decode=True
@@ -288,6 +290,7 @@ def initialize_engine(exp_cfg: dict):
         # batch_size clamp (see below) needs to know exactly what the engine
         # ran with, not assume it matches vllm's internal default forever.
         max_num_seqs=exp_cfg.get("max_num_seqs", DEFAULT_MAX_NUM_SEQS),
+        max_num_batched_tokens=exp_cfg.get("max_num_batched_tokens", DEFAULT_MAX_NUM_BATCHED_TOKENS),
     )
     if exp_cfg["spec_decode"]:
         llm_kwargs["spec_model"] = MODEL_ASSISTANT
@@ -614,7 +617,9 @@ def summarize(exp_id: str, label: str, rows: list[dict]) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
-def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], reps: int) -> list[dict]:
+def run_one_experiment(
+    exp_id: str, exp_cfg: dict, dataset_names: list[str], reps: int, nsight: bool = False,
+) -> list[dict]:
     from transformers import AutoConfig, AutoTokenizer
 
     # An experiment's own "datasets" (if set) overrides whatever
@@ -662,6 +667,33 @@ def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], rep
 
     llm = initialize_engine(exp_cfg)
 
+    # nsight=True brackets ONLY the generate() loop below (not engine
+    # init -- weight loading/compilation warmup is one-time overhead
+    # that would dominate and isn't representative of steady-state
+    # throughput) with cudaProfilerStart/Stop, so that when this whole
+    # process is launched under `nsys profile
+    # --capture-range=cudaProfilerApi ...`, the capture window is scoped
+    # to exactly this one experiment's requests instead of the entire
+    # multi-experiment run. This call alone does NOT start Nsight itself
+    # -- see EXPERIMENT_PLAN_MNS_SPEC_CROSS.md's Nsight section (or
+    # REPRODUCE.md) for the required external nsys/ncu invocation and
+    # setup. The NVTX range is a second, complementary marker that still
+    # works even in a plain full-trace nsys run (no --capture-range),
+    # since it lets the exp_id be located/filtered in the timeline after
+    # the fact without needing the cudaProfilerApi start/stop to have
+    # been honored.
+    nvtx_pushed = False
+    if nsight:
+        try:
+            import torch
+
+            torch.cuda.nvtx.range_push(f"nsight_{exp_id}")
+            nvtx_pushed = True
+            torch.cuda.cudart().cudaProfilerStart()
+            print(f"[run_pipeline] Nsight capture window opened for {exp_id}", flush=True)
+        except Exception as e:
+            print(f"[run_pipeline] WARNING: could not start CUDA profiler for Nsight: {e}", flush=True)
+
     rows: list[dict] = []
     try:
         for dataset_name in dataset_names:
@@ -674,6 +706,17 @@ def run_one_experiment(exp_id: str, exp_cfg: dict, dataset_names: list[str], rep
                 )
                 rows.append(row)
     finally:
+        if nsight:
+            try:
+                import torch
+
+                torch.cuda.cudart().cudaProfilerStop()
+                print(f"[run_pipeline] Nsight capture window closed for {exp_id}", flush=True)
+            except Exception as e:
+                print(f"[run_pipeline] WARNING: could not stop CUDA profiler for Nsight: {e}", flush=True)
+            if nvtx_pushed:
+                torch.cuda.nvtx.range_pop()
+
         present(rows)
         del llm
         gc.collect()
@@ -719,6 +762,18 @@ def main() -> int:
     )
     ap.add_argument("--reps", type=int, default=2, help="Repetitions per (experiment, dataset)")
     ap.add_argument("--list", action="store_true", help="Print the selected suite's experiment matrix and exit")
+    ap.add_argument(
+        "--nsight-exp",
+        default=None,
+        metavar="EXP_ID",
+        help="Bracket ONLY this experiment ID's generate() calls (not engine init) with "
+        "cudaProfilerStart/Stop + an NVTX range, so an external `nsys profile "
+        "--capture-range=cudaProfilerApi ...` (or ncu) wrapping this whole process "
+        "captures just that one experiment instead of the entire --exp/--all run. "
+        "This flag alone does NOT launch Nsight -- see REPRODUCE.md's Nsight section "
+        "for the required external command and setup. Must be one of the IDs actually "
+        "being run this invocation.",
+    )
     args = ap.parse_args()
 
     experiments = SUITES[args.suite]
@@ -746,6 +801,17 @@ def main() -> int:
             print(f"ERROR: unknown dataset '{d}'. Valid: {list(DATASETS.keys())}", file=sys.stderr)
             return 1
 
+    if args.nsight_exp is not None and args.nsight_exp not in exp_ids:
+        # Fail fast rather than silently profiling nothing -- a typo'd or
+        # stale --nsight-exp value would otherwise run the whole batch
+        # normally with no indication the capture window never opened.
+        print(
+            f"ERROR: --nsight-exp '{args.nsight_exp}' is not among the experiment(s) "
+            f"being run this invocation ({', '.join(exp_ids)}).",
+            file=sys.stderr,
+        )
+        return 1
+
     failed_exp_ids: list[str] = []
     for exp_id in exp_ids:
         if exp_id not in experiments:
@@ -758,7 +824,9 @@ def main() -> int:
         exp_cfg = experiments[exp_id]
 
         try:
-            run_one_experiment(exp_id, exp_cfg, dataset_names, args.reps)
+            run_one_experiment(
+                exp_id, exp_cfg, dataset_names, args.reps, nsight=(exp_id == args.nsight_exp),
+            )
         except Exception as e:
             print(f"!!! experiment {exp_id} FAILED: {e}", flush=True)
             import traceback
