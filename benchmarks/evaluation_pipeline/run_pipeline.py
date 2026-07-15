@@ -20,18 +20,23 @@ Usage (via run_experiments.sh):
     run_experiments.sh --suite batch B003           # single batch-size config
     run_experiments.sh --suite cross --all          # all mns x MTP-k cross configs
     run_experiments.sh --suite cross X003           # single cross config
+    run_experiments.sh --suite cross_hi --all       # all high-range mns x MTP-k configs
+    run_experiments.sh --suite cross_hi Y007        # single high-range cross config
 
 Direct call (env vars must already be set):
     python3 run_pipeline.py --exp S003 --reps 2
     python3 run_pipeline.py --suite batch --exp B003 --reps 2
     python3 run_pipeline.py --suite cross --exp X003 --reps 2
+    python3 run_pipeline.py --suite cross_hi --exp Y007 --reps 2
     python3 run_pipeline.py --list
     python3 run_pipeline.py --suite batch --list
     python3 run_pipeline.py --suite cross --list
+    python3 run_pipeline.py --suite cross_hi --list
 
-Three independent sweep suites share this driver (same initialize_engine/
+Four independent sweep suites share this driver (same initialize_engine/
 evaluate/present/summarize -- see EXPERIMENT_PLAN.md,
-EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md):
+EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md,
+EXPERIMENT_PLAN_MNS_SPEC_CROSS_HI.md):
   - "spec"  (default) -- SPEC_EXPERIMENTS (S0xx): spec-decode on/off, MTP
     draft length k, crossed with dataset. max_num_seqs held at
     DEFAULT_MAX_NUM_SEQS for every row.
@@ -40,6 +45,11 @@ EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md):
   - "cross" -- CROSS_EXPERIMENTS (X0xx): max_num_seqs in {128, 256} x MTP
     k in {1, 3, 5}, spec decode on for every row -- the batch x spec-decode
     combination the other two suites deliberately avoid crossing.
+  - "cross_hi" -- CROSS_HI_EXPERIMENTS (Y0xx): same idea as "cross" but a
+    higher range -- max_num_seqs in {128, 256, 512} x MTP k in {4, 6, 8}.
+    The mns=512 rows use a dedicated larger LiveCodeBench sample (same one
+    BATCH_EXPERIMENTS' B006 uses), since the default datasets are too small
+    for mns=512 to actually bind.
   These are deliberately kept in separate dicts / selected via --suite
   rather than merged into one matrix, so --all can never silently cross
   suites in one run -- --suite picks exactly one.
@@ -206,6 +216,46 @@ CROSS_EXPERIMENTS: dict[str, dict] = {
     "X006": dict(label="mns=256 x MTP k=5", spec_decode=True, mtp_k=5, max_num_seqs=256),
 }
 
+# ---------------------------------------------------------------------------
+# Suite 4/4 -- CROSS_HI_EXPERIMENTS ("cross_hi"). A separate suite (not more
+# rows appended to CROSS_EXPERIMENTS) covering a higher mns x k range: mns in
+# {128, 256, 512} x MTP k in {4, 6, 8}, spec decode on for every row -- see
+# EXPERIMENT_PLAN_MNS_SPEC_CROSS_HI.md.
+#
+# mns=512 needs its own dataset override, same reasoning as BATCH_EXPERIMENTS'
+# B006: the default 3 datasets (198-300 prompts) can't make mns=512 actually
+# bind (batch_size = min(len(prompts), max_num_seqs) would just clamp to
+# len(prompts)), so Y007-Y009 use the dedicated 554-prompt
+# "livecodebench_mns512" sample instead of --datasets' default 3.
+#
+# mns=256 against gpqa_diamond (198 prompts) doesn't bind either, for
+# Y004-Y006 -- same caveat as CROSS_EXPERIMENTS' X004-X006 and
+# BATCH_EXPERIMENTS' B005.
+# ---------------------------------------------------------------------------
+CROSS_HI_EXPERIMENTS: dict[str, dict] = {
+    "Y001": dict(label="mns=128 x MTP k=4", spec_decode=True, mtp_k=4, max_num_seqs=128),
+    "Y002": dict(label="mns=128 x MTP k=6", spec_decode=True, mtp_k=6, max_num_seqs=128),
+    "Y003": dict(label="mns=128 x MTP k=8", spec_decode=True, mtp_k=8, max_num_seqs=128),
+    "Y004": dict(label="mns=256 x MTP k=4", spec_decode=True, mtp_k=4, max_num_seqs=256),
+    "Y005": dict(label="mns=256 x MTP k=6", spec_decode=True, mtp_k=6, max_num_seqs=256),
+    "Y006": dict(label="mns=256 x MTP k=8", spec_decode=True, mtp_k=8, max_num_seqs=256),
+    "Y007": dict(
+        label="mns=512 x MTP k=4 (554-prompt LiveCodeBench, dedicated sample)",
+        spec_decode=True, mtp_k=4, max_num_seqs=512,
+        datasets=["livecodebench_mns512"],
+    ),
+    "Y008": dict(
+        label="mns=512 x MTP k=6 (554-prompt LiveCodeBench, dedicated sample)",
+        spec_decode=True, mtp_k=6, max_num_seqs=512,
+        datasets=["livecodebench_mns512"],
+    ),
+    "Y009": dict(
+        label="mns=512 x MTP k=8 (554-prompt LiveCodeBench, dedicated sample)",
+        spec_decode=True, mtp_k=8, max_num_seqs=512,
+        datasets=["livecodebench_mns512"],
+    ),
+}
+
 # Suite name -> matrix, for --suite dispatch in main(). Suites are mutually
 # exclusive by design -- --suite selects exactly one dict, so --all (or an
 # --exp list) can never silently mix experiments from more than one suite
@@ -214,6 +264,7 @@ SUITES: dict[str, dict[str, dict]] = {
     "spec": SPEC_EXPERIMENTS,
     "batch": BATCH_EXPERIMENTS,
     "cross": CROSS_EXPERIMENTS,
+    "cross_hi": CROSS_HI_EXPERIMENTS,
 }
 
 
@@ -741,17 +792,20 @@ def main() -> int:
         default="spec",
         help="Which experiment matrix to select IDs from: 'spec' (SPEC_EXPERIMENTS, "
         "S0xx -- spec-decode/k sweep, default), 'batch' (BATCH_EXPERIMENTS, B0xx -- "
-        "max_num_seqs sweep, spec decode held off), or 'cross' (CROSS_EXPERIMENTS, "
-        "X0xx -- max_num_seqs x MTP k grid, spec decode on for every row). Suites are "
-        "never merged into one --all so a single run can't silently cross suites -- "
-        "pick one per invocation. See EXPERIMENT_PLAN.md, "
-        "EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md.",
+        "max_num_seqs sweep, spec decode held off), 'cross' (CROSS_EXPERIMENTS, "
+        "X0xx -- max_num_seqs {128,256} x MTP k {1,3,5} grid), or 'cross_hi' "
+        "(CROSS_HI_EXPERIMENTS, Y0xx -- max_num_seqs {128,256,512} x MTP k {4,6,8} "
+        "grid). Suites are never merged into one --all so a single run can't "
+        "silently cross suites -- pick one per invocation. See EXPERIMENT_PLAN.md, "
+        "EXPERIMENT_PLAN_MAX_NUM_SEQS.md, EXPERIMENT_PLAN_MNS_SPEC_CROSS.md, "
+        "EXPERIMENT_PLAN_MNS_SPEC_CROSS_HI.md.",
     )
     ap.add_argument(
         "--exp",
         help="Experiment ID(s) from the selected --suite, comma-separated "
         "(e.g. S000 or S000,S003; with --suite batch, B001 or B001,B003; "
-        "with --suite cross, X001 or X001,X004). "
+        "with --suite cross, X001 or X001,X004; with --suite cross_hi, "
+        "Y001 or Y001,Y007). "
         "Omit with --all to run every experiment in the suite.",
     )
     ap.add_argument("--all", action="store_true", help="Run every experiment in the selected --suite")

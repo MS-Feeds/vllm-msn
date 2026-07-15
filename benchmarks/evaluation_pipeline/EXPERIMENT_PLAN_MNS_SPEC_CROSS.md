@@ -33,6 +33,10 @@ folding these rows into either existing dict, for the same reason the
 first two are already split: `--all` should never silently run more
 than one kind of sweep in a single invocation.
 
+A fourth suite, `cross_hi` (`Y0xx`, see `EXPERIMENT_PLAN_MNS_SPEC_CROSS_HI.md`),
+covers a higher-range companion to this one: `max_num_seqs` in
+{128, 256, 512} x MTP `k` in {4, 6, 8}.
+
 ## Why this axis combination matters
 
 `max_num_seqs` and MTP `k` interact in the scheduler, not just

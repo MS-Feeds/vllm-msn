@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # run_experiments.sh — Launch one or more throughput experiments, from
-# one of three independent suites (no accuracy scoring -- see README.md):
+# one of four independent suites (no accuracy scoring -- see README.md):
 #   spec  (default) -- S0xx, spec-decode on/off + MTP draft length k
 #   batch            -- B0xx, max_num_seqs sweep (see EXPERIMENT_PLAN_MAX_NUM_SEQS.md)
-#   cross            -- X0xx, max_num_seqs x MTP k grid, spec decode on for every
-#                        row (see EXPERIMENT_PLAN_MNS_SPEC_CROSS.md)
+#   cross            -- X0xx, max_num_seqs {128,256} x MTP k {1,3,5} grid, spec
+#                        decode on for every row (see EXPERIMENT_PLAN_MNS_SPEC_CROSS.md)
+#   cross_hi         -- Y0xx, max_num_seqs {128,256,512} x MTP k {4,6,8} grid
+#                        (see EXPERIMENT_PLAN_MNS_SPEC_CROSS_HI.md)
 # Suites are never merged into one --all -- pick exactly one via --suite.
 #
 # Usage:
@@ -18,9 +20,12 @@
 #   ./run_experiments.sh --suite batch B003         # single batch-size experiment
 #   ./run_experiments.sh --suite cross --all        # every mns x MTP-k cross experiment
 #   ./run_experiments.sh --suite cross X003         # single cross experiment
+#   ./run_experiments.sh --suite cross_hi --all     # every high-range mns x MTP-k experiment
+#   ./run_experiments.sh --suite cross_hi Y007      # single high-range cross experiment
 #   ./run_experiments.sh --list                    # print the (default suite's) experiment matrix and exit
 #   ./run_experiments.sh --suite batch --list       # print the batch-suite matrix and exit
 #   ./run_experiments.sh --suite cross --list       # print the cross-suite matrix and exit
+#   ./run_experiments.sh --suite cross_hi --list    # print the cross_hi-suite matrix and exit
 #   ./run_experiments.sh --suite batch --all --nsight-exp B003
 #                                                    # run all of B0xx, but only bracket B003's
 #                                                    # generate() calls with cudaProfilerStart/Stop
@@ -96,7 +101,7 @@ while [[ $# -gt 0 ]]; do
     --list)      DO_LIST=1; shift ;;
     --nsight-exp) NSIGHT_EXP="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,30p' "$0"     # print the usage block at top of script
+      sed -n '2,34p' "$0"     # print the usage block at top of script
       exit 0
       ;;
     *)           EXP_IDS+=("$1"); shift ;;
