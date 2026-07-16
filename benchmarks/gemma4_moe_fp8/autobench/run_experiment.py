@@ -117,7 +117,12 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     print(f"  Prompts: {num_prompts}, Reps: {reps}", flush=True)
     print(f"{'='*60}\n", flush=True)
 
-    tok = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+    # Use local_files_only=True for absolute local paths (e.g. /tmp/models/...)
+    # to avoid HFValidationError: Repo id must be in 'namespace/repo' form.
+    _is_local = model.startswith("/") or (len(model) > 1 and model[1] == ":")
+    tok = AutoTokenizer.from_pretrained(
+        model, trust_remote_code=True, local_files_only=_is_local
+    )
     raw_prompts = load_prompts(num_prompts)
     prompts = render_chat(tok, raw_prompts)
     print(f"Loaded {len(prompts)} prompts", flush=True)
