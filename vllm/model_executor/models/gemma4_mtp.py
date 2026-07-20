@@ -45,6 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.layers.gemma4_fused_ops import gemma_rmsnorm_add_scale
 from vllm.sequence import IntermediateTensors
 
 from .gemma4 import Gemma4MLP, _get_text_config
@@ -337,10 +338,13 @@ class Gemma4MTPDecoderLayer(nn.Module):
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
 
-        hidden_states = self.post_feedforward_layernorm(hidden_states)
-        hidden_states = hidden_states + residual
-
-        hidden_states = hidden_states * self.layer_scalar
+        hidden_states = gemma_rmsnorm_add_scale(
+            hidden_states,
+            self.post_feedforward_layernorm.weight,
+            residual,
+            self.layer_scalar,
+            eps=self.post_feedforward_layernorm.variance_epsilon,
+        )
         return hidden_states, None
 
 

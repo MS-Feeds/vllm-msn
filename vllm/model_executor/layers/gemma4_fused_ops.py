@@ -129,3 +129,97 @@ def gemma_dual_rmsnorm_residual_scalar(
         BLOCK_SIZE=triton.next_power_of_2(N),
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Single-path MTP fusion kernel
+# ---------------------------------------------------------------------------
+# Used by Gemma4MTPDecoderLayer to fuse the last 3 sequential ops:
+#   hidden = post_feedforward_layernorm(hidden)   # RMSNorm
+#   hidden = hidden + residual                    # ADD
+#   hidden = hidden * layer_scalar                # SCALE
+# Into a single kernel launch: (rmsnorm(x, w) + residual) * scalar
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _gemma_rmsnorm_add_scale_kernel(
+    X_ptr,
+    W_ptr,
+    Residual_ptr,
+    Scalar_ptr,
+    Out_ptr,
+    stride_x,
+    stride_r,
+    stride_o,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Single-path: out = (rmsnorm(x, w) + residual) * scalar"""
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+
+    x = tl.load(X_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(Residual_ptr + row * stride_r + cols, mask=mask, other=0.0).to(tl.float32)
+
+    var = tl.sum(x * x, axis=0) / N
+    normed = x * tl.rsqrt(var + eps) * w
+
+    scalar = tl.load(Scalar_ptr).to(tl.float32)
+    out = (normed + r) * scalar
+
+    tl.store(Out_ptr + row * stride_o + cols, out.to(Out_ptr.dtype.element_ty), mask=mask)
+
+
+def gemma_rmsnorm_add_scale(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    scalar: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused single-path RMSNorm + residual + scalar for Gemma4 MTP layers.
+
+    Computes: (rmsnorm(x, weight) + residual) * scalar
+
+    Replaces 3 sequential kernel launches in Gemma4MTPDecoderLayer.forward():
+        post_feedforward_layernorm(hidden) + residual * layer_scalar
+
+    Args:
+        x:        MLP output hidden states  [M, N]
+        weight:   post_feedforward_layernorm weights  [N]
+        residual: residual connection before MLP  [M, N]
+        scalar:   per-layer scalar buffer  [1]
+        eps:      epsilon for RMSNorm
+
+    Returns:
+        Fused output tensor  [M, N], same dtype as x.
+    """
+    if x.dim() != 2 or residual.dim() != 2:
+        raise ValueError("gemma_rmsnorm_add_scale expects 2-D tensors")
+    if x.shape != residual.shape:
+        raise ValueError("x and residual must have identical shapes")
+    if x.stride(-1) != 1 or residual.stride(-1) != 1:
+        raise ValueError(
+            "gemma_rmsnorm_add_scale requires contiguous last dim (stride(-1) == 1)"
+        )
+
+    M, N = x.shape
+    out = torch.empty_like(x)
+    _gemma_rmsnorm_add_scale_kernel[(M,)](
+        x,
+        weight,
+        residual,
+        scalar,
+        out,
+        x.stride(0),
+        residual.stride(0),
+        out.stride(0),
+        N,
+        eps,
+        BLOCK_SIZE=triton.next_power_of_2(N),
+    )
+    return out
