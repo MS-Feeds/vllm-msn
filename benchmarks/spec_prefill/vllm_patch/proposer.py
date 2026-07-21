@@ -29,6 +29,8 @@ computing it internally. A future runner-integration pass supplies this for
 real; the standalone test harness supplies a synthetic version.
 """
 
+import os
+import tempfile
 import types
 from dataclasses import dataclass
 from functools import partial
@@ -43,6 +45,53 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
 
 from .kv_cache_utils import retrieve_keys_per_sample
+
+
+def _ensure_distributed_environment(device: torch.device) -> None:
+    """Idempotent: initializes vLLM's distributed environment (single-process,
+    tensor_model_parallel_size=1/pipeline_model_parallel_size=1 -- TP/PP > 1
+    is out of scope for this pass, see EXPERIMENT_PLAN.md) if not already
+    done in this process.
+
+    Needed because `SpecPrefillProposer` loads its model directly via
+    `get_model()`, bypassing the normal `Worker.init_device()` lifecycle that
+    a real `LLM(...)`/`Worker` would otherwise run first -- both
+    `Gemma4Attention.__init__` (`get_tensor_model_parallel_world_size()`/
+    `get_tensor_model_parallel_rank()`) and `tp_gather_qk` (`get_tp_group()`)
+    require it, and calling either without it raises
+    `AssertionError: tensor model parallel group is not initialized`
+    (confirmed on real hardware running `validate_proposer.py` standalone).
+
+    Safe to call even when a real `LLM(...)` has already initialized this in
+    the same process (the case for the real `pruner.py`/`worker.py`
+    integration, where a target-model `LLM()` is constructed first, and for
+    `validate_runner_integration.py`) -- `torch.distributed.is_initialized()`
+    guards the first step, and `ensure_model_parallel_initialized` (true to
+    its name) no-ops if the model-parallel groups already exist at the
+    expected size.
+
+    Modeled on `tests/conftest.py`'s fixture (lines 225-248), which solves
+    the identical "load a model standalone, outside a full engine" problem
+    for this fork's own test suite.
+    """
+    from vllm.distributed.parallel_state import (
+        ensure_model_parallel_initialized,
+        init_distributed_environment,
+    )
+
+    if not torch.distributed.is_initialized():
+        fd, temp_file = tempfile.mkstemp()
+        os.close(fd)
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            distributed_init_method=f"file://{temp_file}",
+            local_rank=0,
+            backend="nccl" if device.type == "cuda" else "gloo",
+        )
+    ensure_model_parallel_initialized(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+    )
 
 
 @dataclass
@@ -125,6 +174,8 @@ class SpecPrefillProposer:
         speculator_model_config: ModelConfig,
         device: torch.device,
     ) -> None:
+        _ensure_distributed_environment(device)
+
         self.vllm_config = self._create_speculator_vllm_config(
             base_vllm_config, speculator_model_config
         )
