@@ -211,6 +211,20 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        # Gemma4 MTP detection: active when both MTP method and Gemma4 MTP draft model
+        # are configured. Used by both the budget correction and dynamic-k logic.
+        self._gemma4_mtp_active: bool = (
+            speculative_config is not None and speculative_config.use_gemma4_mtp()
+        )
+        # Dynamic-k: per-request EMA acceptance rate dict.
+        self._req_accept_ema: dict[str, float] = {}
+        self._accept_ema_alpha: float = float(
+            __import__("os").environ.get("VLLM_DYNK_EMA_ALPHA", "0.3")
+        )
+        self._dynk_min: int = int(
+            __import__("os").environ.get("VLLM_DYNK_MIN", "3")
+        )
+        self._dynk_max: int = self.num_spec_tokens  # updated after speculative_config block
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -218,6 +232,8 @@ class Scheduler(SchedulerInterface):
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
+
+        self._dynk_max = self.num_spec_tokens  # update after speculative_config block
 
         # Create the KV cache manager.
         if hash_block_size is None:
@@ -495,7 +511,13 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
+
+            # Gemma4 MTP budget correction: draft tokens don't need new KV rows.
+            budget_charge = num_new_tokens
+            if self._gemma4_mtp_active and request.spec_token_ids:
+                num_spec = len(request.spec_token_ids)
+                budget_charge = max(0, num_new_tokens - num_spec)
+            token_budget -= budget_charge
             req_index += 1
 
             # Speculative decode related.
@@ -510,6 +532,17 @@ class Scheduler(SchedulerInterface):
                     spec_token_ids = request.spec_token_ids
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
+                    # Dynamic-k: clip to adaptive k based on per-request acceptance rate.
+                    if self._gemma4_mtp_active and len(spec_token_ids) > 0:
+                        req_id = request.request_id
+                        accept_rate = self._req_accept_ema.get(req_id, 0.8)
+                        high, low = 0.8, 0.4
+                        t = max(0.0, min(1.0, (accept_rate - low) / (high - low)))
+                        adaptive_k = int(
+                            round(self._dynk_min + t * (self._dynk_max - self._dynk_min))
+                        )
+                        if len(spec_token_ids) > adaptive_k:
+                            spec_token_ids = spec_token_ids[:adaptive_k]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
@@ -1390,6 +1423,14 @@ class Scheduler(SchedulerInterface):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+                # Dynamic-k: update per-request acceptance EMA.
+                if self._gemma4_mtp_active and num_draft_tokens > 0:
+                    new_rate = num_accepted / num_draft_tokens
+                    prev = self._req_accept_ema.get(req_id, new_rate)
+                    self._req_accept_ema[req_id] = (
+                        self._accept_ema_alpha * new_rate
+                        + (1.0 - self._accept_ema_alpha) * prev
+                    )
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -1993,6 +2034,10 @@ class Scheduler(SchedulerInterface):
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
         )
+
+    def _cleanup_dynk_ema(self, request_id: str) -> None:
+        """Remove EMA state for a finished or preempted request."""
+        self._req_accept_ema.pop(request_id, None)
 
     def make_spec_decoding_stats(
         self,
