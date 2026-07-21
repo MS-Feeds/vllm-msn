@@ -211,6 +211,13 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = self.num_lookahead_tokens = 0
+        # True when Gemma4 MTP is active: draft tokens reuse the target
+        # model's KV positions (constant_draft_positions=True), so they
+        # do NOT consume new KV slots.  We detect this once at init to
+        # avoid a per-request isinstance check in the hot scheduling loop.
+        self._gemma4_mtp_active: bool = (
+            speculative_config is not None and speculative_config.use_gemma4_mtp()
+        )
         if speculative_config:
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
@@ -495,7 +502,25 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
+
+            # Gemma4 MTP budget correction:
+            # With constant_draft_positions=True the Gemma4 proposer runs all
+            # k draft steps from the *same* target-model position.  Draft
+            # tokens therefore reuse the KV slot that the target model already
+            # allocated - no new rows are written to the KV cache for them.
+            # The scheduler's default accounting charges the full
+            # num_tokens_with_spec (prompt + output + spec) against
+            # token_budget, which over-counts by len(spec_token_ids) and
+            # starves decode batches when the queue is long.
+            #
+            # Fix: when Gemma4 MTP is active and this request carries spec
+            # tokens, subtract their count from the budget charge so that only
+            # the tokens that actually need a new KV row are counted.
+            budget_charge = num_new_tokens
+            if self._gemma4_mtp_active and request.spec_token_ids:
+                num_spec = len(request.spec_token_ids)
+                budget_charge = max(0, num_new_tokens - num_spec)
+            token_budget -= budget_charge
             req_index += 1
 
             # Speculative decode related.
