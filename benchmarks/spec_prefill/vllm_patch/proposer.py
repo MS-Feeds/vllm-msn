@@ -39,7 +39,7 @@ from typing import Any, Callable, List, Optional
 import torch
 import torch.nn as nn
 
-from vllm.config import ModelConfig, VllmConfig, replace
+from vllm.config import ModelConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
@@ -174,15 +174,21 @@ class SpecPrefillProposer:
         speculator_model_config: ModelConfig,
         device: torch.device,
     ) -> None:
-        _ensure_distributed_environment(device)
-
         self.vllm_config = self._create_speculator_vllm_config(
             base_vllm_config, speculator_model_config
         )
         self.device = device
-        self.model: nn.Module = get_model(
-            vllm_config=self.vllm_config, prefix="spec_prefill_speculator"
-        )
+
+        # initialize_model_parallel() (inside _ensure_distributed_environment)
+        # reads get_current_vllm_config() internally, so both it and the
+        # model load itself must run inside this context -- confirmed on
+        # real hardware (AssertionError: Current vLLM config is not set,
+        # otherwise).
+        with set_current_vllm_config(self.vllm_config):
+            _ensure_distributed_environment(device)
+            self.model: nn.Module = get_model(
+                vllm_config=self.vllm_config, prefix="spec_prefill_speculator"
+            )
 
         self._speculator_layers = self._find_gemma4_attention_layers(self.model)
         self._num_layers = len(self._speculator_layers)
