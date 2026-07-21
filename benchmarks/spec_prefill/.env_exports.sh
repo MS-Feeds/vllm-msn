@@ -1,5 +1,11 @@
 source /opt/conda/etc/profile.d/conda.sh
 conda activate vllm-ablation
+# Precompiled vLLM binaries need CUDA 13 runtime libs on LD_LIBRARY_PATH
+# (see ../gemma4_moe_benchmarks/EXPERIMENT_PLAN.md's "Runtime environment"
+# section -- that pipeline's run_experiments.sh sets this automatically,
+# this one doesn't have an equivalent wrapper yet, so it's set here instead).
+# $CONDA_PREFIX is set by `conda activate` above, so this must come after it.
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
 export HF_HOME=/scratch/hf_cache
 export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN in shell before sourcing this file}
 export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
