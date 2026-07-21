@@ -7,7 +7,9 @@ reasoned through against this fork's verified V1 APIs. Expect to iterate
 against real errors -- see "Known risk areas" below before debugging blind).
 
 Usage:
-    source ../gemma4_moe_benchmarks/.env_exports.sh   # for HF_TOKEN etc.
+    export HF_TOKEN=<your token>
+    source .env_exports.sh   # this directory's local copy (not the shared
+                              # one in ../gemma4_moe_benchmarks/)
     python3 validate_proposer.py --model $GEMMA4_E2B_MODEL_PATH
 
 What this validates, and why it's split into two steps:

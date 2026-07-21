@@ -97,9 +97,10 @@ against this fork as-is**. Porting checklist:
    metrics). This protocol calls for **LongBench v2** (multiple-choice format, with
    a length field used for the short/<32k-word filter) — a new prediction+eval
    script is needed; the v1 harness can't be reused as-is.
-4. **Missing model path.** `gemma4_moe_benchmarks/.env_exports.sh` has a
-   commented-out `GEMMA4_E2B_MODEL_PATH` placeholder, but the checkpoint itself
-   isn't downloaded yet — see `REPRODUCE.md` step 3 for the exact `hf download`
+4. **Missing model path.** This directory's own `.env_exports.sh` (not the
+   shared one in `gemma4_moe_benchmarks/`) has a commented-out
+   `GEMMA4_E2B_MODEL_PATH` placeholder, but the checkpoint itself isn't
+   downloaded yet — see `REPRODUCE.md` step 3 for the exact `hf download`
    command; uncomment and fill in the real snapshot path once it completes.
 
 This plan's experiment matrix, dataset scoping, and success criteria below are ready
@@ -174,6 +175,11 @@ status #3) — future work, analogous in shape to
 | `EXPERIMENT_PLAN.md` | This file |
 | `README.md` | Overview / index |
 | `REPRODUCE.md` | Environment setup + reproduction steps |
+| `.env_exports.sh` | Local env config (conda activation, `HF_TOKEN`, `GEMMA4_MODEL_PATH`, `GEMMA4_E2B_MODEL_PATH`) — separate from the shared one in `../gemma4_moe_benchmarks/`, see `REPRODUCE.md` step 1 |
+| `vllm_patch/` | The Algorithm 1 implementation (`scoring.py`, `proposer.py`, `kv_cache_utils.py`, `prefill_split.py`, `pruning_registry.py`, `pruner.py`, `model_runner.py`, `worker.py`, `config.py`) — see its own `__init__.py` module map |
+| `test_vllm_patch.py` | Unit tests for the engine-agnostic pieces of `vllm_patch/` (no GPU needed) |
+| `validate_proposer.py` | GPU-node validation: speculator loading + attention hook, per-layer `head_dim` check |
+| `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + the position-override correctness check |
 | `speculative_prefill/` | Cloned reference implementation (gitignored — has its own `.git`) |
 | `datasets/` | LongBench v2 prep output (empty — prep script is future work) |
 | `results/` | Output directory (gitignored) |

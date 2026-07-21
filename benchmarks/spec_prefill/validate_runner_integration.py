@@ -8,7 +8,9 @@ fork's verified V1 APIs but NOT executed. Expect to iterate against real
 errors.)
 
 Usage:
-    source ../gemma4_moe_benchmarks/.env_exports.sh
+    export HF_TOKEN=<your token>
+    source .env_exports.sh   # this directory's local copy (not the shared
+                              # one in ../gemma4_moe_benchmarks/)
     python3 validate_runner_integration.py \
         --target-model $GEMMA4_MODEL_PATH \
         --speculator-model $GEMMA4_E2B_MODEL_PATH

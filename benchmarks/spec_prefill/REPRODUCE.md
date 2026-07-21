@@ -23,6 +23,18 @@ VLLM_USE_PRECOMPILED=1 pip install -e .
 See `../evaluation_pipeline/REPRODUCE.md` steps 3-5 for the full gotchas (do not
 `pip install vllm` from PyPI; OS-level multimodal deps; etc.) — not duplicated here.
 
+Once the env exists, this directory has its own `.env_exports.sh` (conda
+activation + `HF_TOKEN`/`HF_HOME` + `GEMMA4_MODEL_PATH`/`GEMMA4_E2B_MODEL_PATH`)
+— **local to `spec_prefill/`, not the shared one in `../gemma4_moe_benchmarks/`**
+(that file is still the source of truth for `gemma4_moe_benchmarks`/
+`evaluation_pipeline` themselves, but doesn't carry the speculator path this
+pipeline needs, so SpecPrefill work should source this local copy instead):
+
+```bash
+export HF_TOKEN=<your token>
+source benchmarks/spec_prefill/.env_exports.sh
+```
+
 ## 2. The cloned reference implementation's environment (separate env)
 
 `speculative_prefill/` pins `vllm==0.6.3.post1`, `torch==2.4.0`,
@@ -43,11 +55,20 @@ fork's vLLM until the port (Implementation status #1-#2) is done.
 
 ## 3. Model checkpoints
 
-- Gemma-4-26B-A4B-it: already downloaded, see `../gemma4_moe_benchmarks/.env_exports.sh`
-  (`GEMMA4_MODEL_PATH`).
-- Gemma-4-E2B-it: **not yet downloaded.** `../gemma4_moe_benchmarks/.env_exports.sh`
+- **Gemma-4-26B-A4B-it (target)**: `.env_exports.sh`'s `GEMMA4_MODEL_PATH` carries
+  a specific snapshot path that was valid on a prior node ("node-0") — **verify
+  it's actually present on whatever node you're using now** before trusting it,
+  since a fresh/different node may not have it:
+  ```bash
+  ls -la /scratch/hf_cache/models--google--gemma-4-26B-A4B-it/snapshots/*/
+  du -sh /scratch/hf_cache/models--google--gemma-4-26B-A4B-it/   # expect ~49G
+  ```
+  If missing, download it the same way as the speculator below
+  (`hf download google/gemma-4-26B-A4B-it --cache-dir /scratch/hf_cache`) and
+  update `GEMMA4_MODEL_PATH` in `.env_exports.sh`.
+- **Gemma-4-E2B-it (speculator)**: **not yet downloaded.** `.env_exports.sh`
   has a commented-out `GEMMA4_E2B_MODEL_PATH` placeholder ready to fill in. Following
-  the same `hf download` pattern used for the other two Gemma-4 checkpoints
+  the same `hf download` pattern used for the target checkpoint above
   (`../evaluation_pipeline/REPRODUCE.md` step 6):
 
   ```bash
@@ -69,7 +90,8 @@ fork's vLLM until the port (Implementation status #1-#2) is done.
   config/tokenizer files — `AutoTokenizer.from_pretrained()` can succeed even when
   the weight shards are missing; this exact gotcha is in
   `../evaluation_pipeline/REPRODUCE.md`'s troubleshooting table), then uncomment
-  and fill in the real path in `../gemma4_moe_benchmarks/.env_exports.sh`:
+  and fill in the real path in **this directory's** `.env_exports.sh` (not the
+  shared one in `../gemma4_moe_benchmarks/`):
 
   ```bash
   export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/<actual-hash>
@@ -98,6 +120,7 @@ Three checks, in order — each depends on the previous one passing:
    26B MoE target's heterogeneous-head-dim quirk — currently unknown), then
    attempts a minimal forward-pass smoke test if the layout is simple enough:
    ```bash
+   source .env_exports.sh   # this directory's local copy, see step 1
    python3 validate_proposer.py --model $GEMMA4_E2B_MODEL_PATH
    ```
 3. **On the GPU node, once both checkpoints are set** — loads the *target*
