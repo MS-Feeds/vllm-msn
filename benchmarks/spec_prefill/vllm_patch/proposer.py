@@ -215,10 +215,25 @@ class SpecPrefillProposer:
 
     @staticmethod
     def _find_gemma4_attention_layers(model: nn.Module) -> List[nn.Module]:
-        """Locate the speculator's Gemma4Attention layers directly via the
-        known Gemma4ForCausalLM/Gemma4Model structure (model.model.layers[i]
+        """Locate the speculator's Gemma4Attention layers via the known
+        Gemma4ForCausalLM/Gemma4Model structure (model.model.layers[i]
         .self_attn), rather than a generic layer registry -- SpecPrefill's
-        scope is Gemma-4-E2B-it specifically (see EXPERIMENT_PLAN.md)."""
+        scope is Gemma-4-E2B-it specifically (see EXPERIMENT_PLAN.md).
+
+        **Confirmed on real hardware**: `get_model()` loads Gemma-4-E2B-it as
+        `Gemma4ForConditionalGeneration` (the multimodal-capable wrapper
+        class -- both the full and the "text-only" checkpoint variants route
+        here, per `gemma4_mm.py`'s guardrail comments; there is no
+        checkpoint config that yields plain `Gemma4ForCausalLM` directly),
+        not `Gemma4ForCausalLM` as originally assumed. Its real text stack
+        lives under `.language_model` (itself a `Gemma4ForCausalLM`), not
+        `.model` -- unwrap via `supports_multimodal()` +
+        `.get_language_model()`, mirroring the exact pattern this fork's own
+        `vllm/v1/spec_decode/llm_base_proposer.py:1213-1247` already uses
+        for this same class when the MTP/draft-model proposer loads a
+        Gemma4 target model."""
+        from vllm.model_executor.models import supports_multimodal
+
         model_name = type(model).__name__
         if "Gemma4" not in model_name:
             raise NotImplementedError(
@@ -228,7 +243,23 @@ class SpecPrefillProposer:
                 f"faithful copy of Gemma4Attention.forward's body and is "
                 f"not architecture-generic."
             )
-        inner = model.model if hasattr(model, "model") else model
+
+        if supports_multimodal(model):
+            # e.g. Gemma4ForConditionalGeneration -- unwrap to the real
+            # Gemma4ForCausalLM text stack first.
+            text_model = model.get_language_model()
+        else:
+            text_model = model
+
+        inner = text_model.model if hasattr(text_model, "model") else text_model
+        if not hasattr(inner, "layers"):
+            raise NotImplementedError(
+                f"Could not locate decoder layers on {model_name} -- neither "
+                f".get_language_model().model.layers nor .model.layers nor "
+                f".layers resolved. This model's structure doesn't match "
+                f"either known Gemma4 wrapper shape (Gemma4ForCausalLM or "
+                f"Gemma4ForConditionalGeneration)."
+            )
         return [layer.self_attn for layer in inner.layers]
 
     def install_query_capture_hooks(self) -> None:
