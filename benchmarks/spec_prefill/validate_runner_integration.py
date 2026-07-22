@@ -191,22 +191,32 @@ def step_b_position_aliasing_check(
     expected_positions = sorted(kept_positions)
     print(f"Registered PruneRecord: kept {len(kept_positions)} of {orig_len} tokens.")
 
-    # Drive the engine through the prefill step.
-    llm.llm_engine.step()
-
-    captured_per_worker = llm.collective_rpc(_read_captured_positions)
-    captured = captured_per_worker[0] if captured_per_worker else []
+    # Drive the engine through the prefill step. A single step() isn't
+    # guaranteed to actually schedule+execute a just-added request (confirmed
+    # on real hardware: one step() left the hook uncalled, while llm.generate()
+    # -- which loops step() internally -- worked fine in Steps A/C) -- loop
+    # with a bounded retry, checking for captured data after each step so we
+    # don't run more steps than needed.
+    captured: list = []
+    max_steps = 10
+    for step_idx in range(max_steps):
+        llm.llm_engine.step()
+        captured_per_worker = llm.collective_rpc(_read_captured_positions)
+        captured = captured_per_worker[0] if captured_per_worker else []
+        if captured:
+            break
     if not captured:
-        print("FAIL: no positions were captured at all -- the hook may not "
-              "have fired, or the request never reached the model this step.")
+        print(f"FAIL: no positions were captured after {max_steps} step() "
+              f"calls -- the hook may not have fired, or the request never "
+              f"reached the model.")
         return False
 
     # First captured entry should be the prefill step's positions for our
     # request (there may be other requests' data too if the batch wasn't
     # isolated -- take the entry whose length matches our pruned prompt).
-    matching = [p for p in captured if len(p) == record.num_kept]
+    matching = [p for p in captured if len(p) == len(kept_positions)]
     if not matching:
-        print(f"FAIL: no captured position tensor has length {record.num_kept} "
+        print(f"FAIL: no captured position tensor has length {len(kept_positions)} "
               f"(our pruned prompt length). Captured lengths: "
               f"{[len(p) for p in captured]}")
         return False
@@ -218,7 +228,7 @@ def step_b_position_aliasing_check(
               "The self.positions view-aliasing assumption holds.")
         return True
 
-    stock_positions = sorted(range(record.num_kept))
+    stock_positions = sorted(range(len(kept_positions)))
     if actual_positions == stock_positions:
         print("FAIL: the model received the STOCK contiguous positions "
               f"({stock_positions[:5]}...), not our overridden ones "
