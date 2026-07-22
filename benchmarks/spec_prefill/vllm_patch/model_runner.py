@@ -32,6 +32,7 @@ model, and this needs to move earlier (which would require a much larger
 override, see the plan).
 """
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -41,6 +42,19 @@ from . import pruning_registry
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+# TEMPORARY diagnostic gate (2026-07-22): validate_runner_integration.py hung
+# indefinitely on real hardware at llm.llm_engine.step() -> outputs_queue.get()
+# -- EngineCore itself never sent a response, with 0% GPU utilization (a
+# genuine stall, not slow compute), and no fatal-error traceback from
+# EngineCore. Root cause not yet isolated. Setting
+# SPEC_PREFILL_DISABLE_POSITION_OVERRIDE=1 skips
+# _apply_spec_prefill_position_overrides entirely (falls back to pure stock
+# _prepare_inputs behavior) so a re-run can confirm/rule out this override as
+# the cause before debugging further. Remove once root-caused.
+_DISABLE_POSITION_OVERRIDE = bool(
+    os.environ.get("SPEC_PREFILL_DISABLE_POSITION_OVERRIDE")
+)
 
 
 class SpecPrefillGPUModelRunner(GPUModelRunner):
@@ -56,7 +70,8 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
         # spec_decode_metadata)`, per the base class's own docstring --
         # returned unchanged here, only `self.positions` is touched.
         result = super()._prepare_inputs(scheduler_output, *args, **kwargs)
-        self._apply_spec_prefill_position_overrides(scheduler_output)
+        if not _DISABLE_POSITION_OVERRIDE:
+            self._apply_spec_prefill_position_overrides(scheduler_output)
         return result
 
     def _apply_spec_prefill_position_overrides(
