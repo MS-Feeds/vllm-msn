@@ -30,10 +30,12 @@ real; the standalone test harness supplies a synthetic version.
 """
 
 import os
+import sys
 import tempfile
 import types
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import Any, Callable, List, Optional
 
 import torch
@@ -45,6 +47,38 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.model_loader import get_model
 
 from .kv_cache_utils import retrieve_keys_per_sample
+
+_VLLM_REPO_ROOT_ON_SYSPATH = False
+
+
+def _ensure_vllm_repo_root_on_syspath() -> None:
+    """Idempotent: `build_lookahead_metadata` imports `tests.v1.attention.
+    utils` (this fork's own test suite, not part of the installed `vllm`
+    package -- see that method's docstring for why). That import only
+    resolves when the vllm-msn repo ROOT is on `sys.path`, not just
+    `benchmarks/spec_prefill` (which every `vllm_patch` caller script adds
+    for its own imports -- confirmed on real hardware: `ModuleNotFoundError:
+    No module named 'tests'` without this, running from
+    `benchmarks/spec_prefill/`).
+
+    Computed relative to this file's own location
+    (`benchmarks/spec_prefill/vllm_patch/proposer.py`, 3 parents up to repo
+    root) rather than relying on every caller script to add it themselves.
+    """
+    global _VLLM_REPO_ROOT_ON_SYSPATH
+    if _VLLM_REPO_ROOT_ON_SYSPATH:
+        return
+    repo_root = Path(__file__).resolve().parents[3]
+    if not (repo_root / "tests" / "v1" / "attention" / "utils.py").exists():
+        raise RuntimeError(
+            f"Expected the vllm-msn repo root at {repo_root} (computed as "
+            f"3 parents up from {__file__}) to contain "
+            f"tests/v1/attention/utils.py, but it doesn't -- this file may "
+            f"have moved, or the repo layout changed. Add the real repo "
+            f"root to sys.path manually as a workaround."
+        )
+    sys.path.insert(0, str(repo_root))
+    _VLLM_REPO_ROOT_ON_SYSPATH = True
 
 
 def _ensure_distributed_environment(device: torch.device) -> None:
@@ -426,6 +460,7 @@ class SpecPrefillProposer:
         plan's "Scope for this pass"). Every call re-allocates a fresh dummy
         cache sized for exactly this request; not reused across requests.
         """
+        _ensure_vllm_repo_root_on_syspath()
         from tests.v1.attention.utils import (  # proven pattern, see docstring
             BatchSpec,
             create_common_attn_metadata,
