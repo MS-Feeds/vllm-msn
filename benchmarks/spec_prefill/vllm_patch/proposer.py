@@ -434,6 +434,18 @@ class SpecPrefillProposer:
         Q is already buffered (post tp_gather_qk); K is read back from the
         speculator's own KV cache per layer via kv_cache_utils.py.
 
+        `head_size` is accepted for interface-compatibility with callers
+        (`build_lookahead_metadata`'s caller passes one head_dim value), but
+        is **not used per-layer** -- confirmed on real hardware that using a
+        single global head_size here is a real bug: Gemma4's head_dim is
+        heterogeneous (256 sliding-attention / 512 full-attention layers),
+        so K retrieval must read each layer's OWN `self_attn.head_dim`
+        (`RuntimeError: stack expects each tensor to be equal size` in
+        scoring.compute_attention_score otherwise -- layer 4's K was
+        reinterpreted with layer 0's head_dim). `num_kv_heads`/`block_size`
+        are uniform across layers (confirmed: num_kv_heads=1 for every layer
+        in validate_proposer.py's inspection) and stay global.
+
         Returns:
             (query_buffer, key_buffer) where key_buffer[layer_idx] is a list
             of per-sample [context_len, num_kv_heads, head_size] tensors --
@@ -442,7 +454,7 @@ class SpecPrefillProposer:
         """
         key_buffer = [
             retrieve_keys_per_sample(
-                self_attn.attn, block_size, num_kv_heads, head_size, per_sample_slot_mapping
+                self_attn.attn, block_size, num_kv_heads, self_attn.head_dim, per_sample_slot_mapping
             )
             for self_attn in self._speculator_layers
         ]
@@ -506,10 +518,17 @@ class SpecPrefillProposer:
 
         kv_cache_spec = create_standard_kv_cache_spec(self.vllm_config)
         for self_attn in self._speculator_layers:
+            # Confirmed on real hardware: allocating every layer's dummy
+            # cache with a single global head_dim (the `head_dim` parameter,
+            # typically caller-supplied from layer 0) is wrong for Gemma4 --
+            # full-attention layers (head_dim=512) would get a cache tensor
+            # sized for the sliding-attention layers' 256, undersized for
+            # what their real forward pass writes. Each layer's own
+            # self_attn.head_dim is used instead, per layer.
             dummy_cache = create_dummy_kv_cache(
                 block_size,
                 num_kv_heads,
-                head_dim,
+                self_attn.head_dim,
                 self.vllm_config.model_config.dtype,
                 self.device,
             )
