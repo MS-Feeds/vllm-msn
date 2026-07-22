@@ -104,9 +104,19 @@ def _install_position_capture_hook(worker) -> int:
     """collective_rpc target: installs the diagnostic hook on every
     Gemma4Attention layer of the TARGET model (worker.model_runner.model),
     storing captured positions on the worker itself so a later collective_rpc
-    call can read them back. Returns the number of layers hooked."""
+    call can read them back. Returns the number of layers hooked.
+
+    Same `Gemma4ForConditionalGeneration` unwrap as `proposer.py`'s
+    `_find_gemma4_attention_layers` -- confirmed on real hardware that the
+    target model is this wrapper class too (`AttributeError:
+    'Gemma4ForConditionalGeneration' object has no attribute 'layers'`
+    without it), not plain `Gemma4ForCausalLM`. Mirrors this fork's own
+    `vllm/v1/spec_decode/llm_base_proposer.py:1213-1247` pattern."""
+    from vllm.model_executor.models import supports_multimodal
+
     model = worker.model_runner.model
-    inner = model.model if hasattr(model, "model") else model
+    text_model = model.get_language_model() if supports_multimodal(model) else model
+    inner = text_model.model if hasattr(text_model, "model") else text_model
 
     captured: List[torch.Tensor] = []
     setattr(worker, _CAPTURE_ATTR, captured)
