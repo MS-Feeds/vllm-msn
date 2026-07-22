@@ -150,10 +150,30 @@ def _clear_captured_positions(worker) -> None:
         captured.clear()
 
 
-def step_a_basic_wiring(llm: LLM) -> None:
+def _render_chat(tokenizer, prompt: str) -> str:
+    """Renders a single user turn through the checkpoint's own chat
+    template, same as gemma4_moe_benchmarks' render_chat (bench_offline.py).
+    Required for an instruction-tuned checkpoint like Gemma-4-*-it: passing
+    a bare completion-style string straight to generate() skips the
+    <start_of_turn>/generation-prompt markers the model was RLHF'd against,
+    which reliably produces degenerate repetition loops under greedy
+    decoding -- confirmed on real hardware (2026-07-22): even STOCK vLLM
+    with no vllm_patch code loaded at all produced the same garbage
+    (' is is is is') for a raw prompt, fully exonerating SpecPrefillWorker
+    for what looked like a runner-swap bug but was actually just a missing
+    chat template on the test script's own prompts."""
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+
+
+def step_a_basic_wiring(llm: LLM, tokenizer) -> None:
     print("=== Step A: basic wiring (worker_cls loaded, normal generation) ===")
     outputs = llm.generate(
-        ["The capital of France is"], SamplingParams(max_tokens=4, temperature=0.0)
+        [_render_chat(tokenizer, "The capital of France is")],
+        SamplingParams(max_tokens=4, temperature=0.0),
     )
     text = outputs[0].outputs[0].text
     print(f"Normal (non-pruned) generation succeeded: {text!r}")
@@ -174,12 +194,16 @@ def step_b_position_aliasing_check(
     print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model attention layers.")
     llm.collective_rpc(_clear_captured_positions)
 
-    prompt_text = (
+    prompt_text = _render_chat(
+        tokenizer,
         "This is a moderately long test prompt used only to validate that "
         "SpecPrefill's position-restoration mechanism actually reaches the "
-        "model during a real forward pass, not to test generation quality."
+        "model during a real forward pass, not to test generation quality.",
     )
-    prompt_token_ids = tokenizer.encode(prompt_text)
+    # add_special_tokens=False: the chat template string already embeds
+    # whatever special tokens (e.g. <bos>) the model expects -- re-adding
+    # them here would double them up.
+    prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
     request_id = "spec_prefill_validation_request"
     # NOTE: do NOT read back via pruning_registry.get(request_id) here --
@@ -271,10 +295,10 @@ def step_b_position_aliasing_check(
     return False
 
 
-def step_c_coherence_smoke_test(llm: LLM) -> None:
+def step_c_coherence_smoke_test(llm: LLM, tokenizer) -> None:
     print("\n=== Step C: coherence smoke test (secondary signal only) ===")
     outputs = llm.generate(
-        ["Explain in one sentence why the sky is blue."],
+        [_render_chat(tokenizer, "Explain in one sentence why the sky is blue.")],
         SamplingParams(max_tokens=20, temperature=0.0),
     )
     print(f"Output for a normal request run through the SpecPrefill worker: "
@@ -345,7 +369,8 @@ def main() -> None:
     )
     print("Target model loaded.")
 
-    step_a_basic_wiring(llm)
+    tokenizer = llm.get_tokenizer()
+    step_a_basic_wiring(llm, tokenizer)
 
     print(f"\nLoading speculator {args.speculator_model} standalone (via "
           f"SpecPrefillProposer, same as validate_proposer.py) on "
@@ -378,12 +403,11 @@ def main() -> None:
         pool_kernel_size=None,
     )
 
-    tokenizer = llm.get_tokenizer()
     passed = step_b_position_aliasing_check(
         llm, proposer, spec_config, speculator_device, head_dim, tokenizer
     )
 
-    step_c_coherence_smoke_test(llm)
+    step_c_coherence_smoke_test(llm, tokenizer)
 
     if not passed:
         print("\nOVERALL: Step B FAILED -- see above for what to check next.")
