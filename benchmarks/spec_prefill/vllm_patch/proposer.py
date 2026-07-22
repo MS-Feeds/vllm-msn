@@ -29,6 +29,7 @@ computing it internally. A future runner-integration pass supplies this for
 real; the standalone test harness supplies a synthetic version.
 """
 
+import copy
 import os
 import sys
 import tempfile
@@ -256,10 +257,25 @@ class SpecPrefillProposer:
         `compilation_config.mode = CompilationMode.NONE` and
         `cudagraph_mode = CUDAGraphMode.NONE` (`vllm/config/vllm.py:1019-1025`),
         avoiding Dynamo entirely rather than trying to make the hook
-        Dynamo-traceable."""
+        Dynamo-traceable.
+
+        Uses a shallow copy + direct attribute set rather than vLLM's own
+        `replace()` for this specific field -- confirmed on real hardware
+        that `replace(speculator_model_config, enforce_eager=True)` raises
+        `ValueError: Field 'model_arch_config' not found in ModelConfig`
+        (vLLM's `vllm.config.utils.replace`, not stdlib `dataclasses.replace`,
+        chokes on a `model_arch_config` instance attribute that isn't a
+        declared dataclass field). `ModelConfig` uses vLLM's own `@config(...)`
+        wrapper, not a frozen dataclass, and is mutated in place elsewhere in
+        this codebase (e.g. `Gemma4Config.verify_and_update_config` mutates
+        `vllm_config.attention_config.backend` directly) -- direct attribute
+        assignment on a copy is consistent with that convention, not a hack
+        specific to this file."""
+        speculator_model_config = copy.copy(speculator_model_config)
+        speculator_model_config.enforce_eager = True
         return replace(
             base_vllm_config,
-            model_config=replace(speculator_model_config, enforce_eager=True),
+            model_config=speculator_model_config,
             quant_config=None,
         )
 
