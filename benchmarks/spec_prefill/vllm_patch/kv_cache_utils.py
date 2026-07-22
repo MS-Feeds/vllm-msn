@@ -7,12 +7,6 @@ vs. full-attention layers can use different head dims (see gemma4.py's
 `head_dim`/`global_head_dim` split), so every lookup here is per-layer.
 
 Verified against this fork's actual source (not assumed):
-- `get_attention_context(layer_name)` (vllm/model_executor/layers/attention/
-  attention.py:648-688) returns (attn_metadata, attn_layer, kv_cache,
-  slot_mapping) for a layer, reading from the current forward context. Must
-  be called while a `set_forward_context(...)` block from the layer's own
-  forward pass is (or was) active, since `slot_mapping` comes from
-  `forward_context.slot_mapping[layer_name]`.
 - `AttentionBackend.get_kv_cache_shape(num_blocks, block_size, num_kv_heads,
   head_size)` and `.get_kv_cache_block_dim(...)` (vllm/v1/attention/
   backend.py:89-116) are backend classmethods reachable via
@@ -25,11 +19,22 @@ Verified against this fork's actual source (not assumed):
   in proposer.py, buffered during the lookahead loop rather than read back
   from cache.
 
-`get_attention_context` is imported lazily (inside `read_layer_keys`, not at
-module scope) so that `_find_kv_split_dim`/`gather_keys_for_slots` -- pure
-tensor-shape logic with no vLLM dependency -- stay importable/unit-testable
-without vLLM's full runtime (e.g. `pyzmq`) installed, matching the same
-testability goal `scoring.py` documents.
+**Takes the `Attention` layer module directly (e.g.
+`speculator_layers[i].attn`), not a `layer_name` string + `get_attention_
+context()`/`get_forward_context()` lookup** (an earlier version did the
+latter -- confirmed on real hardware this was actually wrong: `kv_cache`
+and `attn_backend` are both plain, persistent attributes on the `Attention`
+module itself, not scoped to an active `set_forward_context(...)` block, but
+`get_attention_context()` internally calls `get_forward_context()`, which
+asserts a context is currently active -- `AssertionError: Forward context is
+not set`, since `retrieve_qk`/`retrieve_keys_per_sample` are called *after*
+`run_lookahead_steps` has already exited its `set_forward_context` blocks,
+by design -- Q/K retrieval is a separate step from the forward passes
+themselves, see proposer.py). `SpecPrefillProposer` already holds direct
+references to each layer's `Attention` instance (`self._speculator_layers[i]
+.attn`), so there's no need to route through the forward-context-scoped
+lookup at all -- this module now has no vLLM dependency whatsoever, not even
+a lazy one.
 """
 
 from typing import List
@@ -70,7 +75,7 @@ def _find_kv_split_dim(
 
 
 def read_layer_keys(
-    layer_name: str,
+    attn_layer,
     block_size: int,
     num_kv_heads: int,
     head_size: int,
@@ -78,13 +83,17 @@ def read_layer_keys(
     """Read the full physical K cache for one layer as a flat, slot-indexable
     tensor: [num_blocks * block_size, num_kv_heads, head_size].
 
+    Args:
+        attn_layer: the `vllm.model_executor.layers.attention.Attention`
+            module instance for this layer (e.g. a speculator layer's
+            `self_attn.attn`) -- read directly, not looked up via
+            `get_attention_context()`, see module docstring.
+
     Caller is expected to index the result with a slot_mapping (physical slot
     = block_id * block_size + offset_within_block, vLLM's standard
     convention) to get per-token keys — see `gather_keys_for_slots` below.
     """
-    from vllm.model_executor.layers.attention.attention import get_attention_context
-
-    _, attn_layer, kv_cache, _ = get_attention_context(layer_name)
+    kv_cache = attn_layer.kv_cache
     attn_backend = attn_layer.attn_backend
 
     split_dim = _find_kv_split_dim(attn_backend, kv_cache, block_size, num_kv_heads, head_size)
@@ -116,7 +125,7 @@ def gather_keys_for_slots(
 
 
 def retrieve_keys_per_sample(
-    layer_name: str,
+    attn_layer,
     block_size: int,
     num_kv_heads: int,
     head_size: int,
@@ -126,11 +135,14 @@ def retrieve_keys_per_sample(
     and split it into per-sample key tensors via each sample's own
     slot_mapping (physical slots for that sample's prompt tokens).
 
+    Args:
+        attn_layer: see `read_layer_keys`'s docstring.
+
     Returns a list (one per prefill sample) of [context_len, num_kv_heads,
     head_size] key tensors -- the `key_buffer[layer_idx]` shape expected by
     scoring.compute_attention_score.
     """
-    flat_keys = read_layer_keys(layer_name, block_size, num_kv_heads, head_size)
+    flat_keys = read_layer_keys(attn_layer, block_size, num_kv_heads, head_size)
     return [
         gather_keys_for_slots(flat_keys, slot_mapping)
         for slot_mapping in per_sample_slot_mapping

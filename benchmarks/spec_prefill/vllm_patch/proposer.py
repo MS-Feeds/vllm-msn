@@ -442,9 +442,9 @@ class SpecPrefillProposer:
         """
         key_buffer = [
             retrieve_keys_per_sample(
-                layer_name, block_size, num_kv_heads, head_size, per_sample_slot_mapping
+                self_attn.attn, block_size, num_kv_heads, head_size, per_sample_slot_mapping
             )
-            for layer_name in self._layer_names
+            for self_attn in self._speculator_layers
         ]
         return query_buffer, key_buffer
 
