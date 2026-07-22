@@ -3,13 +3,13 @@
 
 
 --extra-index-url https://download.pytorch.org/whl/rocm7.1
-torch==2.12.1
+torch==2.13.0
 torchvision==0.26.0
 torchaudio==2.11.0
 triton==3.6.0
 cmake>=3.26.1,<4
 packaging>=24.2
-setuptools>=78.1.1,<80.0.0
+setuptools>=83.0.0,<84.0.0
 setuptools-scm>=8
 wheel
 jinja2>=3.1.6
