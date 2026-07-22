@@ -137,7 +137,17 @@ def _read_captured_positions(worker) -> List[List[int]]:
 
 
 def _clear_captured_positions(worker) -> None:
-    setattr(worker, _CAPTURE_ATTR, [])
+    """Must mutate the existing list in place, NOT reassign a new one --
+    every hooked layer's `partial(_capturing_forward, _captured=...)`
+    (see `_install_position_capture_hook`) closed over the *original* list
+    object at install time. `setattr(worker, _CAPTURE_ATTR, [])` here would
+    only repoint the attribute at a new list, leaving the hooks writing into
+    an orphaned one that `_read_captured_positions` can never see again --
+    confirmed on real hardware as the actual cause of Step B always
+    reporting 'no positions were captured' even though the hook fires."""
+    captured = getattr(worker, _CAPTURE_ATTR, None)
+    if captured is not None:
+        captured.clear()
 
 
 def step_a_basic_wiring(llm: LLM) -> None:
