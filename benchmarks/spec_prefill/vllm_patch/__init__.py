@@ -40,14 +40,21 @@ Module map (Algorithm 1 pseudocode step numbers in parens):
                               chunk_select_from_smoothed_attention. Pure
                               tensor math, engine/architecture-agnostic.
     pruning_registry.py     -- process-local PruneRecord store (T, orig_len
-                              per pruned request_id); the handoff between
-                              pruner.py (driver side) and model_runner.py
-                              (engine side). Pure Python, no vLLM dependency.
+                              per pruned request_id), read by model_runner.py.
+                              Pure Python, no vLLM dependency -- but note
+                              it must be POPULATED inside the Worker's own
+                              process (worker.py's register_prune_record),
+                              not the driver's -- EngineCore always runs
+                              out-of-process from the driver, confirmed on
+                              real hardware, see worker.py's docstring.
     pruner.py               -- driver-facing entry point: runs lines 3-16
                               for one prompt via proposer.py/scoring.py,
-                              registers the PruneRecord, calls
-                              LLMEngine.add_request with the pruned prompt
-                              and cache_salt set (prefix-cache isolation).
+                              pushes the PruneRecord into the Worker's
+                              process via collective_rpc (NOT a direct
+                              pruning_registry call -- see worker.py), then
+                              calls LLMEngine.add_request with the pruned
+                              prompt and cache_salt set (prefix-cache
+                              isolation).
     model_runner.py          -- (18-19) SpecPrefillGPUModelRunner: thin
                               _prepare_inputs override that patches RoPE
                               positions in place for pruned requests only,

@@ -5,8 +5,20 @@ need (consumed on the runner side by `model_runner.py`).
 Called by a benchmark driver script **before** `LLMEngine.add_request()` — not
 by any code running inside the vLLM engine process's per-step loop. See the
 approved plan's "Where pruning is triggered: before the Request even exists".
-Requires driver and engine to be in the same OS process (the default
-single-GPU `UniProcExecutor`) since `pruning_registry` is process-local.
+
+**Correction (2026-07-22, confirmed on real hardware)**: the approved plan
+originally assumed the driver and `EngineCore`/`Worker` share one OS process
+under the default single-GPU `UniProcExecutor`, making a plain
+`pruning_registry.register(...)` call here sufficient. That assumption was
+wrong -- `EngineCore` always runs in its own separate process (visible via
+the `(EngineCore pid=...)` log prefix), regardless of executor topology. A
+direct `pruning_registry.register(...)` call in this module would only
+populate the *driver* process's copy of that module, invisible to
+`model_runner.py` (which runs inside the Worker's process). `prune_and_add_request`
+below instead pushes the record via `llm_engine.collective_rpc(
+"register_prune_record", ...)`, which calls a real method on
+`SpecPrefillWorker` (`worker.py`) running inside the correct process -- see
+that method's docstring for the full reasoning.
 
 **Known limitation inherited from `proposer.build_lookahead_metadata`**: only
 `look_ahead_cnt == 1` (a single real prefill forward on the speculator, no
@@ -24,7 +36,6 @@ from vllm.inputs import TokensPrompt
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.llm_engine import LLMEngine
 
-from . import pruning_registry
 from .config import SpecConfig
 from .proposer import SpecPrefillProposer
 from .scoring import (
@@ -126,12 +137,14 @@ def prune_and_add_request(
     eos_token_id: Optional[int] = None,
 ) -> str:
     """Full driver-facing entry point for one request: prune (lines 3-16),
-    register the PruneRecord the runner subclass needs for RoPE-position
-    restoration (lines 18-19), then call `add_request` with the pruned
-    prompt and `cache_salt` set to isolate this request's prefix-cache block
-    hashes (see the approved plan's "Prefix caching" section -- pruned
-    requests must never coincidentally share a block hash with another
-    request, since the hash doesn't account for position).
+    push the PruneRecord the runner subclass needs for RoPE-position
+    restoration (lines 18-19) into the Worker's own process (see module
+    docstring -- NOT the same process as this function runs in), then call
+    `add_request` with the pruned prompt and `cache_salt` set to isolate
+    this request's prefix-cache block hashes (see the approved plan's
+    "Prefix caching" section -- pruned requests must never coincidentally
+    share a block hash with another request, since the hash doesn't account
+    for position).
 
     Call this instead of `llm_engine.add_request(...)` directly for any
     request that should go through SpecPrefill pruning.
@@ -141,7 +154,13 @@ def prune_and_add_request(
         proposer, spec_config, prompt_token_ids, device, head_dim, eos_token_id
     )
 
-    pruning_registry.register(request_id, kept_positions=kept_positions, orig_len=orig_len)
+    # Must reach the Worker's own process -- see module docstring and
+    # SpecPrefillWorker.register_prune_record's docstring (worker.py). A
+    # direct pruning_registry.register(...) call here would silently do
+    # nothing, since this function runs in the driver process.
+    llm_engine.collective_rpc(
+        "register_prune_record", args=(request_id, kept_positions, orig_len)
+    )
 
     prompt = TokensPrompt(prompt_token_ids=pruned_token_ids, cache_salt=request_id)
     return llm_engine.add_request(request_id, prompt, sampling_params)

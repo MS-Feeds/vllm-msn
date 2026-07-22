@@ -58,6 +58,7 @@ e.g. the KV-cache slot-mapping assumption in the module docstring).
 """
 
 import argparse
+import os
 import sys
 import types
 from functools import partial
@@ -65,6 +66,17 @@ from pathlib import Path
 from typing import List
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+# collective_rpc serializes whatever's sent to the (separate-process, even
+# under UniProcExecutor -- confirmed on real hardware via the
+# "(EngineCore pid=...)" log prefix) Worker; raw function objects aren't
+# serializable by default (security restriction against arbitrary code
+# execution over that channel). This script's own diagnostic hooks
+# (_install_position_capture_hook etc.) are plain functions, not named
+# Worker methods -- acceptable to relax for a throwaway, locally-run
+# validation script; NOT something to set for production use. Must be set
+# before vLLM reads it, so this is as early as possible.
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 import torch
 from vllm import LLM, SamplingParams
