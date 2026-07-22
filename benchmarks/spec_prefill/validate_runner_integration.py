@@ -160,9 +160,21 @@ def step_b_position_aliasing_check(
     tokenizer,
 ) -> bool:
     print("\n=== Step B: self.positions view-aliasing check (risk #1) ===")
-    num_hooked = llm.collective_rpc(_install_position_capture_hook)
-    print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model attention layers.")
-    llm.collective_rpc(_clear_captured_positions)
+    # TEMPORARY diagnostic gate (2026-07-22): bisecting the step()-hang that
+    # persists even with SPEC_PREFILL_DISABLE_POSITION_OVERRIDE=1 (see
+    # model_runner.py's own gate). This hook is the other new thing Step B
+    # introduces that Step A's already-working generate() call never
+    # exercised -- SPEC_PREFILL_DISABLE_DIAGNOSTIC_HOOK=1 skips installing it
+    # so a re-run can tell whether the hook (vs. the pruned-request
+    # scheduling path itself) is where the hang lives. Step B will trivially
+    # FAIL with the hook disabled (no positions to capture) -- that's
+    # expected and fine for this test. Remove once root-caused.
+    if os.environ.get("SPEC_PREFILL_DISABLE_DIAGNOSTIC_HOOK"):
+        print("SPEC_PREFILL_DISABLE_DIAGNOSTIC_HOOK=1 set -- skipping hook install.")
+    else:
+        num_hooked = llm.collective_rpc(_install_position_capture_hook)
+        print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model attention layers.")
+        llm.collective_rpc(_clear_captured_positions)
 
     prompt_text = (
         "This is a moderately long test prompt used only to validate that "
@@ -200,7 +212,9 @@ def step_b_position_aliasing_check(
     captured: list = []
     max_steps = 10
     for step_idx in range(max_steps):
+        print(f"  step() call {step_idx + 1}/{max_steps}...", flush=True)
         llm.llm_engine.step()
+        print(f"  step() call {step_idx + 1}/{max_steps} returned.", flush=True)
         captured_per_worker = llm.collective_rpc(_read_captured_positions)
         captured = captured_per_worker[0] if captured_per_worker else []
         if captured:
