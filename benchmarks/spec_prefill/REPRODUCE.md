@@ -1,11 +1,13 @@
 # Reproduction Steps
 
-Status: the V1 port (`vllm_patch/`) is code-complete but **unvalidated on real
-hardware** — every step below through step 5 is runnable now; step 6 (an actual
-experiment) is still blocked, on GPU validation results plus two known gaps (the
-LongBench v2 dataset, and multi-step lookahead — see `EXPERIMENT_PLAN.md`'s
-"Implementation status" and `vllm_patch/proposer.py`'s `build_lookahead_metadata`
-docstring).
+Status: the V1 port (`vllm_patch/`) is code-complete. Step 5.2 (speculator loading,
+`validate_proposer.py`) **passes on real hardware as of 2026-07-21** — model loads,
+all 35 attention layers hook correctly, heterogeneous head-dim confirmed (see step
+5 below). Step 5.3 (`validate_runner_integration.py`, the riskiest assumption in
+the design) and step 6 (an actual experiment) remain unvalidated/blocked — on
+step 5.3's results plus two known gaps (the LongBench v2 dataset, and multi-step
+lookahead — see `EXPERIMENT_PLAN.md`'s "Implementation status" and
+`vllm_patch/proposer.py`'s `build_lookahead_metadata` docstring).
 
 ## 1. This fork's vLLM environment (for the target/speculator serving side)
 
@@ -116,9 +118,11 @@ Three checks, in order — each depends on the previous one passing:
    ```
 2. **On the GPU node, once step 3's `GEMMA4_E2B_MODEL_PATH` is set** — loads
    the real speculator standalone, installs the query-capture hook, and
-   reports per-layer `head_dim` (answers whether Gemma-4-E2B-it shares the
-   26B MoE target's heterogeneous-head-dim quirk — currently unknown), then
-   attempts a minimal forward-pass smoke test if the layout is simple enough:
+   reports per-layer `head_dim`. **Confirmed passing (2026-07-21)**: 35
+   layers found, `head_dim` heterogeneous (256 sliding / 512 full-attention,
+   `num_kv_heads=1` throughout) — same pattern as the 26B target, so Step B
+   (the forward-pass smoke test, which only runs for a uniform layout) is
+   expected to self-skip:
    ```bash
    source .env_exports.sh   # this directory's local copy, see step 1
    python3 validate_proposer.py --model $GEMMA4_E2B_MODEL_PATH

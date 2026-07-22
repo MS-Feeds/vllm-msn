@@ -92,6 +92,13 @@ against this fork as-is**. Porting checklist:
    attention head dimensions (see `gemma4_moe_benchmarks/EXPERIMENT_PLAN.md`'s
    TRITON_ATTN note) mean the patch's attention-hooking code likely needs
    Gemma4-specific work before the speculator/target pairing here is viable.
+   `vllm_patch/`'s from-scratch Gemma4 port (`proposer.py`) is that work, and
+   **confirmed on real hardware** (`validate_proposer.py`, 2026-07-21): Gemma-4-E2B-it
+   shares the 26B target's heterogeneous head-dim pattern exactly — `head_dim=256`
+   on the 28 sliding-attention layers, `head_dim=512` on the 7 full-attention
+   layers (35 layers total), `num_kv_heads=1` throughout. `kv_cache_utils.py`'s
+   per-layer `AttentionSpec` design (built without assuming uniformity) is
+   therefore load-bearing, not just defensive.
 3. **Benchmark mismatch.** The repo's `eval/long_bench/pred_vllm.py` only targets
    dataset `THUDM/LongBench` (**v1** — free-form QA/summarization with per-task
    metrics). This protocol calls for **LongBench v2** (multiple-choice format, with

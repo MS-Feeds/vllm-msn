@@ -44,8 +44,18 @@ if TYPE_CHECKING:
 
 
 class SpecPrefillGPUModelRunner(GPUModelRunner):
-    def _prepare_inputs(self, scheduler_output: "SchedulerOutput"):
-        result = super()._prepare_inputs(scheduler_output)
+    def _prepare_inputs(self, scheduler_output: "SchedulerOutput", *args, **kwargs):
+        # *args/**kwargs (rather than a hardcoded signature) deliberately:
+        # confirmed on real hardware that the base class's real signature is
+        # `_prepare_inputs(self, scheduler_output, num_scheduled_tokens:
+        # np.ndarray)` -- not `(self, scheduler_output)` alone as first
+        # assumed (TypeError: takes 2 positional arguments but 3 were given).
+        # Passing through opaquely means a future signature change upstream
+        # (e.g. another parameter added) doesn't silently break this thin
+        # wrapper the same way. Return value is `(logits_indices,
+        # spec_decode_metadata)`, per the base class's own docstring --
+        # returned unchanged here, only `self.positions` is touched.
+        result = super()._prepare_inputs(scheduler_output, *args, **kwargs)
         self._apply_spec_prefill_position_overrides(scheduler_output)
         return result
 
