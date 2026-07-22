@@ -81,9 +81,7 @@ os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 import torch
 from vllm import LLM, SamplingParams
 from vllm.config import ModelConfig, VllmConfig
-from vllm.inputs import TokensPrompt
 
-from vllm_patch import pruning_registry
 from vllm_patch.config import SpecConfig
 from vllm_patch.proposer import SpecPrefillProposer
 from vllm_patch.pruner import prune_and_add_request
@@ -174,8 +172,13 @@ def step_b_position_aliasing_check(
     prompt_token_ids = tokenizer.encode(prompt_text)
 
     request_id = "spec_prefill_validation_request"
-    pruning_registry.discard(request_id)  # clean slate if re-run
-    prune_and_add_request(
+    # NOTE: do NOT read back via pruning_registry.get(request_id) here --
+    # that would read the *driver* process's copy, which prune_and_add_request
+    # never writes to by design (the record only exists in the Worker's
+    # process, pushed via collective_rpc -- see pruner.py/worker.py
+    # docstrings). Confirmed on real hardware this is a real trap: use the
+    # return value instead.
+    _, kept_positions, orig_len = prune_and_add_request(
         llm_engine=llm.llm_engine,
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
@@ -185,14 +188,8 @@ def step_b_position_aliasing_check(
         device=speculator_device,
         head_dim=head_dim,
     )
-    record = pruning_registry.get(request_id)
-    if record is None:
-        raise RuntimeError(
-            "PruneRecord was not registered -- prune_and_add_request may have "
-            "failed silently or discard_finished already cleaned it up."
-        )
-    expected_positions = sorted(record.kept_positions)
-    print(f"Registered PruneRecord: kept {record.num_kept} of {record.orig_len} tokens.")
+    expected_positions = sorted(kept_positions)
+    print(f"Registered PruneRecord: kept {len(kept_positions)} of {orig_len} tokens.")
 
     # Drive the engine through the prefill step.
     llm.llm_engine.step()

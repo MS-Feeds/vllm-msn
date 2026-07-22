@@ -135,7 +135,7 @@ def prune_and_add_request(
     device: torch.device,
     head_dim: int,
     eos_token_id: Optional[int] = None,
-) -> str:
+) -> Tuple[str, List[int], int]:
     """Full driver-facing entry point for one request: prune (lines 3-16),
     push the PruneRecord the runner subclass needs for RoPE-position
     restoration (lines 18-19) into the Worker's own process (see module
@@ -148,6 +148,17 @@ def prune_and_add_request(
 
     Call this instead of `llm_engine.add_request(...)` directly for any
     request that should go through SpecPrefill pruning.
+
+    Returns:
+        (request_id, kept_positions, orig_len) -- the caller may want these
+        for logging/verification. Deliberately NOT read back via
+        `pruning_registry.get(request_id)` afterward -- that would read the
+        *driver* process's copy of the module, which this function never
+        writes to (confirmed on real hardware this is a real trap, not
+        hypothetical: see `validate_runner_integration.py`'s history for the
+        exact failure -- `pruning_registry.get()` in the driver always
+        returns None here, by design, since the record only exists in the
+        Worker's process).
     """
     orig_len = len(prompt_token_ids)
     pruned_token_ids, kept_positions = compute_pruned_prompt(
@@ -163,4 +174,5 @@ def prune_and_add_request(
     )
 
     prompt = TokensPrompt(prompt_token_ids=pruned_token_ids, cache_salt=request_id)
-    return llm_engine.add_request(request_id, prompt, sampling_params)
+    llm_engine.add_request(request_id, prompt, sampling_params)
+    return request_id, kept_positions, orig_len
