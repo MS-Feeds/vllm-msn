@@ -240,10 +240,26 @@ class SpecPrefillProposer:
         auto-selected independently rather than inherited from the base
         model (Gemma4's TRITON_ATTN forcing is head-dim-dependent and must
         be re-derived for the speculator's own config, see gemma4.py's
-        `Gemma4Config.verify_and_update_config`)."""
+        `Gemma4Config.verify_and_update_config`).
+
+        Forces `enforce_eager=True` -- the original protocol document's own
+        stated requirement ("run with enforce_eager=True,
+        enable_chunked_prefill=False"), and confirmed necessary on real
+        hardware for a different reason too: without it, `Gemma4Model`'s
+        `@support_torch_compile`-wrapped forward tries to torch.compile/
+        Dynamo-trace through the `functools.partial`-wrapped query-capture
+        hook (`_query_capturing_gemma4_attention_forward`) installed below,
+        and Dynamo can't trace through a `functools.partial` object
+        (`torch._dynamo.exc.Unsupported: can't handle functions not
+        implemented in python`). Setting `model_config.enforce_eager = True`
+        makes `VllmConfig`'s own post-init logic set
+        `compilation_config.mode = CompilationMode.NONE` and
+        `cudagraph_mode = CUDAGraphMode.NONE` (`vllm/config/vllm.py:1019-1025`),
+        avoiding Dynamo entirely rather than trying to make the hook
+        Dynamo-traceable."""
         return replace(
             base_vllm_config,
-            model_config=speculator_model_config,
+            model_config=replace(speculator_model_config, enforce_eager=True),
             quant_config=None,
         )
 

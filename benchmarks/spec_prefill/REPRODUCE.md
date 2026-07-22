@@ -20,6 +20,13 @@ conda activate vllm-ablation
 pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 cd ~/vllm-msn
 VLLM_USE_PRECOMPILED=1 pip install -e .
+pip install pytest   # vllm_patch/proposer.py's build_lookahead_metadata reuses
+                      # this fork's own tests/v1/attention/utils.py (a proven
+                      # attention-metadata-construction pattern -- see its
+                      # docstring for why), which imports pytest for an
+                      # unrelated fallback path never actually hit here; a real
+                      # runtime dependency for this benchmark, confirmed on
+                      # real hardware (ModuleNotFoundError without it).
 ```
 
 See `../evaluation_pipeline/REPRODUCE.md` steps 3-5 for the full gotchas (do not
