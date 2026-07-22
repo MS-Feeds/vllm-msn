@@ -160,21 +160,9 @@ def step_b_position_aliasing_check(
     tokenizer,
 ) -> bool:
     print("\n=== Step B: self.positions view-aliasing check (risk #1) ===")
-    # TEMPORARY diagnostic gate (2026-07-22): bisecting the step()-hang that
-    # persists even with SPEC_PREFILL_DISABLE_POSITION_OVERRIDE=1 (see
-    # model_runner.py's own gate). This hook is the other new thing Step B
-    # introduces that Step A's already-working generate() call never
-    # exercised -- SPEC_PREFILL_DISABLE_DIAGNOSTIC_HOOK=1 skips installing it
-    # so a re-run can tell whether the hook (vs. the pruned-request
-    # scheduling path itself) is where the hang lives. Step B will trivially
-    # FAIL with the hook disabled (no positions to capture) -- that's
-    # expected and fine for this test. Remove once root-caused.
-    if os.environ.get("SPEC_PREFILL_DISABLE_DIAGNOSTIC_HOOK"):
-        print("SPEC_PREFILL_DISABLE_DIAGNOSTIC_HOOK=1 set -- skipping hook install.")
-    else:
-        num_hooked = llm.collective_rpc(_install_position_capture_hook)
-        print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model attention layers.")
-        llm.collective_rpc(_clear_captured_positions)
+    num_hooked = llm.collective_rpc(_install_position_capture_hook)
+    print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model attention layers.")
+    llm.collective_rpc(_clear_captured_positions)
 
     prompt_text = (
         "This is a moderately long test prompt used only to validate that "
@@ -204,25 +192,39 @@ def step_b_position_aliasing_check(
     print(f"Registered PruneRecord: kept {len(kept_positions)} of {orig_len} tokens.")
 
     # Drive the engine through the prefill step. A single step() isn't
-    # guaranteed to actually schedule+execute a just-added request (confirmed
-    # on real hardware: one step() left the hook uncalled, while llm.generate()
-    # -- which loops step() internally -- worked fine in Steps A/C) -- loop
-    # with a bounded retry, checking for captured data after each step so we
-    # don't run more steps than needed.
+    # guaranteed to actually schedule+execute a just-added request, so this
+    # loops with a bounded retry, checking for captured data after each step.
+    #
+    # **Root cause of the real-hardware hang (2026-07-22, confirmed against
+    # this fork's own source, not inferred)**: this loop used to call
+    # `llm.llm_engine.step()` unconditionally up to `max_steps` times. Our
+    # request has `max_tokens=1`, so it fully finishes on the FIRST step()
+    # (the prefill step also samples the one requested token). Every
+    # `llm.generate()` call (Steps A/C) drives step() via vLLM's own required
+    # idiom -- `while self.llm_engine.has_unfinished_requests(): step()` --
+    # see vllm/entrypoints/llm.py:1285-1286. This loop skipped that guard, so
+    # once the request finished, the 2nd step() called
+    # `engine_core.get_output()` (vllm/v1/engine/llm_engine.py:295) with
+    # nothing left scheduled -- EngineCore's background loop had no output to
+    # push, so the client blocked on `outputs_queue.get()` forever. That's
+    # the exact "0% GPU util, no traceback" stall previously attributed to
+    # the position override / diagnostic hook (see model_runner.py's now-
+    # removable diagnostic gate) -- neither was actually the cause.
     captured: list = []
     max_steps = 10
     for step_idx in range(max_steps):
-        print(f"  step() call {step_idx + 1}/{max_steps}...", flush=True)
+        if not llm.llm_engine.has_unfinished_requests():
+            print(f"Engine went idle after {step_idx} step() call(s) "
+                  f"(request finished -- max_tokens=1 completes in one step).")
+            break
         llm.llm_engine.step()
-        print(f"  step() call {step_idx + 1}/{max_steps} returned.", flush=True)
         captured_per_worker = llm.collective_rpc(_read_captured_positions)
         captured = captured_per_worker[0] if captured_per_worker else []
         if captured:
             break
     if not captured:
-        print(f"FAIL: no positions were captured after {max_steps} step() "
-              f"calls -- the hook may not have fired, or the request never "
-              f"reached the model.")
+        print(f"FAIL: no positions were captured -- the hook may not have "
+              f"fired, or the request never reached the model.")
         return False
 
     # First captured entry should be the prefill step's positions for our
