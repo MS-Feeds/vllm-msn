@@ -15,6 +15,15 @@ Usage:
         --target-model $GEMMA4_MODEL_PATH \
         --speculator-model $GEMMA4_E2B_MODEL_PATH
 
+**Confirmed gotcha (2026-07-22, real hardware, single 80GB A100)**: the
+target `LLM(...)` defaults to `gpu_memory_utilization=0.9`, leaving no room
+to also load the speculator standalone in the same process -- CUDA OOM
+loading Gemma-4-E2B-it's very first layer. Worked around via
+`--target-gpu-memory-utilization` (default here: 0.6) -- lower it further if
+the speculator still OOMs. This is a validation-script workaround only; the
+real KV-cache budgeting between two concurrently-loaded Gemma-4 models
+remains deferred, unsolved work (see EXPERIMENT_PLAN.md).
+
 What this validates, in order:
 
 Step A -- basic wiring: constructs a real `LLM(..., worker_cls=
@@ -126,7 +135,7 @@ def step_b_position_aliasing_check(
     llm: LLM,
     proposer: SpecPrefillProposer,
     spec_config: SpecConfig,
-    device: torch.device,
+    speculator_device: torch.device,
     head_dim: int,
     tokenizer,
 ) -> bool:
@@ -151,7 +160,7 @@ def step_b_position_aliasing_check(
         sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
         proposer=proposer,
         spec_config=spec_config,
-        device=device,
+        device=speculator_device,
         head_dim=head_dim,
     )
     record = pruning_registry.get(request_id)
@@ -223,24 +232,78 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-model", required=True)
     parser.add_argument("--speculator-model", required=True)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default="cuda", help="Target model's GPU.")
+    parser.add_argument(
+        "--speculator-device",
+        default=None,
+        help=(
+            "Speculator's GPU, e.g. 'cuda:1'. Defaults to the second visible "
+            "GPU if one exists (the protocol's own resource requirement is "
+            "2x A100 -- see EXPERIMENT_PLAN.md), so the target and speculator "
+            "don't compete for the same GPU's memory. Falls back to sharing "
+            "--device (with a warning) if only one GPU is visible; in that "
+            "case, lower --target-gpu-memory-utilization to make room."
+        ),
+    )
+    parser.add_argument(
+        "--target-gpu-memory-utilization",
+        type=float,
+        default=0.9,
+        help=(
+            "Only matters if the speculator ends up sharing the target's GPU "
+            "(single-GPU fallback above) -- vLLM's own default (0.9) then "
+            "leaves no room to also load the speculator standalone in the "
+            "same process (confirmed on real hardware: CUDA OOM loading "
+            "Gemma-4-E2B-it's first layer). With a real second GPU for the "
+            "speculator (the normal case), this can stay near vLLM's default."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
 
-    print(f"Loading target model {args.target_model} via SpecPrefillWorker...")
+    if args.speculator_device is not None:
+        speculator_device = torch.device(args.speculator_device)
+    elif torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+        speculator_device = torch.device("cuda:1")
+    else:
+        speculator_device = device
+        print(
+            f"WARNING: only {torch.cuda.device_count()} GPU(s) visible -- "
+            f"speculator will share the target's GPU ({device}) instead of "
+            f"getting its own. This is why the target's "
+            f"gpu_memory_utilization ({args.target_gpu_memory_utilization}) "
+            f"matters here; lower it further if the speculator still OOMs."
+        )
+
+    target_gpu_memory_utilization = (
+        args.target_gpu_memory_utilization if speculator_device == device else 0.9
+    )
+    print(f"Loading target model {args.target_model} via SpecPrefillWorker "
+          f"(gpu_memory_utilization={target_gpu_memory_utilization}) on {device}...")
     llm = LLM(
         model=args.target_model,
         worker_cls="vllm_patch.worker.SpecPrefillWorker",
         enforce_eager=True,
         trust_remote_code=True,
+        gpu_memory_utilization=target_gpu_memory_utilization,
     )
     print("Target model loaded.")
 
     step_a_basic_wiring(llm)
 
     print(f"\nLoading speculator {args.speculator_model} standalone (via "
-          f"SpecPrefillProposer, same as validate_proposer.py)...")
+          f"SpecPrefillProposer, same as validate_proposer.py) on "
+          f"{speculator_device}...")
+    if speculator_device.type == "cuda":
+        # get_model()'s internal weight placement follows torch's *current*
+        # CUDA device, not an explicit device argument threaded through
+        # VllmConfig (DeviceConfig.device is deprecated/generic-only, not a
+        # GPU index -- confirmed by reading vllm/config/device.py). Without
+        # this, weights would land on whatever device is "current" (GPU 0,
+        # already holding the target model), regardless of the device=...
+        # passed to SpecPrefillProposer below.
+        torch.cuda.set_device(speculator_device)
     speculator_model_config = ModelConfig(
         model=args.speculator_model, trust_remote_code=True, dtype="bfloat16"
     )
@@ -248,7 +311,7 @@ def main() -> None:
     proposer = SpecPrefillProposer(
         base_vllm_config=base_vllm_config,
         speculator_model_config=speculator_model_config,
-        device=device,
+        device=speculator_device,
     )
     head_dim = proposer._speculator_layers[0].head_dim
     print(f"Speculator loaded, head_dim={head_dim}.")
@@ -262,7 +325,7 @@ def main() -> None:
 
     tokenizer = llm.get_tokenizer()
     passed = step_b_position_aliasing_check(
-        llm, proposer, spec_config, device, head_dim, tokenizer
+        llm, proposer, spec_config, speculator_device, head_dim, tokenizer
     )
 
     step_c_coherence_smoke_test(llm)
