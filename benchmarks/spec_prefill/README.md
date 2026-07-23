@@ -28,6 +28,13 @@ same protocol-markdown + `datasets/`/`results/` structure. Has its own
   loop, scoring, pruning, and the `worker_cls`-based runner integration).
 - `test_vllm_patch.py` / `validate_proposer.py` / `validate_runner_integration.py`
   — tests and GPU-node validation scripts, see `REPRODUCE.md` step 5.
+- `datasets/prep_longbench_v2.py` — downloads `THUDM/LongBench-v2` and filters to
+  the "short" (<32k word) subset; see `REPRODUCE.md` step 4.
+- `predict_longbench_v2.py` — runs the P001–P006 keep-rate sweep (with/without
+  SpecPrefill pruning) against those samples and writes a predictions JSONL per
+  experiment; see `REPRODUCE.md` step 6.
+- `grade_longbench_v2.py` — scores a predictions file against `prep_longbench_v2.py`'s
+  samples; see `REPRODUCE.md` step 4.
 - `speculative_prefill/` — cloned reference implementation (gitignored).
-- `datasets/` — LongBench v2 prompt sets (empty — prep script is future work).
+- `datasets/` — LongBench v2 prompt sets (`longbench_v2_samples.jsonl`).
 - `results/` — gitignored output directory.

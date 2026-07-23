@@ -22,17 +22,21 @@ section for the full reasoning (verified directly against
   stock implementation unmodified via `super()`, then patch just that view
   afterward for pruned requests only.
 
-**Residual risk, not yet verified on real hardware** (see the approved
-plan's risk #1): this assumes nothing in `_prepare_inputs()` after line 2280
-touches `self.positions` again, and that the attention backend's metadata
-builder doesn't `.clone()`/`.contiguous()` the positions field before the
-model actually reads it (which would break the view-aliasing this depends
-on). If either assumption is wrong, positions patched here won't reach the
-model, and this needs to move earlier (which would require a much larger
-override, see the plan).
+**Residual risk, confirmed resolved on real hardware (2026-07-23)**: this
+assumes nothing in `_prepare_inputs()` after line 2280 touches
+`self.positions` again, and that the attention backend's metadata builder
+doesn't `.clone()`/`.contiguous()` the positions field before the model
+actually reads it (which would break the view-aliasing this depends on).
+Confirmed neither happens -- a real, non-degenerate pruned request (30%ish
+retention, ~5400 scattered kept positions out of ~18000) had its overridden
+positions verified, via a diagnostic hook on the model's own attention
+layers, to reach the model exactly as written. (An earlier "pass" at 100%
+token retention had been a false positive -- identity-mapped kept_positions
+are indistinguishable from stock contiguous ones regardless of whether the
+override fires at all; the real bug turned out to be upstream, in
+`pruner.py`'s request-id handling, not here -- see that module's docstring.)
 """
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -42,28 +46,6 @@ from . import pruning_registry
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-
-# TEMPORARY diagnostic gate (2026-07-23): a large (5418-of-17962-token) pruned
-# request's positions weren't reaching the model on real hardware, while a
-# small (51-token) one worked -- confirmed the mismatch is NOT in
-# gpu_model_runner.py itself (call chain, padding, attention backend,
-# uses_mrope, batch reordering all traced and ruled out as size-dependent).
-# The remaining, most likely explanation is that _apply_spec_prefill_
-# position_overrides is silently hitting one of its own no-op `continue`
-# branches for the large request specifically -- every one of them is silent
-# today. SPEC_PREFILL_DEBUG_POSITION_OVERRIDE=1 makes each iteration print
-# exactly which branch fires. Remove once root-caused.
-#
-# print(), not logger.info(): confirmed on real hardware (2026-07-23) that
-# `vllm.logger.init_logger(__name__)` for a "vllm_patch.*"-named module
-# produces NO visible output at INFO level -- vllm.logger only attaches a
-# handler to the "vllm" logger namespace specifically (vllm/logger.py's
-# DEFAULT_LOGGING_CONFIG); "vllm_patch.model_runner" is a disjoint hierarchy
-# with no handler, so .info() calls are silently swallowed (Python's
-# logging.lastResort fallback only surfaces WARNING+). Plain print() has no
-# such namespace dependency and is what every other diagnostic in this
-# codebase already relies on.
-_DEBUG_POSITION_OVERRIDE = bool(os.environ.get("SPEC_PREFILL_DEBUG_POSITION_OVERRIDE"))
 
 
 class SpecPrefillGPUModelRunner(GPUModelRunner):
@@ -121,45 +103,17 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
             req_id = self.input_batch.req_ids[req_idx]
             record = pruning_registry.get(req_id)
             if record is None:
-                if _DEBUG_POSITION_OVERRIDE:
-                    print(
-                        f"[spec_prefill diag] req_id={req_id!r}: no PruneRecord "
-                        f"found (pruning_registry.get returned None) -- stock "
-                        f"positions stand, no override applied this step.",
-                        flush=True,
-                    )
                 continue  # not a pruned request -- stock positions stand.
 
             start = int(query_start_loc_np[req_idx])
             end = int(query_start_loc_np[req_idx + 1])
             num_scheduled_this_step = end - start
             if num_scheduled_this_step <= 0:
-                if _DEBUG_POSITION_OVERRIDE:
-                    print(
-                        f"[spec_prefill diag] req_id={req_id!r}: has a "
-                        f"PruneRecord (num_kept={record.num_kept}) but "
-                        f"num_scheduled_this_step={num_scheduled_this_step} <= 0 "
-                        f"this step -- skipped, no override applied.",
-                        flush=True,
-                    )
                 continue
 
             num_computed_before = int(self.input_batch.num_computed_tokens_cpu[req_idx])
 
             kept_slice = record.positions_for_step(num_computed_before, num_scheduled_this_step)
-            if _DEBUG_POSITION_OVERRIDE:
-                kept_slice_desc = (
-                    "None (decode branch)" if kept_slice is None
-                    else f"<list of {len(kept_slice)}> first5={kept_slice[:5]}"
-                )
-                print(
-                    f"[spec_prefill diag] req_id={req_id!r}: "
-                    f"num_kept={record.num_kept} "
-                    f"num_computed_before={num_computed_before} "
-                    f"num_scheduled_this_step={num_scheduled_this_step} "
-                    f"start={start} end={end} kept_slice={kept_slice_desc}",
-                    flush=True,
-                )
             if kept_slice is not None:
                 kept_positions_gpu = torch.tensor(
                     kept_slice, dtype=self.positions.dtype, device=self.device

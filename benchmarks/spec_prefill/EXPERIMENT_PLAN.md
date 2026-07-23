@@ -99,30 +99,59 @@ against this fork as-is**. Porting checklist:
    layers (35 layers total), `num_kv_heads=1` throughout. `kv_cache_utils.py`'s
    per-layer `AttentionSpec` design (built without assuming uniformity) is
    therefore load-bearing, not just defensive.
-3. **Benchmark mismatch.** The repo's `eval/long_bench/pred_vllm.py` only targets
-   dataset `THUDM/LongBench` (**v1** — free-form QA/summarization with per-task
-   metrics). This protocol calls for **LongBench v2** (multiple-choice format, with
-   a length field used for the short/<32k-word filter) — a new prediction+eval
-   script is needed; the v1 harness can't be reused as-is.
-4. **Missing model path.** This directory's own `.env_exports.sh` (not the
-   shared one in `gemma4_moe_benchmarks/`) has a commented-out
-   `GEMMA4_E2B_MODEL_PATH` placeholder, but the checkpoint itself isn't
-   downloaded yet — see `REPRODUCE.md` step 3 for the exact `hf download`
-   command; uncomment and fill in the real snapshot path once it completes.
+3. **Benchmark mismatch — resolved.** The repo's `eval/long_bench/
+   pred_vllm.py` only targets dataset `THUDM/LongBench` (**v1** — free-form QA/
+   summarization with per-task metrics). This protocol calls for **LongBench v2**
+   (multiple-choice format, with a length field used for the short/<32k-word
+   filter), which the v1 harness can't be reused for as-is. `datasets/
+   prep_longbench_v2.py` (dataset prep + short-subset filter),
+   `predict_longbench_v2.py` (the vLLM-driving prediction-generation
+   counterpart to `pred_vllm.py` — runs the P001–P006 sweep, with or without
+   pruning, and writes a predictions file), and `grade_longbench_v2.py`
+   (scoring predictions against ground truth) now exist — see "Benchmark"
+   section below. Not yet real-hardware-validated (no GPU on the machine
+   this was written on) — see `predict_longbench_v2.py`'s own docstring for
+   what's confirmed vs. reasoned-through, and `REPRODUCE.md` step 6 for the
+   validation steps to run first.
+4. **Missing model path — resolved.** This directory's own `.env_exports.sh`
+   (not the shared one in `gemma4_moe_benchmarks/`) already has
+   `GEMMA4_E2B_MODEL_PATH` filled in with a real, downloaded checkpoint's
+   snapshot path (filled in when `.env_exports.sh` was moved into this
+   directory) — not a placeholder.
 
-This plan's experiment matrix, dataset scoping, and success criteria below are ready
-to execute once items 1–4 land.
+Items 1–2 above are addressed by `vllm_patch/`'s own from-scratch V1/Gemma4
+design (not a literal port of the reference repo's v0 scheduler patch — see
+`README.md`), and items 3–4 are addressed as described above. This plan's
+experiment matrix and success criteria below are ready to execute once the
+full pipeline (`validate_runner_integration.py` Step B/B2 plus
+`predict_longbench_v2.py`) is validated end-to-end on real hardware — see
+`REPRODUCE.md` steps 5–6.
 
 ---
 
 ## SpecPrefill settings
 
 - BF16 precision
-- Chunk-based attention scoring, chunk size **32** (protocol value — note the cloned
-  repo's own configs default to `chunk_size: 32`;)
+- Chunk-based attention scoring, chunk size **64** — matches the "Algorithm
+  reference" table above and the experiment matrix's own cited configs
+  (`config_p{1,3,5,7,9}_full_lah8.yaml`). An earlier version of this section
+  said 32, the cloned repo's own *default*, not the value this protocol's
+  matrix actually uses. `pool_kernel_size` **13**, likewise matching those
+  same cited configs.
 - Look-ahead count: **8**
-- `enforce_eager=True`, `enable_chunked_prefill=False` — required by the reference
-  implementation's own setup notes (printed at patch-apply time), not just the paper
+- `enforce_eager=True`. **`enable_chunked_prefill` is deliberately left at the
+  model's own supported default (on), NOT set to `False`** — this section
+  previously mandated `False` per the reference implementation's own setup
+  notes, but `validate_runner_integration.py` found two confirmed real-hardware
+  blockers with that setting for Gemma-4-26B-A4B-it: it would require
+  `max_num_batched_tokens >= max_model_len` (262144) on every step, and vLLM
+  itself warns this model doesn't officially support disabling chunked prefill
+  ("may cause the engine to crash or produce incorrect outputs").
+  `predict_longbench_v2.py` follows `validate_runner_integration.py`'s adopted
+  resolution instead — chunking on, `max_num_batched_tokens` sized generously
+  per request (see that script's own docstring for the residual risk this
+  trades in: a separate confirmed upstream bug where a request exceeding the
+  batched-token budget never correctly resumes prefill past its first chunk).
 
 ---
 
@@ -144,9 +173,12 @@ Metrics captured per run: accuracy (LongBench v2 scoring), QPS, TTFT.
 ## Benchmark
 
 **LongBench v2**, restricted for this protocol round to "short" questions
-(<32k words). Dataset prep and grader do not exist in this repo yet (Implementation
-status #3) — future work, analogous in shape to
-`evaluation_pipeline/datasets/prep_aime.py`.
+(<32k words). Dataset prep (`datasets/prep_longbench_v2.py`) and grading
+(`grade_longbench_v2.py`) now exist, modeled in shape on
+`evaluation_pipeline/datasets/prep_aime.py`. Still missing (Implementation
+status #3): a prediction-generation script to actually run the target model
+against the prepped samples and produce the predictions file
+`grade_longbench_v2.py` scores.
 
 ---
 
@@ -188,5 +220,8 @@ status #3) — future work, analogous in shape to
 | `validate_proposer.py` | GPU-node validation: speculator loading + attention hook, per-layer `head_dim` check |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + the position-override correctness check |
 | `speculative_prefill/` | Cloned reference implementation (gitignored — has its own `.git`) |
-| `datasets/` | LongBench v2 prep output (empty — prep script is future work) |
+| `datasets/prep_longbench_v2.py` | Downloads `THUDM/LongBench-v2`, filters to the "short" (<32k word) subset, writes `datasets/longbench_v2_samples.jsonl` |
+| `predict_longbench_v2.py` | Runs the P001–P006 keep-rate sweep (with/without SpecPrefill pruning) against those samples, writes a predictions JSONL per experiment |
+| `grade_longbench_v2.py` | Scores a predictions file against `prep_longbench_v2.py`'s samples; writes `result.json` + prints a Markdown summary |
+| `datasets/` | LongBench v2 prep output (`longbench_v2_samples.jsonl`, gitignored raw `.cache/`) |
 | `results/` | Output directory (gitignored) |

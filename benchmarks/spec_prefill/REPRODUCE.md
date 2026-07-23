@@ -4,10 +4,14 @@ Status: the V1 port (`vllm_patch/`) is code-complete. Step 5.2 (speculator loadi
 `validate_proposer.py`) **passes on real hardware as of 2026-07-21** — model loads,
 all 35 attention layers hook correctly, heterogeneous head-dim confirmed (see step
 5 below). Step 5.3 (`validate_runner_integration.py`, the riskiest assumption in
-the design) and step 6 (an actual experiment) remain unvalidated/blocked — on
-step 5.3's results plus two known gaps (the LongBench v2 dataset, and multi-step
-lookahead — see `EXPERIMENT_PLAN.md`'s "Implementation status" and
-`vllm_patch/proposer.py`'s `build_lookahead_metadata` docstring).
+the design) and step 6 (an actual experiment) remain unvalidated on real
+hardware. The multi-step lookahead gap this section used to list is resolved
+(fixed 2026-07-23, see `vllm_patch/proposer.py`'s `run_lookahead_steps`
+docstring). The LongBench v2 dataset gap is closed too: step 4 below has a
+prep + grading script, and step 6 has the prediction-generation driver
+(`predict_longbench_v2.py`) — see `EXPERIMENT_PLAN.md`'s "Implementation
+status" #3. What's left is real-hardware validation of the full pipeline
+end-to-end, not missing code.
 
 ## 1. This fork's vLLM environment (for the target/speculator serving side)
 
@@ -75,42 +79,49 @@ fork's vLLM until the port (Implementation status #1-#2) is done.
   If missing, download it the same way as the speculator below
   (`hf download google/gemma-4-26B-A4B-it --cache-dir /scratch/hf_cache`) and
   update `GEMMA4_MODEL_PATH` in `.env_exports.sh`.
-- **Gemma-4-E2B-it (speculator)**: **not yet downloaded.** `.env_exports.sh`
-  has a commented-out `GEMMA4_E2B_MODEL_PATH` placeholder ready to fill in. Following
-  the same `hf download` pattern used for the target checkpoint above
-  (`../evaluation_pipeline/REPRODUCE.md` step 6):
-
-  ```bash
-  export HF_TOKEN=<your token>
-  df -h /scratch   # confirm space before a multi-GB download
-
-  hf download google/gemma-4-E2B-it --cache-dir /scratch/hf_cache
-  ```
-
-  Then find the real snapshot path (same "no `hub/` nesting" gotcha as the other
-  checkpoints — see `.env_exports.sh`'s own NOTE comment):
-
+- **Gemma-4-E2B-it (speculator)**: `.env_exports.sh`'s `GEMMA4_E2B_MODEL_PATH`
+  already carries a specific, already-downloaded snapshot path (filled in when
+  `.env_exports.sh` was moved into this directory) — same as `GEMMA4_MODEL_PATH`
+  above, **verify it's actually present on whatever node you're using now**
+  before trusting it:
   ```bash
   ls -la /scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/*/
   du -sh /scratch/hf_cache/models--google--gemma-4-E2B-it/
   ```
-
   Confirm `*.safetensors` + `model.safetensors.index.json` are present (not just
   config/tokenizer files — `AutoTokenizer.from_pretrained()` can succeed even when
   the weight shards are missing; this exact gotcha is in
-  `../evaluation_pipeline/REPRODUCE.md`'s troubleshooting table), then uncomment
-  and fill in the real path in **this directory's** `.env_exports.sh` (not the
-  shared one in `../gemma4_moe_benchmarks/`):
-
-  ```bash
-  export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/<actual-hash>
-  ```
+  `../evaluation_pipeline/REPRODUCE.md`'s troubleshooting table). If missing,
+  download it the same way as the target checkpoint above
+  (`hf download google/gemma-4-E2B-it --cache-dir /scratch/hf_cache`) and update
+  `GEMMA4_E2B_MODEL_PATH` in **this directory's** `.env_exports.sh` (not the
+  shared one in `../gemma4_moe_benchmarks/`).
 
 ## 4. LongBench v2 dataset
 
-**TBD** — no prep script exists yet (Implementation status #3). Will need to fetch
-`THUDM/LongBench-v2` from Hugging Face and filter to the "short" (<32k word) subset,
-analogous in shape to `../evaluation_pipeline/datasets/prep_aime.py`.
+`datasets/prep_longbench_v2.py` fetches `THUDM/LongBench-v2` from Hugging Face,
+filters to the "short" (<32k word) subset, and writes
+`datasets/longbench_v2_samples.jsonl`:
+
+```bash
+cd benchmarks/spec_prefill
+python3 datasets/prep_longbench_v2.py --max-keep -1
+```
+
+`grade_longbench_v2.py` scores a predictions file (JSONL of `{"id", "pred"}` rows)
+against that samples file:
+
+```bash
+python3 grade_longbench_v2.py \
+    --samples datasets/longbench_v2_samples.jsonl \
+    --predictions <path-to-predictions.jsonl> \
+    --output results/longbench_v2_result.json
+```
+
+**Still missing**: a prediction-*generation* script (the vLLM-driving counterpart
+to the cloned reference repo's `eval/long_bench/pred_vllm.py`) to actually produce
+that predictions file for a given keep-rate config — see
+`EXPERIMENT_PLAN.md`'s "Implementation status" #3.
 
 ## 5. Validating the Algorithm 1 pieces built so far (`vllm_patch/`)
 
@@ -153,25 +164,32 @@ most likely to need a fix on the first real run.
 
 ## 6. Running an experiment
 
-**TBD** — blocked on: (a) validation results from step 5 above, (b) the
-multi-step lookahead limitation (`EXPERIMENT_PLAN.md`'s default
-`look_ahead_cnt: 8` isn't reliable yet — see `vllm_patch/proposer.py`'s
-`build_lookahead_metadata` docstring), and (c) the LongBench v2 dataset (step
-4, not started). Once available, the entrypoint is expected to resemble the
-reference repo's own pattern:
+`predict_longbench_v2.py` runs the P001–P006 keep-rate sweep (see
+`EXPERIMENT_PLAN.md`'s experiment matrix), with or without SpecPrefill
+pruning, and writes a predictions JSONL per experiment that `grade_longbench_v2.py`
+(step 4) scores:
 
 ```bash
-# reference repo's own pattern (Llama, v0 engine) — NOT directly valid against
-# this fork; vllm_patch/pruner.py's prune_and_add_request + vllm_patch/worker.py's
-# SpecPrefillWorker are this fork's equivalent entry points, still need a driver
-# script to actually run a full benchmark sweep like this one does:
-cd speculative_prefill
-SPEC_CONFIG_PATH=../configs/config_p1_full_lah8.yaml python eval/long_bench/pred_vllm.py \
-    --model "$GEMMA4_MODEL_PATH" \
-    --spec-model "$GEMMA4_E2B_MODEL_PATH" \
-    --spec-prefill \
-    --exp spec_p1_full_lah8
+cd benchmarks/spec_prefill
+python3 predict_longbench_v2.py --list           # print the experiment matrix
+python3 predict_longbench_v2.py --exp P001 --max-keep 2   # smoke test first
+python3 predict_longbench_v2.py --exp P001,P002,P003,P004,P005,P006
+python3 grade_longbench_v2.py --samples datasets/longbench_v2_samples.jsonl \
+    --predictions results/P002_predictions.jsonl
 ```
+
+The multi-step lookahead limitation this section previously listed here is
+resolved — `vllm_patch/proposer.py`'s `run_lookahead_steps` had a real bug
+that made `look_ahead_cnt > 1` unreliable, fixed 2026-07-23 (see that
+function's own docstring); `EXPERIMENT_PLAN.md`'s `look_ahead_cnt: 8` default
+is safe to use now.
+
+**Still blocked on**: validation results from step 5 above (Step B/B2 in
+`validate_runner_integration.py`), plus `predict_longbench_v2.py`'s own
+real-hardware validation — see that script's docstring ("Multi-request
+engine-driving loop" section) for what's confirmed vs. reasoned-through-but-
+not-yet-executed (no GPU on the machine it was written on, same as every
+other script here).
 
 ## Expected runtime / hardware
 

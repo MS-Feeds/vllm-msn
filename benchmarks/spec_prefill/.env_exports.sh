@@ -20,9 +20,10 @@ export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 export GEMMA4_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52
 
 # Speculator model (SpecPrefill-specific -- not used by gemma4_moe_benchmarks
-# or evaluation_pipeline). Not yet downloaded as of this writing -- run the
-# `hf download` command in REPRODUCE.md step 3, then uncomment and fill in
-# the real snapshot path below.
+# or evaluation_pipeline, see that pipeline's own .env_exports.sh for its NOTE
+# on this). Already downloaded; this path was filled in when .env_exports.sh
+# was moved into this directory. Same "no hub/ nesting" and "verify it's still
+# present on this node" caveats as GEMMA4_MODEL_PATH above apply here too.
 export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/3e22461f65e89153144f8adb70e3b8c2cc9845a7
 
 # NOTE: no "hub/" in these paths -- `hf download --cache-dir X` places
