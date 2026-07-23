@@ -29,19 +29,32 @@ max_num_batched_tokens never correctly resumes prefill past its first chunk
 prompts run up to ~32k words -- for P001 (no pruning) the FULL prompt must fit
 in one chunk; for P002-P006 only the PRUNED (kept) token count must.
 
-**Multi-request engine-driving loop -- reasoned through against this fork's
-verified V1 APIs, NOT yet executed on real hardware** (same status as every
-other real-hardware-pending piece in this package). validate_runner_integration.py
-proves the underlying pattern (has_unfinished_requests()/step(), never
-early-abort, always use the RETURNED real_request_id) for 1-2 requests driven
-purely for a position-capture diagnostic; this generalizes it to N concurrently
--submitted requests whose actual generated text is collected, by accumulating
-each step()'s returned RequestOutputs into a request_id-keyed dict (mirroring
-what vllm/entrypoints/llm.py's own internal `_run_engine` does for
-llm.generate()) and reading each request's `.metrics.first_token_ts` for TTFT.
-See predict_longbench_v2.py's own docstring below (drive_engine_to_completion)
-and REPRODUCE.md for the real-hardware validation steps to run before trusting
-a full sweep's numbers.
+**Multi-request engine-driving loop.** validate_runner_integration.py proves
+the underlying pattern (has_unfinished_requests()/step(), never early-abort)
+for 1-2 requests driven purely for a position-capture diagnostic (it never
+needed to correlate step()'s output back to a specific request by content,
+since it read positions via a separate collective_rpc channel instead). This
+generalizes the pattern to N concurrently-submitted requests whose actual
+generated text is collected, by accumulating each step()'s returned
+RequestOutputs into a request_id-keyed dict.
+
+**Confirmed on real hardware (2026-07-23): id_to_sample must be keyed by the
+ORIGINAL (caller-supplied) request_id, NOT the rewritten id add_request()
+returns.** An earlier version of this script keyed it by the rewritten id
+(following pruner.py's "always use the returned real_request_id" guidance,
+which is correct for THAT function's purpose -- matching the WORKER-side
+req_id for collective_rpc registration) and got zero captured outputs for
+every single request, even though has_unfinished_requests()/step() drove them
+to real, correct completion (confirmed via wall-clock time spent). Root cause:
+vllm/v1/engine/output_processor.py's `_new_request_output` always builds
+`RequestOutput(request_id=external_req_id, ...)` -- literally commented
+"request_id is what was provided externally" in that file -- so step()'s
+output objects are keyed by the ORIGINAL id in every case, while
+add_request()'s return value (and the WORKER-side req_id pruner.py/
+model_runner.py depend on) is the rewritten one. These are two genuinely
+different id namespaces serving two different purposes; see
+submit_baseline_requests/submit_pruned_requests below for exactly where each
+one is used now.
 
 TTFT is a *batched-generate offline approximation*: all requests in one
 experiment are submitted ~simultaneously (not a live server's Poisson-arrival
@@ -245,12 +258,22 @@ def submit_baseline_requests(llm, samples: list[dict], tok, max_tokens: int) -> 
         sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
         request_id = f"lbv2-{sample['id']}-{i}"
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-        # add_request's return value is the REAL id (rewritten with a random
-        # suffix by InputProcessor.assign_request_id) -- see pruner.py's
-        # confirmed-on-real-hardware finding, which applies here identically
-        # even without pruning.
-        real_id = llm.llm_engine.add_request(request_id, prompt, sampling_params)
-        id_to_sample[real_id] = sample
+        # add_request()'s return value is the REWRITTEN id (InputProcessor.
+        # assign_request_id appends "-{8 random chars}") -- needed for
+        # anything that must match the WORKER-side req_id (e.g. pruner.py's
+        # collective_rpc registration, in submit_pruned_requests below), but
+        # NOT for correlating step()'s returned RequestOutputs back to a
+        # sample: output_processor.py's _new_request_output always builds
+        # RequestOutput(request_id=external_req_id, ...) -- the ORIGINAL
+        # caller-supplied id, never the rewritten one (confirmed on real
+        # hardware, 2026-07-23: keying this dict by the rewritten id instead
+        # left every single request's output uncaptured, "no output
+        # captured" for 100% of requests, even though has_unfinished_
+        # requests()/step() drove them to real completion). Deliberately
+        # NOT capturing add_request()'s return value here at all -- nothing
+        # in this function needs it.
+        llm.llm_engine.add_request(request_id, prompt, sampling_params)
+        id_to_sample[request_id] = sample
     return id_to_sample
 
 
@@ -278,8 +301,18 @@ def submit_pruned_requests(
     the ordering (add_request first, THEN collective_rpc with the returned
     real id) is load-bearing.
 
-    Returns: (id_to_sample, real_id_to_keep_stats, num_skipped_too_large)
-    where keep_stats is (num_kept, orig_len) per request.
+    **`id_to_sample`/`keep_stats` are keyed by the ORIGINAL (caller-supplied)
+    request_id, NOT the rewritten one add_request() returns** -- confirmed on
+    real hardware (2026-07-23, see submit_baseline_requests's docstring for
+    the full finding): step()'s RequestOutput objects always carry
+    `external_req_id` (the original id), never the rewritten one. The
+    rewritten id (`real_id` below) is used ONLY for the collective_rpc call,
+    which must match the WORKER-side req_id -- a completely different
+    namespace from what correlates back to a sample here.
+
+    Returns: (id_to_sample, keep_stats, num_skipped_too_large) -- both dicts
+    keyed by the original request_id; keep_stats values are
+    (num_kept, orig_len) per request.
     """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -317,13 +350,20 @@ def submit_pruned_requests(
         orig_len = len(prompt_token_ids)
         sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
         prompt = TokensPrompt(prompt_token_ids=pruned_token_ids, cache_salt=request_id)
+        # real_id (rewritten) is required here -- model_runner.py's
+        # pruning_registry.get(req_id) lookup runs in the Worker process
+        # against the WORKER's own self.input_batch.req_ids, which reflects
+        # this rewritten id, not the original request_id. See pruner.py's
+        # docstring for the full history of this specific requirement.
         real_id = llm.llm_engine.add_request(request_id, prompt, sampling_params)
         llm.llm_engine.collective_rpc(
             "register_prune_record", args=(real_id, kept_positions, orig_len)
         )
 
-        id_to_sample[real_id] = sample
-        keep_stats[real_id] = (len(kept_positions), orig_len)
+        # Keyed by the ORIGINAL request_id, not real_id -- see this
+        # function's docstring; this is what step()'s RequestOutputs use.
+        id_to_sample[request_id] = sample
+        keep_stats[request_id] = (len(kept_positions), orig_len)
 
     return id_to_sample, keep_stats, num_skipped
 
@@ -437,11 +477,11 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             out_lens, ttfts = [], []
             finish_counts = {"stop": 0, "length": 0, "other": 0}
             predictions = []
-            for real_id, sample in id_to_sample.items():
-                output = outputs_by_id.get(real_id)
+            for req_id, sample in id_to_sample.items():
+                output = outputs_by_id.get(req_id)
                 if output is None:
                     print(f"WARNING: no output captured for sample id={sample['id']!r} "
-                          f"(request_id={real_id!r}) -- skipping from predictions.")
+                          f"(request_id={req_id!r}) -- skipping from predictions.")
                     continue
                 completion = output.outputs[0]
                 out_lens.append(len(completion.token_ids))
