@@ -161,33 +161,63 @@ def prune_and_add_request(
     share a block hash with another request, since the hash doesn't account
     for position).
 
+    **Confirmed on real hardware (2026-07-23): `request_id` rewriting.**
+    `LLMEngine.add_request()` (via `InputProcessor.assign_request_id`,
+    `vllm/v1/engine/input_processor.py:215-232`) unconditionally rewrites
+    the caller-supplied `request_id`, appending an 8-character random
+    suffix (`f"{external_req_id}-{random_uuid():.8}"`) to guarantee
+    uniqueness -- not something a caller can opt out of short of the
+    deprecated `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION` env var, not a safe
+    thing for a library function to depend on a caller having set. The
+    Worker's own `self.input_batch.req_ids` (what `model_runner.py`'s
+    `pruning_registry.get(req_id)` looks up against) reflects this
+    *rewritten* id, not the one this function was originally called with.
+    Registering the `PruneRecord` under the caller-supplied id (the old,
+    broken behavior) meant the lookup never matched for *any* pruned
+    request -- confirmed on real hardware as the reason an earlier
+    `validate_runner_integration.py` Step B "pass" was actually a
+    no-op-indistinguishable degenerate case (100% token retention, so a
+    never-applied override and a correctly-applied one look identical), and
+    a genuine failure once retention dropped below 100% (Step B2). Fixed by
+    calling `add_request()` *first* and using its **return value** (the
+    real, rewritten id) for the RPC registration -- safe to reorder since
+    nothing advances the engine (no scheduling happens) between
+    `add_request()` returning and `collective_rpc()` completing; only an
+    explicit `step()` call (always the caller's responsibility, always
+    after this function returns) does that.
+
     Call this instead of `llm_engine.add_request(...)` directly for any
     request that should go through SpecPrefill pruning.
 
     Returns:
-        (request_id, kept_positions, orig_len) -- the caller may want these
-        for logging/verification. Deliberately NOT read back via
-        `pruning_registry.get(request_id)` afterward -- that would read the
-        *driver* process's copy of the module, which this function never
-        writes to (confirmed on real hardware this is a real trap, not
-        hypothetical: see `validate_runner_integration.py`'s history for the
-        exact failure -- `pruning_registry.get()` in the driver always
-        returns None here, by design, since the record only exists in the
-        Worker's process).
+        (real_request_id, kept_positions, orig_len) -- `real_request_id` is
+        the *rewritten* id (see above), not necessarily equal to the
+        `request_id` this function was called with; use it for anything
+        that needs to reference this request later (e.g. `abort_request`).
+        Deliberately NOT read back via `pruning_registry.get(real_request_id)`
+        afterward -- that would read the *driver* process's copy of the
+        module, which this function never writes to (confirmed on real
+        hardware this is a real trap, not hypothetical: see
+        `validate_runner_integration.py`'s history for the exact failure --
+        `pruning_registry.get()` in the driver always returns `None` here,
+        by design, since the record only exists in the Worker's process).
     """
     orig_len = len(prompt_token_ids)
     pruned_token_ids, kept_positions = compute_pruned_prompt(
         proposer, spec_config, prompt_token_ids, device, head_dim, eos_token_id
     )
 
+    prompt = TokensPrompt(prompt_token_ids=pruned_token_ids, cache_salt=request_id)
+    real_request_id = llm_engine.add_request(request_id, prompt, sampling_params)
+
     # Must reach the Worker's own process -- see module docstring and
     # SpecPrefillWorker.register_prune_record's docstring (worker.py). A
     # direct pruning_registry.register(...) call here would silently do
-    # nothing, since this function runs in the driver process.
+    # nothing, since this function runs in the driver process. Uses
+    # real_request_id, NOT the caller-supplied request_id -- see this
+    # method's own docstring for why that distinction is load-bearing.
     llm_engine.collective_rpc(
-        "register_prune_record", args=(request_id, kept_positions, orig_len)
+        "register_prune_record", args=(real_request_id, kept_positions, orig_len)
     )
 
-    prompt = TokensPrompt(prompt_token_ids=pruned_token_ids, cache_salt=request_id)
-    llm_engine.add_request(request_id, prompt, sampling_params)
-    return request_id, kept_positions, orig_len
+    return real_request_id, kept_positions, orig_len

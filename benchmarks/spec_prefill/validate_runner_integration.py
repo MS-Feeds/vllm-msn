@@ -349,7 +349,16 @@ def _run_position_check(
     # process, pushed via collective_rpc -- see pruner.py/worker.py
     # docstrings). Confirmed on real hardware this is a real trap: use the
     # return value instead.
-    _, kept_positions, orig_len = prune_and_add_request(
+    #
+    # real_request_id, NOT the request_id parameter passed in below: vLLM's
+    # LLMEngine.add_request() unconditionally rewrites every request_id with
+    # an appended random suffix (InputProcessor.assign_request_id) --
+    # prune_and_add_request()'s return value is the REAL id actually tracked
+    # by the engine/worker; using the original request_id anywhere after
+    # this call (e.g. for abort_request below) would silently target a
+    # request that doesn't exist. See pruner.py's own docstring for the full
+    # story -- this was a real, confirmed-on-hardware bug, not a hypothetical.
+    real_request_id, kept_positions, orig_len = prune_and_add_request(
         llm_engine=llm.llm_engine,
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
@@ -418,10 +427,14 @@ def _run_position_check(
     # `sorted(outputs, key=lambda x: int(x.request_id))`
     # (vllm/entrypoints/llm.py:1317) assumes every output belongs to that
     # generate() call's own integer-indexed requests, and blew up on this
-    # request's leftover string request_id once it eventually finished
-    # naturally during Step C's own step() loop. Safe to call unconditionally
-    # even if the request already finished on its own.
-    llm.llm_engine.abort_request([request_id])
+    # request's leftover request_id once it eventually finished naturally
+    # during Step C's own step() loop. Safe to call unconditionally even if
+    # the request already finished on its own. Uses real_request_id (not the
+    # request_id parameter) -- see the comment above prune_and_add_request's
+    # call for why that distinction matters; aborting the wrong id here
+    # would silently no-op and reintroduce the exact crash this guards
+    # against.
+    llm.llm_engine.abort_request([real_request_id])
 
     if not observed_chunks:
         print("FAIL: no positions were captured at all -- the hook may not "
