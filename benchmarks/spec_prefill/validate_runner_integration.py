@@ -397,6 +397,21 @@ def _run_position_check(
     # required idiom -- `while self.llm_engine.has_unfinished_requests():
     # step()` -- see vllm/entrypoints/llm.py:1285-1286 -- which this loop
     # now follows too.
+    # Run to NATURAL completion (has_unfinished_requests() -> False) rather
+    # than breaking out early once enough positions are captured. Confirmed
+    # on real hardware (2026-07-23): an earlier version of this loop broke
+    # early and then explicitly called abort_request() to clean up -- that
+    # left the engine's output-delivery bookkeeping inconsistent for at
+    # least one request (its stale, *unsuffixed* request_id leaked into
+    # Step C's later llm.generate() call and crashed
+    # `sorted(outputs, key=lambda x: int(x.request_id))`,
+    # vllm/entrypoints/llm.py:1317, even though abort_request() was called
+    # with the correct real_request_id). Letting vLLM's own completion path
+    # run its course avoids whatever that interaction was, at the cost of a
+    # few extra (cheap, max_tokens=4) decode steps -- fine here since the
+    # whole prefill now completes correctly in one step regardless (no more
+    # exposure to the fork-level chunked-prefill bug this used to also
+    # guard against, since that only bites incomplete/partial first chunks).
     observed_chunks: List[List[int]] = []
     step_idx = 0
     while llm.llm_engine.has_unfinished_requests() and step_idx < max_steps:
@@ -410,31 +425,6 @@ def _run_position_check(
             # Every hooked layer sees an identical positions tensor within
             # one forward pass -- any one representative entry suffices.
             observed_chunks.append(captured_this_step[0])
-            # Stop as soon as we've captured the full pruned prefill (total
-            # captured length == the registered kept-token count) -- any
-            # further steps are decode continuation, irrelevant to this
-            # check (which only validates prefill-time position
-            # restoration) and best avoided anyway, since driving the
-            # request further than needed just risks the fork-level
-            # chunked-prefill/discard-masking bug noted above.
-            if sum(len(c) for c in observed_chunks) >= len(kept_positions):
-                break
-
-    # Explicitly abort -- breaking out early (above) or hitting max_steps
-    # can both leave this request alive in the engine's running queue even
-    # though we're done with it. Confirmed on real hardware (2026-07-23):
-    # leaving it dangling crashed Step C's later llm.generate() call --
-    # `sorted(outputs, key=lambda x: int(x.request_id))`
-    # (vllm/entrypoints/llm.py:1317) assumes every output belongs to that
-    # generate() call's own integer-indexed requests, and blew up on this
-    # request's leftover request_id once it eventually finished naturally
-    # during Step C's own step() loop. Safe to call unconditionally even if
-    # the request already finished on its own. Uses real_request_id (not the
-    # request_id parameter) -- see the comment above prune_and_add_request's
-    # call for why that distinction matters; aborting the wrong id here
-    # would silently no-op and reintroduce the exact crash this guards
-    # against.
-    llm.llm_engine.abort_request([real_request_id])
 
     if not observed_chunks:
         print("FAIL: no positions were captured at all -- the hook may not "
