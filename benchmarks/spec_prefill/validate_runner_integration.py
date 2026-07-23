@@ -334,7 +334,7 @@ def _run_position_check(
     observed_chunks: List[List[int]] = []
     step_idx = 0
     while llm.llm_engine.has_unfinished_requests() and step_idx < max_steps:
-        llm.llm_engine.step()
+        step_outputs = llm.llm_engine.step()
         step_idx += 1
         captured_per_worker = llm.collective_rpc(_read_captured_positions)
         captured_this_step = captured_per_worker[0] if captured_per_worker else []
@@ -344,14 +344,21 @@ def _run_position_check(
             # Every hooked layer sees an identical positions tensor within
             # one forward pass -- any one representative entry suffices.
             observed_chunks.append(captured_this_step[0])
-            # TEMPORARY diagnostic (2026-07-23): disambiguating whether the
-            # scheduler is genuinely not chunking a large pruned prefill
-            # (unexpected -- max_num_batched_tokens should cap it), or
-            # whether it IS chunking but this loop is somehow only
-            # capturing/counting one of the chunks. Remove once root-caused.
-            print(f"  [diag] step {step_idx}: captured chunk length "
-                  f"{len(captured_this_step[0])}, "
-                  f"has_unfinished_requests={llm.llm_engine.has_unfinished_requests()}")
+        # TEMPORARY diagnostic (2026-07-23): the request is being marked
+        # finished after only a partial (max_num_batched_tokens-sized)
+        # chunk of a much longer pruned prompt -- root-causing whether this
+        # is genuine premature completion (finish_reason/num_cached_tokens
+        # will say why) or a test-driver miscount. Remove once root-caused.
+        for out in step_outputs:
+            if out.request_id == request_id:
+                completion = out.outputs[0] if out.outputs else None
+                print(f"  [diag] step {step_idx}: captured chunk length "
+                      f"{len(captured_this_step[0]) if captured_this_step else 0}, "
+                      f"RequestOutput.finished={out.finished}, "
+                      f"num_cached_tokens={out.num_cached_tokens}, "
+                      f"finish_reason={getattr(completion, 'finish_reason', None)!r}, "
+                      f"stop_reason={getattr(completion, 'stop_reason', None)!r}, "
+                      f"has_unfinished_requests={llm.llm_engine.has_unfinished_requests()}")
 
     if llm.llm_engine.has_unfinished_requests():
         print(f"FAIL: request did not finish within {max_steps} step() call(s).")
