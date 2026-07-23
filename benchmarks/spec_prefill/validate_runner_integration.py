@@ -50,38 +50,69 @@ holds end-to-end. If they instead match the *stock* contiguous numbering,
 the override isn't reaching the model and `model_runner.py`'s override
 point needs to move earlier (see its own docstring for what that implies).
 
-Step B2 -- same check as Step B, but for a pruned prompt long enough that
-vLLM's chunked-prefill scheduling splits its kept tokens across multiple
-engine steps (Step B's own prompt always fits in one step, so it can't catch
-a chunk-boundary bug in `model_runner.py`'s `PruneRecord.positions_for_step`
--- see that method's docstring). To actually force multi-step scheduling
-from a manageable prompt, `--target-max-num-batched-tokens` (default 3072)
-is passed into `LLM(...)` along with `enable_chunked_prefill=True`
-explicitly.
+Step B2 -- same check as Step B, but for a much larger pruned prompt, run
+under **EXPERIMENT_PLAN.md's actual real-benchmark config**
+(`enable_chunked_prefill=False`), not a chunked-prefill config, as an
+earlier version of this step tried. History, since the reasoning matters:
 
-**Confirmed gotcha (2026-07-23, real hardware)**: this can't be pushed down
-to a small value like 64 the way a non-multimodal model would allow --
-Gemma-4-26B-A4B-it has "multimodal-bidirectional attention", and
-`vllm/platforms/cuda.py:221-241` unconditionally force-disables chunked MM
-input for such models, which then requires `max_num_batched_tokens >=
-max_tokens_per_mm_item` (2496 for this model) at `LLM(...)` construction
-time -- not overridable via any kwarg, since it's forced by the platform
-regardless of what's passed in. 3072 clears that floor with margin.
-Consequently Step B2's synthetic prompt (`_build_long_test_prompt_text`)
-needs to produce well over 3072 *kept* tokens (not just over
-`--target-max-num-batched-tokens`) to still force multiple chunks -- its
-default `target_word_count` accounts for this.
+**Originally** this step deliberately forced `enable_chunked_prefill=True`
+with a small `--target-max-num-batched-tokens` specifically to exercise
+`model_runner.py`'s multi-step `PruneRecord.positions_for_step` chunk-
+boundary logic (Step B's own prompt always fits in one step, so it couldn't
+catch a chunk-boundary bug there). That approach hit two real, confirmed
+findings before being abandoned:
 
-**This deliberately diverges from EXPERIMENT_PLAN.md's real-benchmark
-config** (`enable_chunked_prefill=False`) -- confirmed against this fork's
-scheduler config validation (`vllm/config/scheduler.py`'s
-`verify_max_model_len`) that with chunked prefill off, `max_num_batched_tokens`
-is required to be `>= max_model_len`, making single-request prefill
-all-or-nothing by construction and this multi-step path unreachable to test
-under that config at all. Whoever eventually writes the LongBench v2 driver
-script should revisit this reachability question then -- vLLM's own default
-is chunked-prefill-on, so it likely matters regardless of what this
-validation script assumes. Note also: Step B2's longer prompt exercises the
+1. Gemma-4-26B-A4B-it has "multimodal-bidirectional attention", and
+   `vllm/platforms/cuda.py:221-241` unconditionally force-disables chunked
+   MM input for such models, requiring `max_num_batched_tokens >=
+   max_tokens_per_mm_item` (2496 for this model) at construction time --
+   not overridable, forced by the platform.
+2. **A confirmed upstream bug, not a spec_prefill issue (2026-07-23, real
+   hardware, reproduced with PLAIN STOCK vLLM -- no `worker_cls`, no
+   spec_prefill code involved at all)**: under `enable_chunked_prefill=True`,
+   a single request whose prompt exceeds `max_num_batched_tokens` never
+   actually resumes prefill after its first chunk on this fork -- the
+   scheduler treats it as if prefill were complete and starts generating
+   decode tokens against a KV cache that only holds the first chunk,
+   forever, regardless of `max_tokens` size (confirmed up to `max_tokens=8`:
+   it just generates 8 bogus tokens against the incomplete cache instead of
+   ever resuming prefill, then finishes with `finish_reason='length'`).
+   Traced as far as confirming `gpu_model_runner.py`'s `discard_request_mask`
+   is computed correctly (`optimistic_seq_lens_cpu < request.num_tokens`,
+   unaffected by anything `model_runner.py`/`proposer.py` touch) but its
+   sampled-token output is NOT actually being discarded as that computation
+   implies it should be -- the disconnect is somewhere between that
+   computation and `vllm/v1/core/sched/utils.py`'s
+   `check_stop`/`_update_request_with_output`, not pinned down further.
+
+**Current approach**: since `EXPERIMENT_PLAN.md` already mandates
+`enable_chunked_prefill=False` for the real benchmark -- and, per
+`vllm/config/scheduler.py`'s `verify_max_model_len`, that config makes a
+request's prefill genuinely all-or-nothing by construction (never partial,
+so the upstream bug above is structurally unreachable, not just
+unlikely) -- this step now runs under that same real config instead of
+working around chunked prefill's bug. The trade-off, and it's a real one:
+`enable_chunked_prefill=False` requires `max_num_batched_tokens >=
+max_model_len` (also enforced at construction), so
+`--target-max-num-batched-tokens` (default 131072, matching the E2B
+speculator's own logged `max_model_len` this session -- adjust if the 26B
+target's own config differs and construction fails with a clear "smaller
+than max_model_len" error) now exists purely to satisfy that floor, not to
+force small chunks.
+
+**Consequence for 3.1's own fix**: under this config, `model_runner.py`'s
+multi-step `PruneRecord.positions_for_step` continuation-chunk logic is
+never exercised -- a single request's prefill is always one step, so the
+"first chunk vs. later chunk" branch never diverges from the single-step
+case in practice. That logic remains unit-tested (`test_vllm_patch.py`,
+5 tests covering exactly this) but not real-hardware-confirmed for N>1
+chunks, and per the real benchmark's own mandated config, may never need to
+be -- see the plan file / session history for the full reasoning. Step B2
+now serves as a large-scale (tens of thousands of tokens) single-step
+sanity check instead: still a meaningfully different scale than Step B's
+tiny prompt (worth keeping, since it exercises much larger *position
+values* -- kept tokens scattered up to `orig_len - 1`, not just tens), just
+not a multi-chunk one. Note also: Step B2's longer prompt exercises the
 speculator's lookahead path at a scale beyond what `validate_proposer.py`
 has verified -- if B2 fails, triage against `validate_proposer.py`-style
 speculator diagnostics before assuming the `model_runner.py`/`proposer.py`
@@ -134,8 +165,8 @@ _SHORT_TEST_PROMPT_TEXT = (
 # A small pool of distinct filler sentences, cycled (not one sentence
 # repeated verbatim) -- avoids feeding SpecPrefill's importance scorer an
 # unnaturally-degenerate, fully-uniform attention pattern, which is an
-# unnecessary risk for a prompt whose only job is to force multi-step
-# scheduling (Step B2), not to test scoring quality.
+# unnecessary risk for a prompt whose only job is to be large (Step B2),
+# not to test scoring quality.
 _LONG_TEST_PROMPT_FILLER_SENTENCES = [
     "The quick brown fox jumps over the lazy dog near the riverbank.",
     "Distant mountains fade into a pale haze as the afternoon wears on.",
@@ -148,15 +179,12 @@ _LONG_TEST_PROMPT_FILLER_SENTENCES = [
 def _build_long_test_prompt_text(target_word_count: int = 16000) -> str:
     """Cycles through a small pool of distinct filler sentences until the
     text reaches roughly `target_word_count` words. Content is irrelevant --
-    only length matters, to force multi-step chunked-prefill scheduling in
-    Step B2 (see module docstring).
-
-    16000 words (not the original 500) because the *kept* token count (after
-    spec_config's ~30% pruning) needs to clear `--target-max-num-batched-
-    tokens` (3072), not just be long -- and 3072 itself is a floor forced by
-    Gemma-4-26B-A4B-it's multimodal encoder budget, not a free choice (see
-    module docstring's 'Step B2' section). ~16000 words -> comfortably
-    several thousand kept tokens, several chunks at that budget."""
+    only length matters, to exercise position restoration at a much larger
+    scale than Step B's tiny prompt (Step B2 -- see module docstring; NOT a
+    multi-chunk test under this script's current enable_chunked_prefill=False
+    config, just a large single-step one). 16000 words -> several thousand
+    kept tokens with original positions scattered up to `orig_len - 1`, a
+    meaningfully different scale than Step B's ~50-position range."""
     sentences: List[str] = []
     word_count = 0
     i = 0
@@ -306,19 +334,16 @@ def _run_position_check(
         llm_engine=llm.llm_engine,
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
-        # max_tokens=4, not 1 -- confirmed on real hardware (2026-07-23) that
-        # max_tokens=1 combined with a multi-chunk prefill hits a real,
-        # PRE-EXISTING bug in this vLLM fork's chunked-prefill discard-
-        # masking (gpu_model_runner.py's discard_request_mask/check_stop
-        # interaction): the request gets marked finished
-        # (finish_reason='length') after just the FIRST partial chunk,
-        # before the remaining prefill ever gets scheduled -- reproduced
-        # with plain stock vLLM, worker_cls=None, zero spec_prefill code
-        # involved, so this is NOT a bug in this patch. max_tokens=4 avoids
-        # tripping it (the bogus early count from one incomplete chunk
-        # stays under the threshold, so scheduling correctly continues) --
-        # this is a validation-script workaround, not a fix; the underlying
-        # fork bug is a separate, out-of-scope follow-up.
+        # max_tokens=4 (harmless, not load-bearing): this used to be a
+        # required workaround for a confirmed upstream chunked-prefill bug
+        # (max_tokens=1 + a multi-chunk prefill caused premature
+        # "finished" completion after just the first partial chunk -- see
+        # module docstring's "Step B2" section for the full history). That
+        # bug's precondition (a partial, multi-step prefill chunk) can no
+        # longer occur now that this script runs under
+        # enable_chunked_prefill=False -- every request's prefill is
+        # genuinely all-or-nothing. Left at 4 rather than reverted to 1
+        # purely so this stays robust if that config ever changes back.
         sampling_params=SamplingParams(max_tokens=4, temperature=0.0),
         proposer=proposer,
         spec_config=spec_config,
@@ -460,22 +485,22 @@ def main() -> None:
     parser.add_argument(
         "--target-max-num-batched-tokens",
         type=int,
-        default=3072,
+        default=131072,
         help=(
-            "Passed through to LLM(...)'s max_num_batched_tokens, along with "
-            "enable_chunked_prefill=True, to force genuine multi-step "
-            "chunked-prefill scheduling for Step B2's longer prompt (while "
-            "Step B's existing short prompt still fits in a single step, "
-            "preserving single-step coverage too). Can't be pushed much "
-            "lower than this for Gemma-4-26B-A4B-it specifically: its "
-            "multimodal-bidirectional attention forces "
-            "max_num_batched_tokens >= max_tokens_per_mm_item (2496 for "
-            "this model, vllm/platforms/cuda.py's CUDA platform forcing, "
-            "not overridable) at LLM(...) construction time -- see the "
-            "module docstring's 'Step B2' section for the real-hardware "
-            "confirmation of this gotcha. NOTE: this whole setup "
-            "deliberately diverges from EXPERIMENT_PLAN.md's real-benchmark "
-            "config (enable_chunked_prefill=False) -- see the same section."
+            "Passed through to LLM(...)'s max_num_batched_tokens. This "
+            "script uses enable_chunked_prefill=False (matching "
+            "EXPERIMENT_PLAN.md's real-benchmark config), which requires "
+            "max_num_batched_tokens >= the target model's own max_model_len "
+            "(vllm/config/scheduler.py's verify_max_model_len, enforced at "
+            "LLM(...) construction) -- so this value exists purely to clear "
+            "that floor, not to force small chunks (see the module "
+            "docstring's 'Step B2' section for why an earlier version of "
+            "this script tried the opposite -- forcing small chunks under "
+            "enable_chunked_prefill=True -- and hit a confirmed upstream "
+            "bug). Default (131072) matches the E2B speculator's own logged "
+            "max_model_len this session; if the 26B target's own config "
+            "differs, construction will fail with a clear error naming the "
+            "real value to use instead."
         ),
     )
     args = parser.parse_args()
@@ -508,11 +533,11 @@ def main() -> None:
         trust_remote_code=True,
         gpu_memory_utilization=target_gpu_memory_utilization,
         max_num_batched_tokens=args.target_max_num_batched_tokens,
-        enable_chunked_prefill=True,  # explicit, not relying on the (already
-            # default-True) upstream default -- see
-            # --target-max-num-batched-tokens' help text for why this script
-            # intentionally diverges from EXPERIMENT_PLAN.md's real-
-            # benchmark config here.
+        enable_chunked_prefill=False,  # matches EXPERIMENT_PLAN.md's real-
+            # benchmark config -- see --target-max-num-batched-tokens' help
+            # text and the module docstring's "Step B2" section for why
+            # (structurally avoids a confirmed upstream chunked-prefill bug,
+            # since this makes single-request prefill all-or-nothing).
     )
     print("Target model loaded.")
 
@@ -573,11 +598,13 @@ def main() -> None:
     )
     passed_b2 = _run_position_check(
         llm, proposer, spec_config, speculator_device, head_dim, tokenizer,
-        request_id="spec_prefill_validation_request_b2_multistep",
+        request_id="spec_prefill_validation_request_b2_largescale",
         prompt_text=_render_chat(tokenizer, _build_long_test_prompt_text()),
-        label="Step B2: multi-step chunked-prefill check (position "
-              "restoration across 2+ scheduler steps for one pruned request)",
-        min_expected_chunks=2,
+        label="Step B2: large-scale single-step prefill check (position "
+              "restoration at real-benchmark-scale position values, under "
+              "EXPERIMENT_PLAN.md's actual enable_chunked_prefill=False "
+              "config -- NOT a multi-chunk test, see module docstring)",
+        min_expected_chunks=1,
     )
     passed = passed_b and passed_b2
 
