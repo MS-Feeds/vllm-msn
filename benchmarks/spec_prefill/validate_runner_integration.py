@@ -55,8 +55,23 @@ vLLM's chunked-prefill scheduling splits its kept tokens across multiple
 engine steps (Step B's own prompt always fits in one step, so it can't catch
 a chunk-boundary bug in `model_runner.py`'s `PruneRecord.positions_for_step`
 -- see that method's docstring). To actually force multi-step scheduling
-from a short-ish prompt, `--target-max-num-batched-tokens` (default 64) is
-passed into `LLM(...)` along with `enable_chunked_prefill=True` explicitly.
+from a manageable prompt, `--target-max-num-batched-tokens` (default 3072)
+is passed into `LLM(...)` along with `enable_chunked_prefill=True`
+explicitly.
+
+**Confirmed gotcha (2026-07-23, real hardware)**: this can't be pushed down
+to a small value like 64 the way a non-multimodal model would allow --
+Gemma-4-26B-A4B-it has "multimodal-bidirectional attention", and
+`vllm/platforms/cuda.py:221-241` unconditionally force-disables chunked MM
+input for such models, which then requires `max_num_batched_tokens >=
+max_tokens_per_mm_item` (2496 for this model) at `LLM(...)` construction
+time -- not overridable via any kwarg, since it's forced by the platform
+regardless of what's passed in. 3072 clears that floor with margin.
+Consequently Step B2's synthetic prompt (`_build_long_test_prompt_text`)
+needs to produce well over 3072 *kept* tokens (not just over
+`--target-max-num-batched-tokens`) to still force multiple chunks -- its
+default `target_word_count` accounts for this.
+
 **This deliberately diverges from EXPERIMENT_PLAN.md's real-benchmark
 config** (`enable_chunked_prefill=False`) -- confirmed against this fork's
 scheduler config validation (`vllm/config/scheduler.py`'s
@@ -68,9 +83,9 @@ script should revisit this reachability question then -- vLLM's own default
 is chunked-prefill-on, so it likely matters regardless of what this
 validation script assumes. Note also: Step B2's longer prompt exercises the
 speculator's lookahead path at a scale beyond what `validate_proposer.py`
-has verified (tens of tokens vs. ~500) -- if B2 fails, triage against
-`validate_proposer.py`-style speculator diagnostics before assuming the
-`model_runner.py` fix under test is wrong.
+has verified -- if B2 fails, triage against `validate_proposer.py`-style
+speculator diagnostics before assuming the `model_runner.py`/`proposer.py`
+fixes under test are wrong.
 
 Step C -- coherence smoke test: generates a few tokens for a heavily-pruned
 prompt and just prints the output for a human eyeball check -- not a
@@ -130,11 +145,18 @@ _LONG_TEST_PROMPT_FILLER_SENTENCES = [
 ]
 
 
-def _build_long_test_prompt_text(target_word_count: int = 500) -> str:
+def _build_long_test_prompt_text(target_word_count: int = 16000) -> str:
     """Cycles through a small pool of distinct filler sentences until the
     text reaches roughly `target_word_count` words. Content is irrelevant --
     only length matters, to force multi-step chunked-prefill scheduling in
-    Step B2 (see module docstring)."""
+    Step B2 (see module docstring).
+
+    16000 words (not the original 500) because the *kept* token count (after
+    spec_config's ~30% pruning) needs to clear `--target-max-num-batched-
+    tokens` (3072), not just be long -- and 3072 itself is a floor forced by
+    Gemma-4-26B-A4B-it's multimodal encoder budget, not a free choice (see
+    module docstring's 'Step B2' section). ~16000 words -> comfortably
+    several thousand kept tokens, several chunks at that budget."""
     sentences: List[str] = []
     word_count = 0
     i = 0
@@ -411,17 +433,22 @@ def main() -> None:
     parser.add_argument(
         "--target-max-num-batched-tokens",
         type=int,
-        default=64,
+        default=3072,
         help=(
             "Passed through to LLM(...)'s max_num_batched_tokens, along with "
-            "enable_chunked_prefill=True. Small on purpose: forces genuine "
-            "multi-step chunked-prefill scheduling for Step B2's longer "
-            "prompt, while Step B's existing short prompt (well under this "
-            "value after tokenization) still fits in a single step, "
-            "preserving single-step coverage too. NOTE: this deliberately "
-            "diverges from EXPERIMENT_PLAN.md's real-benchmark config "
-            "(enable_chunked_prefill=False) -- see the module docstring's "
-            "'Step B2' section for why."
+            "enable_chunked_prefill=True, to force genuine multi-step "
+            "chunked-prefill scheduling for Step B2's longer prompt (while "
+            "Step B's existing short prompt still fits in a single step, "
+            "preserving single-step coverage too). Can't be pushed much "
+            "lower than this for Gemma-4-26B-A4B-it specifically: its "
+            "multimodal-bidirectional attention forces "
+            "max_num_batched_tokens >= max_tokens_per_mm_item (2496 for "
+            "this model, vllm/platforms/cuda.py's CUDA platform forcing, "
+            "not overridable) at LLM(...) construction time -- see the "
+            "module docstring's 'Step B2' section for the real-hardware "
+            "confirmation of this gotcha. NOTE: this whole setup "
+            "deliberately diverges from EXPERIMENT_PLAN.md's real-benchmark "
+            "config (enable_chunked_prefill=False) -- see the same section."
         ),
     )
     args = parser.parse_args()
