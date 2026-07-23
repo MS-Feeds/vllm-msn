@@ -306,7 +306,20 @@ def _run_position_check(
         llm_engine=llm.llm_engine,
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
-        sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+        # max_tokens=4, not 1 -- confirmed on real hardware (2026-07-23) that
+        # max_tokens=1 combined with a multi-chunk prefill hits a real,
+        # PRE-EXISTING bug in this vLLM fork's chunked-prefill discard-
+        # masking (gpu_model_runner.py's discard_request_mask/check_stop
+        # interaction): the request gets marked finished
+        # (finish_reason='length') after just the FIRST partial chunk,
+        # before the remaining prefill ever gets scheduled -- reproduced
+        # with plain stock vLLM, worker_cls=None, zero spec_prefill code
+        # involved, so this is NOT a bug in this patch. max_tokens=4 avoids
+        # tripping it (the bogus early count from one incomplete chunk
+        # stays under the threshold, so scheduling correctly continues) --
+        # this is a validation-script workaround, not a fix; the underlying
+        # fork bug is a separate, out-of-scope follow-up.
+        sampling_params=SamplingParams(max_tokens=4, temperature=0.0),
         proposer=proposer,
         spec_config=spec_config,
         device=speculator_device,
@@ -334,7 +347,7 @@ def _run_position_check(
     observed_chunks: List[List[int]] = []
     step_idx = 0
     while llm.llm_engine.has_unfinished_requests() and step_idx < max_steps:
-        step_outputs = llm.llm_engine.step()
+        llm.llm_engine.step()
         step_idx += 1
         captured_per_worker = llm.collective_rpc(_read_captured_positions)
         captured_this_step = captured_per_worker[0] if captured_per_worker else []
@@ -344,28 +357,27 @@ def _run_position_check(
             # Every hooked layer sees an identical positions tensor within
             # one forward pass -- any one representative entry suffices.
             observed_chunks.append(captured_this_step[0])
-        # TEMPORARY diagnostic (2026-07-23): the request is being marked
-        # finished after only a partial (max_num_batched_tokens-sized)
-        # chunk of a much longer pruned prompt -- root-causing whether this
-        # is genuine premature completion (finish_reason/num_cached_tokens
-        # will say why) or a test-driver miscount. Remove once root-caused.
-        for out in step_outputs:
-            if out.request_id == request_id:
-                completion = out.outputs[0] if out.outputs else None
-                print(f"  [diag] step {step_idx}: captured chunk length "
-                      f"{len(captured_this_step[0]) if captured_this_step else 0}, "
-                      f"RequestOutput.finished={out.finished}, "
-                      f"num_cached_tokens={out.num_cached_tokens}, "
-                      f"finish_reason={getattr(completion, 'finish_reason', None)!r}, "
-                      f"stop_reason={getattr(completion, 'stop_reason', None)!r}, "
-                      f"has_unfinished_requests={llm.llm_engine.has_unfinished_requests()}")
+            # Stop as soon as we've captured the full pruned prefill (total
+            # captured length == the registered kept-token count) -- any
+            # further steps are decode continuation, irrelevant to this
+            # check (which only validates prefill-time position
+            # restoration) and best avoided anyway, since driving the
+            # request further than needed just risks the fork-level
+            # chunked-prefill/discard-masking bug noted above.
+            if sum(len(c) for c in observed_chunks) >= len(kept_positions):
+                break
 
-    if llm.llm_engine.has_unfinished_requests():
-        print(f"FAIL: request did not finish within {max_steps} step() call(s).")
-        return False
     if not observed_chunks:
         print("FAIL: no positions were captured at all -- the hook may not "
               "have fired, or the request never reached the model.")
+        return False
+    total_captured = sum(len(c) for c in observed_chunks)
+    if total_captured < len(kept_positions):
+        print(f"FAIL: only captured {total_captured} of {len(kept_positions)} "
+              f"expected pruned-prefill positions after {step_idx} step(s) "
+              f"(has_unfinished_requests={llm.llm_engine.has_unfinished_requests()}) "
+              f"-- the request ended (out of steps, or the engine considers it "
+              f"finished) before its prefill actually completed.")
         return False
     if len(observed_chunks) < min_expected_chunks:
         print(f"FAIL: only {len(observed_chunks)} step-chunk(s) observed, "
