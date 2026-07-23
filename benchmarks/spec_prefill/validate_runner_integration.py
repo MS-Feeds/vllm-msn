@@ -492,7 +492,14 @@ def main() -> None:
     spec_config = SpecConfig(
         keep_strategy="percentage",
         keep_kwargs={"chunk": True, "chunk_size": 64, "percentage": 0.3},
-        look_ahead_cnt=1,  # see proposer.py's known limitation -- >1 not yet reliable
+        # look_ahead_cnt=8 matches EXPERIMENT_PLAN.md's documented default --
+        # was pinned to 1 here since proposer.py's multi-step lookahead had
+        # a real bug (see run_lookahead_steps' docstring, fixed 2026-07-23);
+        # now that it's fixed, this deliberately exercises the multi-step
+        # path since this script already proved (2026-07-22, Step B/B2 PASS)
+        # it can run the full pruner.py pipeline against the real
+        # heterogeneous-head-dim speculator end-to-end.
+        look_ahead_cnt=8,
         pool_kernel_size=None,
     )
 
