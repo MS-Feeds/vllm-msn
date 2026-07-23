@@ -344,6 +344,14 @@ def _run_position_check(
             # Every hooked layer sees an identical positions tensor within
             # one forward pass -- any one representative entry suffices.
             observed_chunks.append(captured_this_step[0])
+            # TEMPORARY diagnostic (2026-07-23): disambiguating whether the
+            # scheduler is genuinely not chunking a large pruned prefill
+            # (unexpected -- max_num_batched_tokens should cap it), or
+            # whether it IS chunking but this loop is somehow only
+            # capturing/counting one of the chunks. Remove once root-caused.
+            print(f"  [diag] step {step_idx}: captured chunk length "
+                  f"{len(captured_this_step[0])}, "
+                  f"has_unfinished_requests={llm.llm_engine.has_unfinished_requests()}")
 
     if llm.llm_engine.has_unfinished_requests():
         print(f"FAIL: request did not finish within {max_steps} step() call(s).")
