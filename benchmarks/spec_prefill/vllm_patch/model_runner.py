@@ -36,15 +36,12 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.logger import init_logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from . import pruning_registry
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
-
-logger = init_logger(__name__)
 
 # TEMPORARY diagnostic gate (2026-07-23): a large (5418-of-17962-token) pruned
 # request's positions weren't reaching the model on real hardware, while a
@@ -54,8 +51,18 @@ logger = init_logger(__name__)
 # The remaining, most likely explanation is that _apply_spec_prefill_
 # position_overrides is silently hitting one of its own no-op `continue`
 # branches for the large request specifically -- every one of them is silent
-# today. SPEC_PREFILL_DEBUG_POSITION_OVERRIDE=1 makes each iteration log
+# today. SPEC_PREFILL_DEBUG_POSITION_OVERRIDE=1 makes each iteration print
 # exactly which branch fires. Remove once root-caused.
+#
+# print(), not logger.info(): confirmed on real hardware (2026-07-23) that
+# `vllm.logger.init_logger(__name__)` for a "vllm_patch.*"-named module
+# produces NO visible output at INFO level -- vllm.logger only attaches a
+# handler to the "vllm" logger namespace specifically (vllm/logger.py's
+# DEFAULT_LOGGING_CONFIG); "vllm_patch.model_runner" is a disjoint hierarchy
+# with no handler, so .info() calls are silently swallowed (Python's
+# logging.lastResort fallback only surfaces WARNING+). Plain print() has no
+# such namespace dependency and is what every other diagnostic in this
+# codebase already relies on.
 _DEBUG_POSITION_OVERRIDE = bool(os.environ.get("SPEC_PREFILL_DEBUG_POSITION_OVERRIDE"))
 
 
@@ -115,11 +122,11 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
             record = pruning_registry.get(req_id)
             if record is None:
                 if _DEBUG_POSITION_OVERRIDE:
-                    logger.info(
-                        "[spec_prefill diag] req_id=%r: no PruneRecord found "
-                        "(pruning_registry.get returned None) -- stock "
-                        "positions stand, no override applied this step.",
-                        req_id,
+                    print(
+                        f"[spec_prefill diag] req_id={req_id!r}: no PruneRecord "
+                        f"found (pruning_registry.get returned None) -- stock "
+                        f"positions stand, no override applied this step.",
+                        flush=True,
                     )
                 continue  # not a pruned request -- stock positions stand.
 
@@ -128,11 +135,12 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
             num_scheduled_this_step = end - start
             if num_scheduled_this_step <= 0:
                 if _DEBUG_POSITION_OVERRIDE:
-                    logger.info(
-                        "[spec_prefill diag] req_id=%r: has a PruneRecord "
-                        "(num_kept=%d) but num_scheduled_this_step=%d <= 0 "
-                        "this step -- skipped, no override applied.",
-                        req_id, record.num_kept, num_scheduled_this_step,
+                    print(
+                        f"[spec_prefill diag] req_id={req_id!r}: has a "
+                        f"PruneRecord (num_kept={record.num_kept}) but "
+                        f"num_scheduled_this_step={num_scheduled_this_step} <= 0 "
+                        f"this step -- skipped, no override applied.",
+                        flush=True,
                     )
                 continue
 
@@ -140,14 +148,17 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
 
             kept_slice = record.positions_for_step(num_computed_before, num_scheduled_this_step)
             if _DEBUG_POSITION_OVERRIDE:
-                logger.info(
-                    "[spec_prefill diag] req_id=%r: num_kept=%d "
-                    "num_computed_before=%d num_scheduled_this_step=%d "
-                    "start=%d end=%d kept_slice=%s",
-                    req_id, record.num_kept, num_computed_before,
-                    num_scheduled_this_step, start, end,
+                kept_slice_desc = (
                     "None (decode branch)" if kept_slice is None
-                    else f"<list of {len(kept_slice)}> first5={kept_slice[:5]}",
+                    else f"<list of {len(kept_slice)}> first5={kept_slice[:5]}"
+                )
+                print(
+                    f"[spec_prefill diag] req_id={req_id!r}: "
+                    f"num_kept={record.num_kept} "
+                    f"num_computed_before={num_computed_before} "
+                    f"num_scheduled_this_step={num_scheduled_this_step} "
+                    f"start={start} end={end} kept_slice={kept_slice_desc}",
+                    flush=True,
                 )
             if kept_slice is not None:
                 kept_positions_gpu = torch.tensor(
