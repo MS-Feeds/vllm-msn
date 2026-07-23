@@ -106,6 +106,50 @@ def test_compute_attention_score_uneven_lookahead():
     assert attn_scores[1].shape[2] == 1
 
 
+def test_query_capture_stack_rejects_nonuniform_steps():
+    """Regression guard for a real bug fixed 2026-07-23 in proposer.py's
+    run_lookahead_steps: it used to treat the bootstrap prefill (capturing
+    one query per PROMPT token, shape [prompt_len, H*D]) as if it were
+    itself lookahead step 0, stacked alongside genuine 1-token decode steps
+    (shape [1, H*D] each). If that regresses, stacking non-uniform shapes
+    must fail loudly here, not silently truncate via zip downstream in
+    compute_attention_score (see test_prune_record_positions_for_step_*-
+    style regression tests elsewhere in this file for the sibling pattern)."""
+    prompt_len, HD, look_ahead_cnt = 8, 32, 3
+    steps = [torch.randn(prompt_len, HD)] + [
+        torch.randn(1, HD) for _ in range(look_ahead_cnt - 1)
+    ]
+    try:
+        torch.stack(steps, dim=1)
+        raise AssertionError("expected RuntimeError for non-uniform per-step shapes")
+    except RuntimeError:
+        pass
+
+
+def test_query_capture_stack_and_score_uniform_contract():
+    """Fixed contract: every captured lookahead step is [1, H*D] (the
+    bootstrap prefill's own capture is discarded before scoring -- see
+    proposer.py's run_lookahead_steps). Stacking must succeed and produce
+    [1, look_ahead_cnt, H*D] (num_samples=1, NOT prompt_len), and
+    compute_attention_score must consume the FULL look_ahead_cnt-length
+    trajectory -- the old bug's zip-truncation would have silently
+    collapsed this to 1 step regardless of look_ahead_cnt."""
+    num_layers, HD, num_heads, num_kv_heads, head_dim, look_ahead_cnt, ctx_len = (
+        2, 32, 4, 4, 8, 3, 16,
+    )
+    query_buffer = [
+        torch.stack([torch.randn(1, HD) for _ in range(look_ahead_cnt)], dim=1)
+        for _ in range(num_layers)
+    ]
+    for q in query_buffer:
+        assert q.shape == (1, look_ahead_cnt, HD)  # num_samples=1, not prompt_len
+
+    key_buffer = [[torch.randn(ctx_len, num_kv_heads, head_dim)] for _ in range(num_layers)]
+    attn_scores = compute_attention_score(query_buffer, key_buffer, [look_ahead_cnt])
+    assert len(attn_scores) == 1
+    assert attn_scores[0].shape == (num_layers, num_heads, look_ahead_cnt, ctx_len)
+
+
 def test_aggregate_and_select_pipeline():
     cfg = SpecConfig(
         keep_strategy="percentage",
@@ -256,6 +300,45 @@ def test_prune_record_validation():
     try:
         PruneRecord(kept_positions=[0, 8], orig_len=8)
         raise AssertionError("expected ValueError for out-of-range position")
+    except ValueError:
+        pass
+
+
+def test_prune_record_positions_for_step_single_step():
+    """Existing single-step-prefill-then-decode shape -- must not regress."""
+    record = PruneRecord(kept_positions=[0, 3, 5, 9], orig_len=12)
+    assert record.positions_for_step(0, 4) == [0, 3, 5, 9]
+    assert record.positions_for_step(4, 1) is None
+    assert record.positions_for_step(7, 1) is None
+
+
+def test_prune_record_positions_for_step_even_multi_chunk():
+    record = PruneRecord(kept_positions=list(range(0, 20, 2)), orig_len=20)  # N=10
+    assert record.positions_for_step(0, 5) == [0, 2, 4, 6, 8]
+    assert record.positions_for_step(5, 5) == [10, 12, 14, 16, 18]
+    assert record.positions_for_step(10, 1) is None
+
+
+def test_prune_record_positions_for_step_uneven_chunks():
+    record = PruneRecord(kept_positions=[1, 4, 6, 7, 12, 15, 19], orig_len=20)  # N=7
+    assert record.positions_for_step(0, 3) == [1, 4, 6]
+    assert record.positions_for_step(3, 3) == [7, 12, 15]
+    assert record.positions_for_step(6, 1) == [19]  # boundary chunk: completes
+        # prefill and (per stock vLLM) legitimately samples in the same step
+    assert record.positions_for_step(7, 1) is None  # first true decode step
+
+
+def test_prune_record_positions_for_step_pure_decode_steps():
+    record = PruneRecord(kept_positions=[0, 1, 2], orig_len=5)  # N=3
+    for num_computed_before in (3, 4, 10, 100):
+        assert record.positions_for_step(num_computed_before, 1) is None
+
+
+def test_prune_record_positions_for_step_overrun_raises():
+    record = PruneRecord(kept_positions=[0, 1, 2, 3], orig_len=10)  # N=4
+    try:
+        record.positions_for_step(2, 5)  # [2, 7) overruns num_kept=4
+        raise AssertionError("expected ValueError for an overrunning step range")
     except ValueError:
         pass
 

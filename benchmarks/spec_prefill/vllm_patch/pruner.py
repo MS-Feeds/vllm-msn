@@ -20,19 +20,13 @@ below instead pushes the record via `llm_engine.collective_rpc(
 `SpecPrefillWorker` (`worker.py`) running inside the correct process -- see
 that method's docstring for the full reasoning.
 
-**Known limitation inherited from `proposer.build_lookahead_metadata`**: only
-`look_ahead_cnt == 1` (a single real prefill forward on the speculator, no
-decode continuation) is verified consistent end-to-end. `EXPERIMENT_PLAN.md`'s
-default `look_ahead_cnt: 8` is **not yet reliable** through this path — see
-that method's docstring for exactly what's missing (per-step KV-cache-slot
-advancement across decode steps). Don't treat multi-step results as trustworthy
-until that's fixed.
 """
 
 from typing import List, Optional, Tuple
 
 import torch
 from vllm.inputs import TokensPrompt
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.llm_engine import LLMEngine
 
@@ -43,6 +37,8 @@ from .scoring import (
     chunk_select_from_smoothed_attention,
     compute_attention_score,
 )
+
+logger = init_logger(__name__)
 
 
 def _last_token_only(sampled_token_ids: torch.Tensor) -> torch.Tensor:
@@ -93,8 +89,9 @@ def compute_pruned_prompt(
     query_buffer = proposer.run_lookahead_steps(
         initial_input_ids=input_ids,
         initial_positions=positions,
-        num_tokens=prompt_len,
         look_ahead_cnt=look_ahead_cnt,
+        prefill_attn_metadata=lookahead_meta.prefill_attn_metadata,
+        prefill_slot_mapping=lookahead_meta.prefill_slot_mapping,
         per_step_attn_metadata=lookahead_meta.per_step_attn_metadata,
         per_step_slot_mapping=lookahead_meta.per_step_slot_mapping,
         next_input_fn=_last_token_only,
@@ -105,6 +102,24 @@ def compute_pruned_prompt(
     # Actual steps completed (may be < look_ahead_cnt on early EOS) -- one
     # sample (this single prompt) in this batch.
     actual_look_ahead_cnts = [query_buffer[0].shape[1]]
+
+    # Zero real lookahead steps ran (EOS fired on the bootstrap prefill's own
+    # sampled token, or look_ahead_cnt=0 was configured) -- confirmed by
+    # direct execution that feeding this into aggregate_attention_score's
+    # `attn.mean(0)` over an empty step axis produces an all-NaN tensor with
+    # NO exception, and chunk_select_from_smoothed_attention's torch.topk on
+    # that NaN tensor returns an arbitrary, implementation-defined "kept"
+    # set with no error signal -- a silent-wrong-answer footgun in the exact
+    # path that decides what the target model gets to see. Short-circuit to
+    # keeping the whole prompt instead of feeding this into scoring at all.
+    if actual_look_ahead_cnts[0] == 0:
+        logger.warning(
+            "SpecPrefill: 0 lookahead steps completed for this request (EOS "
+            "on the speculator's very first candidate token, or "
+            "look_ahead_cnt=0) -- keeping the full, unpruned prompt rather "
+            "than scoring with no signal."
+        )
+        return list(prompt_token_ids), list(range(prompt_len))
 
     gathered_qk = proposer.tp_gather_qk(query_buffer)
     per_sample_slot_mapping = [lookahead_meta.slot_mapping]

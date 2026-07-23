@@ -50,10 +50,32 @@ holds end-to-end. If they instead match the *stock* contiguous numbering,
 the override isn't reaching the model and `model_runner.py`'s override
 point needs to move earlier (see its own docstring for what that implies).
 
+Step B2 -- same check as Step B, but for a pruned prompt long enough that
+vLLM's chunked-prefill scheduling splits its kept tokens across multiple
+engine steps (Step B's own prompt always fits in one step, so it can't catch
+a chunk-boundary bug in `model_runner.py`'s `PruneRecord.positions_for_step`
+-- see that method's docstring). To actually force multi-step scheduling
+from a short-ish prompt, `--target-max-num-batched-tokens` (default 64) is
+passed into `LLM(...)` along with `enable_chunked_prefill=True` explicitly.
+**This deliberately diverges from EXPERIMENT_PLAN.md's real-benchmark
+config** (`enable_chunked_prefill=False`) -- confirmed against this fork's
+scheduler config validation (`vllm/config/scheduler.py`'s
+`verify_max_model_len`) that with chunked prefill off, `max_num_batched_tokens`
+is required to be `>= max_model_len`, making single-request prefill
+all-or-nothing by construction and this multi-step path unreachable to test
+under that config at all. Whoever eventually writes the LongBench v2 driver
+script should revisit this reachability question then -- vLLM's own default
+is chunked-prefill-on, so it likely matters regardless of what this
+validation script assumes. Note also: Step B2's longer prompt exercises the
+speculator's lookahead path at a scale beyond what `validate_proposer.py`
+has verified (tens of tokens vs. ~500) -- if B2 fails, triage against
+`validate_proposer.py`-style speculator diagnostics before assuming the
+`model_runner.py` fix under test is wrong.
+
 Step C -- coherence smoke test: generates a few tokens for a heavily-pruned
 prompt and just prints the output for a human eyeball check -- not a
-substitute for Step B's direct check, but a useful secondary signal
-(if Step B passes but output is obvious garbage, something *else* is wrong,
+substitute for Step B/B2's direct check, but a useful secondary signal
+(if Step B/B2 pass but output is obvious garbage, something *else* is wrong,
 e.g. the KV-cache slot-mapping assumption in the module docstring).
 """
 
@@ -87,6 +109,41 @@ from vllm_patch.proposer import SpecPrefillProposer
 from vllm_patch.pruner import prune_and_add_request
 
 _CAPTURE_ATTR = "_spec_prefill_debug_positions"
+
+_SHORT_TEST_PROMPT_TEXT = (
+    "This is a moderately long test prompt used only to validate that "
+    "SpecPrefill's position-restoration mechanism actually reaches the "
+    "model during a real forward pass, not to test generation quality."
+)
+
+# A small pool of distinct filler sentences, cycled (not one sentence
+# repeated verbatim) -- avoids feeding SpecPrefill's importance scorer an
+# unnaturally-degenerate, fully-uniform attention pattern, which is an
+# unnecessary risk for a prompt whose only job is to force multi-step
+# scheduling (Step B2), not to test scoring quality.
+_LONG_TEST_PROMPT_FILLER_SENTENCES = [
+    "The quick brown fox jumps over the lazy dog near the riverbank.",
+    "Distant mountains fade into a pale haze as the afternoon wears on.",
+    "A small boat drifts slowly across the calm surface of the lake.",
+    "Researchers continue to debate the exact origins of the old manuscript.",
+    "The market square was busy with vendors selling fruit and bread.",
+]
+
+
+def _build_long_test_prompt_text(target_word_count: int = 500) -> str:
+    """Cycles through a small pool of distinct filler sentences until the
+    text reaches roughly `target_word_count` words. Content is irrelevant --
+    only length matters, to force multi-step chunked-prefill scheduling in
+    Step B2 (see module docstring)."""
+    sentences: List[str] = []
+    word_count = 0
+    i = 0
+    while word_count < target_word_count:
+        sentence = _LONG_TEST_PROMPT_FILLER_SENTENCES[i % len(_LONG_TEST_PROMPT_FILLER_SENTENCES)]
+        sentences.append(sentence)
+        word_count += len(sentence.split())
+        i += 1
+    return "Ignore sentence content; only length matters here. " + " ".join(sentences)
 
 
 def _capturing_forward(self, positions, hidden_states, _orig_forward, _captured, **kwargs):
@@ -181,31 +238,42 @@ def step_a_basic_wiring(llm: LLM, tokenizer) -> None:
         print("WARNING: empty output -- something may be wrong even for the non-pruned path.")
 
 
-def step_b_position_aliasing_check(
+def _run_position_check(
     llm: LLM,
     proposer: SpecPrefillProposer,
     spec_config: SpecConfig,
     speculator_device: torch.device,
     head_dim: int,
     tokenizer,
+    *,
+    request_id: str,
+    prompt_text: str,
+    label: str,
+    min_expected_chunks: int = 1,
+    max_steps: int = 20,
 ) -> bool:
-    print("\n=== Step B: self.positions view-aliasing check (risk #1) ===")
-    num_hooked = llm.collective_rpc(_install_position_capture_hook)
-    print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model attention layers.")
+    """Shared driver for Step B / Step B2 (see module docstring): registers
+    a pruned request, drives the engine step-by-step -- reading AND clearing
+    captured positions after every single step, not just once up front, so
+    each step's capture is isolated -- then checks that concatenating those
+    per-step captures IN STEP ORDER reproduces the registered
+    `kept_positions` EXACTLY (not just as a set: order is exactly what a
+    multi-chunk check needs to catch a chunk-boundary/ordering bug in
+    `PruneRecord.positions_for_step`). Works identically whether the
+    request's prefill lands in one step (Step B) or several (Step B2).
+
+    Assumes `_install_position_capture_hook` has already been called once
+    for this `llm` (installing it again per-call would nest wrappers around
+    the already-wrapped forward and orphan the previous call's capture
+    list -- see `_install_position_capture_hook`'s own docstring)."""
+    print(f"\n=== {label} ===")
     llm.collective_rpc(_clear_captured_positions)
 
-    prompt_text = _render_chat(
-        tokenizer,
-        "This is a moderately long test prompt used only to validate that "
-        "SpecPrefill's position-restoration mechanism actually reaches the "
-        "model during a real forward pass, not to test generation quality.",
-    )
     # add_special_tokens=False: the chat template string already embeds
     # whatever special tokens (e.g. <bos>) the model expects -- re-adding
     # them here would double them up.
     prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
 
-    request_id = "spec_prefill_validation_request"
     # NOTE: do NOT read back via pruning_registry.get(request_id) here --
     # that would read the *driver* process's copy, which prune_and_add_request
     # never writes to by design (the record only exists in the Worker's
@@ -222,63 +290,66 @@ def step_b_position_aliasing_check(
         device=speculator_device,
         head_dim=head_dim,
     )
-    expected_positions = sorted(kept_positions)
+    # kept_positions is already ascending -- chunk_select_from_smoothed_
+    # attention's own sortedness invariant (see test_aggregate_and_select_
+    # pipeline in test_vllm_patch.py) -- NOT re-sorted here, since order
+    # (not just set membership) is exactly what this check verifies.
+    expected_positions = list(kept_positions)
     print(f"Registered PruneRecord: kept {len(kept_positions)} of {orig_len} tokens.")
 
-    # Drive the engine through the prefill step. A single step() isn't
-    # guaranteed to actually schedule+execute a just-added request, so this
-    # loops with a bounded retry, checking for captured data after each step.
-    #
-    # **Root cause of the real-hardware hang (2026-07-22, confirmed against
-    # this fork's own source, not inferred)**: this loop used to call
-    # `llm.llm_engine.step()` unconditionally up to `max_steps` times. Our
-    # request has `max_tokens=1`, so it fully finishes on the FIRST step()
-    # (the prefill step also samples the one requested token). Every
-    # `llm.generate()` call (Steps A/C) drives step() via vLLM's own required
-    # idiom -- `while self.llm_engine.has_unfinished_requests(): step()` --
-    # see vllm/entrypoints/llm.py:1285-1286. This loop skipped that guard, so
-    # once the request finished, the 2nd step() called
-    # `engine_core.get_output()` (vllm/v1/engine/llm_engine.py:295) with
-    # nothing left scheduled -- EngineCore's background loop had no output to
-    # push, so the client blocked on `outputs_queue.get()` forever. That's
-    # the exact "0% GPU util, no traceback" stall previously attributed to
-    # the position override / diagnostic hook (see model_runner.py's now-
-    # removable diagnostic gate) -- neither was actually the cause.
-    captured: list = []
-    max_steps = 10
-    for step_idx in range(max_steps):
-        if not llm.llm_engine.has_unfinished_requests():
-            print(f"Engine went idle after {step_idx} step() call(s) "
-                  f"(request finished -- max_tokens=1 completes in one step).")
-            break
+    # Drive the engine through however many steps this request's prefill
+    # actually takes. **Root cause of a real-hardware hang this script used
+    # to have (2026-07-22, confirmed against this fork's own source, not
+    # inferred)**: an earlier version of this loop called
+    # `llm.llm_engine.step()` unconditionally without checking
+    # `has_unfinished_requests()` first -- once a request finished,
+    # `engine_core.get_output()` (vllm/v1/engine/llm_engine.py:295) blocked
+    # forever on `outputs_queue.get()` since EngineCore had nothing left to
+    # report. `llm.generate()` (Steps A/C) avoids this via vLLM's own
+    # required idiom -- `while self.llm_engine.has_unfinished_requests():
+    # step()` -- see vllm/entrypoints/llm.py:1285-1286 -- which this loop
+    # now follows too.
+    observed_chunks: List[List[int]] = []
+    step_idx = 0
+    while llm.llm_engine.has_unfinished_requests() and step_idx < max_steps:
         llm.llm_engine.step()
+        step_idx += 1
         captured_per_worker = llm.collective_rpc(_read_captured_positions)
-        captured = captured_per_worker[0] if captured_per_worker else []
-        if captured:
-            break
-    if not captured:
-        print(f"FAIL: no positions were captured -- the hook may not have "
-              f"fired, or the request never reached the model.")
+        captured_this_step = captured_per_worker[0] if captured_per_worker else []
+        llm.collective_rpc(_clear_captured_positions)  # read-then-clear: keeps
+            # each observed_chunks entry scoped to exactly this step.
+        if captured_this_step:
+            # Every hooked layer sees an identical positions tensor within
+            # one forward pass -- any one representative entry suffices.
+            observed_chunks.append(captured_this_step[0])
+
+    if llm.llm_engine.has_unfinished_requests():
+        print(f"FAIL: request did not finish within {max_steps} step() call(s).")
+        return False
+    if not observed_chunks:
+        print("FAIL: no positions were captured at all -- the hook may not "
+              "have fired, or the request never reached the model.")
+        return False
+    if len(observed_chunks) < min_expected_chunks:
+        print(f"FAIL: only {len(observed_chunks)} step-chunk(s) observed, "
+              f"expected >= {min_expected_chunks} -- this run did not "
+              f"actually exercise the scenario {label!r} is meant to test "
+              f"(check prompt length vs --target-max-num-batched-tokens and "
+              f"spec_config's keep percentage).")
         return False
 
-    # First captured entry should be the prefill step's positions for our
-    # request (there may be other requests' data too if the batch wasn't
-    # isolated -- take the entry whose length matches our pruned prompt).
-    matching = [p for p in captured if len(p) == len(kept_positions)]
-    if not matching:
-        print(f"FAIL: no captured position tensor has length {len(kept_positions)} "
-              f"(our pruned prompt length). Captured lengths: "
-              f"{[len(p) for p in captured]}")
-        return False
+    actual_positions = [p for chunk in observed_chunks for p in chunk]
+    print(f"Captured {len(observed_chunks)} step-chunk(s), "
+          f"{len(actual_positions)} position(s) total.")
 
-    actual_positions = sorted(matching[0])
     if actual_positions == expected_positions:
-        print("PASS: positions the model actually received during its real "
-              "forward pass EXACTLY MATCH the registered kept_positions (T). "
-              "The self.positions view-aliasing assumption holds.")
+        print("PASS: concatenated per-step positions the model actually "
+              "received EXACTLY MATCH the registered kept_positions (T), "
+              "in order, across all step(s). The self.positions "
+              "view-aliasing assumption holds.")
         return True
 
-    stock_positions = sorted(range(len(kept_positions)))
+    stock_positions = list(range(len(kept_positions)))
     if actual_positions == stock_positions:
         print("FAIL: the model received the STOCK contiguous positions "
               f"({stock_positions[:5]}...), not our overridden ones "
@@ -337,6 +408,22 @@ def main() -> None:
             "speculator (the normal case), this can stay near vLLM's default."
         ),
     )
+    parser.add_argument(
+        "--target-max-num-batched-tokens",
+        type=int,
+        default=64,
+        help=(
+            "Passed through to LLM(...)'s max_num_batched_tokens, along with "
+            "enable_chunked_prefill=True. Small on purpose: forces genuine "
+            "multi-step chunked-prefill scheduling for Step B2's longer "
+            "prompt, while Step B's existing short prompt (well under this "
+            "value after tokenization) still fits in a single step, "
+            "preserving single-step coverage too. NOTE: this deliberately "
+            "diverges from EXPERIMENT_PLAN.md's real-benchmark config "
+            "(enable_chunked_prefill=False) -- see the module docstring's "
+            "'Step B2' section for why."
+        ),
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -366,6 +453,12 @@ def main() -> None:
         enforce_eager=True,
         trust_remote_code=True,
         gpu_memory_utilization=target_gpu_memory_utilization,
+        max_num_batched_tokens=args.target_max_num_batched_tokens,
+        enable_chunked_prefill=True,  # explicit, not relying on the (already
+            # default-True) upstream default -- see
+            # --target-max-num-batched-tokens' help text for why this script
+            # intentionally diverges from EXPERIMENT_PLAN.md's real-
+            # benchmark config here.
     )
     print("Target model loaded.")
 
@@ -403,14 +496,34 @@ def main() -> None:
         pool_kernel_size=None,
     )
 
-    passed = step_b_position_aliasing_check(
-        llm, proposer, spec_config, speculator_device, head_dim, tokenizer
+    # Installed once, before both position checks below -- calling this
+    # per-check would nest wrappers around the already-wrapped forward and
+    # orphan the previous call's capture list (see its own docstring).
+    num_hooked = llm.collective_rpc(_install_position_capture_hook)
+    print(f"Diagnostic hook installed on {num_hooked} worker(s)' target-model "
+          f"attention layers.")
+
+    passed_b = _run_position_check(
+        llm, proposer, spec_config, speculator_device, head_dim, tokenizer,
+        request_id="spec_prefill_validation_request_b_singlestep",
+        prompt_text=_render_chat(tokenizer, _SHORT_TEST_PROMPT_TEXT),
+        label="Step B: self.positions view-aliasing check, single-step prefill (risk #1)",
+        min_expected_chunks=1,
     )
+    passed_b2 = _run_position_check(
+        llm, proposer, spec_config, speculator_device, head_dim, tokenizer,
+        request_id="spec_prefill_validation_request_b2_multistep",
+        prompt_text=_render_chat(tokenizer, _build_long_test_prompt_text()),
+        label="Step B2: multi-step chunked-prefill check (position "
+              "restoration across 2+ scheduler steps for one pruned request)",
+        min_expected_chunks=2,
+    )
+    passed = passed_b and passed_b2
 
     step_c_coherence_smoke_test(llm, tokenizer)
 
     if not passed:
-        print("\nOVERALL: Step B FAILED -- see above for what to check next.")
+        print("\nOVERALL: Step B/B2 FAILED -- see above for what to check next.")
         sys.exit(1)
     print("\nOVERALL: all checks passed.")
 

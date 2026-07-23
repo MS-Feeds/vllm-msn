@@ -37,7 +37,7 @@ import types
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -133,8 +133,22 @@ def _ensure_distributed_environment(device: torch.device) -> None:
 class LookaheadMetadata:
     """Everything `run_lookahead_steps` needs for one single-request
     lookahead run, built by `SpecPrefillProposer.build_lookahead_metadata`.
+
+    `prefill_attn_metadata`/`prefill_slot_mapping` are for the ONE bootstrap
+    prefill call only (seeds the KV cache over the full prompt, produces the
+    first candidate token -- not itself a scored lookahead step, see
+    `run_lookahead_steps`'s docstring). `per_step_attn_metadata`/
+    `per_step_slot_mapping` are unambiguously decode-only: exactly
+    `look_ahead_cnt` entries, each shaped for a single new token appended to
+    a growing context. `slot_mapping` (bare tensor, distinct from
+    `prefill_slot_mapping`'s dict form) is for K-retrieval only (see
+    `retrieve_qk`) -- always the prompt's own slots, unaffected by any of
+    the above, since scoring always attends back to the prompt's keys, never
+    the lookahead steps' own generated keys.
     """
 
+    prefill_attn_metadata: Dict[str, Any]
+    prefill_slot_mapping: Dict[str, torch.Tensor]
     per_step_attn_metadata: List[Any]
     per_step_slot_mapping: List[dict]
     slot_mapping: torch.Tensor
@@ -351,8 +365,9 @@ class SpecPrefillProposer:
         self,
         initial_input_ids: torch.Tensor,
         initial_positions: torch.Tensor,
-        num_tokens: int,
         look_ahead_cnt: int,
+        prefill_attn_metadata: Dict[str, Any],
+        prefill_slot_mapping: Dict[str, torch.Tensor],
         per_step_attn_metadata: List[Any],
         per_step_slot_mapping: List[dict],
         next_input_fn: Callable[[torch.Tensor], torch.Tensor],
@@ -362,35 +377,95 @@ class SpecPrefillProposer:
         """Algorithm lines 3-7: run the speculator for `look_ahead_cnt`
         steps, buffering its post-RoPE queries via the installed hook.
 
+        **Root cause of a real bug fixed 2026-07-23 (confirmed via direct
+        tensor-shape simulation, not inferred)**: this method used to treat
+        the initial full-prompt prefill as "lookahead step 0" itself,
+        capturing its query alongside the genuine decode steps. That query
+        tensor has shape [prompt_len, H*D] (one entry per PROMPT token),
+        while every real decode step captures [1, H*D] (one new token) --
+        for look_ahead_cnt>1 the final `torch.stack(dim=1)` below raised
+        `RuntimeError: stack expects each tensor to be equal size` outright;
+        for look_ahead_cnt==1 it "succeeded" but produced [prompt_len, 1,
+        H*D], and scoring.compute_attention_score's `zip(queries, keys,
+        actual_look_ahead_cnts)` (lengths prompt_len, 1, 1) silently
+        truncated to 1 pair -- the FIRST prompt token's own query (causally
+        blind to almost the whole prompt) -- discarding every other prompt
+        token's captured query with no error. Per EXPERIMENT_PLAN.md's own
+        algorithm description ("prefills the full prompt, THEN runs a few
+        lookahead decode steps, capturing... during THOSE steps"), the
+        prefill was never supposed to be a scored step. Fixed by running it
+        as a separate, uncaptured bootstrap call (see below) -- every
+        captured step is now uniformly [1, H*D], for any look_ahead_cnt.
+
         Per-step attention metadata/slot mapping are supplied by the caller
         (see module docstring's scope boundary) -- this method only handles
         the forward-call loop and EOS early-stop (line 6), not KV-cache-slot
         bookkeeping between steps.
 
         Args:
+            prefill_attn_metadata/prefill_slot_mapping: for the ONE
+                bootstrap prefill call (prompt-shaped) -- NOT one of the
+                `look_ahead_cnt` scored steps; its query-buffer contribution
+                is discarded immediately after (see body).
             next_input_fn: given the previous step's sampled token ids,
                 returns the next step's input_ids (greedy next-token, or a
                 caller-supplied sampling strategy).
-            next_positions_fn: given the previous positions and the step
-                index, returns the next step's positions tensor.
+            next_positions_fn: given the current positions and the decode
+                step index (0-indexed, the step ABOUT to run), returns that
+                step's positions tensor. Called once per decode iteration,
+                starting at step=0 for the first token after the prompt --
+                NOT called for the bootstrap prefill.
 
         Returns:
             Per-layer query_buffer, each entry stacked to
-            [num_prefill_samples, actual_look_ahead_steps, num_heads*head_dim]
-            -- the shape scoring.compute_attention_score expects.
+            [1, actual_look_ahead_steps, num_heads*head_dim] -- num_samples
+            is always 1 here (one prompt per call) -- the shape
+            scoring.compute_attention_score expects. Empty ([1, 0, H*D]) if
+            zero decode steps actually ran (look_ahead_cnt=0, or EOS fired
+            on the bootstrap's own sampled token) -- callers must check for
+            this (see pruner.py's zero-lookahead-steps guard) rather than
+            feed it into scoring, since aggregating over an empty step axis
+            produces silent NaN/garbage, not an error.
         """
         assert len(per_step_attn_metadata) == look_ahead_cnt
         assert len(per_step_slot_mapping) == look_ahead_cnt
 
+        # Bootstrap prefill: seeds the KV cache over the full prompt,
+        # produces the first candidate continuation token. NOT a scored
+        # lookahead step -- see docstring above for why conflating this
+        # with a scored step was the root cause of the bugs fixed here.
         self.reset_query_buffer()
-        input_ids = initial_input_ids
+        with set_forward_context(
+            prefill_attn_metadata,
+            self.vllm_config,
+            num_tokens=initial_input_ids.shape[0],
+            slot_mapping=prefill_slot_mapping,
+        ):
+            hidden_states = self.model(input_ids=initial_input_ids, positions=initial_positions)
+        next_token_ids = self.model.compute_logits(hidden_states).argmax(dim=-1)
+        self.reset_query_buffer()  # discard the bootstrap's own capture
+
+        # next_token_ids here has shape [prompt_len] (one prediction per
+        # teacher-forced prompt position) -- only the LAST one is the real
+        # autoregressive continuation. torch.all(...) (used below for
+        # genuine 1-token decode steps) would check every position, which
+        # is essentially never true -- must slice to [-1] here specifically.
+        bootstrap_eos = eos_token_id is not None and bool(
+            next_token_ids[-1] == eos_token_id
+        )
+        if look_ahead_cnt == 0 or bootstrap_eos:
+            hd = self._speculator_layers[0].num_heads * self._speculator_layers[0].head_dim
+            return [torch.empty(1, 0, hd, device=self.device) for _ in range(self._num_layers)]
+
+        input_ids = next_input_fn(next_token_ids)
         positions = initial_positions
 
         for step in range(look_ahead_cnt):
+            positions = next_positions_fn(positions, step)
             with set_forward_context(
                 per_step_attn_metadata[step],
                 self.vllm_config,
-                num_tokens=num_tokens,
+                num_tokens=input_ids.shape[0],
                 slot_mapping=per_step_slot_mapping[step],
             ):
                 hidden_states = self.model(input_ids=input_ids, positions=positions)
@@ -403,7 +478,6 @@ class SpecPrefillProposer:
                 break
 
             input_ids = next_input_fn(next_token_ids)
-            positions = next_positions_fn(positions, step)
 
         return [torch.stack(layer_steps, dim=1) for layer_steps in self._query_buffer]
 
@@ -463,29 +537,38 @@ class SpecPrefillProposer:
     def build_lookahead_metadata(
         self, prompt_len: int, look_ahead_cnt: int, head_dim: int
     ) -> LookaheadMetadata:
-        """Build minimal, real per-step attention metadata plus a dummy KV
-        cache for running `run_lookahead_steps`/`retrieve_qk` against a
-        single request of length `prompt_len`.
+        """Build real attention metadata plus a dummy KV cache for running
+        `run_lookahead_steps`/`retrieve_qk` against a single request of
+        length `prompt_len`: one bootstrap-prefill metadata entry (shaped
+        for `prompt_len` query tokens) plus `look_ahead_cnt` decode-step
+        metadata entries (each shaped for exactly 1 new query token,
+        appended to a growing context) -- see `LookaheadMetadata`'s own
+        docstring for the field split, and `run_lookahead_steps`'s
+        docstring for why the prefill must not be treated as a scored step.
 
-        **Known limitation, read before using `look_ahead_cnt > 1`:** every
-        step's metadata is currently built identically -- shaped for
-        `prompt_len` query tokens, reusing the same `common_attn_metadata`
-        (fresh per step via `builder.build(...)`, but always against a
-        `BatchSpec(seq_lens=[prompt_len], query_lens=[prompt_len])`). This is
-        correct for step 0 (the real prefill). For step 1+, `run_lookahead_steps`
-        actually only feeds 1 new token (via its `next_input_fn`), so the
-        metadata (still `prompt_len`-shaped) and the actual input (1 token)
-        would mismatch -- this is exactly the "cross-step KV-cache-slot
-        advancement" complexity this class's module docstring already flags
-        as out of scope (what EAGLE's `eagle_step_update_slot_mapping_and_metadata`
-        solves for the runner's own drafter). **Only `look_ahead_cnt == 1`
-        (a single real prefill forward, no decode continuation) is verified
-        consistent by this method as written.** Properly supporting
-        `look_ahead_cnt > 1` needs per-step metadata that shrinks to 1 query
-        token and grows `seq_lens`/slot mapping consistently against the
-        *same* persistent dummy cache across steps -- not yet implemented;
-        do not assume correctness for the multi-step case without fixing
-        this first.
+        **Slot-mapping fix (2026-07-23, confirmed against this fork's actual
+        source, not assumed)**: `create_common_attn_metadata(...,
+        arange_block_indices=True)` assigns block ids as literal ascending
+        integers (`block_table_tensor = arange(max_blocks)`) fresh per call
+        -- this stays physically consistent across the bootstrap + N decode
+        calls below ONLY because each call passes the FULL CUMULATIVE
+        `seq_lens` (not an incremental delta), so `max_blocks` grows
+        monotonically and block `b` always refers to the same physical
+        block in the one persistent dummy cache bound below. Its own
+        `slot_mapping` (`arange(num_tokens)`) is NOT similarly
+        self-correcting -- for a decode call it's always `arange(1) = [0]`
+        regardless of context, so it's manually overridden per decode step
+        to the true absolute logical position via `.replace(slot_mapping=
+        ...)`. This exploits the identity `slot == logical position` that
+        holds under this scheme (block id == block number by construction,
+        so `slot = block_id*block_size + offset = logical_position`) -- not
+        a general-purpose slot-computation utility. The KV-cache *write*
+        itself is driven by the `slot_mapping=` dict passed to
+        `set_forward_context` in `run_lookahead_steps` (confirmed via
+        `Attention.forward` -> `unified_kv_cache_update` ->
+        `get_forward_context().slot_mapping[layer_name]`), which is built
+        from this same overridden value below -- so this override is what
+        actually determines where each decode step's new K/V land.
 
         Uses this fork's own proven test utilities
         (`tests/v1/attention/utils.py` -- `create_common_attn_metadata`,
@@ -502,7 +585,12 @@ class SpecPrefillProposer:
         dual-model cache-budget management between the speculator and the
         target model, which is out of scope for this pass (see the approved
         plan's "Scope for this pass"). Every call re-allocates a fresh dummy
-        cache sized for exactly this request; not reused across requests.
+        cache sized for this request: `prompt_len + look_ahead_cnt` tokens
+        (the prompt plus every decode step's own new token) -- not reused
+        across requests. Scaling this for arbitrarily long real prompts
+        (LongBench v2's up-to-32k-word documents) is a separate, deferred
+        concern, same scoping spirit as the target-model chunked-prefill fix
+        being scoped to its own mechanism.
         """
         _ensure_vllm_repo_root_on_syspath()
         from tests.v1.attention.utils import (  # proven pattern, see docstring
@@ -515,6 +603,10 @@ class SpecPrefillProposer:
 
         block_size = self.vllm_config.cache_config.block_size
         num_kv_heads = self._speculator_layers[0].num_kv_heads
+        # Exact fit: the last decode step's seq_lens == prompt_len +
+        # look_ahead_cnt, so this is the true max block count needed --
+        # verified arithmetic, no slack/off-by-one.
+        num_blocks_needed = -(-(prompt_len + look_ahead_cnt) // block_size)
 
         kv_cache_spec = create_standard_kv_cache_spec(self.vllm_config)
         for self_attn in self._speculator_layers:
@@ -531,13 +623,9 @@ class SpecPrefillProposer:
                 self_attn.head_dim,
                 self.vllm_config.model_config.dtype,
                 self.device,
+                num_blocks=num_blocks_needed,
             )
             self_attn.attn.kv_cache = dummy_cache
-
-        batch_spec = BatchSpec(seq_lens=[prompt_len], query_lens=[prompt_len])
-        common_attn_metadata = create_common_attn_metadata(
-            batch_spec, block_size=block_size, device=self.device, arange_block_indices=True
-        )
 
         backend_enum = self.vllm_config.attention_config.backend
         builder_cls, _ = try_get_attention_backend(backend_enum)
@@ -547,21 +635,55 @@ class SpecPrefillProposer:
             vllm_config=self.vllm_config,
             device=self.device,
         )
+
+        # Bootstrap prefill metadata: unchanged shape from before this fix --
+        # the full prompt, in one chunk.
+        prefill_batch_spec = BatchSpec(seq_lens=[prompt_len], query_lens=[prompt_len])
+        prefill_common_attn_metadata = create_common_attn_metadata(
+            prefill_batch_spec, block_size=block_size, device=self.device,
+            arange_block_indices=True,
+        )
+        prefill_attn_metadata_built = builder.build(
+            common_prefix_len=0, common_attn_metadata=prefill_common_attn_metadata
+        )
+
+        # Decode-step metadata: query_lens=[1], seq_lens growing by 1 each
+        # step, slot_mapping manually corrected -- see method docstring's
+        # "Slot-mapping fix" section for why create_common_attn_metadata's
+        # own arange(num_tokens)=[0] is wrong for a decode continuation.
         per_step_attn_metadata = []
         per_step_slot_mapping = []
-        for _ in range(look_ahead_cnt):
-            attn_metadata = builder.build(
-                common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        for step in range(look_ahead_cnt):
+            new_token_position = prompt_len + step  # 0-indexed logical position
+            decode_batch_spec = BatchSpec(
+                seq_lens=[new_token_position + 1], query_lens=[1]
             )
-            per_step_attn_metadata.append({name: attn_metadata for name in self._layer_names})
+            decode_common_attn_metadata = create_common_attn_metadata(
+                decode_batch_spec, block_size=block_size, device=self.device,
+                arange_block_indices=True,
+            ).replace(
+                slot_mapping=torch.tensor(
+                    [new_token_position], dtype=torch.int64, device=self.device
+                )
+            )
+            decode_attn_metadata = builder.build(
+                common_prefix_len=0, common_attn_metadata=decode_common_attn_metadata
+            )
+            per_step_attn_metadata.append(
+                {name: decode_attn_metadata for name in self._layer_names}
+            )
             per_step_slot_mapping.append(
-                {name: common_attn_metadata.slot_mapping for name in self._layer_names}
+                {name: decode_common_attn_metadata.slot_mapping for name in self._layer_names}
             )
 
         return LookaheadMetadata(
+            prefill_attn_metadata={name: prefill_attn_metadata_built for name in self._layer_names},
+            prefill_slot_mapping={
+                name: prefill_common_attn_metadata.slot_mapping for name in self._layer_names
+            },
             per_step_attn_metadata=per_step_attn_metadata,
             per_step_slot_mapping=per_step_slot_mapping,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            slot_mapping=prefill_common_attn_metadata.slot_mapping,
             block_size=block_size,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,

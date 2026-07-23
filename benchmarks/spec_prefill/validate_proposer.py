@@ -67,6 +67,7 @@ import torch
 
 from vllm.config import CacheConfig, ModelConfig, VllmConfig, replace
 from vllm_patch.proposer import SpecPrefillProposer
+from vllm_patch.pruner import _last_token_only, _make_next_positions_fn
 
 
 def step_a_inspect_head_dims(proposer: SpecPrefillProposer) -> dict:
@@ -94,8 +95,16 @@ def step_a_inspect_head_dims(proposer: SpecPrefillProposer) -> dict:
 def step_b_forward_smoke_test(
     proposer: SpecPrefillProposer, head_dim: int, device: torch.device
 ) -> dict:
-    look_ahead_cnt = 2
-    prompt_len = 8
+    # look_ahead_cnt=8 matches EXPERIMENT_PLAN.md's documented default.
+    # prompt_len=64 (not the old 8) so chunk_select_from_smoothed_attention
+    # (default chunk_size=32) sees chunk_cnt>1 -- confirmed this session
+    # that a shorter prompt always keeps 100% of chunks regardless of the
+    # actual scores, which is exactly the blind spot that let a real
+    # zip-truncation bug in compute_attention_score go undetected: this
+    # smoke test needs to be long enough that WRONG scores would actually
+    # change the outcome, not just short enough to "not crash."
+    look_ahead_cnt = 8
+    prompt_len = 64
 
     # Metadata/dummy-KV-cache construction factored into
     # SpecPrefillProposer.build_lookahead_metadata (shared with pruner.py) --
@@ -106,17 +115,27 @@ def step_b_forward_smoke_test(
     input_ids = torch.randint(0, 1000, (prompt_len,), dtype=torch.int32, device=device)
     positions = torch.arange(prompt_len, dtype=torch.int64, device=device)
 
+    # Reuse pruner.py's actual production callbacks (not a second, divergent
+    # approximation) -- exercises the real code path this smoke test exists
+    # to validate, not a stand-in that could hide a real bug.
     query_buffer = proposer.run_lookahead_steps(
         initial_input_ids=input_ids,
         initial_positions=positions,
-        num_tokens=prompt_len,
         look_ahead_cnt=look_ahead_cnt,
+        prefill_attn_metadata=lookahead_meta.prefill_attn_metadata,
+        prefill_slot_mapping=lookahead_meta.prefill_slot_mapping,
         per_step_attn_metadata=lookahead_meta.per_step_attn_metadata,
         per_step_slot_mapping=lookahead_meta.per_step_slot_mapping,
-        next_input_fn=lambda tok: tok[:1].int(),  # not realistic multi-token advance; smoke test only
-        next_positions_fn=lambda pos, step: pos[:1] + step + 1,
+        next_input_fn=_last_token_only,
+        next_positions_fn=_make_next_positions_fn(prompt_len),
         eos_token_id=None,
     )
+
+    # The single check that would have caught the 2026-07-23 query-capture
+    # bug on the very first real run: num_samples (dim 0) must be 1 (one
+    # prompt), NOT prompt_len -- a regression here means the bootstrap
+    # prefill is being captured as a scored step again.
+    wrong_sample_dim = [q.shape[0] != 1 for q in query_buffer]
 
     nan_or_inf = [bool(torch.isnan(q).any() or torch.isinf(q).any()) for q in query_buffer]
 
@@ -132,6 +151,8 @@ def step_b_forward_smoke_test(
 
     return {
         "query_buffer_shapes": [tuple(q.shape) for q in query_buffer],
+        "actual_look_ahead_cnt": query_buffer[0].shape[1] if query_buffer else None,
+        "any_wrong_sample_dim": any(wrong_sample_dim),
         "any_nan_or_inf_in_queries": any(nan_or_inf),
         "key_buffer_shapes": [tuple(key_buffer[0][0].shape)] if key_buffer and key_buffer[0] else None,
         "attention_backend": proposer.vllm_config.attention_config.backend,
@@ -185,14 +206,21 @@ def main():
     result_b = step_b_forward_smoke_test(proposer, head_dim, device)
     print(f"Attention backend selected: {result_b['attention_backend']}")
     print(f"Query buffer shapes (per layer): {result_b['query_buffer_shapes']}")
+    print(f"Actual lookahead steps completed: {result_b['actual_look_ahead_cnt']}")
     print(f"Any NaN/Inf in captured queries: {result_b['any_nan_or_inf_in_queries']}")
     print(f"Retrieved key shape (layer 0, sample 0): {result_b['key_buffer_shapes']}")
 
+    if result_b["any_wrong_sample_dim"]:
+        print("\nFAIL: query_buffer's leading (sample) dimension is not 1 for "
+              "at least one layer -- the bootstrap prefill is being captured "
+              "as a scored lookahead step again (see run_lookahead_steps' "
+              "docstring for the bug this regresses to).")
+        sys.exit(1)
     if result_b["any_nan_or_inf_in_queries"]:
         print("\nFAIL: NaN/Inf detected in captured queries -- investigate the "
               "query-capture hook or model loading (dtype/precision issue?).")
         sys.exit(1)
-    print("\nStep B PASSED (no NaN/Inf, shapes look sane).")
+    print("\nStep B PASSED (sample dim correct, no NaN/Inf, shapes look sane).")
 
 
 if __name__ == "__main__":

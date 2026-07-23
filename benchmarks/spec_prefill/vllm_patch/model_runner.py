@@ -66,21 +66,27 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
         buffer -- see module docstring) for any request in this step's batch
         that has a `PruneRecord` in `pruning_registry`.
 
-        Two cases, distinguished by whether this is the request's first
-        step (prefill) or a later one (decode):
+        Delegates the actual case split to `PruneRecord.positions_for_step`
+        (pruning_registry.py), which distinguishes a prefill chunk (first or
+        a later continuation -- chunked prefill may split a long pruned
+        prompt's kept tokens across multiple steps once they exceed the
+        scheduler's per-step token budget) from a decode step:
 
-        - **Prefill** (`num_computed_tokens_cpu[req_idx] == 0`): per scope
-          (single-step, non-chunked pruned prefill -- see
-          EXPERIMENT_PLAN.md), the *entire* pruned prompt must be scheduled
-          in this one step. Replace this request's slice of `self.positions`
-          with `PruneRecord.kept_positions` directly (T, the original
-          scattered positions of the surviving tokens).
-        - **Decode** (`num_computed_tokens_cpu[req_idx] > 0`): the stock
+        - **Prefill chunk** (`positions_for_step` returns a list): replace
+          this request's slice of `self.positions` with the returned
+          original, scattered positions for exactly the tokens scheduled
+          this step -- correct whether this is the first chunk or a later
+          continuation, since `positions_for_step` slices from
+          `num_computed_before`.
+        - **Decode** (`positions_for_step` returns `None`): the stock
           formula already gives correct *relative* spacing (each step
           advances by the right amount), it's just anchored to the pruned
           length `N` instead of the original length `M`. Add the constant
           `PruneRecord.decode_offset` (`M - N`) to continue the *original*
           prompt's numbering.
+
+        Preemption was checked and needs no special-casing here either --
+        see `positions_for_step`'s own docstring.
         """
         num_reqs = self.input_batch.num_reqs
         # Populated by the stock super() call just above, still valid here --
@@ -102,19 +108,10 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
 
             num_computed_before = int(self.input_batch.num_computed_tokens_cpu[req_idx])
 
-            if num_computed_before == 0:
-                if num_scheduled_this_step != record.num_kept:
-                    raise NotImplementedError(
-                        f"Pruned request {req_id!r} prefill was scheduled "
-                        f"across multiple steps ({num_scheduled_this_step} "
-                        f"of {record.num_kept} pruned tokens this step) -- "
-                        f"chunked pruned prefill is out of scope for this "
-                        f"pass, see EXPERIMENT_PLAN.md's Implementation "
-                        f"status and the approved plan's 'Scope for this "
-                        f"pass'."
-                    )
+            kept_slice = record.positions_for_step(num_computed_before, num_scheduled_this_step)
+            if kept_slice is not None:
                 kept_positions_gpu = torch.tensor(
-                    record.kept_positions, dtype=self.positions.dtype, device=self.device
+                    kept_slice, dtype=self.positions.dtype, device=self.device
                 )
                 self.positions[start:end] = kept_positions_gpu
             else:
