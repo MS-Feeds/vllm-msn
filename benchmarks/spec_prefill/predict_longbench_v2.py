@@ -60,7 +60,19 @@ TTFT is a *batched-generate offline approximation*: all requests in one
 experiment are submitted ~simultaneously (not a live server's Poisson-arrival
 stream), so this is not directly comparable to benchmark_serving.py's
 concurrent-streaming-client TTFT -- both are real, vLLM-internal-clock-accurate
-numbers, but they measure different things. Requires disable_log_stats=False
+numbers, but they measure different things.
+
+**Confirmed on real hardware (2026-07-23): use `metrics.first_token_latency`,
+NOT `metrics.first_token_ts - metrics.arrival_time`.** An earlier version of
+this script computed TTFT that way and got a huge negative number in
+practice -- `arrival_time` is a wall-clock timestamp but `first_token_ts` is
+an "engine core timestamp (monotonic)" (vllm/v1/metrics/stats.py:207-214), a
+different clock with an arbitrary epoch; subtracting across the two is
+meaningless. `first_token_latency` is vLLM's own already-computed value on a
+single consistent basis (`IterationStats._time_since(arrival_time)`,
+stats.py:349-351/369-371) -- use that directly instead of re-deriving it.
+
+Requires disable_log_stats=False
 (see run_pipeline.py's identical use for the same reason).
 
 Usage:
@@ -487,10 +499,18 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 out_lens.append(len(completion.token_ids))
                 finish_counts[completion.finish_reason if completion.finish_reason in
                               finish_counts else "other"] += 1
-                if output.metrics is not None and output.metrics.first_token_ts:
-                    ttfts.append(
-                        (output.metrics.first_token_ts - output.metrics.arrival_time) * 1000
-                    )
+                # NOT (first_token_ts - arrival_time): confirmed on real
+                # hardware (2026-07-23) that this produces garbage (a huge
+                # negative number) -- arrival_time is a wall-clock timestamp
+                # but first_token_ts is an "engine core timestamp (monotonic)"
+                # (vllm/v1/metrics/stats.py:207-214), a different clock with
+                # an arbitrary epoch. Use first_token_latency instead --
+                # vLLM's own internal metric, already computed correctly on
+                # a single consistent (wall-clock) basis via
+                # IterationStats._time_since(arrival_time)
+                # (vllm/v1/metrics/stats.py:349-351, 369-371).
+                if output.metrics is not None and output.metrics.first_token_latency:
+                    ttfts.append(output.metrics.first_token_latency * 1000)
                 predictions.append({"id": sample["id"], "pred": completion.text})
 
             if rep == args.reps:
