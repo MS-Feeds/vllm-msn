@@ -32,15 +32,31 @@ model, and this needs to move earlier (which would require a much larger
 override, see the plan).
 """
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from . import pruning_registry
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+logger = init_logger(__name__)
+
+# TEMPORARY diagnostic gate (2026-07-23): a large (5418-of-17962-token) pruned
+# request's positions weren't reaching the model on real hardware, while a
+# small (51-token) one worked -- confirmed the mismatch is NOT in
+# gpu_model_runner.py itself (call chain, padding, attention backend,
+# uses_mrope, batch reordering all traced and ruled out as size-dependent).
+# The remaining, most likely explanation is that _apply_spec_prefill_
+# position_overrides is silently hitting one of its own no-op `continue`
+# branches for the large request specifically -- every one of them is silent
+# today. SPEC_PREFILL_DEBUG_POSITION_OVERRIDE=1 makes each iteration log
+# exactly which branch fires. Remove once root-caused.
+_DEBUG_POSITION_OVERRIDE = bool(os.environ.get("SPEC_PREFILL_DEBUG_POSITION_OVERRIDE"))
 
 
 class SpecPrefillGPUModelRunner(GPUModelRunner):
@@ -98,17 +114,41 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
             req_id = self.input_batch.req_ids[req_idx]
             record = pruning_registry.get(req_id)
             if record is None:
+                if _DEBUG_POSITION_OVERRIDE:
+                    logger.info(
+                        "[spec_prefill diag] req_id=%r: no PruneRecord found "
+                        "(pruning_registry.get returned None) -- stock "
+                        "positions stand, no override applied this step.",
+                        req_id,
+                    )
                 continue  # not a pruned request -- stock positions stand.
 
             start = int(query_start_loc_np[req_idx])
             end = int(query_start_loc_np[req_idx + 1])
             num_scheduled_this_step = end - start
             if num_scheduled_this_step <= 0:
+                if _DEBUG_POSITION_OVERRIDE:
+                    logger.info(
+                        "[spec_prefill diag] req_id=%r: has a PruneRecord "
+                        "(num_kept=%d) but num_scheduled_this_step=%d <= 0 "
+                        "this step -- skipped, no override applied.",
+                        req_id, record.num_kept, num_scheduled_this_step,
+                    )
                 continue
 
             num_computed_before = int(self.input_batch.num_computed_tokens_cpu[req_idx])
 
             kept_slice = record.positions_for_step(num_computed_before, num_scheduled_this_step)
+            if _DEBUG_POSITION_OVERRIDE:
+                logger.info(
+                    "[spec_prefill diag] req_id=%r: num_kept=%d "
+                    "num_computed_before=%d num_scheduled_this_step=%d "
+                    "start=%d end=%d kept_slice=%s",
+                    req_id, record.num_kept, num_computed_before,
+                    num_scheduled_this_step, start, end,
+                    "None (decode branch)" if kept_slice is None
+                    else f"<list of {len(kept_slice)}> first5={kept_slice[:5]}",
+                )
             if kept_slice is not None:
                 kept_positions_gpu = torch.tensor(
                     kept_slice, dtype=self.positions.dtype, device=self.device

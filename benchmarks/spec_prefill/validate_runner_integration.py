@@ -411,6 +411,18 @@ def _run_position_check(
             if sum(len(c) for c in observed_chunks) >= len(kept_positions):
                 break
 
+    # Explicitly abort -- breaking out early (above) or hitting max_steps
+    # can both leave this request alive in the engine's running queue even
+    # though we're done with it. Confirmed on real hardware (2026-07-23):
+    # leaving it dangling crashed Step C's later llm.generate() call --
+    # `sorted(outputs, key=lambda x: int(x.request_id))`
+    # (vllm/entrypoints/llm.py:1317) assumes every output belongs to that
+    # generate() call's own integer-indexed requests, and blew up on this
+    # request's leftover string request_id once it eventually finished
+    # naturally during Step C's own step() loop. Safe to call unconditionally
+    # even if the request already finished on its own.
+    llm.llm_engine.abort_request([request_id])
+
     if not observed_chunks:
         print("FAIL: no positions were captured at all -- the hook may not "
               "have fired, or the request never reached the model.")
