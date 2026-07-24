@@ -442,14 +442,26 @@ class SpecPrefillProposer:
             slot_mapping=prefill_slot_mapping,
         ):
             hidden_states = self.model(input_ids=initial_input_ids, positions=initial_positions)
-        next_token_ids = self.model.compute_logits(hidden_states).argmax(dim=-1)
+        # Slice to the LAST position before compute_logits, not after --
+        # confirmed on real hardware (2026-07-24): computing logits over
+        # every one of the prompt's teacher-forced positions (the previous
+        # `self.model.compute_logits(hidden_states)`, unsliced) projects the
+        # full [prompt_len, hidden_size] tensor through the LM head to
+        # [prompt_len, vocab_size] -- only the LAST row was ever used (see
+        # comment below), but for a real LongBench-v2-scale prompt (tens of
+        # thousands of tokens) against Gemma4's ~256k vocab, that wasted
+        # projection alone is tens of GB and OOM'd on an 80GB GPU that had
+        # already loaded the speculator. Slicing first reduces the
+        # projection to a single position -- identical result (next_input_fn
+        # below already re-slices to `[-1:]` regardless, so this changes
+        # nothing about correctness, only the wasted compute/memory).
+        next_token_ids = self.model.compute_logits(hidden_states[-1:]).argmax(dim=-1)
         self.reset_query_buffer()  # discard the bootstrap's own capture
 
-        # next_token_ids here has shape [prompt_len] (one prediction per
-        # teacher-forced prompt position) -- only the LAST one is the real
-        # autoregressive continuation. torch.all(...) (used below for
-        # genuine 1-token decode steps) would check every position, which
-        # is essentially never true -- must slice to [-1] here specifically.
+        # next_token_ids here has shape [1] now (see slicing above) -- the
+        # single real autoregressive continuation; earlier prompt positions
+        # were teacher-forced during prefill and their predictions were
+        # never meaningful here regardless.
         bootstrap_eos = eos_token_id is not None and bool(
             next_token_ids[-1] == eos_token_id
         )
