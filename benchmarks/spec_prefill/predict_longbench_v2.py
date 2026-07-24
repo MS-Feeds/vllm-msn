@@ -355,6 +355,9 @@ def submit_pruned_requests(
     keyed by the original request_id; keep_stats values are
     (num_kept, orig_len) per request.
     """
+    import gc
+
+    import torch
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
     from vllm_patch.pruner import compute_pruned_prompt
@@ -376,6 +379,21 @@ def submit_pruned_requests(
             head_dim=head_dim,
             eos_token_id=tok.eos_token_id,
         )
+        # Confirmed on real hardware (2026-07-24): build_lookahead_metadata
+        # (called inside compute_pruned_prompt, once per sample) allocates a
+        # FRESH dummy KV cache every call, sized for THIS sample's own
+        # prompt_len -- 178 different-length samples in this loop means 178
+        # differently-sized CUDA allocations in sequence, with nothing
+        # explicitly releasing one sample's tensors before the next sample's
+        # (potentially much larger) allocation. This is a real fragmentation/
+        # accumulation risk (confirmed: a later OOM reported 58+ GiB already
+        # allocated on the speculator's GPU, far more than the ~9.5 GiB E2B
+        # checkpoint itself needs) -- proactively releasing PyTorch's cached-
+        # but-idle blocks after every sample keeps each iteration's peak
+        # memory closer to what THAT sample alone needs, rather than
+        # accumulating across the whole 178-sample loop.
+        gc.collect()
+        torch.cuda.empty_cache()
         if len(pruned_token_ids) > max_num_batched_tokens:
             num_skipped += 1
             print(
