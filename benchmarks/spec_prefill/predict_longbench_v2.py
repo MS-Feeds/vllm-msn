@@ -433,6 +433,22 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         args.target_max_num_batched_tokens, token_lengths, is_baseline
     )
 
+    # Explicitly cap max_model_len at what this run actually needs (resolved
+    # prompt budget + generation length), rather than leaving it at the
+    # model's native 262144. Confirmed on real hardware (2026-07-24): vLLM's
+    # own startup sanity check (_check_enough_kv_cache_memory) requires
+    # enough KV cache to serve at least ONE request at max_model_len,
+    # regardless of whether this run will ever actually submit one that
+    # long -- with max_model_len left at 262144, that check demanded 18.67
+    # GiB and only 10.89 GiB was available (most of the GPU already spent on
+    # the 48.51 GiB of model weights), a hard failure even though our own
+    # pre-flight/skip logic already guarantees no request here exceeds
+    # max_num_batched_tokens. Since every submitted request is already
+    # bounded by max_num_batched_tokens (prompt) + max_tokens (generation),
+    # there's no reason to reserve KV cache for vLLM's much larger native
+    # default.
+    max_model_len = max_num_batched_tokens + args.max_tokens
+
     llm_kwargs = dict(
         model=args.target_model,
         trust_remote_code=True,
@@ -440,6 +456,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         disable_log_stats=False,  # required for RequestOutput.metrics (TTFT)
         gpu_memory_utilization=args.target_gpu_memory_utilization,
         max_num_batched_tokens=max_num_batched_tokens,
+        max_model_len=max_model_len,
         # enable_chunked_prefill deliberately left unset (model's own
         # supported default, on) -- see module docstring items 3 for why
         # this deviates from EXPERIMENT_PLAN.md's literal enable_chunked_
