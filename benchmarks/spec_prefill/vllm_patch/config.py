@@ -40,14 +40,14 @@ class SpecConfig:
         return cls(**used_data)
 
     def __post_init__(self):
-        assert self.keep_strategy in ["percentage"]
+        if self.keep_kwargs is None:
+            self.keep_kwargs = {}
 
         if self.keep_strategy is None:
             self.keep_strategy = "percentage"
             self.keep_kwargs["percentage"] = 0.5
 
-        if self.keep_kwargs is None:
-            self.keep_kwargs = {}
+        assert self.keep_strategy in ["percentage"]
 
 
 _SPEC_CONFIG: Optional[SpecConfig] = None
