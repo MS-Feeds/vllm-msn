@@ -371,6 +371,32 @@ def submit_pruned_requests(
         prompt_token_ids = tok.encode(rendered, add_special_tokens=False)
         request_id = f"lbv2-{sample['id']}-{i}"
 
+        # Confirmed on real hardware (2026-07-24): the speculator's bootstrap
+        # prefill (inside compute_pruned_prompt/run_lookahead_steps) must
+        # process the FULL, UNPRUNED prompt in one shot to score it -- there
+        # was no check here against the full prompt length before this,
+        # only against the PRUNED length afterward. Gemma4's per-layer-input
+        # mechanism (get_per_layer_inputs/project_per_layer_inputs) allocates
+        # tensors shaped (num_tokens, num_layers, hidden_size_per_layer) --
+        # for a very long full prompt this OOM'd even on GPU 1, which is
+        # otherwise idle apart from the ~9.5 GiB E2B speculator itself.
+        # Reusing max_num_batched_tokens as the ceiling here too -- not a
+        # precisely profiled speculator-specific budget, just a reasonable,
+        # already-established bound rather than inventing a new untested
+        # threshold. Skip and report (loud, not silent) rather than crash.
+        if len(prompt_token_ids) > max_num_batched_tokens:
+            num_skipped += 1
+            print(
+                f"[predict_longbench_v2] SKIP sample id={sample['id']!r}: "
+                f"full (unpruned) prompt length {len(prompt_token_ids)} "
+                f"exceeds --target-max-num-batched-tokens="
+                f"{max_num_batched_tokens} -- the speculator's bootstrap "
+                f"prefill must process the whole prompt in one shot to "
+                f"score it, and this risks OOM on the speculator's GPU "
+                f"before pruning even happens."
+            )
+            continue
+
         pruned_token_ids, kept_positions = compute_pruned_prompt(
             proposer=proposer,
             spec_config=spec_config,
