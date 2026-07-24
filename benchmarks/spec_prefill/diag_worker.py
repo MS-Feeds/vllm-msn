@@ -77,6 +77,22 @@ class DiagnosticSpecPrefillGPUModelRunner(SpecPrefillGPUModelRunner):
         num_reqs = self.input_batch.num_reqs
         query_start_loc_np = self.query_start_loc.np[: num_reqs + 1]
 
+        # Direct cross-check against the SCHEDULER's own raw decision, not
+        # inferred through self.input_batch/query_start_loc (which are the
+        # runner's own derived state, several layers downstream of
+        # scheduler_output). scheduler_output.num_scheduled_tokens is set by
+        # scheduler.py's `num_scheduled_tokens[request_id] = num_new_tokens`
+        # (the exact token-budget-capped, possibly-partial value) -- reading
+        # it here directly rules out any bug in this diagnostic's own
+        # downstream inference chain being the reason no chunking was
+        # observed across two real-hardware runs despite the scheduler
+        # source (vllm/v1/core/sched/scheduler.py's
+        # `num_new_tokens = min(num_new_tokens, token_budget)`, confirmed
+        # unconditional when chunked prefill is enabled) suggesting it
+        # should happen under this repro's forced budget contention.
+        new_req_ids_this_step = {r.req_id for r in scheduler_output.scheduled_new_reqs}
+        sched_num_scheduled_tokens = dict(scheduler_output.num_scheduled_tokens)
+
         # discard_request_mask / num_computed_tokens_cpu are both populated by
         # the super()._prepare_inputs() call just above (gpu_model_runner.py
         # ~lines 1970-1997/1885) -- reading them here observes exactly what
@@ -161,6 +177,21 @@ class DiagnosticSpecPrefillGPUModelRunner(SpecPrefillGPUModelRunner):
                     "discard_request_mask": bool(discard_mask_np[req_idx]),
                     "is_prefill_chunk_step": is_prefill_chunk_step,
                     "positions_correct": positions_correct,
+                    # Direct scheduler cross-check (see comment above where
+                    # these are read). sched_num_scheduled_tokens should
+                    # exactly equal num_scheduled_this_step -- if it doesn't,
+                    # the bug is in THIS diagnostic's query_start_loc-based
+                    # derivation, not in vllm_patch/ or the scheduler.
+                    # is_new_admission_this_step distinguishes "just entered
+                    # self.running for the first time" from "continuing from
+                    # an earlier step" -- multiple True rows in the SAME step
+                    # across different requests directly proves multiple
+                    # requests were considered for admission in that one
+                    # step (informative even when none of them end up
+                    # partially chunked).
+                    "sched_num_scheduled_tokens": sched_num_scheduled_tokens.get(req_id),
+                    "is_new_admission_this_step": req_id in new_req_ids_this_step,
+                    "num_new_admissions_this_step": len(new_req_ids_this_step),
                 }
             )
 

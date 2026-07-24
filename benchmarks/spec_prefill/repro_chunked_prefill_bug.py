@@ -210,6 +210,59 @@ def analyze_diag_log(
     for rows in rows_by_req.values():
         rows.sort(key=lambda r: r["step"])
 
+    # Direct scheduler cross-check, independent of id_to_sample correlation
+    # (see diag_worker.py's comment on sched_num_scheduled_tokens/
+    # is_new_admission_this_step for why this exists): if
+    # num_scheduled_this_step (derived from query_start_loc, this repro's
+    # own downstream inference) ever disagrees with
+    # sched_num_scheduled_tokens (read straight from SchedulerOutput), the
+    # bug is in this diagnostic, not in vllm_patch/ or the scheduler --
+    # everything else in this report would be suspect.
+    all_rows = [r for rows in rows_by_req.values() for r in rows]
+    mismatches = [
+        r for r in all_rows
+        if r.get("sched_num_scheduled_tokens") is not None
+        and r["sched_num_scheduled_tokens"] != r["num_scheduled_this_step"]
+    ]
+    if mismatches:
+        print(f"[repro] WARNING: {len(mismatches)} row(s) where this script's own "
+              f"num_scheduled_this_step disagrees with the scheduler's real "
+              f"num_scheduled_tokens -- this diagnostic's query_start_loc-based "
+              f"derivation has a bug; do not trust is_prefill_chunk_step/"
+              f"positions_correct below until that's fixed. First mismatch: "
+              f"{mismatches[0]}")
+    else:
+        print(f"[repro] Cross-check OK: num_scheduled_this_step matches the "
+              f"scheduler's own num_scheduled_tokens on all {len(all_rows)} rows.")
+
+    # The most direct possible signal for "did the SCHEDULER itself ever
+    # give a pruned request fewer tokens than it needed to finish prefill
+    # this step" -- reads sched_num_scheduled_tokens (straight from
+    # SchedulerOutput) against full_target_len (PruneRecord.num_kept, this
+    # repro's own known-correct ground truth for prompt length), bypassing
+    # is_prefill_chunk_step/multi-step reasoning entirely.
+    scheduler_level_chunks = [
+        r for r in all_rows
+        if r.get("has_prune_record")
+        and r.get("sched_num_scheduled_tokens") is not None
+        and r["num_computed_before"] < r["full_target_len"]
+        and r["num_computed_before"] + r["sched_num_scheduled_tokens"] < r["full_target_len"]
+    ]
+    print(f"[repro] Scheduler-level partial-prefill rows (sched_num_scheduled_tokens "
+          f"< remaining prompt length, the most direct signal): {len(scheduler_level_chunks)}")
+
+    step1_new_admissions = next(
+        (r["num_new_admissions_this_step"] for r in all_rows if r["step"] == 1), None
+    )
+    if step1_new_admissions is not None:
+        print(f"[repro] New requests admitted in scheduler step 1: "
+              f"{step1_new_admissions} (out of {len(rows_by_req)} submitted) -- "
+              f"if this is less than the full submitted count, the rest waited "
+              f"unscheduled rather than each getting a partial share; if it's "
+              f"the full count with zero scheduler_level_chunks above, every "
+              f"request that WAS admitted got its complete length in one shot "
+              f"despite the shared budget.")
+
     # diag log rows are keyed by the WORKER-side rewritten request_id
     # (self.input_batch.req_ids, same namespace pruning_registry.get() looks
     # up against -- see pruner.py's docstring for why this differs from the
