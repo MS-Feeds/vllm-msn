@@ -202,35 +202,44 @@ def resolve_max_num_batched_tokens(
     explicit: Optional[int], token_lengths: list[int], is_baseline: bool
 ) -> int:
     """If the user didn't pass --target-max-num-batched-tokens explicitly,
-    auto-size it from the samples themselves (full prompt length for the
-    baseline, since P001 must fit every sample's complete prompt in one
-    scheduling chunk to avoid the confirmed upstream chunked-prefill-resume
-    bug -- see module docstring). For pruned experiments this is only a
-    starting point printed for visibility -- the real per-request check
-    happens after pruning, against actual kept-token counts (see
-    submit_pruned_requests's skip-and-report logic)."""
+    auto-size it off **p90**, not the raw max.
+
+    Confirmed on real hardware (2026-07-24): auto-sizing off the raw max
+    directly caused a CUDA OOM -- one dataset sample (813963 tokens, ~14x
+    p90's 58180) made the auto-sized budget balloon to 855040, which is far
+    more than an 80GB GPU can hold even before any real request runs (vLLM's
+    own internal profile_run()/`_dummy_run` simulates a full-budget-sized
+    batch to measure available memory, and OOM'd trying to allocate for it).
+    Whether that one sample is a genuine (if extreme) "short" LongBench v2
+    entry or a data/filtering anomaly in prep_longbench_v2.py is a separate
+    question worth checking directly against the samples file -- either way,
+    a single extreme sample should not be allowed to dictate a budget that
+    makes every OTHER sample's run impossible.
+
+    Both P001 (baseline, full prompt) and P002-P006 (pruned, kept-token
+    count) now use the SAME skip-and-report treatment for any individual
+    sample that doesn't fit the resolved budget (see submit_baseline_requests/
+    submit_pruned_requests) -- there is no longer a hard requirement that the
+    budget cover literally every sample, baseline included."""
+    p90_len = int(percentile(token_lengths, 0.9)) if token_lengths else 0
     max_len = token_lengths[-1] if token_lengths else 0
     if explicit is not None:
-        if is_baseline and explicit < max_len:
-            raise ValueError(
-                f"--target-max-num-batched-tokens={explicit} is smaller than "
-                f"the largest sample's full prompt ({max_len} tokens) -- the "
-                f"P001 baseline needs every sample's complete prompt to fit "
-                f"in one scheduling chunk (see module docstring's 'known "
-                f"residual risk'). Raise the budget or exclude the longest "
-                f"samples (--max-keep / a smaller samples file)."
-            )
         return explicit
 
-    # Auto-size with a small safety margin; round up to a clean multiple of
-    # 1024 for legibility, not for any correctness reason.
-    margin = max(256, max_len // 20)
-    auto = ((max_len + margin + 1023) // 1024) * 1024
+    # Auto-size off p90 with a safety margin, capped so a single extreme
+    # outlier can't balloon the budget -- oversized samples get skipped
+    # per-request instead (see docstring above). Round up to a clean
+    # multiple of 1024 for legibility, not for any correctness reason.
+    margin = max(256, p90_len // 5)
+    auto = ((p90_len + margin + 1023) // 1024) * 1024
     print(
         f"[predict_longbench_v2] --target-max-num-batched-tokens not given -- "
-        f"auto-sized to {auto} from the largest observed prompt "
-        f"({max_len} tokens + {margin}-token margin). Pass "
-        f"--target-max-num-batched-tokens explicitly to override."
+        f"auto-sized to {auto} from p90 ({p90_len} tokens + {margin}-token "
+        f"margin), NOT the raw max ({max_len} tokens) -- a single extreme "
+        f"outlier should not dictate a budget that risks OOM for everyone "
+        f"else. Samples exceeding {auto} tokens will be skipped and reported "
+        f"rather than included. Pass --target-max-num-batched-tokens "
+        f"explicitly to override."
     )
     return auto
 
@@ -255,18 +264,38 @@ def drive_engine_to_completion(llm_engine) -> dict:
     return outputs_by_id
 
 
-def submit_baseline_requests(llm, samples: list[dict], tok, max_tokens: int) -> dict:
+def submit_baseline_requests(
+    llm, samples: list[dict], tok, max_tokens: int, max_num_batched_tokens: int
+) -> tuple[dict, int]:
     """P001: plain add_request, no worker_cls/proposer/pruning at all --
     SpecPrefillWorker is provably a no-op without any registered PruneRecord
     (see vllm_patch/model_runner.py's docstring), so there's no correctness
-    reason to pay for it on the baseline."""
+    reason to pay for it on the baseline.
+
+    Skips (and reports, doesn't silently drop) any individual sample whose
+    full prompt exceeds max_num_batched_tokens -- same treatment as
+    submit_pruned_requests, no longer a hard requirement that the resolved
+    budget cover literally every sample (see resolve_max_num_batched_tokens's
+    docstring for the real-hardware OOM this replaces).
+
+    Returns: (id_to_sample, num_skipped_too_large).
+    """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
     id_to_sample: dict = {}
+    num_skipped = 0
     for i, sample in enumerate(samples):
         rendered = render_chat(tok, sample["prompt"])
         prompt_token_ids = tok.encode(rendered, add_special_tokens=False)
+        if len(prompt_token_ids) > max_num_batched_tokens:
+            num_skipped += 1
+            print(
+                f"[predict_longbench_v2] SKIP sample id={sample['id']!r}: "
+                f"full prompt length {len(prompt_token_ids)} exceeds "
+                f"--target-max-num-batched-tokens={max_num_batched_tokens}."
+            )
+            continue
         sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
         request_id = f"lbv2-{sample['id']}-{i}"
         prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
@@ -286,7 +315,7 @@ def submit_baseline_requests(llm, samples: list[dict], tok, max_tokens: int) -> 
         # in this function needs it.
         llm.llm_engine.add_request(request_id, prompt, sampling_params)
         id_to_sample[request_id] = sample
-    return id_to_sample
+    return id_to_sample, num_skipped
 
 
 def submit_pruned_requests(
@@ -474,9 +503,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         for rep in range(1, args.reps + 1):
             t0 = time.time()
             if is_baseline:
-                id_to_sample = submit_baseline_requests(llm, samples, tok, args.max_tokens)
+                id_to_sample, num_skipped = submit_baseline_requests(
+                    llm, samples, tok, args.max_tokens, max_num_batched_tokens
+                )
                 keep_stats: dict = {}
-                num_skipped = 0
             else:
                 id_to_sample, keep_stats, num_skipped = submit_pruned_requests(
                     llm, samples, tok, proposer, spec_config, speculator_device,

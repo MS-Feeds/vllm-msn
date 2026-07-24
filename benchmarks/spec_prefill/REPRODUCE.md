@@ -22,6 +22,7 @@ source /opt/conda/etc/profile.d/conda.sh
 conda create -n vllm-ablation python=3.10 -y   # skip if it already exists
 conda activate vllm-ablation
 pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+git clone https://github.com/overwindows/vllm-msn
 cd ~/vllm-msn
 VLLM_USE_PRECOMPILED=1 pip install -e .
 pip install pytest   # vllm_patch/proposer.py's build_lookahead_metadata reuses
@@ -31,6 +32,11 @@ pip install pytest   # vllm_patch/proposer.py's build_lookahead_metadata reuses
                       # unrelated fallback path never actually hit here; a real
                       # runtime dependency for this benchmark, confirmed on
                       # real hardware (ModuleNotFoundError without it).
+pip install datasets  # Hugging Face `datasets` library (distinct from
+                      # `transformers`) -- datasets/prep_longbench_v2.py's
+                      # load_dataset() call needs it; confirmed on real
+                      # hardware (ModuleNotFoundError without it) -- not
+                      # pulled in by anything else in this env.
 ```
 
 See `../evaluation_pipeline/REPRODUCE.md` steps 3-5 for the full gotchas (do not
