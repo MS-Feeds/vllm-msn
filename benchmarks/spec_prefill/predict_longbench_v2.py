@@ -185,6 +185,25 @@ def render_chat(tok, prompt: str) -> str:
     )
 
 
+_CHAT_WRAPPER_PLACEHOLDER = "@@SPEC_PREFILL_CONTENT_PLACEHOLDER@@"
+
+
+def chat_wrapper_pieces(tok) -> tuple[str, str]:
+    """Returns (before, after): the fixed chat-template text surrounding a
+    single user turn's content (e.g. `<start_of_turn>user\\n` /
+    `<end_of_turn>\\n<start_of_turn>model\\n`), independent of what that
+    content actually is. Used by submit_pruned_requests to tokenize the
+    always-kept prefix/suffix pieces separately from the prunable context --
+    see that function's docstring for why."""
+    rendered = tok.apply_chat_template(
+        [{"role": "user", "content": _CHAT_WRAPPER_PLACEHOLDER}],
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    before, after = rendered.split(_CHAT_WRAPPER_PLACEHOLDER)
+    return before, after
+
+
 def token_length_summary(tok, samples: list[dict]) -> list[int]:
     """Tokenizes every sample's rendered prompt and returns the sorted token
     counts (full, unpruned length) -- used both for the printed percentile
@@ -342,6 +361,33 @@ def submit_pruned_requests(
     the ordering (add_request first, THEN collective_rpc with the returned
     real id) is load-bearing.
 
+    **Confirmed on real hardware (2026-07-24): the question/choices/answer-
+    format instruction must be force-kept, never left to SpecPrefill's own
+    chunk-based scoring.** An earlier version fed the ENTIRE combined
+    "prompt" (context + question + choices + instruction) into
+    compute_pruned_prompt as one blob. P001 (no pruning) produced perfectly
+    coherent answers; P002-P006 (pruned) produced pure gibberish -- ruling
+    out the model/checkpoint/environment (same for both) and pointing at
+    pruning specifically. Root cause: at aggressive keep rates, the trailing
+    "Answer with a single letter..." instruction is a tiny fraction of the
+    prompt and has no special protection -- it competes for a spot against
+    thousands of document chunks and can be pruned away entirely, so the
+    model never learns it's supposed to answer a multiple-choice question at
+    all. It just free-continues whatever document fragments survived, which
+    is exactly the observed gibberish (not a positions bug -- Step B2 in
+    validate_runner_integration.py passed).
+
+    Fix: the speculator still SCORES the full context+question+choices+
+    instruction sequence (so its importance scoring still sees the actual
+    question, unaffected), but the prefix ("Please read the following long
+    text...") and suffix (question/choices/instruction + chat closing
+    wrapper) are tokenized SEPARATELY from the context and force-included in
+    the final pruned request regardless of what compute_pruned_prompt
+    decided for those positions -- only the CONTEXT region's own scoring
+    decision is honored. Tokenizing prefix/context/suffix as separate pieces
+    (rather than slicing one jointly-tokenized string at a computed
+    boundary) avoids subword-tokenization boundary ambiguity entirely.
+
     **`id_to_sample`/`keep_stats` are keyed by the ORIGINAL (caller-supplied)
     request_id, NOT the rewritten one add_request() returns** -- confirmed on
     real hardware (2026-07-23, see submit_baseline_requests's docstring for
@@ -362,14 +408,40 @@ def submit_pruned_requests(
     from vllm.inputs import TokensPrompt
     from vllm_patch.pruner import compute_pruned_prompt
 
+    # Mirrors datasets/prep_longbench_v2.py's _PROMPT_TEMPLATE exactly (must
+    # stay in sync with it) -- split into the piece that comes before
+    # {context} and the piece that comes after, so each can be tokenized
+    # independently of the (potentially huge) context.
+    _PREFIX_TEXT = "Please read the following long text and answer the question below.\n\n"
+    _SUFFIX_TEMPLATE = (
+        "\n\nQuestion: {question}\n(A) {choice_A}\n(B) {choice_B}\n(C) {choice_C}"
+        "\n(D) {choice_D}\n\nAnswer with a single letter (A, B, C, or D) "
+        "corresponding to the correct choice."
+    )
+
     id_to_sample: dict = {}
     keep_stats: dict = {}
     num_skipped = 0
 
+    chat_before, chat_after = chat_wrapper_pieces(tok)
+
     for i, sample in enumerate(samples):
-        rendered = render_chat(tok, sample["prompt"])
-        prompt_token_ids = tok.encode(rendered, add_special_tokens=False)
         request_id = f"lbv2-{sample['id']}-{i}"
+
+        prefix_text = chat_before + _PREFIX_TEXT
+        context_text = sample["context"]
+        suffix_text = _SUFFIX_TEMPLATE.format(
+            question=sample["question"],
+            choice_A=sample["choices"][0],
+            choice_B=sample["choices"][1],
+            choice_C=sample["choices"][2],
+            choice_D=sample["choices"][3],
+        ) + chat_after
+
+        prefix_ids = tok.encode(prefix_text, add_special_tokens=False)
+        context_ids = tok.encode(context_text, add_special_tokens=False)
+        suffix_ids = tok.encode(suffix_text, add_special_tokens=False)
+        full_prompt_token_ids = prefix_ids + context_ids + suffix_ids
 
         # Confirmed on real hardware (2026-07-24): the speculator's bootstrap
         # prefill (inside compute_pruned_prompt/run_lookahead_steps) must
@@ -384,11 +456,11 @@ def submit_pruned_requests(
         # precisely profiled speculator-specific budget, just a reasonable,
         # already-established bound rather than inventing a new untested
         # threshold. Skip and report (loud, not silent) rather than crash.
-        if len(prompt_token_ids) > max_num_batched_tokens:
+        if len(full_prompt_token_ids) > max_num_batched_tokens:
             num_skipped += 1
             print(
                 f"[predict_longbench_v2] SKIP sample id={sample['id']!r}: "
-                f"full (unpruned) prompt length {len(prompt_token_ids)} "
+                f"full (unpruned) prompt length {len(full_prompt_token_ids)} "
                 f"exceeds --target-max-num-batched-tokens="
                 f"{max_num_batched_tokens} -- the speculator's bootstrap "
                 f"prefill must process the whole prompt in one shot to "
@@ -397,10 +469,10 @@ def submit_pruned_requests(
             )
             continue
 
-        pruned_token_ids, kept_positions = compute_pruned_prompt(
+        raw_pruned_ids, raw_kept_positions = compute_pruned_prompt(
             proposer=proposer,
             spec_config=spec_config,
-            prompt_token_ids=prompt_token_ids,
+            prompt_token_ids=full_prompt_token_ids,
             device=speculator_device,
             head_dim=head_dim,
             eos_token_id=tok.eos_token_id,
@@ -420,11 +492,36 @@ def submit_pruned_requests(
         # accumulating across the whole 178-sample loop.
         gc.collect()
         torch.cuda.empty_cache()
+
+        # Force-keep prefix/suffix regardless of what SpecPrefill's own
+        # scoring decided for those positions -- only honor its decision for
+        # the CONTEXT region (see this function's docstring for why). The
+        # scorer still SAW the full context+question+choices+instruction
+        # sequence when computing importance, so context scoring quality is
+        # unaffected -- only the FINAL kept set is overridden here.
+        context_start = len(prefix_ids)
+        context_end = len(prefix_ids) + len(context_ids)
+        kept_context_pairs = [
+            (tok_id, pos)
+            for tok_id, pos in zip(raw_pruned_ids, raw_kept_positions)
+            if context_start <= pos < context_end
+        ]
+        kept_context_ids = [t for t, _ in kept_context_pairs]
+        kept_context_positions = [p for _, p in kept_context_pairs]
+
+        pruned_token_ids = prefix_ids + kept_context_ids + suffix_ids
+        kept_positions = (
+            list(range(context_start))
+            + kept_context_positions
+            + list(range(context_end, context_end + len(suffix_ids)))
+        )
+
         if len(pruned_token_ids) > max_num_batched_tokens:
             num_skipped += 1
             print(
                 f"[predict_longbench_v2] SKIP sample id={sample['id']!r}: "
-                f"pruned length {len(pruned_token_ids)} exceeds "
+                f"pruned length {len(pruned_token_ids)} (after force-keeping "
+                f"the question/choices/instruction) exceeds "
                 f"--target-max-num-batched-tokens={max_num_batched_tokens} -- "
                 f"would hit the confirmed upstream chunked-prefill-resume "
                 f"bug (see module docstring) rather than fitting in one "
@@ -432,7 +529,7 @@ def submit_pruned_requests(
             )
             continue
 
-        orig_len = len(prompt_token_ids)
+        orig_len = len(full_prompt_token_ids)
         sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
         prompt = TokensPrompt(prompt_token_ids=pruned_token_ids, cache_salt=request_id)
         # real_id (rewritten) is required here -- model_runner.py's

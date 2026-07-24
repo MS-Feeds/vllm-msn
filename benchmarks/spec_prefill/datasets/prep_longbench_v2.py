@@ -12,8 +12,12 @@ long_bench/pred_vllm.py's `load_dataset('THUDM/LongBench', ...)` call), filters
 to the official "short" length bucket (LongBench v2's own categorical `length`
 field, defined by the paper as <32k words -- see ../EXPERIMENT_PLAN.md's
 "Benchmark" section), and writes datasets/longbench_v2_samples.jsonl as
-{"id", "domain", "sub_domain", "difficulty", "length", "prompt",
-"choices": [...], "answer": "A"} rows.
+{"id", "domain", "sub_domain", "difficulty", "length", "prompt", "context",
+"question", "choices": [...], "answer": "A"} rows. "context"/"question" are
+stored separately (not just folded into "prompt") so predict_longbench_v2.py
+can prune only the document context and always force-keep the question/
+choices/instruction intact -- see that script's own docstring for the real
+gibberish-output bug this fixes.
 
 This script writes one combined raw text block as "prompt" (context + question
 + lettered choices + an answer-format instruction), NOT chat-template-rendered
@@ -162,6 +166,20 @@ def build_longbench_v2_samples(
                 "difficulty": row.get("difficulty"),
                 "length": row.get("length"),
                 "prompt": prompt,
+                # context/question stored separately (not just folded into
+                # "prompt") so predict_longbench_v2.py can prune ONLY the
+                # document context and always force-keep the question/
+                # choices/instruction intact -- confirmed on real hardware
+                # (2026-07-24): pruning the whole combined "prompt" as one
+                # blob risks SpecPrefill's chunk-based scorer dropping the
+                # trailing "Answer with a single letter..." instruction
+                # entirely at aggressive keep rates, since it competes for a
+                # spot against thousands of document chunks with no special
+                # protection. That produced pure gibberish (the model never
+                # learns it's supposed to answer a multiple-choice question)
+                # -- not a position-restoration bug, a scoring-scope bug.
+                "context": context,
+                "question": question,
                 "choices": choices,
                 "answer": answer,
             }
