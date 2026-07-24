@@ -92,6 +92,7 @@ from predict_longbench_v2 import (  # noqa: E402 -- see sys.path insert above
     POOL_KERNEL_SIZE,
     drive_engine_to_completion,
     load_samples,
+    render_chat,
     submit_pruned_requests,
     token_length_summary,
 )
@@ -125,6 +126,37 @@ def repeated_bigram_ratio(text: str) -> float:
     counts = Counter(bigrams)
     repeated = sum(c - 1 for c in counts.values() if c > 1)
     return repeated / len(bigrams)
+
+
+def select_shortest_samples(samples: list[dict], tok, num_samples: int) -> list[dict]:
+    """Sort ALL loaded samples by full (unpruned) rendered token length and
+    return the shortest `num_samples`.
+
+    **Confirmed on real hardware (2026-07-24): file order is NOT length
+    order.** An earlier version of this script just took the first
+    `--num-samples` after loading -- LongBench v2's "short" (<32k WORD)
+    filter still allows individual documents from ~15k to ~90k+ TOKENS
+    (word count and token count diverge a lot at this scale), and file
+    order doesn't correlate with either. `submit_pruned_requests` (reused
+    unmodified here, see module docstring) requires each sample's FULL,
+    UNPRUNED length to fit under `--target-max-num-batched-tokens` -- the
+    speculator's bootstrap prefill must score the whole document in one
+    shot -- which is a completely different constraint from the
+    budget-contention scenario this script is trying to force among
+    PRUNED requests. Picking samples by file order meant most of a
+    12-sample batch got skipped before pruning ever ran (real observed
+    lengths: 15400-88541 tokens against a 3072 budget), leaving 0 requests
+    submitted. Sorting by actual rendered length and taking the shortest
+    N is the only way to reliably get samples whose full length clears
+    that pre-check while still being numerous/small enough for their
+    PRUNED lengths to contend for a shared budget once summed."""
+    lengths = [(len(tok.encode(render_chat(tok, s["prompt"]), add_special_tokens=False)), s) for s in samples]
+    lengths.sort(key=lambda pair: pair[0])
+    chosen = lengths[:num_samples]
+    print(f"[repro] selected the {len(chosen)} shortest of {len(samples)} loaded "
+          f"samples by full rendered length: "
+          f"{[l for l, _ in chosen]}")
+    return [s for _, s in chosen]
 
 
 def analyze_diag_log(
@@ -335,19 +367,30 @@ def main() -> None:
     from vllm_patch.config import SpecConfig
     from vllm_patch.proposer import SpecPrefillProposer
 
-    # No special selection logic -- just the first --num-samples after
-    # loading. Pruned length isn't known until after the (expensive)
-    # speculator scoring pass runs, so this can't pre-filter for
-    # "individually small but collectively over budget" without running
-    # pruning twice. Rely instead on --target-max-num-batched-tokens being
-    # set small relative to --num-samples (the post-submission report below
-    # confirms whether contention was actually achieved either way).
-    samples = load_samples(args.samples, max_keep=args.num_samples)
+    # Load everything, then pick the shortest --num-samples by actual
+    # rendered length -- see select_shortest_samples's docstring for why
+    # file order (an earlier version of this script) doesn't work: full
+    # (unpruned) length must clear submit_pruned_requests's own pre-check
+    # (a completely different constraint from the budget-contention
+    # scenario under test here), and LongBench v2 "short" documents still
+    # range from ~15k to ~90k+ tokens regardless of file position.
+    all_samples = load_samples(args.samples, max_keep=-1)
     tok = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+    samples = select_shortest_samples(all_samples, tok, args.num_samples)
 
     token_lengths = token_length_summary(tok, samples)
     print(f"[repro] {len(samples)} sample(s), full (unpruned) rendered prompt "
           f"token lengths: min={token_lengths[0]} max={token_lengths[-1]}")
+    if token_lengths[-1] > args.target_max_num_batched_tokens:
+        print(
+            f"[repro] WARNING: even the shortest {len(samples)} samples' max "
+            f"full length ({token_lengths[-1]}) exceeds "
+            f"--target-max-num-batched-tokens={args.target_max_num_batched_tokens} "
+            f"-- some/all will be SKIPPED before pruning runs (same failure "
+            f"mode as before, just for however many still don't fit). Raise "
+            f"--target-max-num-batched-tokens or lower --num-samples so more "
+            f"of the dataset's shorter documents are in play."
+        )
     print(f"[repro] --target-max-num-batched-tokens={args.target_max_num_batched_tokens} "
           f"-- if this exceeds the SUM of every sample's pruned length, "
           f"contention won't be forced; the post-run report will confirm "
