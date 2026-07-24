@@ -1,11 +1,29 @@
 #!/usr/bin/env python3
-"""Repro/diagnostic for the "shared-budget-induced multi-chunk prefill"
-hypothesis discussed for the P002-P006 garbled-output investigation.
+"""Repro/diagnostic for the P002-P006 garbled-output investigation --
+tests TWO independent hypotheses about vllm_patch/'s never-real-hardware-
+tested multi-chunk-prefill code paths (see EXPERIMENT_PLAN.md and
+validate_runner_integration.py for the accuracy-affecting-instruction-
+truncation bug this ISN'T -- that one's already fixed, commit
+47fd38f8a).
 
 **Status: NOT executed here -- no GPU on this machine (same caveat every
 other validate_*.py/predict_longbench_v2.py script in this directory
 carries). Written to be run on the GPU node. Nothing below is "confirmed
 on real hardware" yet -- that's exactly what running this determines.**
+
+**Real-hardware run log, 2026-07-24 (hypothesis #1 only, before hypothesis
+#2 was added below): 12/12 concurrently-submitted samples had their
+prefill span >1 total step; discard_request_mask stayed correctly True
+through every incomplete-prefill step for all 12 -- hypothesis #1 (below)
+is RULED OUT with real evidence. Output at --max-tokens=16 was truncated
+mid-explanation for all 12 (not garbled); at --max-tokens=128, most
+resolved into long coherent text but at least one (sample
+66f37eb9821e116aacb2d295) degenerated hard into a repetition loop
+("liberty liberty liberty..."). That run's "12/12 spanned >1 step" claim
+conflated decode steps with prefill chunks (a bug in this script, since
+fixed -- see multi_chunk_prefill_requests below) -- hypothesis #2's
+direct position-identity check was added specifically to test that
+degenerating sample properly, not yet run.**
 
 What this checks, concretely: predict_longbench_v2.py's P002-P006 sweeps
 submit every sample's pruned request to the engine ~simultaneously (see
@@ -15,18 +33,27 @@ budget (`max_num_batched_tokens`). vllm/v1/core/sched/scheduler.py's
 source) means a request can get only a PARTIAL prefill chunk scheduled in
 step 1 -- not because ITS OWN prompt exceeds the budget (already checked
 per-request before submission, see submit_pruned_requests), but because
-other concurrently-running requests used up the shared pool first.
+other concurrently-running requests used up the shared pool first. This
+lands squarely on TWO separate code paths validate_runner_integration.py
+explicitly never exercised (Step B/B2 always fit in one chunk, by
+design):
 
-validate_runner_integration.py's module docstring already documents a
-CONFIRMED real-hardware bug, reproduced with PLAIN STOCK vLLM (no
-spec_prefill code involved): a request whose prefill spans >1 scheduler
-step never actually resumes past its first chunk -- the scheduler treats
-it as finished and starts sampling against an incomplete KV cache. That
-finding was for a single request individually too long for the budget.
-The open question this script answers: does the SAME failure fire when a
-request is split across steps purely from losing the shared-budget race
-against OTHER concurrent requests (predict_longbench_v2.py's actual
-scenario), which was never specifically tested?
+  Hypothesis #1: the confirmed-on-stock-vLLM "prefill never resumes past
+  its first chunk" bug (validate_runner_integration.py's docstring,
+  finding #2) -- found there for a single request individually too big
+  for the budget; open question was whether shared-budget-induced
+  splitting triggers the same failure. RULED OUT, see run log above.
+
+  Hypothesis #2: model_runner.py's multi-chunk `PruneRecord
+  .positions_for_step` continuation-chunk branch -- unit-tested
+  (test_vllm_patch.py) but, per that module's own docstring, never
+  confirmed correct against the real scheduler/runner for N>1 chunks.
+  Tests whether the ACTUAL RoPE positions the model receives on a 2nd (or
+  later) prefill chunk match what PruneRecord says they should be --
+  wrong positions there would corrupt attention without ever tripping
+  discard_request_mask (a completeness check, not a correctness one),
+  which is exactly why hypothesis #1 being ruled out doesn't rule this
+  one out too.
 
 Method: submit a handful of real LongBench v2 samples through the exact
 production pruning path (`predict_longbench_v2.submit_pruned_requests`,
@@ -36,22 +63,24 @@ can't diverge from what P002-P006 actually do), with `--target-max-num
 the shared budget is very likely exhausted before every sample's full
 (individually-small) pruned prompt fits in step 1. Drives via
 `worker_cls=diag_worker.DiagnosticSpecPrefillWorker`, which logs, every
-step, every request's (num_computed_before, num_scheduled_this_step,
-whether its prefill is complete after this step, and vLLM's own
-`discard_request_mask` value for it) to a JSONL file -- see diag_worker.py
-for why a file, not collective_rpc, and why this can't just be
-monkeypatched from the driver process.
+step, every request's completeness state (num_computed_before,
+num_scheduled_this_step, whether prefill is complete after this step,
+vLLM's own `discard_request_mask` value) AND, for genuine prefill-chunk
+steps specifically, whether the actual `self.positions` values the model
+received match `PruneRecord.positions_for_step`'s expected values -- to a
+JSONL file. See diag_worker.py for why a file, not collective_rpc, and
+why this can't just be monkeypatched from the driver process.
 
 After the run, this script:
-  1. Reports whether budget contention was actually forced (i.e. did any
-     request really take >1 step) -- if not, the repro didn't create the
-     target scenario at all; increase --num-samples or decrease
-     --target-max-num-batched-tokens and rerun.
-  2. For every request that DID span >1 step, checks whether
-     `discard_request_mask` was ever False on a step where its prefill was
-     still incomplete afterward -- that's the bug's exact signature (vLLM
-     about to sample/emit output for a request it should still be
-     silently discarding). Flags CONFIRMED for those.
+  1. Reports whether budget contention was actually forced -- specifically
+     whether any request's prefill really split across >1 CHUNK (not just
+     >1 total step, which decode alone inflates trivially -- see
+     multi_chunk_prefill_requests vs. the merely-informational
+     multi_step_requests in analyze_diag_log). If not forced, increase
+     --num-samples or decrease --target-max-num-batched-tokens and rerun.
+  2. For every request with a genuine multi-chunk prefill, checks BOTH
+     hypotheses' exact signatures independently and reports each
+     separately -- a request can fail one, both, or neither.
   3. Prints each flagged request's actual generated text alongside a
      coherence heuristic (repeated-bigram ratio) so a human can eyeball
      whether it matches the garbled pattern from the original report.
@@ -212,8 +241,10 @@ def analyze_diag_log(
         # excluded from the per-request analysis below; the "samples with no
         # diag rows" count printed at the end surfaces this instead.
 
-    multi_step_requests = []
-    confirmed_bug_requests = []
+    multi_step_requests = []  # total steps (prefill chunks + decode), informational only
+    multi_chunk_prefill_requests = []  # prefill ACTUALLY split across >1 chunk -- the real signal
+    completeness_bug_requests = []  # hypothesis #1: discard_request_mask wrong
+    position_bug_requests = []  # hypothesis #2: wrong position identity on a later chunk
 
     for original_id, sample in id_to_sample.items():
         real_id = original_to_real.get(original_id)
@@ -221,52 +252,78 @@ def analyze_diag_log(
             continue
         rows = rows_by_req[real_id]
         num_steps = len(rows)
-        if num_steps <= 1:
-            continue
-        multi_step_requests.append((original_id, real_id, num_steps))
+        if num_steps > 1:
+            multi_step_requests.append((original_id, real_id, num_steps))
 
-        # The bug's exact signature: on some step, this request's prefill is
-        # NOT complete afterward, yet discard_request_mask is False (vLLM
-        # about to sample/emit for it anyway instead of correctly
-        # withholding output until prefill actually finishes).
-        bad_steps = [
+        # The REAL "did prefill span multiple chunks" signal -- num_steps
+        # above conflates this with decode steps (one row per generated
+        # token too), which is why an earlier version of this report's
+        # "Requests that spanned >1 scheduler step: 12" at --max-tokens=16
+        # and "...128" at --max-tokens=128 wasn't actually confirming
+        # multi-chunk prefill, just multi-step generation (true for nearly
+        # any request that generates more than one token).
+        prefill_chunk_rows = [r for r in rows if r["is_prefill_chunk_step"]]
+        if len(prefill_chunk_rows) > 1:
+            multi_chunk_prefill_requests.append((original_id, real_id, len(prefill_chunk_rows)))
+
+        # Hypothesis #1's exact signature: on some step, this request's
+        # prefill is NOT complete afterward, yet discard_request_mask is
+        # False (vLLM about to sample/emit for it anyway instead of
+        # correctly withholding output until prefill actually finishes).
+        bad_completeness_steps = [
             r for r in rows
             if not r["prefill_complete_after_this_step"] and not r["discard_request_mask"]
         ]
-        if bad_steps:
-            confirmed_bug_requests.append((original_id, real_id, bad_steps))
+        if bad_completeness_steps:
+            completeness_bug_requests.append((original_id, real_id, bad_completeness_steps))
+
+        # Hypothesis #2's exact signature: on some prefill-chunk step
+        # (first OR a later continuation), the actual positions the model
+        # received don't match what PruneRecord says they should be.
+        bad_position_steps = [r for r in prefill_chunk_rows if r["positions_correct"] is False]
+        if bad_position_steps:
+            position_bug_requests.append((original_id, real_id, bad_position_steps))
 
     print(f"\n{'=' * 70}\nDiagnostic results\n{'=' * 70}")
     print(f"Requests with a diag-log entry: {len(rows_by_req)}")
-    print(f"Requests that spanned >1 scheduler step: {len(multi_step_requests)}")
-    if not multi_step_requests:
+    print(f"Requests with >1 total step (prefill chunks + decode combined, "
+          f"informational only -- NOT proof of multi-chunk prefill): "
+          f"{len(multi_step_requests)}")
+    print(f"Requests where prefill ACTUALLY split across >1 chunk "
+          f"(the real contention signal): {len(multi_chunk_prefill_requests)}")
+    if not multi_chunk_prefill_requests:
         print(
             "\n[repro] Budget contention was NOT forced -- every request's "
-            "prefill fit in a single step. This repro didn't exercise the "
-            "scenario under test. Rerun with more --num-samples and/or a "
-            "smaller --target-max-num-batched-tokens."
+            "prefill fit in a single chunk (decode alone can still produce "
+            "many total steps, which is not the same thing). This repro "
+            "didn't exercise the scenario under test. Rerun with more "
+            "--num-samples and/or a smaller --target-max-num-batched-tokens."
         )
         return
 
     print(f"Requests where discard_request_mask=False on an INCOMPLETE-prefill "
-          f"step (bug signature): {len(confirmed_bug_requests)}")
+          f"step (hypothesis #1 signature): {len(completeness_bug_requests)}")
+    print(f"Requests where actual RoPE positions != PruneRecord on a prefill "
+          f"chunk, first or later (hypothesis #2 signature): "
+          f"{len(position_bug_requests)}")
 
-    if not confirmed_bug_requests:
-        print(
-            "\n[repro] Contention was forced (some requests took >1 step), but "
-            "discard_request_mask correctly stayed True until prefill actually "
-            "finished for all of them -- no evidence of the "
-            "never-resumes-past-first-chunk bug firing here. The garbled "
-            "output has some OTHER cause; the untested "
-            "PruneRecord.positions_for_step multi-chunk branch (never "
-            "confirmed correct on real hardware either) is the next thing to "
-            "check directly, e.g. by comparing kept token IDENTITY (not just "
-            "count) against what was registered."
-        )
-    else:
-        print(f"\n[repro] BUG SIGNATURE CONFIRMED for {len(confirmed_bug_requests)} "
+    if position_bug_requests:
+        print(f"\n[repro] HYPOTHESIS #2 CONFIRMED for {len(position_bug_requests)} "
+              f"request(s) -- model_runner.py's multi-chunk "
+              f"PruneRecord.positions_for_step branch IS delivering wrong "
+              f"positions on a real chunk boundary. Details:\n")
+        for original_id, real_id, bad_steps in position_bug_requests[:5]:
+            sample = id_to_sample[original_id]
+            print(f"--- sample id={sample['id']!r} (request_id={original_id!r}) ---")
+            for r in bad_steps[:3]:
+                print(f"  step={r['step']} num_computed_before={r['num_computed_before']} "
+                      f"num_scheduled_this_step={r['num_scheduled_this_step']}")
+            print()
+
+    if completeness_bug_requests:
+        print(f"\n[repro] HYPOTHESIS #1 CONFIRMED for {len(completeness_bug_requests)} "
               f"request(s). Sampled details:\n")
-        for original_id, real_id, bad_steps in confirmed_bug_requests[:5]:
+        for original_id, real_id, bad_steps in completeness_bug_requests[:5]:
             sample = id_to_sample[original_id]
             output = outputs_by_id.get(original_id)
             text = output.outputs[0].text if output is not None else "<no output captured>"
@@ -279,20 +336,37 @@ def analyze_diag_log(
             print(f"  generated text: {text[:300]!r}")
             print()
 
-    # Requests that took >1 step but were NOT flagged -- useful negative
-    # signal either way (proves contention was forced without the bug
-    # firing for them specifically, or shows partial firing).
-    clean_multi_step = [
-        (oid, rid, n) for oid, rid, n in multi_step_requests
-        if oid not in {c[0] for c in confirmed_bug_requests}
+    if not completeness_bug_requests and not position_bug_requests:
+        print(
+            "\n[repro] Neither hypothesis fired, on a real (not single-chunk) "
+            "multi-chunk prefill. Both the confirmed-on-stock-vLLM "
+            "'never resumes' failure mode AND the never-real-hardware-tested "
+            "multi-chunk position-override branch are now ruled out with "
+            "actual evidence, not assumption. Whatever is producing "
+            "incoherent output (e.g. the repetition-loop sample from the "
+            "128-token run) has some OTHER cause -- most likely the "
+            "SpecPrefill scoring/pruning ALGORITHM itself making a bad token "
+            "selection for that specific document (an accuracy/tuning "
+            "problem, not a plumbing bug), not this runner-integration path."
+        )
+
+    # Requests where prefill genuinely split across chunks but neither
+    # hypothesis's signature fired -- useful negative signal either way.
+    flagged_ids = {c[0] for c in completeness_bug_requests} | {c[0] for c in position_bug_requests}
+    clean_multi_chunk = [
+        (oid, rid, n) for oid, rid, n in multi_chunk_prefill_requests
+        if oid not in flagged_ids
     ]
-    print(f"\nMulti-step requests WITHOUT the bug signature: {len(clean_multi_step)}")
-    for original_id, real_id, num_steps in clean_multi_step[:5]:
+    print(f"\nMulti-chunk-prefill requests WITHOUT either bug signature: "
+          f"{len(clean_multi_chunk)}")
+    for original_id, real_id, num_chunks in clean_multi_chunk[:5]:
         sample = id_to_sample[original_id]
         output = outputs_by_id.get(original_id)
         text = output.outputs[0].text if output is not None else "<no output captured>"
-        print(f"  sample id={sample['id']!r}: {num_steps} steps, "
-              f"repeated-bigram ratio={repeated_bigram_ratio(text):.2f}, "
+        ratio = repeated_bigram_ratio(text)
+        print(f"  sample id={sample['id']!r}: {num_chunks} prefill chunks, "
+              f"repeated-bigram ratio={ratio:.2f} "
+              f"({'looks garbled/loopy' if ratio > 0.3 else 'looks plausibly coherent'}), "
               f"text={text[:150]!r}")
 
 

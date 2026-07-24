@@ -112,6 +112,37 @@ class DiagnosticSpecPrefillGPUModelRunner(SpecPrefillGPUModelRunner):
             num_computed_after = num_computed_before + num_scheduled_this_step
             prefill_complete_after_this_step = num_computed_after >= full_target_len
 
+            # Direct identity check for model_runner.py's untested multi-chunk
+            # PruneRecord.positions_for_step branch (see this repro's own
+            # module docstring, hypothesis #2): expected_positions is the
+            # EXACT list of original positions this step's tokens should carry
+            # if this is a prefill chunk (any chunk -- first or a later
+            # continuation), or None if this step is decode (positions_for_step
+            # already makes that distinction, see pruning_registry.py). Compare
+            # against self.positions[start:end] -- the actual, real values
+            # about to be fed into the model's RoPE this step, read via the
+            # exact same "self.positions is a persistent, already-overridden
+            # instance buffer" property model_runner.py's own docstring
+            # documents and validate_runner_integration.py's Step B/B2 already
+            # relied on for the single-chunk case. is_prefill_chunk_step=True
+            # + positions_correct=False on ANY row is the smoking gun for
+            # hypothesis #2; is_prefill_chunk_step=True +
+            # positions_correct=True on EVERY row (including 2nd/3rd/...
+            # continuation chunks, which Step B/B2 never exercised) rules it
+            # out with the same rigor hypothesis #1 was ruled out with.
+            is_prefill_chunk_step = False
+            positions_correct = None
+            if record is not None:
+                expected_positions = record.positions_for_step(
+                    num_computed_before, num_scheduled_this_step
+                )
+                if expected_positions is not None:
+                    is_prefill_chunk_step = True
+                    actual_positions = (
+                        self.positions[start:end].detach().to("cpu").tolist()
+                    )
+                    positions_correct = actual_positions == expected_positions
+
             rows.append(
                 {
                     "step": step,
@@ -128,6 +159,8 @@ class DiagnosticSpecPrefillGPUModelRunner(SpecPrefillGPUModelRunner):
                     # unmodified here, not re-derived -- so this diagnostic
                     # can never disagree with what the real sampler saw.
                     "discard_request_mask": bool(discard_mask_np[req_idx]),
+                    "is_prefill_chunk_step": is_prefill_chunk_step,
+                    "positions_correct": positions_correct,
                 }
             )
 
