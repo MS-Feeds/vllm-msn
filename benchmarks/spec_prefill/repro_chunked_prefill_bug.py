@@ -286,7 +286,19 @@ def main() -> None:
                               "unconditionally at construction time, unrelated to "
                               "what this script is testing (see "
                               "MIN_MAX_NUM_BATCHED_TOKENS above).")
-    parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.6)
+    parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.9,
+                         help="Matches predict_longbench_v2.py's own default, NOT "
+                              "validate_runner_integration.py's 0.6 -- that lower "
+                              "value is a workaround specific to sharing ONE GPU "
+                              "between target and speculator, confirmed on real "
+                              "hardware (2026-07-24, this script) to leave "
+                              "negative KV-cache memory otherwise: the target's "
+                              "~48.5 GiB of weights alone consume essentially all "
+                              "of a 0.6-of-80GB budget. This script puts the "
+                              "speculator on a second GPU when available (same as "
+                              "predict_longbench_v2.py), so there's no reason to "
+                              "keep the conservative single-GPU value. Lower this "
+                              "explicitly if actually sharing one GPU.")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--speculator-device", default=None)
     parser.add_argument("--max-tokens", type=int, default=16)
