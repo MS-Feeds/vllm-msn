@@ -19,6 +19,24 @@ export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 # If missing, download it (see REPRODUCE.md step 3) and update this path.
 export GEMMA4_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52
 
+# Text-only variant of the target model (vision/audio/video weights + config
+# stripped -- see ../../examples/create_text_only_model.py). Confirmed on
+# real hardware (2026-07-24): the full multimodal checkpoint above loads as
+# Gemma4ForConditionalGeneration, which reserves a multimodal "encoder cache"
+# (sized off max_num_batched_tokens) even for pure-text workloads like
+# LongBench v2 -- this ate ~12GB of GPU memory that would otherwise go to KV
+# cache, exactly the difference between this pipeline's available KV cache
+# and gemma4_moe_benchmarks' (which always uses model_variant="text_only").
+# Without vision_config, this should resolve as plain Gemma4ForCausalLM
+# instead and skip that reservation entirely -- confirm the startup log says
+# "Resolved architecture: Gemma4ForCausalLM" (not
+# "Gemma4ForConditionalGeneration") and no "Encoder cache" line appears.
+# Not yet generated on this node -- run:
+#   python3 ../../examples/create_text_only_model.py \
+#       --model_path "$GEMMA4_MODEL_PATH" \
+#       --output_path /scratch/hf_cache/gemma-4-26B-A4B-it-text-only
+export GEMMA4_TEXT_ONLY_MODEL_PATH=/scratch/hf_cache/gemma-4-26B-A4B-it-text-only
+
 # Speculator model (SpecPrefill-specific -- not used by gemma4_moe_benchmarks
 # or evaluation_pipeline, see that pipeline's own .env_exports.sh for its NOTE
 # on this). Already downloaded; this path was filled in when .env_exports.sh

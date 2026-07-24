@@ -85,6 +85,23 @@ fork's vLLM until the port (Implementation status #1-#2) is done.
   If missing, download it the same way as the speculator below
   (`hf download google/gemma-4-26B-A4B-it --cache-dir /scratch/hf_cache`) and
   update `GEMMA4_MODEL_PATH` in `.env_exports.sh`.
+- **Text-only variant of the target** (`GEMMA4_TEXT_ONLY_MODEL_PATH`): use this
+  instead of `GEMMA4_MODEL_PATH` for `predict_longbench_v2.py` runs (pure-text
+  workload, no images/video). Confirmed on real hardware (2026-07-24): the
+  full multimodal checkpoint reserves a multimodal "encoder cache" (~12GB)
+  even for text-only requests, at the direct expense of KV cache memory —
+  this is why `gemma4_moe_benchmarks` (which always uses
+  `model_variant="text_only"`) has noticeably more KV cache headroom than
+  this pipeline did before switching. Not downloaded by `hf download` — it's
+  generated locally from the full checkpoint:
+  ```bash
+  python3 ../../examples/create_text_only_model.py \
+      --model_path "$GEMMA4_MODEL_PATH" \
+      --output_path /scratch/hf_cache/gemma-4-26B-A4B-it-text-only
+  ```
+  Confirm it worked by checking the engine startup log says
+  `Resolved architecture: Gemma4ForCausalLM` (not `Gemma4ForConditionalGeneration`)
+  and no "Encoder cache" line appears.
 - **Gemma-4-E2B-it (speculator)**: `.env_exports.sh`'s `GEMMA4_E2B_MODEL_PATH`
   already carries a specific, already-downloaded snapshot path (filled in when
   `.env_exports.sh` was moved into this directory) — same as `GEMMA4_MODEL_PATH`
