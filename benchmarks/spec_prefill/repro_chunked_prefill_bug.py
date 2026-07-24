@@ -60,7 +60,18 @@ Usage:
     python3 repro_chunked_prefill_bug.py \
         --target-model $GEMMA4_MODEL_PATH \
         --speculator-model $GEMMA4_E2B_MODEL_PATH \
-        --num-samples 12 --target-max-num-batched-tokens 1200
+        --num-samples 12 --target-max-num-batched-tokens 3072
+
+Note: --target-max-num-batched-tokens has a hard floor of 2496 regardless of
+what value would otherwise best force contention -- Gemma-4-26B-A4B-it's
+multimodal-bidirectional attention requires max_num_batched_tokens >=
+max_tokens_per_mm_item (vllm/platforms/cuda.py:221-241, already documented
+in validate_runner_integration.py's own docstring; confirmed here too, the
+hard way: "ValueError: Chunked MM input disabled but max_tokens_per_mm_item
+(2496) is larger than max_num_batched_tokens (1200)" against an earlier,
+too-low default). If 2496 doesn't comfortably force contention with
+--num-samples's default, raise --num-samples rather than lowering the
+budget further -- it can't go below that floor.
 """
 
 from __future__ import annotations
@@ -86,6 +97,17 @@ from predict_longbench_v2 import (  # noqa: E402 -- see sys.path insert above
 )
 
 DEFAULT_DIAG_LOG = Path(os.environ.get("BENCH_RESULTS_DIR", "results")) / "chunked_prefill_diag.jsonl"
+
+# Gemma-4-26B-A4B-it's multimodal-bidirectional attention forces chunked MM
+# input off unconditionally (vllm/platforms/cuda.py:221-241, per
+# validate_runner_integration.py's own docstring), which requires
+# max_num_batched_tokens >= max_tokens_per_mm_item (2496 for this model) at
+# LLM construction time -- not overridable, a hard floor regardless of what
+# this script is trying to test. Confirmed on real hardware the hard way:
+# "ValueError: Chunked MM input disabled but max_tokens_per_mm_item (2496)
+# is larger than max_num_batched_tokens (1200)" with an earlier default
+# below this floor.
+MIN_MAX_NUM_BATCHED_TOKENS = 2496
 
 
 def repeated_bigram_ratio(text: str) -> float:
@@ -254,11 +276,16 @@ def main() -> None:
                          help="Aggressive-ish keep rate, deliberately not one of "
                               "P002-P006's exact values -- this script isolates "
                               "the chunking mechanism, not the accuracy sweep.")
-    parser.add_argument("--target-max-num-batched-tokens", type=int, default=1200,
+    parser.add_argument("--target-max-num-batched-tokens", type=int, default=3072,
                          help="Deliberately small relative to --num-samples, to "
                               "force the shared budget to be exhausted before "
                               "every sample's (individually-small) pruned prompt "
-                              "fits in scheduling step 1.")
+                              "fits in scheduling step 1. Must be >= "
+                              f"{MIN_MAX_NUM_BATCHED_TOKENS} -- Gemma-4-26B-A4B-it's "
+                              "multimodal-bidirectional attention forces this floor "
+                              "unconditionally at construction time, unrelated to "
+                              "what this script is testing (see "
+                              "MIN_MAX_NUM_BATCHED_TOKENS above).")
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--speculator-device", default=None)
@@ -269,6 +296,18 @@ def main() -> None:
     if not args.target_model or not args.speculator_model:
         parser.error("--target-model/--speculator-model (or $GEMMA4_MODEL_PATH/"
                       "$GEMMA4_E2B_MODEL_PATH) are required.")
+
+    if args.target_max_num_batched_tokens < MIN_MAX_NUM_BATCHED_TOKENS:
+        parser.error(
+            f"--target-max-num-batched-tokens={args.target_max_num_batched_tokens} "
+            f"is below Gemma-4-26B-A4B-it's hard floor of "
+            f"{MIN_MAX_NUM_BATCHED_TOKENS} (multimodal-bidirectional attention "
+            f"forces chunked MM input off, which requires max_num_batched_tokens "
+            f">= max_tokens_per_mm_item -- see MIN_MAX_NUM_BATCHED_TOKENS's "
+            f"comment above). This floor is unrelated to the budget-contention "
+            f"scenario under test -- raise --num-samples instead if you need "
+            f"more contention at a budget above this floor."
+        )
 
     # Truncate any stale log from a previous run -- see diag_worker.py's
     # docstring: the worker process only ever APPENDS.
