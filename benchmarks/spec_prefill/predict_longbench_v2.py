@@ -122,12 +122,19 @@ LOOK_AHEAD_CNT = 8
 POOL_KERNEL_SIZE = 13
 
 PRUNE_EXPERIMENTS = {
-    "P001": {"label": "Baseline (no SpecPrefill)", "keep_percentage": None},
-    "P002": {"label": "Keep 10%", "keep_percentage": 0.1},
-    "P003": {"label": "Keep 30%", "keep_percentage": 0.3},
-    "P004": {"label": "Keep 50%", "keep_percentage": 0.5},
-    "P005": {"label": "Keep 70%", "keep_percentage": 0.7},
-    "P006": {"label": "Keep 90%", "keep_percentage": 0.9},
+    "P001": {"label": "Baseline (no SpecPrefill)", "keep_percentage": None, "model": "target"},
+    "P002": {"label": "Keep 10%", "keep_percentage": 0.1, "model": "target"},
+    "P003": {"label": "Keep 30%", "keep_percentage": 0.3, "model": "target"},
+    "P004": {"label": "Keep 50%", "keep_percentage": 0.5, "model": "target"},
+    "P005": {"label": "Keep 70%", "keep_percentage": 0.7, "model": "target"},
+    "P006": {"label": "Keep 90%", "keep_percentage": 0.9, "model": "target"},
+    # Standalone speculator (Gemma-4-E2B-it) baseline -- no pruning, no target
+    # model involved at all. Answers "how well does the small speculator do
+    # on its own?", a useful reference point distinct from P001 (the 26B
+    # target's own unpruned baseline) -- e.g. to sanity-check that
+    # SpecPrefill's pruned target-model accuracy (P002-P006) isn't secretly
+    # just tracking the much weaker speculator's own ceiling.
+    "E2B": {"label": "E2B standalone baseline (no pruning)", "keep_percentage": None, "model": "speculator"},
 }
 
 
@@ -558,11 +565,16 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     label = exp_cfg["label"]
     keep_percentage = exp_cfg["keep_percentage"]
     is_baseline = keep_percentage is None
+    # Which checkpoint this experiment actually generates from -- "target"
+    # (Gemma-4-26B-A4B-it, P001-P006) or "speculator" (Gemma-4-E2B-it
+    # standalone, e.g. "E2B": no pruning machinery involved either way, same
+    # as any other is_baseline=True row, just a different model path.
+    model_path = args.speculator_model if exp_cfg.get("model") == "speculator" else args.target_model
 
     print(f"\n{'=' * 70}\n{exp_id}: {label}\n{'=' * 70}")
 
     samples = load_samples(args.samples, args.max_keep)
-    tok = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     token_lengths = token_length_summary(tok, samples)
     print(
@@ -591,7 +603,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     max_model_len = max_num_batched_tokens + args.max_tokens
 
     llm_kwargs = dict(
-        model=args.target_model,
+        model=model_path,
         trust_remote_code=True,
         enforce_eager=True,
         disable_log_stats=False,  # required for RequestOutput.metrics (TTFT)
@@ -783,7 +795,8 @@ def main() -> None:
 
     if args.list:
         for exp_id, cfg in PRUNE_EXPERIMENTS.items():
-            print(f"{exp_id}: {cfg['label']} (keep_percentage={cfg['keep_percentage']})")
+            print(f"{exp_id}: {cfg['label']} (keep_percentage={cfg['keep_percentage']}, "
+                  f"model={cfg.get('model', 'target')})")
         return
 
     if args.output_dir is not None:
@@ -794,8 +807,6 @@ def main() -> None:
 
     if not args.exp:
         parser.error("--exp is required (or use --list)")
-    if not args.target_model:
-        parser.error("--target-model or $GEMMA4_MODEL_PATH is required")
 
     ensure_csv_header()
     exp_ids = [x.strip() for x in args.exp.split(",")]
@@ -804,7 +815,16 @@ def main() -> None:
         if exp_id not in PRUNE_EXPERIMENTS:
             print(f"Unknown experiment ID: {exp_id!r} (see --list)")
             sys.exit(1)
-        if PRUNE_EXPERIMENTS[exp_id]["keep_percentage"] is not None and not args.speculator_model:
+        exp_cfg = PRUNE_EXPERIMENTS[exp_id]
+        # --target-model is only required for experiments that actually
+        # generate from the target checkpoint -- "E2B" runs entirely off
+        # --speculator-model and needs no target model at all.
+        if exp_cfg.get("model", "target") == "target" and not args.target_model:
+            parser.error(f"{exp_id} requires --target-model or $GEMMA4_MODEL_PATH")
+        # --speculator-model is required either for pruning (P002-P006) or
+        # for a standalone speculator experiment like "E2B".
+        if (exp_cfg["keep_percentage"] is not None or exp_cfg.get("model") == "speculator") \
+                and not args.speculator_model:
             parser.error(f"{exp_id} requires --speculator-model or $GEMMA4_E2B_MODEL_PATH")
         try:
             run_experiment(exp_id, PRUNE_EXPERIMENTS[exp_id], args)
