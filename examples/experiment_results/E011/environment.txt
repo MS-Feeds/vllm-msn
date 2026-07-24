@@ -1,0 +1,32 @@
+# Experiment E011 - Environment Info
+Date: 2026-05-21 03:24:56
+
+## Configuration
+Model: /nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-text-only
+Backend: FLASHINFER
+Batch Size: 128
+Max Batched Tokens: 32768
+Max Model Len: 32768
+Max Tokens/Request: 1024
+FP8: true
+Quantization: fp8
+KV Cache Dtype: auto
+CUDA Graphs: true
+MTP: true
+GPU Memory Util: 0.80
+Text-Only: true
+
+## Hardware
+name, memory.total [MiB], driver_version, compute_cap
+NVIDIA A100 80GB PCIe, 81920 MiB, 560.35.03, 8.0
+
+## Software
+Python 3.10.20
+PyTorch: 2.11.0+cu126
+vLLM: 0.21.1rc1.dev253+g2514eda53.d20260520
+Attention Backend: FLASHINFER
+FlashInfer MoE FP8: disabled
+
+## Git Commit
+7cefd888c Improve environment activation and model check logic
+7cefd888c09495aafc7a28aad564f57b424d57eb
