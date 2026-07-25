@@ -71,13 +71,22 @@ def cuda_platform_plugin() -> str | None:
             # we need to check if vllm is built with cpu too.
             # Otherwise, vllm will always activate cuda plugin
             # on a GPU machine, even if in a cpu build.
+            # Check if this is a CPU-only vLLM build installed via pip.
+            # When vLLM is loaded via PYTHONPATH (not pip-installed), the
+            # package metadata is absent and version("vllm") throws
+            # PackageNotFoundError. In that case we conservatively assume
+            # it is NOT a CPU build (i.e., treat as CUDA-capable).
+            try:
+                is_cpu_build = vllm_version_matches_substr("cpu")
+            except Exception:
+                is_cpu_build = False
             is_cuda = (
                 pynvml.nvmlDeviceGetCount() > 0
-                and not vllm_version_matches_substr("cpu")
+                and not is_cpu_build
             )
             if pynvml.nvmlDeviceGetCount() <= 0:
                 logger.debug("CUDA platform is not available because no GPU is found.")
-            if vllm_version_matches_substr("cpu"):
+            if is_cpu_build:
                 logger.debug(
                     "CUDA platform is not available because vLLM is built with CPU."
                 )
