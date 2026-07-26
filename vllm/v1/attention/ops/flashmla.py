@@ -84,16 +84,22 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 
 
 if _is_flashmla_available()[0]:
-    from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
-        FlashMLASchedMeta,
-        flash_attn_varlen_func,
-        flash_attn_varlen_kvpacked_func,
-        flash_attn_varlen_qkvpacked_func,
-        flash_mla_sparse_fwd,
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
-else:
+    try:
+        from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
+            FlashMLASchedMeta,
+            flash_attn_varlen_func,
+            flash_attn_varlen_kvpacked_func,
+            flash_attn_varlen_qkvpacked_func,
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+    except (ImportError, ModuleNotFoundError):
+        # The C extension (.so) is present but the Python package path
+        # vllm.third_party.flashmla is not installed (e.g. A100 AML nodes).
+        # Fall through to the stub definitions below.
+        _flashmla_C_AVAILABLE = False
+if not _is_flashmla_available()[0]:
 
     class FlashMLASchedMeta:  # type: ignore[no-redef]
         pass
