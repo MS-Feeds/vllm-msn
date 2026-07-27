@@ -540,6 +540,11 @@ class Scheduler(SchedulerInterface):
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
+        # budget_charges[req_id] is the amount actually deducted from
+        # token_budget for each request.  For Gemma4 MTP requests this is
+        # less than num_scheduled_tokens[req_id] because spec tokens reuse
+        # the target model's KV slot and should not be counted against budget.
+        budget_charges: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         spec = self.vllm_config.speculative_config
         draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
@@ -706,7 +711,10 @@ class Scheduler(SchedulerInterface):
                             preempted_req_id = preempted_req.request_id
                             scheduled_running_reqs.remove(preempted_req)
                             restored = num_scheduled_tokens.pop(preempted_req_id)
-                            token_budget += restored
+                            token_budget += budget_charges.pop(
+                                preempted_req_id,
+                                restored,
+                            )
                             input_budget += restored + draft_slots
                             req_to_new_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
@@ -744,7 +752,30 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
-            token_budget -= num_new_tokens
+
+            # Gemma4 MTP budget correction:
+            # With constant_draft_positions=True the Gemma4 proposer runs all
+            # k draft steps from the *same* target-model position.  Draft
+            # tokens therefore reuse the KV slot that the target model already
+            # allocated — no new rows are written to the KV cache for them.
+            # The scheduler's default accounting charges the full
+            # num_tokens_with_spec (prompt + output + spec) against
+            # token_budget, which over-counts by len(spec_token_ids) and
+            # starves decode batches when the queue is long.
+            #
+            # Fix: when Gemma4 MTP is active and this request carries spec
+            # tokens, subtract their count from the budget charge so that only
+            # the tokens that actually need a new KV row are counted.
+            # NOTE: num_scheduled_tokens keeps the full count because downstream
+            # engine code uses it to advance num_computed_tokens correctly.
+            # budget_charges tracks only what was deducted from token_budget so
+            # that preemption rollback and the post-schedule assertion stay consistent.
+            budget_charge = num_new_tokens
+            if self._gemma4_mtp_active and request.spec_token_ids:
+                num_spec = len(request.spec_token_ids)
+                budget_charge = max(0, num_new_tokens - num_spec)
+            budget_charges[request_id] = budget_charge
+            token_budget -= budget_charge
             input_budget -= num_new_tokens + draft_slots
             req_index += 1
 
@@ -1210,7 +1241,12 @@ class Scheduler(SchedulerInterface):
                     request_id
                 )
                 num_scheduled_tokens[request_id] = num_new_tokens
-                token_budget -= num_new_tokens
+                # Apply Gemma4 MTP budget correction for newly-admitted requests too.
+                _wbudget_charge = num_new_tokens
+                if self._gemma4_mtp_active and request.spec_token_ids:
+                    _wbudget_charge = max(0, num_new_tokens - len(request.spec_token_ids))
+                budget_charges[request_id] = _wbudget_charge
+                token_budget -= _wbudget_charge
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
@@ -1248,7 +1284,10 @@ class Scheduler(SchedulerInterface):
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
-        assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+        # Use budget_charges (discounted for Gemma4 MTP) to validate against
+        # max_num_scheduled_tokens, because token_budget was decremented by
+        # budget_charges, not by num_scheduled_tokens.
+        assert sum(budget_charges.values()) <= self.max_num_scheduled_tokens
 
         assert token_budget >= 0
         assert input_budget >= 0
