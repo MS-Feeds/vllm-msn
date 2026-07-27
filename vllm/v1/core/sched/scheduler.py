@@ -563,11 +563,20 @@ class Scheduler(SchedulerInterface):
                     spec_token_ids = request.spec_token_ids
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
-                    # Dynamic-k: clip to per-request adaptive k when Gemma4 MTP
-                    # is active.  Requests with high recent acceptance rate keep
-                    # k=_dynk_max (= num_spec_tokens); requests with low acceptance
-                    # are capped at _dynk_min to avoid paying target-model attention
-                    # cost for tokens that will almost certainly be rejected.
+                    # Dynamic-k: limit effective spec tokens per request when
+                    # Gemma4 MTP is active.  Requests with high recent acceptance
+                    # rate keep k=_dynk_max (= num_spec_tokens); low-acceptance
+                    # requests are reduced to _dynk_min.
+                    #
+                    # IMPORTANT: CUDA graphs are captured at a fixed batch shape
+                    # that includes num_spec_tokens spec positions.  We must NOT
+                    # truncate spec_token_ids to a shorter list — that would change
+                    # the tensor layout and cause a device-side scatter/gather
+                    # index-out-of-bounds assert during graph replay.
+                    # Instead, pad extra positions with -1 (invalid token marker).
+                    # The target model will execute all spec positions but will
+                    # reject the -1 slots, giving the same throughput benefit
+                    # without breaking CUDA graph shapes.
                     if self._gemma4_mtp_active and len(spec_token_ids) > 0:
                         req_id = request.request_id
                         accept_rate = self._req_accept_ema.get(
@@ -580,7 +589,13 @@ class Scheduler(SchedulerInterface):
                             round(self._dynk_min + t * (self._dynk_max - self._dynk_min))
                         )
                         if len(spec_token_ids) > adaptive_k:
-                            spec_token_ids = spec_token_ids[:adaptive_k]
+                            # Pad excess positions with -1 instead of truncating,
+                            # so the list length (= num_spec_tokens) stays constant
+                            # and CUDA graph batch shapes remain valid.
+                            spec_token_ids = (
+                                list(spec_token_ids[:adaptive_k])
+                                + [-1] * (len(spec_token_ids) - adaptive_k)
+                            )
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
