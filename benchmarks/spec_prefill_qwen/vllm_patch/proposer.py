@@ -620,7 +620,6 @@ class SpecPrefillProposer:
         from tests.v1.attention.utils import (  # proven pattern, see docstring
             BatchSpec,
             create_common_attn_metadata,
-            create_dummy_kv_cache,
             create_standard_kv_cache_spec,
             try_get_attention_backend,
         )
@@ -631,29 +630,6 @@ class SpecPrefillProposer:
         # look_ahead_cnt, so this is the true max block count needed --
         # verified arithmetic, no slack/off-by-one.
         num_blocks_needed = -(-(prompt_len + look_ahead_cnt) // block_size)
-
-        kv_cache_spec = create_standard_kv_cache_spec(self.vllm_config)
-        for self_attn in self._speculator_layers:
-            # Confirmed on real hardware for the sibling Gemma4 pipeline:
-            # allocating every layer's dummy cache with a single global
-            # head_dim (the `head_dim` parameter, typically caller-supplied
-            # from layer 0) was wrong there -- Gemma-4-E2B-it's
-            # full-attention layers (head_dim=512) would get a cache tensor
-            # sized for its sliding-attention layers' 256, undersized for
-            # what their real forward pass writes. Each layer's own
-            # self_attn.head_dim is used instead, per layer -- for
-            # Qwen3-1.7B (uniform head_dim across layers, not independently
-            # confirmed here) this degenerates to every layer getting the
-            # same size, so no code change is needed, only this rationale.
-            dummy_cache = create_dummy_kv_cache(
-                block_size,
-                num_kv_heads,
-                self_attn.head_dim,
-                self.vllm_config.model_config.dtype,
-                self.device,
-                num_blocks=num_blocks_needed,
-            )
-            self_attn.attn.kv_cache = dummy_cache
 
         # self.vllm_config.attention_config.backend is only populated when a
         # model-specific config hook force-sets it (e.g. Gemma4Config.
@@ -671,9 +647,57 @@ class SpecPrefillProposer:
         # `Attention.__init__` always sets `self.backend` via
         # get_attn_backend(...) regardless of whether the config override
         # was ever set (vllm/model_executor/layers/attention/attention.py:386)
-        # -- robust for any model, not just ones with a forcing hook.
+        # -- robust for any model, not just ones with a forcing hook. Resolved
+        # BEFORE allocating the dummy cache below (not just before building
+        # the metadata builder, as in the original version of this method) --
+        # the dummy cache's own tensor shape must match this backend's real
+        # KV-cache layout too, see the next comment.
         backend_enum = self._speculator_layers[0].attn.backend
+        backend_cls = backend_enum.get_class()
         builder_cls, _ = try_get_attention_backend(backend_enum)
+
+        kv_cache_spec = create_standard_kv_cache_spec(self.vllm_config)
+        for self_attn in self._speculator_layers:
+            # Confirmed on real hardware for the sibling Gemma4 pipeline:
+            # allocating every layer's dummy cache with a single global
+            # head_dim (the `head_dim` parameter, typically caller-supplied
+            # from layer 0) was wrong there -- Gemma-4-E2B-it's
+            # full-attention layers (head_dim=512) would get a cache tensor
+            # sized for its sliding-attention layers' 256, undersized for
+            # what their real forward pass writes. Each layer's own
+            # self_attn.head_dim is used instead, per layer -- for
+            # Qwen3-1.7B (uniform head_dim across layers, not independently
+            # confirmed here) this degenerates to every layer getting the
+            # same size, so no code change is needed, only this rationale.
+            #
+            # Confirmed on real hardware (2026-07-28): the dummy cache's
+            # SHAPE, not just its head_dim, must also match whatever backend
+            # was actually resolved above -- tests/v1/attention/utils.py's
+            # own create_dummy_kv_cache() hardcodes a Triton-style
+            # (num_blocks, 2, block_size, num_kv_heads, head_size) layout
+            # (split dim at index 1), which happened to match TRITON_ATTN
+            # (the backend Gemma4's forcing hook always selected, see above)
+            # but does NOT match FlashAttention's real layout -- `(2,
+            # num_blocks, block_size, num_kv_heads, head_size)`, split dim at
+            # index 0 (vllm/v1/attention/backends/flash_attn.py:149) -- which
+            # is what gets auto-selected for Qwen3 (no forcing hook fires).
+            # Using the mismatched shape crashed inside FlashAttention's own
+            # do_kv_cache_update with `ValueError: too many values to unpack
+            # (expected 2)` (kv_cache.unbind(0) tried to unbind num_blocks-many
+            # slices instead of the 2 (K, V) it expects). Building the tensor
+            # from the RESOLVED backend's own get_kv_cache_shape(...) instead
+            # of the test helper's hardcoded assumption is correct for
+            # whichever backend actually got selected, not just Triton's.
+            dummy_cache_shape = backend_cls.get_kv_cache_shape(
+                num_blocks_needed, block_size, num_kv_heads, self_attn.head_dim,
+            )
+            dummy_cache = torch.randn(
+                *dummy_cache_shape,
+                dtype=self.vllm_config.model_config.dtype,
+                device=self.device,
+            )
+            self_attn.attn.kv_cache = dummy_cache
+
         builder = builder_cls(
             kv_cache_spec=kv_cache_spec,
             layer_names=self._layer_names,
