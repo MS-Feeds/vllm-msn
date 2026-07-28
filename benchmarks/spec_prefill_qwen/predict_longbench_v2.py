@@ -587,7 +587,7 @@ def submit_pruned_requests(
 
 
 def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
     from vllm_patch.config import SpecConfig
 
@@ -615,26 +615,55 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         args.target_max_num_batched_tokens, token_lengths, is_baseline
     )
 
+    # Confirmed on real hardware (2026-07-28): unlike the sibling Gemma4
+    # pipeline (native max_model_len 262144, always far larger than any
+    # resolved budget below), Qwen3-8B's native max_position_embeddings is
+    # only 40960 -- and LongBench v2's longer "short" (<32k-word) documents
+    # can tokenize past that (this run's own p90/max: 36865/38274 tokens).
+    # vLLM's ModelConfig validation rejects max_model_len exceeding the
+    # checkpoint's own derived native value outright (VLLM_ALLOW_LONG_
+    # MAX_MODEL_LEN=1 would bypass it, but is NOT safe for a RoPE model like
+    # Qwen3 -- positions beyond the trained range produce NaN, per vLLM's
+    # own error message -- so not used here). Clamp BOTH max_num_batched_
+    # tokens and max_model_len to the native ceiling -- a single request can
+    # never need a batched-token budget larger than the model's own max
+    # context anyway, so clamping only max_model_len while leaving
+    # max_num_batched_tokens larger would just be internally inconsistent,
+    # not a real fix.
+    native_max_model_len = AutoConfig.from_pretrained(
+        model_path, trust_remote_code=True
+    ).max_position_embeddings
+    if native_max_model_len is not None and max_num_batched_tokens > native_max_model_len:
+        print(
+            f"[predict_longbench_v2] max_num_batched_tokens "
+            f"({max_num_batched_tokens}) exceeds {model_path}'s native "
+            f"max_position_embeddings ({native_max_model_len}) -- clamping "
+            f"down to it. Samples whose full prompt (P001) or kept-token "
+            f"count (P002-P006) exceeds this will be skipped and reported, "
+            f"same as any other over-budget sample (see "
+            f"submit_baseline_requests/submit_pruned_requests)."
+        )
+        max_num_batched_tokens = native_max_model_len
+
     # Explicitly cap max_model_len at what this run actually needs (resolved
-    # prompt budget + generation length), rather than leaving it at the
-    # model's native max_model_len (Qwen3-8B's real value not independently
-    # confirmed here -- commonly documented as 32768 native, higher with
-    # YaRN rope scaling; verify against this specific checkpoint before
-    # relying on it). Confirmed on real hardware for the sibling Gemma4
-    # pipeline (2026-07-24, native max_model_len there was 262144): vLLM's
-    # own startup sanity check (_check_enough_kv_cache_memory) requires
-    # enough KV cache to serve at least ONE request at max_model_len,
-    # regardless of whether this run will ever actually submit one that
-    # long -- with max_model_len left at its native (large) value, that
-    # check demanded far more KV cache than was available (most of the GPU
-    # already spent on model weights), a hard failure even though our own
-    # pre-flight/skip logic already guarantees no request here exceeds
-    # max_num_batched_tokens. Since every submitted request is already
-    # bounded by max_num_batched_tokens (prompt) + max_tokens (generation),
-    # there's no reason to reserve KV cache for vLLM's much larger native
-    # default -- this reasoning is generic to any model, not Gemma4-specific,
-    # so the capping logic itself needs no change for Qwen3.
+    # prompt budget + generation length) rather than leaving it at the
+    # model's native default -- confirmed on real hardware for the sibling
+    # Gemma4 pipeline (2026-07-24): vLLM's own startup sanity check
+    # (_check_enough_kv_cache_memory) requires enough KV cache to serve at
+    # least ONE request at max_model_len, regardless of whether this run
+    # will ever actually submit one that long -- leaving it at a much larger
+    # native default demands far more KV cache than necessary. Also clamped
+    # to native_max_model_len above (not just floored by it) -- residual
+    # risk, not fully resolved here: a sample whose prompt lands exactly at
+    # the clamped max_num_batched_tokens ceiling leaves zero room within
+    # max_model_len for args.max_tokens of actual generation, which would
+    # surface as a separate, narrower per-request scheduling failure rather
+    # than this startup-time one; not expected to be common given the
+    # auto-sizing margin in resolve_max_num_batched_tokens, but not
+    # independently verified against every sample in the full dataset.
     max_model_len = max_num_batched_tokens + args.max_tokens
+    if native_max_model_len is not None:
+        max_model_len = min(max_model_len, native_max_model_len)
 
     llm_kwargs = dict(
         model=model_path,
