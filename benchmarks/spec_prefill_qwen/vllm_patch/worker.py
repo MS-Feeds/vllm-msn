@@ -67,6 +67,19 @@ class SpecPrefillWorker(Worker):
         directly from the driver) for `model_runner.py` to see it -- see
         module docstring."""
         pruning_registry.register(request_id, kept_positions, orig_len)
+        # TEMPORARY diagnostic (2026-07-28) -- remove once Step B2's
+        # unexplained "override never fires" failure is root-caused. Confirms
+        # this RPC actually executed, in which process, and under exactly
+        # which request_id -- cross-check its pid against model_runner.py's
+        # lookup-side diagnostic print to confirm both run in the same
+        # process (the documented precondition for this to work at all).
+        import os as _os
+        print(
+            f"[spec_prefill DEBUG worker] pid={_os.getpid()} registered "
+            f"req_id={request_id!r} num_kept={len(kept_positions)} "
+            f"orig_len={orig_len}",
+            flush=True,
+        )
 
     def discard_prune_record(self, request_id: str) -> None:
         """RPC-callable, same reasoning as `register_prune_record` above."""

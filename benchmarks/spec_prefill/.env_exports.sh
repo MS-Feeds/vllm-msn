@@ -10,6 +10,21 @@ export HF_HOME=/scratch/hf_cache
 export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN in shell before sourcing this file}
 export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 
+# Confirmed on real hardware (2026-07-28, via the Qwen3 port of this
+# pipeline): vllm_patch/model_runner.py's SpecPrefillGPUModelRunner
+# subclasses the legacy ("v1") GPUModelRunner at
+# vllm/v1/worker/gpu_model_runner.py -- but this fork now defaults to a
+# newer "v2" runner (vllm/v1/worker/gpu/model_runner.py) for dense,
+# non-quantized architectures (vllm/config/vllm.py's use_v2_model_runner
+# property excludes MoE models unconditionally). Gemma-4-26B-A4B-it is MoE,
+# so this pipeline's target model was never actually at risk -- but forced
+# here defensively too, in case the speculator (Gemma-4-E2B-it, not
+# independently confirmed MoE or dense here) or a future model swap ever
+# triggers the v2 default, which surfaces as an AttributeError
+# (num_speculative_steps) at engine startup, not a subtle correctness bug --
+# see spec_prefill_qwen/.env_exports.sh for the full failure mode.
+export VLLM_USE_V2_MODEL_RUNNER=0
+
 # Target model. This exact snapshot path was valid on a prior node
 # ("node-0", per the 2026-07-14 rebuild this was originally copied from --
 # see ../gemma4_moe_benchmarks/.env_exports.sh). On a different/fresh node,

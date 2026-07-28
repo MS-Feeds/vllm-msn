@@ -155,7 +155,18 @@ def step_b_forward_smoke_test(
         "any_wrong_sample_dim": any(wrong_sample_dim),
         "any_nan_or_inf_in_queries": any(nan_or_inf),
         "key_buffer_shapes": [tuple(key_buffer[0][0].shape)] if key_buffer and key_buffer[0] else None,
-        "attention_backend": proposer.vllm_config.attention_config.backend,
+        # proposer.vllm_config.attention_config.backend is only the config
+        # OVERRIDE, populated solely by Gemma4Config.verify_and_update_config's
+        # heterogeneous-head_dim forcing hook (see vllm_patch/proposer.py's
+        # build_lookahead_metadata for the fuller story) -- reads correctly
+        # here today only because that hook always fires for Gemma-4-E2B-it.
+        # Read the actual resolved backend off a loaded attention layer
+        # instead, same fix applied to build_lookahead_metadata itself and to
+        # the Qwen3 port's copy of this script (confirmed there 2026-07-28
+        # that the config field alone prints a misleading "None" once a model
+        # without a forcing hook is involved) -- robust here regardless of
+        # whether the hook fires, not just incidentally correct.
+        "attention_backend": proposer._speculator_layers[0].attn.backend,
     }
 
 

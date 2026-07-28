@@ -608,7 +608,6 @@ class SpecPrefillProposer:
         from tests.v1.attention.utils import (  # proven pattern, see docstring
             BatchSpec,
             create_common_attn_metadata,
-            create_dummy_kv_cache,
             create_standard_kv_cache_spec,
             try_get_attention_backend,
         )
@@ -620,6 +619,31 @@ class SpecPrefillProposer:
         # verified arithmetic, no slack/off-by-one.
         num_blocks_needed = -(-(prompt_len + look_ahead_cnt) // block_size)
 
+        # self.vllm_config.attention_config.backend is only populated when a
+        # model-specific config hook force-sets it -- for Gemma-4-E2B-it
+        # that's Gemma4Config.verify_and_update_config's heterogeneous-
+        # head_dim TRITON_ATTN forcing (vllm/model_executor/models/
+        # config.py:88-99), which always fires here since this speculator's
+        # head_dim IS heterogeneous (256/512, confirmed by
+        # validate_proposer.py's Step A) -- masking a real bug in this line:
+        # for any model where that hook DOESN'T fire (confirmed on real
+        # hardware 2026-07-28 for the Qwen3 port of this pipeline, whose
+        # uniform head_dim never triggers it), attention_config.backend
+        # stays None and try_get_attention_backend raises `AttributeError:
+        # 'NoneType' object has no attribute 'get_class'`. Read the
+        # ALREADY-RESOLVED backend off a loaded attention layer instead --
+        # `Attention.__init__` always sets `self.backend` via
+        # get_attn_backend(...) regardless of whether the config override
+        # was ever set (vllm/model_executor/layers/attention/attention.py:386)
+        # -- robust regardless of whether a model-specific forcing hook
+        # exists, not just incidentally correct for Gemma4. Resolved BEFORE
+        # allocating the dummy cache below (not just before building the
+        # metadata builder) -- the dummy cache's own tensor shape must match
+        # this backend's real KV-cache layout too, see the next comment.
+        backend_enum = self._speculator_layers[0].attn.backend
+        backend_cls = backend_enum.get_class()
+        builder_cls, _ = try_get_attention_backend(backend_enum)
+
         kv_cache_spec = create_standard_kv_cache_spec(self.vllm_config)
         for self_attn in self._speculator_layers:
             # Confirmed on real hardware: allocating every layer's dummy
@@ -629,18 +653,39 @@ class SpecPrefillProposer:
             # sized for the sliding-attention layers' 256, undersized for
             # what their real forward pass writes. Each layer's own
             # self_attn.head_dim is used instead, per layer.
-            dummy_cache = create_dummy_kv_cache(
-                block_size,
-                num_kv_heads,
-                self_attn.head_dim,
-                self.vllm_config.model_config.dtype,
-                self.device,
-                num_blocks=num_blocks_needed,
+            #
+            # Confirmed on real hardware (2026-07-28, via the Qwen3 port of
+            # this pipeline): the dummy cache's SHAPE, not just its head_dim,
+            # must also match whatever backend was actually resolved above --
+            # tests/v1/attention/utils.py's own create_dummy_kv_cache()
+            # hardcodes a Triton-style (num_blocks, 2, block_size,
+            # num_kv_heads, head_size) layout (split dim at index 1), which
+            # happens to match TRITON_ATTN -- the backend Gemma4's forcing
+            # hook always selects here, so this was never actually wrong for
+            # THIS pipeline -- but it does NOT match FlashAttention's real
+            # layout (`(2, num_blocks, block_size, num_kv_heads, head_size)`,
+            # split dim at index 0, vllm/v1/attention/backends/
+            # flash_attn.py:149), which is what got auto-selected for the
+            # Qwen3 port (no forcing hook fires there) and crashed inside
+            # FlashAttention's own do_kv_cache_update with `ValueError: too
+            # many values to unpack (expected 2)`. Building the tensor from
+            # the RESOLVED backend's own get_kv_cache_shape(...) instead of
+            # the test helper's hardcoded assumption is correct for whichever
+            # backend actually got selected, not just Triton's -- kept here
+            # too even though this pipeline's TRITON_ATTN forcing currently
+            # makes the distinction moot, so both pipelines stay consistent
+            # and this doesn't silently regress if that forcing condition
+            # ever stops applying.
+            dummy_cache_shape = backend_cls.get_kv_cache_shape(
+                num_blocks_needed, block_size, num_kv_heads, self_attn.head_dim,
+            )
+            dummy_cache = torch.randn(
+                *dummy_cache_shape,
+                dtype=self.vllm_config.model_config.dtype,
+                device=self.device,
             )
             self_attn.attn.kv_cache = dummy_cache
 
-        backend_enum = self.vllm_config.attention_config.backend
-        builder_cls, _ = try_get_attention_backend(backend_enum)
         builder = builder_cls(
             kv_cache_spec=kv_cache_spec,
             layer_names=self._layer_names,

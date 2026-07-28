@@ -104,6 +104,21 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             record = pruning_registry.get(req_id)
+            # TEMPORARY diagnostic (2026-07-28) -- remove once Step B2's
+            # unexplained "override never fires" failure is root-caused.
+            # Reports, from THIS process (should be the Worker's, per
+            # worker.py's docstring -- pid printed to cross-check), exactly
+            # what req_id is being looked up and whether it was found, plus
+            # the full set of currently-registered keys so a request-id
+            # mismatch (rewritten suffix mismatch, wrong id used at
+            # registration, etc.) is directly visible rather than inferred.
+            import os as _os
+            print(
+                f"[spec_prefill DEBUG model_runner] pid={_os.getpid()} "
+                f"lookup req_id={req_id!r} found={record is not None} "
+                f"registry_keys={list(pruning_registry._registry.keys())!r}",
+                flush=True,
+            )
             if record is None:
                 continue  # not a pruned request -- stock positions stand.
 
