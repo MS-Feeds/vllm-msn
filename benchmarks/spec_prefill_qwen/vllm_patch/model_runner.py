@@ -129,6 +129,25 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
                     kept_slice, dtype=self.positions.dtype, device=self.device
                 )
                 self.positions[start:end] = kept_positions_gpu
+                # TEMPORARY diagnostic (2026-07-28) -- remove once Step B2's
+                # intermittent (FAIL/PASS/FAIL across three otherwise-identical
+                # runs) failure is root-caused. `.tolist()` forces a CUDA
+                # sync, so this readback proves whether the write already
+                # took effect by the time THIS line runs, in THIS process --
+                # if this prints the correct scattered values but the
+                # attention-layer hook still captures stock, the bug is
+                # downstream (backend/staging clobbers or races the write
+                # between here and the model's forward call); if this ALREADY
+                # prints stock/wrong values, the bug is upstream (kept_slice
+                # itself, or the write/dtype/device conversion above).
+                readback = self.positions[start : min(start + 5, end)].tolist()
+                print(
+                    f"[spec_prefill DEBUG model_runner] req_id={req_id!r} "
+                    f"kept_slice[:5]={list(kept_slice[:5])!r} "
+                    f"readback_after_write={readback!r} "
+                    f"num_kept={record.num_kept} orig_len={record.orig_len}",
+                    flush=True,
+                )
             else:
                 self.positions[start:end] += record.decode_offset
 
