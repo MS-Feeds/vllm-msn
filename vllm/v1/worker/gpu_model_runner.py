@@ -1870,14 +1870,31 @@ class GPUModelRunner(
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
 
+        # Compute per-request base (non-spec) token counts.
+        # MTP spec draft tokens are appended to num_scheduled_tokens but their
+        # sum can exceed max_num_batched_tokens (the size of arange_np /
+        # query_pos). Strip them out so position-index arrays stay in bounds.
+        scheduled_spec = scheduler_output.scheduled_spec_decode_tokens
+        if scheduled_spec:
+            spec_counts = np.array(
+                [
+                    len(scheduled_spec.get(self.input_batch.req_ids[i], ()))
+                    for i in range(num_reqs)
+                ],
+                dtype=num_scheduled_tokens.dtype,
+            )
+            num_base_tokens = num_scheduled_tokens - spec_counts
+        else:
+            num_base_tokens = num_scheduled_tokens
+
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
-        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+        req_indices = np.repeat(self.arange_np[:num_reqs], num_base_tokens)
 
         # cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
         # self.query_pos.np[:10]: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         cu_num_tokens = self._get_cumsum_and_arange(
-            num_scheduled_tokens, self.query_pos.np
+            num_base_tokens, self.query_pos.np
         )
 
         # Get positions.
