@@ -10,6 +10,23 @@ export HF_HOME=/scratch/hf_cache
 export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN in shell before sourcing this file}
 export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 
+# Confirmed on real hardware (2026-07-28): vllm_patch/model_runner.py's
+# SpecPrefillGPUModelRunner subclasses the legacy ("v1") GPUModelRunner at
+# vllm/v1/worker/gpu_model_runner.py -- but this fork now defaults to a
+# newer, refactored "v2" runner (vllm/v1/worker/gpu/model_runner.py) for
+# dense, non-quantized architectures in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
+# (vllm/config/vllm.py's use_v2_model_runner property), which Qwen3-8B is.
+# vllm_patch/worker.py unconditionally swaps in our v1-based runner
+# regardless, so the surrounding engine code (e.g. gpu_worker.py's
+# warmup_kernels) ends up calling v2-only APIs (num_speculative_steps) on a
+# v1 object -- AttributeError at engine startup. Gemma-4-26B-A4B-it never
+# hit this because it's MoE, which the v2 default excludes unconditionally
+# -- this is a genuine Qwen3-specific trigger, not a porting oversight.
+# Force v1 until vllm_patch/ is ported to the v2 runner API (out of scope
+# for now -- see validate_runner_integration.py's docstring history for
+# what's already been validated against v1's behavior).
+export VLLM_USE_V2_MODEL_RUNNER=0
+
 # Target model (Qwen3-8B). TODO: fill in with this node's real downloaded
 # snapshot path once available -- see REPRODUCE.md step 3 for download
 # instructions. Verify it's actually present before trusting this value:
