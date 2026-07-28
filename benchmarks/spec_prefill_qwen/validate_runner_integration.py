@@ -338,14 +338,13 @@ def _run_position_check(
     # docstrings). Confirmed on real hardware this is a real trap: use the
     # return value instead.
     #
-    # real_request_id, NOT the request_id parameter passed in below: vLLM's
-    # LLMEngine.add_request() unconditionally rewrites every request_id with
-    # an appended random suffix (InputProcessor.assign_request_id) --
-    # prune_and_add_request()'s return value is the REAL id actually tracked
-    # by the engine/worker; using the original request_id anywhere after
-    # this call (e.g. for abort_request below) would silently target a
-    # request that doesn't exist. See pruner.py's own docstring for the full
-    # story -- this was a real, confirmed-on-hardware bug, not a hypothetical.
+    # Named real_request_id for historical/interface-compatibility reasons --
+    # as of 2026-07-28, pruner.py sets VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1
+    # and registers the PruneRecord *before* calling add_request(), so this
+    # now always equals the `request_id` parameter passed in below verbatim
+    # (see pruner.py's own docstring for why that reordering was necessary --
+    # a real, confirmed-on-hardware race, not the id-rewriting concern this
+    # comment used to describe here).
     real_request_id, kept_positions, orig_len = prune_and_add_request(
         llm_engine=llm.llm_engine,
         request_id=request_id,
