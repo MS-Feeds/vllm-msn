@@ -19,15 +19,8 @@ export QWEN3_MODEL_PATH=/scratch/hf_cache/hub/models--Qwen--Qwen3-8B/snapshots/b
 
 # Speculator model (Qwen3-1.7B, SpecPrefill-specific -- not used by
 # gemma4_moe_benchmarks or evaluation_pipeline).
-# step 3. Same "no hub/ nesting" and "verify it's still present on this
 # node" caveats as QWEN3_MODEL_PATH above apply here too.
 export QWEN3_1_7B_MODEL_PATH=/scratch/hf_cache/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
-
-# NOTE: no "hub/" in these paths -- `hf download --cache-dir X` places
-# snapshots directly under X, not X/hub/ (that hub/ nesting is what
-# HF_HOME-based lazy fetching via transformers/huggingface_hub's default
-# cache would use instead). Re-verify this path if a model is ever
-# re-downloaded with a different tool/flag combination.
 
 # Unlike the sibling Gemma4 pipeline's .env_exports.sh, there is no
 # QWEN3_TEXT_ONLY_MODEL_PATH here -- Qwen3-8B/1.7B have no multimodal

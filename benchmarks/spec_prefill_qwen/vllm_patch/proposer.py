@@ -655,7 +655,24 @@ class SpecPrefillProposer:
             )
             self_attn.attn.kv_cache = dummy_cache
 
-        backend_enum = self.vllm_config.attention_config.backend
+        # self.vllm_config.attention_config.backend is only populated when a
+        # model-specific config hook force-sets it (e.g. Gemma4Config.
+        # verify_and_update_config's heterogeneous-head_dim TRITON_ATTN
+        # forcing, vllm/model_executor/models/config.py:88-99) -- for Qwen3
+        # (no such hook, uniform head_dim) it stays None, which
+        # try_get_attention_backend can't resolve (`AttributeError:
+        # 'NoneType' object has no attribute 'get_class'`, confirmed on real
+        # hardware 2026-07-28). This was latent, unexercised code even for
+        # the sibling Gemma4 pipeline -- its own validate_proposer.py Step B
+        # only runs when head_dim is heterogeneous, which is exactly the
+        # condition that happens to force this field via the hook above, so
+        # this line was never actually hit there either. Read the
+        # ALREADY-RESOLVED backend off a loaded attention layer instead --
+        # `Attention.__init__` always sets `self.backend` via
+        # get_attn_backend(...) regardless of whether the config override
+        # was ever set (vllm/model_executor/layers/attention/attention.py:386)
+        # -- robust for any model, not just ones with a forcing hook.
+        backend_enum = self._speculator_layers[0].attn.backend
         builder_cls, _ = try_get_attention_backend(backend_enum)
         builder = builder_cls(
             kv_cache_spec=kv_cache_spec,
