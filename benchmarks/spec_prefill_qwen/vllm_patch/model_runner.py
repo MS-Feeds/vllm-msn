@@ -2,10 +2,12 @@
 ("restore_pos_ids"/"merge_requests").
 
 Subclasses vLLM's real `GPUModelRunner` (`vllm/v1/worker/gpu_model_runner.py`
--- confirmed the active runner for the sibling Gemma4 pipeline's target
-model, see spec_prefill/EXPERIMENT_PLAN.md and the approved plan; not yet
-independently re-confirmed for Qwen3-8B here, but this is a target-model-class
--agnostic extension point, not a Gemma4-specific one) rather than editing it. Overrides only
+-- confirmed the active runner for both the sibling Gemma4 pipeline's target
+model and, as of 2026-07-28, this Qwen3 port's -- see
+`VLLM_USE_V2_MODEL_RUNNER=0` in `.env_exports.sh`, forced because this fork
+now defaults dense, non-quantized architectures like Qwen3-8B to a newer,
+refactored "v2" runner this file was never ported to) rather than editing
+it. Overrides only
 `_prepare_inputs()`, and even that override is a thin wrapper, not a
 reimplementation -- see the approved plan's "Position override mechanism"
 section for the full reasoning (verified directly against
@@ -24,19 +26,25 @@ section for the full reasoning (verified directly against
   stock implementation unmodified via `super()`, then patch just that view
   afterward for pruned requests only.
 
-**Residual risk, confirmed resolved on real hardware (2026-07-23)**: this
-assumes nothing in `_prepare_inputs()` after line 2280 touches
-`self.positions` again, and that the attention backend's metadata builder
-doesn't `.clone()`/`.contiguous()` the positions field before the model
-actually reads it (which would break the view-aliasing this depends on).
-Confirmed neither happens -- a real, non-degenerate pruned request (30%ish
-retention, ~5400 scattered kept positions out of ~18000) had its overridden
-positions verified, via a diagnostic hook on the model's own attention
-layers, to reach the model exactly as written. (An earlier "pass" at 100%
-token retention had been a false positive -- identity-mapped kept_positions
+**Residual risk, confirmed resolved on real hardware for the sibling Gemma4
+pipeline (2026-07-23) and independently re-confirmed here for Qwen3-8B
+(2026-07-28)**: this assumes nothing in `_prepare_inputs()` after line 2280
+touches `self.positions` again, and that the attention backend's metadata
+builder doesn't `.clone()`/`.contiguous()` the positions field before the
+model actually reads it (which would break the view-aliasing this depends
+on). Confirmed neither happens for either pipeline -- a real, non-degenerate
+pruned request (30%ish retention, 5497 scattered kept positions out of
+18233 for the Qwen3 case) had its overridden positions verified, via a
+diagnostic hook on the model's own attention layers, to reach the model
+exactly as written. (An earlier "pass" at 100% token retention had been a
+false positive for the Gemma4 pipeline -- identity-mapped kept_positions
 are indistinguishable from stock contiguous ones regardless of whether the
 override fires at all; the real bug turned out to be upstream, in
-`pruner.py`'s request-id handling, not here -- see that module's docstring.)
+`pruner.py`'s request-id handling, not here -- see that module's docstring.
+`validate_runner_integration.py`'s own Step B for Qwen3 hits this exact
+same 100%-retention blind spot for a different reason -- its short test
+prompt has too few tokens to prune below 100% at chunk_size=64 -- so Step
+B2, not Step B, is this mechanism's real confirmation here too.)
 """
 
 from typing import TYPE_CHECKING
@@ -104,21 +112,6 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             record = pruning_registry.get(req_id)
-            # TEMPORARY diagnostic (2026-07-28) -- remove once Step B2's
-            # unexplained "override never fires" failure is root-caused.
-            # Reports, from THIS process (should be the Worker's, per
-            # worker.py's docstring -- pid printed to cross-check), exactly
-            # what req_id is being looked up and whether it was found, plus
-            # the full set of currently-registered keys so a request-id
-            # mismatch (rewritten suffix mismatch, wrong id used at
-            # registration, etc.) is directly visible rather than inferred.
-            import os as _os
-            print(
-                f"[spec_prefill DEBUG model_runner] pid={_os.getpid()} "
-                f"lookup req_id={req_id!r} found={record is not None} "
-                f"registry_keys={list(pruning_registry._registry.keys())!r}",
-                flush=True,
-            )
             if record is None:
                 continue  # not a pruned request -- stock positions stand.
 

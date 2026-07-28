@@ -268,11 +268,18 @@ def _render_chat(tokenizer, prompt: str) -> str:
     SpecPrefillWorker for what looked like a runner-swap bug but was
     actually just a missing chat template on the test script's own
     prompts. This reasoning is generic to any instruction-tuned checkpoint,
-    not Gemma-specific."""
+    not Gemma-specific.
+
+    `enable_thinking=False`: EXPERIMENT_PLAN.md specifies "thinking mode
+    off, greedy decoding" for this protocol -- confirmed on real hardware
+    (2026-07-28) that Qwen3's chat template defaults to reasoning mode ON
+    otherwise (Step C's coherence smoke test output had a leading
+    `<think>...` block before this fix), which Gemma4 has no equivalent of."""
     return tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
         tokenize=False,
+        enable_thinking=False,
     )
 
 

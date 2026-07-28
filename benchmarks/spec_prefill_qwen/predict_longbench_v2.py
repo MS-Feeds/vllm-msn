@@ -192,11 +192,22 @@ def render_chat(tok, prompt: str) -> str:
     """Required for this instruction-tuned checkpoint -- see
     validate_runner_integration.py's confirmed finding: a bare
     completion-style prompt produces degenerate repetition loops under greedy
-    decoding, even with stock vLLM."""
+    decoding, even with stock vLLM.
+
+    `enable_thinking=False`: EXPERIMENT_PLAN.md's header table specifies
+    "thinking mode off, greedy decoding" for this protocol -- confirmed on
+    real hardware (2026-07-28) that Qwen3's chat template defaults to
+    reasoning mode ON otherwise (observed a leading `<think>...` block in an
+    unrelated smoke-test generation), which Gemma4 has no equivalent of, so
+    this wasn't something the sibling pipeline's render_chat needed to
+    handle. `tok.apply_chat_template` forwards unrecognized kwargs straight
+    into the Jinja template context, which is how Qwen3's own template reads
+    this flag."""
     return tok.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
         tokenize=False,
+        enable_thinking=False,
     )
 
 
@@ -209,11 +220,19 @@ def chat_wrapper_pieces(tok) -> tuple[str, str]:
     `<end_of_turn>\\n<start_of_turn>model\\n`), independent of what that
     content actually is. Used by submit_pruned_requests to tokenize the
     always-kept prefix/suffix pieces separately from the prunable context --
-    see that function's docstring for why."""
+    see that function's docstring for why.
+
+    `enable_thinking=False` must match render_chat's own setting exactly --
+    Qwen3's template changes what it appends after the generation prompt
+    depending on this flag (e.g. an empty `<think>\\n\\n</think>\\n\\n`
+    block when explicitly disabled), so the "after" piece computed here
+    would silently diverge from what render_chat actually produces
+    elsewhere if this call disagreed with it."""
     rendered = tok.apply_chat_template(
         [{"role": "user", "content": _CHAT_WRAPPER_PLACEHOLDER}],
         add_generation_prompt=True,
         tokenize=False,
+        enable_thinking=False,
     )
     before, after = rendered.split(_CHAT_WRAPPER_PLACEHOLDER)
     return before, after

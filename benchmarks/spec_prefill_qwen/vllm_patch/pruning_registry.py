@@ -5,11 +5,19 @@ Populated by `pruner.py` before `LLMEngine.add_request()`; consumed by
 pruned requests (see algorithm lines 18-19 -- "restore_pos_ids"/"merge_requests").
 
 A plain process-local dict, not a distributed/shared-memory structure -- this
-only works when the driver and the vLLM worker run in the same OS process
-(true for the default single-GPU `UniProcExecutor`, see
-`vllm/v1/executor/uniproc_executor.py:45`). Explicitly out of scope for
-multiprocess/Ray executors, see EXPERIMENT_PLAN.md's "Implementation status"
-and the approved plan's "Scope for this pass".
+module's own state is only ever visible within whatever single OS process
+imports it. Confirmed on real hardware (2026-07-22, see `worker.py`'s module
+docstring): `EngineCore`/`Worker` always runs in its own separate OS process
+from the driver script, even under the default single-GPU `UniProcExecutor`
+-- an earlier version of this comment claimed the opposite (driver and
+worker sharing one process under `UniProcExecutor`), which was wrong and is
+exactly why `register()`/`get()` alone are insufficient; callers MUST push
+records into the Worker's own copy of this module via
+`SpecPrefillWorker.register_prune_record`'s `collective_rpc` (see
+`pruner.py`'s `prune_and_add_request`), not call `register()` directly from
+driver-side code. Still explicitly out of scope for multiprocess/Ray
+executors with more than one Worker process, see EXPERIMENT_PLAN.md's
+"Implementation status" and the approved plan's "Scope for this pass".
 
 Lifecycle: `register()` when a pruned request is created (by `pruner.py`,
 before `add_request`), `get()` read once per step by the runner subclass to
