@@ -167,7 +167,15 @@ def step_b_forward_smoke_test(
         "any_wrong_sample_dim": any(wrong_sample_dim),
         "any_nan_or_inf_in_queries": any(nan_or_inf),
         "key_buffer_shapes": [tuple(key_buffer[0][0].shape)] if key_buffer and key_buffer[0] else None,
-        "attention_backend": proposer.vllm_config.attention_config.backend,
+        # proposer.vllm_config.attention_config.backend is only the config
+        # OVERRIDE, populated solely by a model-specific forcing hook (see
+        # vllm_patch/proposer.py's build_lookahead_metadata for the fuller
+        # story) -- for Qwen3 it stays None even once a real backend has
+        # been resolved and used, which would print a misleading "None"
+        # here. Read the actual resolved backend off a loaded attention
+        # layer instead, same fix applied to build_lookahead_metadata
+        # itself (confirmed on real hardware 2026-07-28).
+        "attention_backend": proposer._speculator_layers[0].attn.backend,
     }
 
 
