@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Scores a predictions file against `datasets/prep_longbench_v2.py`'s samples
+(see EXPERIMENT_PLAN.md's "Experiment matrix": accuracy is the only metric
+LongBench v2 scoring needs here, unlike LongBench v1's per-task F1/ROUGE/
+classification metrics -- see the cloned reference repo's
+speculative_prefill/speculative_prefill/eval/long_bench/eval.py for that older
+harness, which this is deliberately NOT reused from, per EXPERIMENT_PLAN.md's
+"Implementation status" #3).
+
+Predictions file format (produced by a not-yet-built prediction-generation
+script -- see EXPERIMENT_PLAN.md's "Implementation status" #3 and
+REPRODUCE.md step 4): one JSON object per line,
+{"id": <matches a sample's "id">, "pred": "<raw model output text>"}.
+
+Answer extraction mirrors LongBench v2's own official eval convention: look
+for an explicit "answer is X" statement first, then fall back to the first
+standalone A-D letter in the text. A prediction that matches neither is
+counted as incorrect (same as a wrong letter) but tracked separately as
+"unparseable" so a systematic extraction failure is visible rather than
+silently blended into the wrong-answer count.
+
+Usage:
+    python3 grade_longbench_v2.py \\
+        --samples datasets/longbench_v2_samples.jsonl \\
+        --predictions <path-to-predictions.jsonl> \\
+        --output results/longbench_v2_result.json \\
+        --per-sample-output results/longbench_v2_per_sample.csv
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+from typing import Optional
+
+DEFAULT_SAMPLES = Path(__file__).parent / "datasets" / "longbench_v2_samples.jsonl"
+DEFAULT_OUTPUT = Path(__file__).parent / "results" / "longbench_v2_result.json"
+
+_ANSWER_IS_RE = re.compile(r"answer is\s*\(?([A-D])\)?", re.IGNORECASE)
+_STANDALONE_LETTER_RE = re.compile(r"\b([A-D])\b")
+
+
+def extract_answer_letter(raw_text: str) -> Optional[str]:
+    """Extracts a single A-D answer letter from a raw model output string.
+    Returns None if neither pattern matches (unparseable)."""
+    match = _ANSWER_IS_RE.search(raw_text)
+    if match:
+        return match.group(1).upper()
+    match = _STANDALONE_LETTER_RE.search(raw_text)
+    if match:
+        return match.group(1).upper()
+    return None
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def _accuracy(results: list[bool]) -> float:
+    return 100.0 * sum(results) / len(results) if results else 0.0
+
+
+def grade(samples: list[dict], predictions: list[dict]) -> dict:
+    """Joins predictions to samples by id and computes accuracy plus
+    breakdowns by difficulty and domain -- **always over `matched` samples
+    only** (i.e. samples that actually got a prediction). A `missing`
+    sample (no prediction at all -- e.g. skipped by predict_longbench_v2.py
+    for exceeding the token budget) is excluded from every accuracy
+    denominator entirely, not counted as wrong: `counts.total` still
+    reports the full dataset size and `counts.missing` how many of those
+    were skipped, but `overall`/`by_difficulty`/`by_domain` are scored only
+    over `counts.matched`. This matters when comparing experiments whose
+    skip rates differ -- e.g. P001 (baseline) needs the FULL unpruned
+    prompt to fit the token budget, so it's likely to skip more samples
+    than a pruned experiment (P002-P006) only needs the smaller *kept*
+    length to fit; scoring both against the same fixed `total` would
+    otherwise penalize P001 for skips that have nothing to do with answer
+    quality, muddying EXPERIMENT_PLAN.md's "accuracy drop vs. baseline"
+    comparison. `unparseable` (a prediction that came back but had no
+    extractable A-D letter) IS still counted as wrong within `matched`, by
+    contrast -- that's a real model-output failure, not something skipped
+    before generation even happened.
+
+    Also returns a `per_sample` list (id, domain, difficulty, the raw
+    prediction text, the extracted letter, the ground-truth answer, and
+    whether it was correct -- `None` for a missing sample, since it was
+    never scored) for anyone who wants a side-by-side comparison rather
+    than just the aggregate stats -- see `write_per_sample_csv` / the
+    `--per-sample-output` CLI flag."""
+    pred_by_id = {p["id"]: p["pred"] for p in predictions}
+
+    total = len(samples)
+    matched = 0
+    missing = 0
+    unparseable = 0
+
+    correct_by_difficulty: dict[str, list[bool]] = {}
+    correct_by_domain: dict[str, list[bool]] = {}
+    overall: list[bool] = []
+    per_sample: list[dict] = []
+
+    for sample in samples:
+        sample_id = sample["id"]
+        difficulty = sample.get("difficulty") or "unknown"
+        domain = sample.get("domain") or "unknown"
+
+        if sample_id not in pred_by_id:
+            missing += 1
+            per_sample.append(
+                {
+                    "id": sample_id,
+                    "domain": domain,
+                    "difficulty": difficulty,
+                    "answer": sample["answer"],
+                    "pred_letter": None,
+                    "correct": None,  # never scored -- excluded, not wrong
+                    "pred_raw": None,
+                }
+            )
+            continue  # excluded from every accuracy denominator below
+
+        matched += 1
+        pred_raw = pred_by_id[sample_id]
+        extracted = extract_answer_letter(pred_raw)
+        if extracted is None:
+            unparseable += 1
+        is_correct = extracted == sample["answer"]
+
+        overall.append(is_correct)
+        correct_by_difficulty.setdefault(difficulty, []).append(is_correct)
+        correct_by_domain.setdefault(domain, []).append(is_correct)
+        per_sample.append(
+            {
+                "id": sample_id,
+                "domain": domain,
+                "difficulty": difficulty,
+                "answer": sample["answer"],
+                "pred_letter": extracted,
+                "correct": is_correct,
+                "pred_raw": pred_raw,
+            }
+        )
+
+    return {
+        "overall": _accuracy(overall),
+        "by_difficulty": {k: _accuracy(v) for k, v in sorted(correct_by_difficulty.items())},
+        "by_domain": {k: _accuracy(v) for k, v in sorted(correct_by_domain.items())},
+        "counts": {
+            "total": total,
+            "matched": matched,
+            "missing": missing,
+            "unparseable": unparseable,
+        },
+        "per_sample": per_sample,
+    }
+
+
+def write_per_sample_csv(result: dict, path: Path) -> None:
+    """Writes the side-by-side id/domain/difficulty/answer/pred_letter/
+    correct/pred_raw comparison as CSV -- easy to open in a spreadsheet or
+    `column -s, -t` in a terminal, unlike scrolling the full JSON output."""
+    import csv
+
+    fieldnames = ["id", "domain", "difficulty", "answer", "pred_letter", "correct", "pred_raw"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in result["per_sample"]:
+            writer.writerow(row)
+
+
+def render_summary_table(result: dict) -> str:
+    """Markdown summary, same group -> stat -> table shape as
+    ../gemma4_moe_benchmarks/analyze_results.py's render_table (adapted from
+    throughput stats to accuracy; no shared module exists to import that
+    code from -- see grep results across this repo for prior art)."""
+    lines = []
+    counts = result["counts"]
+    lines.append(
+        f"**Overall accuracy: {result['overall']:.2f}%** "
+        f"(over {counts['matched']} matched of {counts['total']} total -- "
+        f"{counts['missing']} missing/skipped excluded from this %, "
+        f"{counts['unparseable']} unparseable counted as wrong within it)"
+    )
+    lines.append("")
+    lines.append("| Difficulty | Accuracy |")
+    lines.append("|---|---:|")
+    for key, acc in result["by_difficulty"].items():
+        lines.append(f"| {key} | {acc:.2f}% |")
+    lines.append("")
+    lines.append("| Domain | Accuracy |")
+    lines.append("|---|---:|")
+    for key, acc in result["by_domain"].items():
+        lines.append(f"| {key} | {acc:.2f}% |")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Grade LongBench v2 predictions")
+    parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
+    parser.add_argument("--predictions", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--per-sample-output",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to write a side-by-side CSV (id, domain, "
+            "difficulty, ground-truth answer, extracted pred_letter, "
+            "correct, and the raw pred_raw text) -- one row per sample. "
+            "Not written by default since it can be large (full raw "
+            "prediction text per row); --output's JSON stays aggregate-"
+            "stats-only either way."
+        ),
+    )
+    args = parser.parse_args()
+
+    samples = _read_jsonl(args.samples)
+    predictions = _read_jsonl(args.predictions)
+    result = grade(samples, predictions)
+
+    if args.per_sample_output is not None:
+        args.per_sample_output.parent.mkdir(parents=True, exist_ok=True)
+        write_per_sample_csv(result, args.per_sample_output)
+        print(f"[grade_longbench_v2] wrote per-sample comparison -> {args.per_sample_output}")
+
+    # --output stays aggregate-only (per_sample lives in the CSV above, not
+    # here) -- keeps this file small and stable for anything that reads it
+    # programmatically (e.g. a future analyze_results.py-style script).
+    aggregate_result = {k: v for k, v in result.items() if k != "per_sample"}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(aggregate_result, f, indent=2)
+
+    print(render_summary_table(result))
+    print(f"\n[grade_longbench_v2] wrote {args.output}")
+
+
+if __name__ == "__main__":
+    main()
