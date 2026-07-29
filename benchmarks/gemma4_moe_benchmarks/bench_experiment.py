@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """Ablation-study benchmark for Gemma 4 26B MoE FP8.
 
-Runs one experiment from a 16-config ablation matrix using vllm.LLM offline.
+Runs one experiment from a 19-config ablation matrix using vllm.LLM offline.
 Replicates the config design from examples/EXPERIMENT_PLAN_ABLATION_STUDY.md
 but drives it through the bench_offline.py throughput framework so results
 are directly comparable to the sc1/sc2 H100 sweep.
 
 IMPORTANT — environment variables must be set BEFORE this script is imported
 (before vllm is imported).  Do NOT call this script directly.  Use
-run_ablation.sh which sets VLLM_ATTENTION_BACKEND etc. and then execs this.
+run_experiments.sh which sets VLLM_ATTENTION_BACKEND etc. and then execs this.
 
-Usage (via run_ablation.sh):
-    run_ablation.sh E001            # single experiment
-    run_ablation.sh --all           # all 16 experiments sequentially
-    run_ablation.sh E006 E011 E013  # subset
+Usage (via run_experiments.sh):
+    run_experiments.sh E001            # single experiment
+    run_experiments.sh --all           # all experiments in the --all list
+    run_experiments.sh E006 E011 E013  # subset
 
 Direct single-experiment call (env vars must already be set):
     VLLM_ATTENTION_BACKEND=FLASH_ATTN \\
-    python3 bench_ablation.py --exp E001 --scenario sc1 --reps 2
+    python3 bench_experiment.py --exp E001 --scenario sc1 --reps 2
 """
 from __future__ import annotations
 
@@ -34,8 +34,10 @@ from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Output paths (sibling to bench_offline.py results)
+# Override the directory via BENCH_RESULTS_DIR so different hardware rounds
+# (e.g. results_A100_80G vs results_A100_40G_mock) don't overwrite each other.
 # ---------------------------------------------------------------------------
-OUT_DIR = Path("ablation_results")
+OUT_DIR = Path(os.environ.get("BENCH_RESULTS_DIR", "results"))
 OUT_DIR.mkdir(exist_ok=True)
 CSV_PATH = OUT_DIR / "all_runs.csv"
 
@@ -75,6 +77,13 @@ SCENARIOS = {
     ),
 }
 
+# Optional override of the per-scenario prompt count (e.g. to use a larger
+# dataset). Applies to every scenario so fork/stock runs stay consistent.
+_BENCH_NUM_PROMPTS = os.environ.get("BENCH_NUM_PROMPTS")
+if _BENCH_NUM_PROMPTS:
+    for _sc in SCENARIOS.values():
+        _sc["num_prompts"] = int(_BENCH_NUM_PROMPTS)
+
 # ---------------------------------------------------------------------------
 # Model paths
 # Adjust MODEL_BASE and MODEL_TEXT_ONLY to your local checkpoint locations.
@@ -90,7 +99,7 @@ MODEL_ASSISTANT = os.environ.get(
 )
 
 # ---------------------------------------------------------------------------
-# 16-experiment ablation matrix
+# 19-experiment ablation matrix
 # Derived from examples/EXPERIMENT_PLAN_ABLATION_STUDY.md (A100 run 2026-05-21)
 # and adapted for H100 NVL where noted.
 #
@@ -109,7 +118,7 @@ MODEL_ASSISTANT = os.environ.get(
 # Note: there is NO attention_backend field in these dicts.  Gemma 4 has
 # heterogeneous attention head dims (256 and 512), so vLLM forces TRITON_ATTN
 # at runtime regardless of VLLM_ATTENTION_BACKEND.  The env var is set by
-# run_ablation.sh for logging purposes only — it has no effect on this model.
+# run_experiments.sh for logging purposes only — it has no effect on this model.
 #
 # A100 run notes (sm_80):
 #   - VLLM_USE_FLASHINFER_MOE_FP8=0 on A100 — FlashInfer FP8 MoE requires
@@ -247,6 +256,31 @@ EXPERIMENTS: dict[str, dict] = {
         model_variant="text_only",
     ),
     # ------------------------------------------------------------------
+    # E017–E018 — low max_num_seqs sweep for tighter-memory GPUs (e.g. 40G)
+    # ------------------------------------------------------------------
+    "E017": dict(
+        label="low-mns sweep: mns=16",
+        dtype="bfloat16",
+        quantization="fp8",
+        kv_cache_dtype="auto",
+        enforce_eager=False,
+        mtp=True,    mtp_k=5,
+        max_num_seqs=16,
+        gpu_memory_utilization=0.90,
+        model_variant="text_only",
+    ),
+    "E018": dict(
+        label="low-mns sweep: mns=32",
+        dtype="bfloat16",
+        quantization="fp8",
+        kv_cache_dtype="auto",
+        enforce_eager=False,
+        mtp=True,    mtp_k=5,
+        max_num_seqs=32,
+        gpu_memory_utilization=0.90,
+        model_variant="text_only",
+    ),
+    # ------------------------------------------------------------------
     # E010–E011 — gpu_memory_utilization sweep (from E006)
     # ------------------------------------------------------------------
     "E010": dict(
@@ -328,9 +362,23 @@ EXPERIMENTS: dict[str, dict] = {
         model_variant="text_only",
     ),
     # ------------------------------------------------------------------
-    # E016 — FP16 with CUDA graphs (full model)
+    # E016 — BF16/FP16 + CUDA graphs only (isolate CUDA graphs on full precision)
     # ------------------------------------------------------------------
     "E016": dict(
+        label="BF16 + CUDA graphs only (no MTP, no FP8)",
+        dtype="bfloat16",
+        quantization=None,
+        kv_cache_dtype="auto",
+        enforce_eager=False,
+        mtp=False,   mtp_k=0,
+        max_num_seqs=128,
+        gpu_memory_utilization=0.90,
+        model_variant="text_only",
+    ),
+    # ------------------------------------------------------------------
+    # E019 — FP16 with CUDA graphs (full model)
+    # ------------------------------------------------------------------
+    "E019": dict(
         label="FP16 + CUDA graphs (full model)",
         dtype="float16",
         quantization=None,
@@ -416,10 +464,13 @@ def run_experiment(
     reps: int,
 ) -> list[dict]:
     """Build engine for one experiment config, run `reps` generations."""
+    import torch
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
     model = MODEL_TEXT_ONLY if exp_cfg["model_variant"] == "text_only" else MODEL_BASE
+    mem_scale = float(os.environ.get("GPU_MEM_SCALE", "1.0"))
+    gpu_mem_util = exp_cfg["gpu_memory_utilization"] * mem_scale
 
     print(
         f"\n{'='*70}\n"
@@ -432,7 +483,8 @@ def run_experiment(
         f"kv_cache_dtype={exp_cfg['kv_cache_dtype']}  "
         f"enforce_eager={exp_cfg['enforce_eager']}\n"
         f"  max_num_seqs={exp_cfg['max_num_seqs']}  "
-        f"gpu_memory_utilization={exp_cfg['gpu_memory_utilization']}  "
+        f"gpu_memory_utilization(planned)={exp_cfg['gpu_memory_utilization']}  "
+        f"gpu_memory_utilization(effective)={gpu_mem_util:.3f}  "
         f"mtp={exp_cfg['mtp']} k={exp_cfg['mtp_k']}\n"
         f"  VLLM_ATTENTION_BACKEND={os.environ.get('VLLM_ATTENTION_BACKEND', 'unset')}\n"
         f"  VLLM_USE_FLASHINFER_MOE_FP8="
@@ -446,6 +498,36 @@ def run_experiment(
     prompts = render_chat(tok, raw_prompts)
     print(f"loaded {len(prompts)} prompts from {sc_cfg['dataset']}", flush=True)
 
+    # Optional scaling of gpu_memory_utilization, e.g. to mock A100 40 GB on an
+    # 80 GB device: GPU_MEM_SCALE=0.5 caps vLLM's KV-cache budget at half the
+    # planned value (40/80 of total HBM). BF16 experiments will not fit on a
+    # real 40 GB device and are expected to OOM here as well.
+    if mem_scale != 1.0:
+        print(
+            f"  GPU_MEM_SCALE={mem_scale}  ->  effective gpu_memory_utilization="
+            f"{gpu_mem_util:.3f} (planned {exp_cfg['gpu_memory_utilization']})",
+            flush=True,
+        )
+
+    # Strict physical-memory emulation cap for this process.
+    # Example: GPU_MEM_SCALE=0.5 on an 80 GB card -> ~40 GB process cap.
+    process_mem_cap = max(0.0, min(1.0, mem_scale))
+    if torch.cuda.is_available() and process_mem_cap > 0.0:
+        try:
+            dev_idx = torch.cuda.current_device()
+            torch.cuda.set_per_process_memory_fraction(process_mem_cap,
+                                                       device=dev_idx)
+            print(
+                f"  torch.cuda.set_per_process_memory_fraction="
+                f"{process_mem_cap:.3f} on cuda:{dev_idx}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"  WARNING: failed to set torch per-process memory cap: {e}",
+                flush=True,
+            )
+
     # Build LLM kwargs
     llm_kwargs: dict = dict(
         model=model,
@@ -454,7 +536,7 @@ def run_experiment(
         max_model_len=sc_cfg["max_model_len"],
         max_num_seqs=exp_cfg["max_num_seqs"],
         max_num_batched_tokens=sc_cfg["max_num_batched_tokens"],
-        gpu_memory_utilization=exp_cfg["gpu_memory_utilization"],
+        gpu_memory_utilization=gpu_mem_util,
         enforce_eager=exp_cfg["enforce_eager"],
         seed=0,
     )
@@ -519,7 +601,7 @@ def run_experiment(
             "mtp": exp_cfg["mtp"],
             "mtp_k": exp_cfg["mtp_k"],
             "max_num_seqs": exp_cfg["max_num_seqs"],
-            "gpu_memory_utilization": exp_cfg["gpu_memory_utilization"],
+            "gpu_memory_utilization": gpu_mem_util,
             "model_variant": exp_cfg["model_variant"],
             "num_prompts": len(prompts),
             "output_len_cap": sc_cfg["output_len"],
@@ -634,6 +716,7 @@ def main() -> int:
     ensure_csv_header()
     sc_cfg = SCENARIOS[args.scenario]
     exp_ids = [x.strip() for x in args.exp.split(",")]
+    failed_exp_ids: list[str] = []
 
     for exp_id in exp_ids:
         if exp_id not in EXPERIMENTS:
@@ -642,7 +725,7 @@ def main() -> int:
             return 1
         exp_cfg = EXPERIMENTS[exp_id]
 
-        # Log the attention backend env var (set by run_ablation.sh before import).
+        # Log the attention backend env var (set by run_experiments.sh before import).
         # Note: Gemma 4 has heterogeneous attention head dims (256 and 512), so
         # vLLM forces TRITON_ATTN at runtime regardless of VLLM_ATTENTION_BACKEND.
         # The env var is logged for reproducibility but has no effect on this model.
@@ -665,6 +748,14 @@ def main() -> int:
             print(f"!!! experiment {exp_id} FAILED: {e}", flush=True)
             import traceback
             traceback.print_exc()
+            failed_exp_ids.append(exp_id)
+
+    if failed_exp_ids:
+        print(
+            f"\nDone with failures. failed={','.join(failed_exp_ids)}",
+            flush=True,
+        )
+        return 1
 
     print("\nDone.", flush=True)
     return 0

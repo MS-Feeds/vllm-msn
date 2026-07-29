@@ -1068,3 +1068,80 @@ is amortized for sc1. To measure cold prefill, pass
   campaign in
   [`../../examples/gemma4/ablation_study_async_engine.md`](../../examples/gemma4/ablation_study_async_engine.md)
   for per-request latency measurements.
+
+---
+
+## Fork vs stock vLLM 0.22 — do the custom Gemma 4 fusions help?
+
+**Setup.** Full ablation matrix (E001–E018, sc1, 1000 realistic `[SYSTEM]` MAI
+prompts, 2 reps each) run twice on a single A100-SXM4-80GB:
+
+- **Fork** — `feat/gemma4-moe-opt-a100`, vLLM `0.1.dev16934+gb050b6756`
+  (editable in-repo), with the custom Gemma 4 fusions (`norm_quant`,
+  `act_quant`). Results in
+  [`../gemma4_moe_benchmarks/results_A100_80G_verify/`](../gemma4_moe_benchmarks/results_A100_80G_verify/).
+- **Stock** — vLLM `0.22.0` in an isolated venv, no custom code. Results in
+  [`../gemma4_moe_benchmarks/results_A100_80G_official/`](../gemma4_moe_benchmarks/results_A100_80G_official/).
+
+Both runs use identical configs and the same dataset; E003 (FP8 KV) fails on
+A100 in both, as expected.
+
+**Result — fork and stock are statistically tied** (output tok/s, sc1):
+
+| Exp | Config | Fork | Stock 0.22 | Δ |
+|---|---|---:|---:|---:|
+| E001 | BF16 baseline | 690.0 | 651.0 | −5.7% |
+| E002 | +FP8 weights | 1127.2 | 1065.2 | −5.5% |
+| E004 | +CUDA graphs | 1466.8 | 1473.0 | +0.4% |
+| E005 | +MTP k=5 | 1997.5 | 2021.2 | +1.2% |
+| E006 | +text-only | 2016.4 | 2013.5 | −0.1% |
+| E008 | mns=192 | 1995.2 | 2005.4 | +0.5% |
+| E010 | gpu_mem=0.80 | 1958.6 | 1969.7 | +0.6% |
+| E011 | gpu_mem=0.95 (**best**) | 2057.3 | 2037.4 | −1.0% |
+| E012 | no MTP @ optimal | 1453.9 | 1472.2 | +1.3% |
+| E013 | no CUDA graphs | 1812.8 | 1890.3 | +4.3% |
+| E017 | mns=16 | 1253.0 | 1256.4 | +0.3% |
+| E018 | mns=32 | 1581.4 | 1584.4 | +0.2% |
+
+**Conclusion.** Every difference is within ~±5%, with no consistent direction —
+i.e. run-to-run noise. **The fork's custom fusions deliver no meaningful
+throughput gain over stock vLLM 0.22 on A100 for this workload.** The full
+**3.1× speedup over the BF16 baseline** comes entirely from features that are
+already in stock vLLM:
+
+- **MTP k=5** (speculative decoding): +37% — the single biggest lever
+- **CUDA graphs**: +38%
+- **FP8 weights** (Marlin weight-only on A100): +64%
+
+MTP helps on **both** stock and fork (E005 ≈ 2× over E004) on this realistic
+dataset — consistent with the dataset-dependence finding below.
+
+---
+
+## Open questions / TODO
+
+- [ ] **Does MTP (speculative decoding) actually help on every workload?**
+  Observed evidence says *no — it is dataset-dependent*. On stock vLLM 0.22
+  (A100, sc1, 1000 prompts, k=5, `max_num_seqs=128`):
+  - Artificial fixed-text data (identical Shakespeare body, only a
+    `[sample N]` tag differs): MTP was **~14% slower** (E004 1133 → E005 976
+    output tok/s).
+  - Realistic `[SYSTEM]` MAI personalization data (varied, structured
+    output): MTP was **~34% faster** (E004 1483 → E005 1989 output tok/s).
+  The deciding factor is the **draft acceptance rate**: MTP only wins when
+  the small draft model's proposed tokens match the target model's. On
+  out-of-distribution / unseen-distribution data the draft mispredicts,
+  acceptance collapses, and MTP becomes pure overhead (extra draft forwards
+  with no token savings).
+  - [ ] Instrument and log the per-run **acceptance rate**
+    (`spec_decode_num_accepted_tokens / num_draft_tokens` via
+    `llm.get_metrics()`) — currently not captured because runs use
+    `disable_log_stats=True`.
+  - [ ] Run a controlled distribution sweep: same MTP config across several
+    datasets spanning in-distribution → OOD, and correlate acceptance rate
+    with the MTP speedup/slowdown.
+  - [ ] Sweep `num_speculative_tokens` (k) per dataset — optimal k likely
+    drops as acceptance falls; high k on low-acceptance data amplifies the
+    penalty.
+  - [ ] Quantify the break-even acceptance threshold below which MTP should
+    be auto-disabled for a given workload.

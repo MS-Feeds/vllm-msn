@@ -29,6 +29,24 @@ if current_platform.is_cuda():
 else:
     _flashmla_extension_C_AVAILABLE = False
 
+if _flashmla_C_AVAILABLE and _flashmla_extension_C_AVAILABLE:
+    try:
+        from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
+            FlashMLASchedMeta,
+            flash_attn_varlen_func,
+            flash_attn_varlen_kvpacked_func,
+            flash_attn_varlen_qkvpacked_func,
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+        _flashmla_interface_AVAILABLE = True
+    except (ImportError, ModuleNotFoundError) as e:
+        logger.debug("FlashMLA Python interface not available: %s", e)
+        _flashmla_interface_AVAILABLE = False
+else:
+    _flashmla_interface_AVAILABLE = False
+
 
 def _is_flashmla_available() -> tuple[bool, str | None]:
     if not _flashmla_C_AVAILABLE:
@@ -43,6 +61,12 @@ def _is_flashmla_available() -> tuple[bool, str | None]:
             False,
             "vllm._flashmla_extension_C is not available, likely "
             "was not compiled due to a build error.",
+        )
+    if not _flashmla_interface_AVAILABLE:
+        return (
+            False,
+            "vllm.third_party.flashmla.flash_mla_interface is not available. "
+            "The Python wrapper module is missing from the vLLM source tree.",
         )
 
     return True, None
@@ -83,17 +107,7 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
     raise RuntimeError(reason or "FlashMLA is not available")
 
 
-if _is_flashmla_available()[0]:
-    from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
-        FlashMLASchedMeta,
-        flash_attn_varlen_func,
-        flash_attn_varlen_kvpacked_func,
-        flash_attn_varlen_qkvpacked_func,
-        flash_mla_sparse_fwd,
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
-else:
+if not _flashmla_interface_AVAILABLE:
 
     class FlashMLASchedMeta:  # type: ignore[no-redef]
         pass

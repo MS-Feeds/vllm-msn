@@ -42,6 +42,9 @@ from vllm.model_executor.layers.fused_moe import (
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.gemma4_fused_ops import (
+    gemma_dual_rmsnorm_residual_scalar,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -404,9 +407,10 @@ class Gemma4Attention(nn.Module):
         # Q/K norms with learnable weights handle scaling implicitly.
         self.scaling = 1.0
 
-        # QKVParallelLinear handles GQA correctly for all layer types.
-        # k_eq_v layers load K weights into both K and V slots via
-        # _weight_iterator remapping — no structural difference needed.
+        # For k_eq_v global attention layers the checkpoint has no v_proj —
+        # v_head_size=0 drops the V slot from the packed weight matrix,
+        # saving memory and eliminating the redundant V GEMM.  V is derived
+        # from the K projection output in forward() instead.
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -415,6 +419,7 @@ class Gemma4Attention(nn.Module):
             bias=config.attention_bias,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            v_head_size=0 if self.use_k_eq_v else None,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -508,29 +513,38 @@ class Gemma4Attention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        # Unified QKV path (works for both k_eq_v and standard layers).
-        # For k_eq_v, K weights are loaded into both K and V slots of
-        # qkv_proj, so V == K automatically.
         qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Q norm (always applied)
+        q = qkv[..., : self.q_size]
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
 
         if not self.is_kv_shared_layer:
-            # Non-shared: apply K norm + RoPE, V norm
-            k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
-            k = k.flatten(-2, -1)
-            q, k = self.rotary_emb(positions, q, k)
-
-            v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            v = self.v_norm(v)
-            v = v.flatten(-2, -1)
+            if self.use_k_eq_v:
+                # qkv_proj has v_head_size=0: output is [Q, K] only.
+                # Derive V from the pre-norm K tensor via v_norm (no
+                # learnable scale), which is mathematically identical to
+                # the old approach of loading K weights into the V slot.
+                k = qkv[..., self.q_size :]
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(k).flatten(-2, -1)
+                k = self.k_norm(k).flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                # Standard path: apply K norm + RoPE, V norm
+                k = qkv[..., self.q_size : self.q_size + self.kv_size]
+                v = qkv[..., self.q_size + self.kv_size :]
+                k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                k = self.k_norm(k).flatten(-2, -1)
+                q, k = self.rotary_emb(positions, q, k)
+                v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
+                v = self.v_norm(v).flatten(-2, -1)
         else:
-            # Shared: only apply RoPE to Q
+            # KV-shared layers: only apply RoPE to Q; K/V come from cache
+            k = qkv[..., self.q_size : self.q_size + self.kv_size]
+            v = k if self.use_k_eq_v else qkv[..., self.q_size + self.kv_size :]
             q = self.rotary_emb(positions, q, k)[0]
 
         attn_output = self.attn(q, k, v)
@@ -690,6 +704,11 @@ class Gemma4DecoderLayer(nn.Module):
             self.per_layer_projection = None
             self.post_per_layer_input_norm = None
 
+        self.has_ple = (
+            self.hidden_size_per_layer_input is not None
+            and self.hidden_size_per_layer_input > 0
+        )
+
         # Layer scalar (loaded from checkpoint) — applies to ALL text layers
         self.register_buffer("layer_scalar", torch.ones(1))
 
@@ -723,13 +742,58 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
 
         if self.enable_moe_block:
-            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states)
+            hidden_states_1 = hidden_states  # defer norm; fused kernel handles it
 
             # Router and MoE experts see the residual (pre-MLP state),
             # matching the HF transformers forward path
             router_logits = self.router(residual)
             hidden_states_2 = self.pre_feedforward_layernorm_2(residual)
             hidden_states_2 = self.moe(hidden_states_2, router_logits)
+
+            if (
+                not self.has_ple
+                and hidden_states_1.is_cuda
+                and hidden_states_1.dim() in (2, 3)
+            ):
+                # Fast path: fuse 5 kernel launches into 1 Triton kernel.
+                # Computes: (rms(rms(h1,w1)+rms(h2,w2), w3) + residual) * scalar.
+                # We also support 3-D inputs by flattening [B, S, H] -> [B*S, H]
+                # and reshaping back after the fused kernel.
+                fused_shape = None
+                fused_h1 = hidden_states_1
+                fused_h2 = hidden_states_2
+                fused_residual = residual
+                if hidden_states_1.dim() == 3:
+                    fused_shape = hidden_states_1.shape
+                    fused_h1 = hidden_states_1.reshape(-1, fused_shape[-1])
+                    fused_h2 = hidden_states_2.reshape(-1, fused_shape[-1])
+                    fused_residual = residual.reshape(-1, fused_shape[-1])
+
+                # The Triton kernel uses row-stride addressing and assumes the
+                # hidden dimension is contiguous in memory (stride(-1) == 1).
+                if (
+                    fused_h1.stride(-1) == 1
+                    and fused_h2.stride(-1) == 1
+                    and fused_residual.stride(-1) == 1
+                ):
+                    fused_out = gemma_dual_rmsnorm_residual_scalar(
+                        fused_h1,
+                        self.post_feedforward_layernorm_1.weight.data,
+                        fused_h2,
+                        self.post_feedforward_layernorm_2.weight.data,
+                        self.post_feedforward_layernorm.weight.data,
+                        fused_residual,
+                        self.layer_scalar,
+                        self.post_feedforward_layernorm_1.variance_epsilon,
+                        self.post_feedforward_layernorm_2.variance_epsilon,
+                        self.post_feedforward_layernorm.variance_epsilon,
+                    )
+                    if fused_shape is not None:
+                        fused_out = fused_out.reshape(fused_shape)
+                    return fused_out, None
+
+            # Unfused fallback path
+            hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
 
             # Combine MLP and MoE outputs
@@ -749,7 +813,6 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = hidden_states + per_layer_contribution
 
-        # Apply layer scalar for full-attention layers
         # Apply per-layer scalar (all text layers)
         hidden_states = hidden_states * self.layer_scalar
 
@@ -1522,9 +1585,9 @@ class Gemma4ForCausalLM(
             ".moe.experts.down_proj": ".moe.down_proj",
         },
     )
-    # Note: qkv_proj packing applies to non-k_eq_v layers (sliding
-    # attention and full attention without k_eq_v). k_eq_v layers use
-    # separate q_proj + k_proj without packing.
+    # Note: k_eq_v global attention layers use qkv_proj with v_head_size=0
+    # (no V slot).  LoRA targeting qkv_proj.v_proj on those layers is
+    # not supported and requires separate handling.
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1619,22 +1682,39 @@ class Gemma4ForCausalLM(
         # Checkpoint weight names use "language_model." prefix (from the
         # Gemma4ForConditionalGeneration wrapper). Strip it to map to our
         # model tree which is just "model.*".
-        def _weight_iterator():
-            use_k_eq_v = getattr(self.config, "attention_k_eq_v", False)
-            # Build set of k_eq_v layer indices (full_attention layers
-            # when attention_k_eq_v is enabled). These layers have k_proj
-            # but no v_proj in checkpoint — we duplicate k_proj as v_proj.
-            k_eq_v_layer_indices: set[int] = set()
-            if use_k_eq_v:
-                for idx, lt in enumerate(self.config.layer_types):
-                    if lt == "full_attention":
-                        k_eq_v_layer_indices.add(idx)
 
+        # Pre-compute the set of layer indices that use k_eq_v attention.
+        # For those layers, qkv_proj is built with v_head_size=0 — there is
+        # no V slot in the packed weight matrix.  Any v_proj weight from the
+        # checkpoint must be dropped before reaching QKVParallelLinear's
+        # weight_loader, otherwise it tries to copy into a zero-size region
+        # and raises a shape-mismatch error.
+        k_eq_v_layer_indices: set[int] = {
+            layer_idx
+            for layer_idx, layer in enumerate(self.model.layers)
+            if layer.self_attn.use_k_eq_v
+        }
+
+        def _weight_iterator():
             for name, weight in weights:
                 # Remap "language_model." → "" to match our model tree.
                 # Checkpoint: model.language_model.layers.X.*
                 # Our model:  model.layers.X.*
                 name = name.replace("language_model.", "")
+
+                # Drop v_proj weights for k_eq_v layers.
+                # Those layers have qkv_proj built with v_head_size=0 (no V
+                # slot).  Attempting to load v_proj into a zero-size shard
+                # raises a shape-mismatch error in QKVParallelLinear's
+                # weight_loader.  The V output is derived from K at runtime
+                # via v_norm instead, so the checkpoint v_proj is not needed.
+                #
+                # Weight name pattern: model.layers.{idx}.self_attn.v_proj.*
+                # We match on ".self_attn.v_proj" and parse the layer index.
+                if ".self_attn.v_proj" in name and k_eq_v_layer_indices:
+                    _m = re.search(r"\.layers\.(\d+)\.", name)
+                    if _m and int(_m.group(1)) in k_eq_v_layer_indices:
+                        continue  # skip — no V slot in this layer's qkv_proj
 
                 # Remap new HF checkpoint naming to internal vLLM
                 # naming: HF moved per_expert_scale to router and
@@ -1691,18 +1771,6 @@ class Gemma4ForCausalLM(
                         expert_name = name.replace("moe.", f"moe.experts.{expert_id}.")
                         yield expert_name, weight[expert_id]
                     continue
-
-                # k_eq_v layers: checkpoint has k_proj but no v_proj.
-                # QKVParallelLinear expects both, so duplicate k_proj
-                # as v_proj so V gets identical weights to K.
-                # ONLY for full_attention layers — sliding layers have
-                # their own real v_proj weights.
-                if "self_attn.k_proj" in name and k_eq_v_layer_indices:
-                    m = re.search(r"layers\.(\d+)\.", name)
-                    if m and int(m.group(1)) in k_eq_v_layer_indices:
-                        yield name, weight
-                        yield name.replace("k_proj", "v_proj"), weight.clone()
-                        continue
 
                 yield name, weight
 
