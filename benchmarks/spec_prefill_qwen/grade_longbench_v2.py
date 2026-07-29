@@ -69,12 +69,32 @@ def _accuracy(results: list[bool]) -> float:
 
 
 def grade(samples: list[dict], predictions: list[dict]) -> dict:
-    """Joins predictions to samples by id and computes overall accuracy plus
-    breakdowns by difficulty and domain. Also returns a `per_sample` list
-    (id, domain, difficulty, the raw prediction text, the extracted letter,
-    the ground-truth answer, and whether it was correct) for anyone who
-    wants a side-by-side comparison rather than just the aggregate stats --
-    see `write_per_sample_csv` / the `--per-sample-output` CLI flag."""
+    """Joins predictions to samples by id and computes accuracy plus
+    breakdowns by difficulty and domain -- **always over `matched` samples
+    only** (i.e. samples that actually got a prediction). A `missing`
+    sample (no prediction at all -- e.g. skipped by predict_longbench_v2.py
+    for exceeding the token budget) is excluded from every accuracy
+    denominator entirely, not counted as wrong: `counts.total` still
+    reports the full dataset size and `counts.missing` how many of those
+    were skipped, but `overall`/`by_difficulty`/`by_domain` are scored only
+    over `counts.matched`. This matters when comparing experiments whose
+    skip rates differ -- e.g. P001 (baseline) needs the FULL unpruned
+    prompt to fit the token budget, so it's likely to skip more samples
+    than a pruned experiment (P002-P006) only needs the smaller *kept*
+    length to fit; scoring both against the same fixed `total` would
+    otherwise penalize P001 for skips that have nothing to do with answer
+    quality, muddying EXPERIMENT_PLAN.md's "accuracy drop vs. baseline"
+    comparison. `unparseable` (a prediction that came back but had no
+    extractable A-D letter) IS still counted as wrong within `matched`, by
+    contrast -- that's a real model-output failure, not something skipped
+    before generation even happened.
+
+    Also returns a `per_sample` list (id, domain, difficulty, the raw
+    prediction text, the extracted letter, the ground-truth answer, and
+    whether it was correct -- `None` for a missing sample, since it was
+    never scored) for anyone who wants a side-by-side comparison rather
+    than just the aggregate stats -- see `write_per_sample_csv` / the
+    `--per-sample-output` CLI flag."""
     pred_by_id = {p["id"]: p["pred"] for p in predictions}
 
     total = len(samples)
@@ -94,16 +114,25 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
 
         if sample_id not in pred_by_id:
             missing += 1
-            is_correct = False
-            pred_raw = None
-            extracted = None
-        else:
-            matched += 1
-            pred_raw = pred_by_id[sample_id]
-            extracted = extract_answer_letter(pred_raw)
-            if extracted is None:
-                unparseable += 1
-            is_correct = extracted == sample["answer"]
+            per_sample.append(
+                {
+                    "id": sample_id,
+                    "domain": domain,
+                    "difficulty": difficulty,
+                    "answer": sample["answer"],
+                    "pred_letter": None,
+                    "correct": None,  # never scored -- excluded, not wrong
+                    "pred_raw": None,
+                }
+            )
+            continue  # excluded from every accuracy denominator below
+
+        matched += 1
+        pred_raw = pred_by_id[sample_id]
+        extracted = extract_answer_letter(pred_raw)
+        if extracted is None:
+            unparseable += 1
+        is_correct = extracted == sample["answer"]
 
         overall.append(is_correct)
         correct_by_difficulty.setdefault(difficulty, []).append(is_correct)
@@ -157,8 +186,9 @@ def render_summary_table(result: dict) -> str:
     counts = result["counts"]
     lines.append(
         f"**Overall accuracy: {result['overall']:.2f}%** "
-        f"({counts['matched']}/{counts['total']} matched, "
-        f"{counts['missing']} missing, {counts['unparseable']} unparseable)"
+        f"(over {counts['matched']} matched of {counts['total']} total -- "
+        f"{counts['missing']} missing/skipped excluded from this %, "
+        f"{counts['unparseable']} unparseable counted as wrong within it)"
     )
     lines.append("")
     lines.append("| Difficulty | Accuracy |")
