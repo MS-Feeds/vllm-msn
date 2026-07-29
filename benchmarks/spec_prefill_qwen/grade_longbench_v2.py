@@ -23,7 +23,8 @@ Usage:
     python3 grade_longbench_v2.py \\
         --samples datasets/longbench_v2_samples.jsonl \\
         --predictions <path-to-predictions.jsonl> \\
-        --output results/longbench_v2_result.json
+        --output results/longbench_v2_result.json \\
+        --per-sample-output results/longbench_v2_per_sample.csv
 """
 
 from __future__ import annotations
@@ -69,7 +70,11 @@ def _accuracy(results: list[bool]) -> float:
 
 def grade(samples: list[dict], predictions: list[dict]) -> dict:
     """Joins predictions to samples by id and computes overall accuracy plus
-    breakdowns by difficulty and domain."""
+    breakdowns by difficulty and domain. Also returns a `per_sample` list
+    (id, domain, difficulty, the raw prediction text, the extracted letter,
+    the ground-truth answer, and whether it was correct) for anyone who
+    wants a side-by-side comparison rather than just the aggregate stats --
+    see `write_per_sample_csv` / the `--per-sample-output` CLI flag."""
     pred_by_id = {p["id"]: p["pred"] for p in predictions}
 
     total = len(samples)
@@ -80,6 +85,7 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
     correct_by_difficulty: dict[str, list[bool]] = {}
     correct_by_domain: dict[str, list[bool]] = {}
     overall: list[bool] = []
+    per_sample: list[dict] = []
 
     for sample in samples:
         sample_id = sample["id"]
@@ -89,9 +95,12 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
         if sample_id not in pred_by_id:
             missing += 1
             is_correct = False
+            pred_raw = None
+            extracted = None
         else:
             matched += 1
-            extracted = extract_answer_letter(pred_by_id[sample_id])
+            pred_raw = pred_by_id[sample_id]
+            extracted = extract_answer_letter(pred_raw)
             if extracted is None:
                 unparseable += 1
             is_correct = extracted == sample["answer"]
@@ -99,6 +108,17 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
         overall.append(is_correct)
         correct_by_difficulty.setdefault(difficulty, []).append(is_correct)
         correct_by_domain.setdefault(domain, []).append(is_correct)
+        per_sample.append(
+            {
+                "id": sample_id,
+                "domain": domain,
+                "difficulty": difficulty,
+                "answer": sample["answer"],
+                "pred_letter": extracted,
+                "correct": is_correct,
+                "pred_raw": pred_raw,
+            }
+        )
 
     return {
         "overall": _accuracy(overall),
@@ -110,7 +130,22 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
             "missing": missing,
             "unparseable": unparseable,
         },
+        "per_sample": per_sample,
     }
+
+
+def write_per_sample_csv(result: dict, path: Path) -> None:
+    """Writes the side-by-side id/domain/difficulty/answer/pred_letter/
+    correct/pred_raw comparison as CSV -- easy to open in a spreadsheet or
+    `column -s, -t` in a terminal, unlike scrolling the full JSON output."""
+    import csv
+
+    fieldnames = ["id", "domain", "difficulty", "answer", "pred_letter", "correct", "pred_raw"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in result["per_sample"]:
+            writer.writerow(row)
 
 
 def render_summary_table(result: dict) -> str:
@@ -143,15 +178,37 @@ def main() -> None:
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
     parser.add_argument("--predictions", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--per-sample-output",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to write a side-by-side CSV (id, domain, "
+            "difficulty, ground-truth answer, extracted pred_letter, "
+            "correct, and the raw pred_raw text) -- one row per sample. "
+            "Not written by default since it can be large (full raw "
+            "prediction text per row); --output's JSON stays aggregate-"
+            "stats-only either way."
+        ),
+    )
     args = parser.parse_args()
 
     samples = _read_jsonl(args.samples)
     predictions = _read_jsonl(args.predictions)
     result = grade(samples, predictions)
 
+    if args.per_sample_output is not None:
+        args.per_sample_output.parent.mkdir(parents=True, exist_ok=True)
+        write_per_sample_csv(result, args.per_sample_output)
+        print(f"[grade_longbench_v2] wrote per-sample comparison -> {args.per_sample_output}")
+
+    # --output stays aggregate-only (per_sample lives in the CSV above, not
+    # here) -- keeps this file small and stable for anything that reads it
+    # programmatically (e.g. a future analyze_results.py-style script).
+    aggregate_result = {k: v for k, v in result.items() if k != "per_sample"}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
+        json.dump(aggregate_result, f, indent=2)
 
     print(render_summary_table(result))
     print(f"\n[grade_longbench_v2] wrote {args.output}")
