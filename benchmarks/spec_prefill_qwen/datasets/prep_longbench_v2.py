@@ -81,7 +81,7 @@ Question: {question}
 (C) {choice_C}
 (D) {choice_D}
 
-Answer with a single letter (A, B, C, or D) corresponding to the correct choice."""
+Answer with ONLY a single letter."""
 
 
 def _resolve_hf_token(explicit: str | None) -> str | None:

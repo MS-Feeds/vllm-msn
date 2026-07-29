@@ -449,8 +449,7 @@ def submit_pruned_requests(
     _PREFIX_TEXT = "Please read the following long text and answer the question below.\n\n"
     _SUFFIX_TEMPLATE = (
         "\n\nQuestion: {question}\n(A) {choice_A}\n(B) {choice_B}\n(C) {choice_C}"
-        "\n(D) {choice_D}\n\nAnswer with a single letter (A, B, C, or D) "
-        "corresponding to the correct choice."
+        "\n(D) {choice_D}\n\nAnswer with ONLY a single letter."
     )
 
     id_to_sample: dict = {}
