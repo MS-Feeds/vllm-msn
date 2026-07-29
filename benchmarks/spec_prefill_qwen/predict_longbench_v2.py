@@ -87,6 +87,7 @@ Usage:
     python3 predict_longbench_v2.py --list
     python3 predict_longbench_v2.py --exp P001 --max-keep 2   # smoke test first
     python3 predict_longbench_v2.py --exp P001,P002,P003,P004,P005,P006
+    python3 predict_longbench_v2.py --exp P000  # speculator standalone baseline
 """
 
 from __future__ import annotations
@@ -130,19 +131,22 @@ LOOK_AHEAD_CNT = 8
 POOL_KERNEL_SIZE = 13
 
 PRUNE_EXPERIMENTS = {
+    # Standalone speculator (Qwen3-1.7B) baseline -- no pruning, no target
+    # model involved at all. Answers "how well does the small speculator do
+    # on its own?", a useful reference point distinct from P001 (the 8B
+    # target's own unpruned baseline) -- e.g. to sanity-check that
+    # SpecPrefill's pruned target-model accuracy (P002-P006) isn't secretly
+    # just tracking the much weaker speculator's own ceiling. Numbered P000
+    # (not part of the official P001-P006 experiment matrix) so it sorts
+    # before P001 in --list output and slots into the same --exp comma-
+    # separated syntax as everything else.
+    "P000": {"label": "Speculator standalone baseline (no pruning)", "keep_percentage": None, "model": "speculator"},
     "P001": {"label": "Baseline (no SpecPrefill)", "keep_percentage": None, "model": "target"},
     "P002": {"label": "Keep 10%", "keep_percentage": 0.1, "model": "target"},
     "P003": {"label": "Keep 30%", "keep_percentage": 0.3, "model": "target"},
     "P004": {"label": "Keep 50%", "keep_percentage": 0.5, "model": "target"},
     "P005": {"label": "Keep 70%", "keep_percentage": 0.7, "model": "target"},
     "P006": {"label": "Keep 90%", "keep_percentage": 0.9, "model": "target"},
-    # Standalone speculator (Qwen3-1.7B) baseline -- no pruning, no target
-    # model involved at all. Answers "how well does the small speculator do
-    # on its own?", a useful reference point distinct from P001 (the 8B
-    # target's own unpruned baseline) -- e.g. to sanity-check that
-    # SpecPrefill's pruned target-model accuracy (P002-P006) isn't secretly
-    # just tracking the much weaker speculator's own ceiling.
-    "SPEC": {"label": "Speculator standalone baseline (no pruning)", "keep_percentage": None, "model": "speculator"},
 }
 
 
@@ -594,8 +598,8 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     keep_percentage = exp_cfg["keep_percentage"]
     is_baseline = keep_percentage is None
     # Which checkpoint this experiment actually generates from -- "target"
-    # (Qwen3-8B, P001-P006) or "speculator" (Qwen3-1.7B standalone, e.g.
-    # "SPEC"): no pruning machinery involved either way, same as any other
+    # (Qwen3-8B, P001-P006) or "speculator" (Qwen3-1.7B standalone, "P000"):
+    # no pruning machinery involved either way, same as any other
     # is_baseline=True row, just a different model path.
     model_path = args.speculator_model if exp_cfg.get("model") == "speculator" else args.target_model
 
@@ -879,12 +883,12 @@ def main() -> None:
             sys.exit(1)
         exp_cfg = PRUNE_EXPERIMENTS[exp_id]
         # --target-model is only required for experiments that actually
-        # generate from the target checkpoint -- "SPEC" runs entirely off
+        # generate from the target checkpoint -- "P000" runs entirely off
         # --speculator-model and needs no target model at all.
         if exp_cfg.get("model", "target") == "target" and not args.target_model:
             parser.error(f"{exp_id} requires --target-model or $QWEN3_MODEL_PATH")
         # --speculator-model is required either for pruning (P002-P006) or
-        # for a standalone speculator experiment like "SPEC".
+        # for a standalone speculator experiment like "P000".
         if (exp_cfg["keep_percentage"] is not None or exp_cfg.get("model") == "speculator") \
                 and not args.speculator_model:
             parser.error(f"{exp_id} requires --speculator-model or $QWEN3_1_7B_MODEL_PATH")

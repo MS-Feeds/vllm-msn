@@ -191,7 +191,7 @@ validated end-to-end on real hardware for Qwen3 — see `REPRODUCE.md` steps
 
 Metrics captured per run: accuracy (LongBench v2 scoring), QPS, TTFT.
 
-`predict_longbench_v2.py` additionally supports a standalone `SPEC`
+`predict_longbench_v2.py` additionally supports a standalone `P000`
 experiment (Qwen3-1.7B generating alone, no pruning, no target model) as a
 reference point for how much of the pruned target's accuracy is just
 tracking the speculator's own ceiling — not part of the official matrix
