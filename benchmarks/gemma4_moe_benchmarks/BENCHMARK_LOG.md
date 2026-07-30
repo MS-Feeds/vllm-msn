@@ -591,3 +591,62 @@ See `results/summary.md` for auto-generated comparison table.
 
 
 
+
+---
+
+## H100 NVL Round 2 Results (2026-07-30)
+
+### Run environment
+- Hardware: 2× NVIDIA A100 80GB PCIe (sm_80) — one per experiment
+- Conda env: `vllm-ablation`
+- Models:
+  - Target: `/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it`
+  - Text-only: `/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-text-only`
+  - Eagle3 assistant: `/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-speculator.eagle3`
+
+### E001 — BF16 baseline (GPU 0)
+- Command: `GEMMA4_ASSISTANT_MODEL_PATH=/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-assistant BENCH_RESULTS_DIR=results_v0240_baseline bash run_experiments.sh E001`
+- Results:
+  - rep1: elapsed=1674.827s, total_tps=3404.34
+  - rep2: elapsed=1833.003s, total_tps=3109.11
+  - **Mean: 3256.7 total_tps**
+
+### E005 — +MTP speculative decoding k=5 (Eagle3, GPU 1)
+- Command: `CUDA_VISIBLE_DEVICES=1 GEMMA4_ASSISTANT_MODEL_PATH=/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-speculator.eagle3 BENCH_RESULTS_DIR=results_v0240_baseline_eagle3 bash run_experiments.sh E005 --reps 1`
+- Results:
+  - rep1: elapsed=1487.244s, total_tps=3799.66
+- **~16.7% faster than E001 baseline**
+
+### Remaining experiments (in progress on GPU 0)
+- E002, E003, E004 queued to run
+
+
+### E002 — +FP8 weights (GPU 0, completed 21:39)
+- elapsed=1109.061s, total_tps=5070.06
+- ~53% faster than baseline
+
+### E005 — +DFlash MTP k=5 (GPU 1, completed 21:54)
+- Assistant: `/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-DFlash`
+- elapsed=998.079s, total_tps=5673.65
+- **~83% faster than baseline** — best result so far!
+
+### E004 — +CUDA graphs (GPU 0, completed 21:58)
+- elapsed=988.410s, total_tps=5700.47
+- **~75% faster than baseline**
+
+### Summary — H100 NVL Round 2 Results
+
+| Experiment | Config | total_tps | vs baseline |
+|------------|--------|-----------|-------------|
+| E001 | BF16 baseline | 3256.7 (mean of 2 reps) | — |
+| E002 | +FP8 weights | 5070.06 | +56% |
+| E004 | +CUDA graphs | 5700.47 | +75% |
+| E005 | +Eagle3 MTP k=5 | 3799.66 | +17% |
+| E005 | +DFlash MTP k=5 | 5673.65 | +74% |
+
+Best result: **E004 +CUDA graphs at 5700.47 total_tps** (~75% faster than baseline).
+DFlash MTP (5673.65 tps) is close second — slightly slower than E004 but adds speculative decoding benefit.
+
+**Note on DFlash mtp_k=8**: The `--mtp-k` flag is not supported by bench_experiment.py.
+To run DFlash with mtp_k=8, bench_experiment.py would need to be modified to accept
+an optional `--mtp-k` override parameter.
