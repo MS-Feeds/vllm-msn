@@ -78,15 +78,19 @@ matrix is built from:
 |---|---|---|
 | `keep_strategy` | Selection strategy (only `"percentage"` is currently supported) | `percentage` |
 | `keep_kwargs.chunk` | Whether to group tokens into chunks before scoring | `True` |
-| `keep_kwargs.chunk_size` | Chunk size for scoring/selection | `64` |
+| `keep_kwargs.chunk_size` | Chunk size for scoring/selection | `32` |
 | `keep_kwargs.percentage` | Fraction of chunks to keep | swept: 0.1 / 0.3 / 0.5 / 0.7 / 0.9 |
 | `look_ahead_cnt` | Number of lookahead decode steps used for scoring | `8` |
 | `pool_kernel_size` | Pooling kernel size for chunk score aggregation | `13`, matching the reference repo's own cited configs |
 
-These are SpecPrefill algorithm hyperparameters (inherited unchanged from
-`../spec_prefill/`'s matrix, itself modeled on the reference repo's own
-`config_p{1,3,5,7,9}_full_lah8.yaml`), not facts about Gemma4, Qwen3, or
-Llama — no re-derivation needed for the model swap.
+These are SpecPrefill algorithm hyperparameters, not facts about Gemma4,
+Qwen3, or Llama — no re-derivation needed for the model swap. `chunk_size`
+is this pipeline's one deliberate deviation from `../spec_prefill/`'s and
+`../spec_prefill_qwen/`'s matrix, which both use `64` (matching the
+reference repo's own `config_p{1,3,5,7,9}_full_lah8.yaml`); `32` was set
+explicitly here instead. `validate_runner_integration.py`'s own standalone
+smoke-test `SpecConfig` is not wired to this value and still uses `64` — see
+that script if it should be updated to match.
 
 ---
 
@@ -169,10 +173,11 @@ validated end-to-end on real hardware for Llama — see `REPRODUCE.md` steps
 ## SpecPrefill settings
 
 - BF16 precision
-- Chunk-based attention scoring, chunk size **64**, `pool_kernel_size` **13**
-  — matching the "Algorithm reference" table above and inherited unchanged
-  from `../spec_prefill/`'s matrix (these are algorithm hyperparameters, not
-  model-architecture facts).
+- Chunk-based attention scoring, chunk size **32**, `pool_kernel_size` **13**
+  — matching the "Algorithm reference" table above (these are algorithm
+  hyperparameters, not model-architecture facts). `chunk_size` is a
+  deliberate deviation from `../spec_prefill/`'s and `../spec_prefill_qwen/`'s
+  matrix, both of which use `64`.
 - Look-ahead count: **8**
 - `enforce_eager=True`. **`enable_chunked_prefill` is left at the model's
   own supported default (on) for now, matching `../spec_prefill/`'s
@@ -192,11 +197,11 @@ validated end-to-end on real hardware for Llama — see `REPRODUCE.md` steps
 | ID | Label | Keep rate | Chunk size | Look-ahead | Based on (reference repo config) |
 |---|---|---:|---:|---:|---|
 | P001 | Baseline (no SpecPrefill) | 100% | — | — | `experiments/run_long_bench_70b.sh` baseline branch |
-| P002 | Keep 10% | 10% | 64 | 8 | `config_p1_full_lah8.yaml` |
-| P003 | Keep 30% | 30% | 64 | 8 | `config_p3_full_lah8.yaml` |
-| P004 | Keep 50% | 50% | 64 | 8 | `config_p5_full_lah8.yaml` |
-| P005 | Keep 70% | 70% | 64 | 8 | `config_p7_full_lah8.yaml` |
-| P006 | Keep 90% | 90% | 64 | 8 | `config_p9_full_lah8.yaml` |
+| P002 | Keep 10% | 10% | 32 | 8 | `config_p1_full_lah8.yaml` |
+| P003 | Keep 30% | 30% | 32 | 8 | `config_p3_full_lah8.yaml` |
+| P004 | Keep 50% | 50% | 32 | 8 | `config_p5_full_lah8.yaml` |
+| P005 | Keep 70% | 70% | 32 | 8 | `config_p7_full_lah8.yaml` |
+| P006 | Keep 90% | 90% | 32 | 8 | `config_p9_full_lah8.yaml` |
 
 Metrics captured per run: accuracy (LongBench v2 scoring), QPS, TTFT.
 

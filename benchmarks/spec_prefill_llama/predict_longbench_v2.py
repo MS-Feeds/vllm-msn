@@ -15,8 +15,13 @@ and the config-deviation rationale below were updated.
 Config deviations from EXPERIMENT_PLAN.md, and why (see that file's
 "SpecPrefill settings" section, updated alongside this script):
 
-1. chunk_size=64, not the prose section's stale "32" -- the experiment matrix
-   itself (P002-P006) and validate_runner_integration.py both already use 64.
+1. chunk_size=32 -- set explicitly for this pipeline (overriding the value
+   inherited from the Qwen3/Gemma4 ports, which used 64, matching the
+   experiment matrix and validate_runner_integration.py's own hardcoded
+   chunk_size). validate_runner_integration.py's SpecConfig still uses 64
+   independently (it's a standalone smoke test, not wired to this constant) --
+   update that too if the smoke test should match this pipeline's actual
+   experiment chunk size.
 2. pool_kernel_size=13, not validate_runner_integration.py's `None` -- 13 is
    what the matrix's own cited basis configs (config_p{1,3,5,7,9}_full_lah8.yaml)
    use; `None` there was a validation-script simplification, not a protocol
@@ -128,7 +133,7 @@ CSV_FIELDS = [
 
 # See module docstring items 1-2 -- deviate from EXPERIMENT_PLAN.md's stale
 # "32" prose value and validate_runner_integration.py's `None` simplification.
-CHUNK_SIZE = 64
+CHUNK_SIZE = 32
 LOOK_AHEAD_CNT = 8
 POOL_KERNEL_SIZE = 13
 
@@ -885,12 +890,12 @@ def main() -> None:
         # generate from the target checkpoint -- "P000" runs entirely off
         # --speculator-model and needs no target model at all.
         if exp_cfg.get("model", "target") == "target" and not args.target_model:
-            parser.error(f"{exp_id} requires --target-model or $QWEN3_MODEL_PATH")
+            parser.error(f"{exp_id} requires --target-model or $LLAMA31_8B_MODEL_PATH")
         # --speculator-model is required either for pruning (P002-P006) or
         # for a standalone speculator experiment like "P000".
         if (exp_cfg["keep_percentage"] is not None or exp_cfg.get("model") == "speculator") \
                 and not args.speculator_model:
-            parser.error(f"{exp_id} requires --speculator-model or $QWEN3_1_7B_MODEL_PATH")
+            parser.error(f"{exp_id} requires --speculator-model or $LLAMA32_1B_MODEL_PATH")
         try:
             run_experiment(exp_id, PRUNE_EXPERIMENTS[exp_id], args)
         except Exception as e:
