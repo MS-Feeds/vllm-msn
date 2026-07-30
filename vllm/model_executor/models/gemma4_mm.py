@@ -1042,8 +1042,10 @@ class Gemma4ForConditionalGeneration(
         ]:
             tower_quant = quant_config
         else:
+            # vision_config is None for the text-only variant, which builds no
+            # towers at all; leave them unquantized rather than dereferencing it.
             vision_cfg = config.vision_config
-            quantizable = (
+            quantizable = vision_cfg is not None and (
                 vision_cfg.hidden_size % 64 == 0
                 and vision_cfg.intermediate_size % 64 == 0
             )
