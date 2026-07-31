@@ -25,7 +25,7 @@ alembic==1.18.4
     # via optuna
 annotated-doc==0.0.4
     # via fastapi
-annotated-types==0.7.0
+annotated-types==0.8.0
     # via pydantic
 anyio==4.14.2
     # via
@@ -60,7 +60,7 @@ backoff==2.2.1
     # via
     #   -r requirements/test/cuda.in
     #   schemathesis
-bitsandbytes==0.49.2
+bitsandbytes==0.50.0
     # via -r requirements/test/cuda.in
 black==24.10.0
     # via datamodel-code-generator
@@ -113,7 +113,7 @@ colorama==0.4.6
     #   schemathesis
 colorful==0.5.6
     # via ray
-colorlog==6.10.1
+colorlog==6.12.0
     # via optuna
 contourpy==1.3.0
     # via matplotlib
@@ -129,7 +129,7 @@ cryptography==48.0.0
     #   pyjwt
 cuda-bindings==13.3.1
     # via torch
-cuda-pathfinder==1.5.5
+cuda-pathfinder==1.6.0
     # via cuda-bindings
 cuda-toolkit==13.3.0
     # via torch
@@ -137,7 +137,7 @@ cupy-cuda12x==13.6.0
     # via ray
 cycler==0.12.1
     # via matplotlib
-datamodel-code-generator==0.68.1
+datamodel-code-generator==0.71.0
     # via -r requirements/test/cuda.in
 dataproperty==1.1.1
     # via
@@ -183,7 +183,7 @@ et-xmlfile==2.0.0
     # via openpyxl
 evaluate==0.4.3
     # via lm-eval
-fastapi==0.139.2
+fastapi==0.140.7
     # via
     #   -c requirements/common.txt
     #   gpt-oss
@@ -195,7 +195,7 @@ fastsafetensors==0.3.2
     # via
     #   -c requirements/cuda.txt
     #   -r requirements/test/cuda.in
-filelock==3.30.2
+filelock==3.32.0
     # via
     #   -c requirements/common.txt
     #   blobfile
@@ -227,7 +227,7 @@ genai-perf==0.0.16
     # via -r requirements/test/cuda.in
 genson==1.4.0
     # via datamodel-code-generator
-google-api-core==2.32.0
+google-api-core==2.33.0
     # via
     #   google-cloud-core
     #   google-cloud-storage
@@ -256,18 +256,18 @@ graphql-core==3.2.6
     # via hypothesis-graphql
 greenlet==3.5.1
     # via sqlalchemy
-grpcio==1.82.1
+grpcio==1.83.0
     # via
     #   -r requirements/test/cuda.in
     #   grpcio-reflection
     #   ray
-grpcio-reflection==1.82.1
+grpcio-reflection==1.83.0
     # via -r requirements/test/cuda.in
 h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-h2==4.3.0
+h2==4.4.0
     # via httpx
 harfile==0.5.0
     # via schemathesis
@@ -287,7 +287,7 @@ httpx==0.28.1
     #   huggingface-hub
     #   perceptron
     #   schemathesis
-huggingface-hub==1.23.0
+huggingface-hub==1.25.1
     # via
     #   accelerate
     #   datasets
@@ -304,7 +304,7 @@ humanize==4.16.0
     # via runai-model-streamer
 hyperframe==6.1.0
     # via h2
-hypothesis==6.156.6
+hypothesis==6.161.8
     # via
     #   hypothesis-graphql
     #   hypothesis-jsonschema
@@ -629,7 +629,7 @@ pillow==10.4.0
     #   scikit-image
     #   segmentation-models-pytorch
     #   torchvision
-platformdirs==4.10.0
+platformdirs==4.11.0
     # via
     #   black
     #   pooch
@@ -642,7 +642,7 @@ pluggy==1.6.0
     # via
     #   pytest
     #   pytest-cov
-polars==1.42.1
+polars==1.43.1
     # via mteb
 pooch==1.9.0
     # via librosa
@@ -650,7 +650,7 @@ portalocker==2.10.1
     # via sacrebleu
 pqdm==0.2.0
     # via -r requirements/test/cuda.in
-prometheus-client==0.25.0
+prometheus-client==0.26.0
     # via
     #   -c requirements/common.txt
     #   opentelemetry-exporter-prometheus
@@ -766,7 +766,7 @@ python-rapidjson==1.23
     # via tritonclient
 pytrec-eval-terrier==0.5.7
     # via mteb
-pytz==2026.2
+pytz==2026.3.post1
     # via
     #   pandas
     #   typepy
@@ -798,7 +798,7 @@ referencing==0.37.0
     # via
     #   jsonschema
     #   jsonschema-specifications
-regex==2026.7.10
+regex==2026.7.19
     # via
     #   nltk
     #   open-clip-torch
@@ -1024,7 +1024,7 @@ torchvision==0.26.0+cu130
     #   open-clip-torch
     #   segmentation-models-pytorch
     #   timm
-tqdm==4.68.4
+tqdm==4.70.0
     # via
     #   datasets
     #   evaluate
@@ -1112,7 +1112,7 @@ urllib3==2.7.0
     #   tritonclient
 uvicorn==0.51.0
     # via gpt-oss
-vector-quantize-pytorch==1.30.1
+vector-quantize-pytorch==1.31.0
     # via -r requirements/test/cuda.in
 virtualenv==20.31.2
     # via ray
