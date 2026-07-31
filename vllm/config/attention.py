@@ -53,6 +53,23 @@ class AttentionConfig:
     use_non_causal: bool = False
     """Whether to use non-causal (bidirectional) attention."""
 
+    enable_relay_attention: bool = False
+    """Enable RelayAttention for workloads with a shared long system prompt.
+    See docs/design/relay_attention.md and arXiv:2402.14808 for details.
+    When True and backend is not explicitly set, RELAY_ATTN will be used."""
+
+    relay_system_prompt_length: int = 0
+    """Expected number of system-prompt tokens. Used to pre-allocate the
+    prefix KV cache when enable_relay_attention=True. 0 = dynamic detection."""
+
+    relay_min_batch_size: int = 2
+    """Minimum batch size below which relay fusion is disabled at runtime
+    (B=1 gains nothing from relay but still pays the merge overhead)."""
+
+    relay_min_system_length: int = 256
+    """Minimum system-prompt token length below which relay fusion is skipped.
+    Short system prompts have negligible bandwidth savings vs merge cost."""
+
     flex_attn_block_m: int | None = None
     """Triton kernel BLOCK_M tile size for flex attention.
     Must be a power of 2 >= 16. If None and VLLM_BATCH_INVARIANT=1,

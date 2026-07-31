@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.v1.attention.backend import AttentionBackend, AttentionType
 from vllm.v1.attention.backends.registry import (
+    AttentionBackendEnum,
     MambaAttentionBackendEnum,
 )
 
@@ -95,8 +96,24 @@ def get_attn_backend(
         use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
     )
 
+    # Auto-select RELAY_ATTN when the feature flag is set and no explicit
+    # backend has been requested by the user.
+    attn_config = vllm_config.attention_config
+    effective_backend = attn_config.backend
+    if (
+        attn_config.enable_relay_attention
+        and effective_backend is None
+        and (attn_type or AttentionType.DECODER) == AttentionType.DECODER
+    ):
+        effective_backend = AttentionBackendEnum.RELAY_ATTN
+        logger.info(
+            "enable_relay_attention=True: using RELAY_ATTN backend "
+            "(system_prompt_length=%d).",
+            attn_config.relay_system_prompt_length,
+        )
+
     return _cached_get_attn_backend(
-        backend=vllm_config.attention_config.backend,
+        backend=effective_backend,
         attn_selector_config=attn_selector_config,
         num_heads=num_heads,
     )
