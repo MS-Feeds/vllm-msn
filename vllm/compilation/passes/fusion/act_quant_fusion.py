@@ -30,16 +30,23 @@ FP4_DTYPE = torch.uint8
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 
-FUSED_OPS: dict[QuantKey, OpOverload] = {
-    kFp8StaticTensorSym: torch.ops._C.silu_and_mul_quant.default,  # noqa: E501
-}
+FUSED_OPS: dict[QuantKey, OpOverload] = {}
+# Guard op access at import time: prebuilt CUDA binaries (e.g. Docker-shipped
+# .so shadowed via PYTHONPATH) may predate these ops. Register only what the
+# loaded _C extension actually exposes, mirroring the nvfp4 guard below.
+silu_and_mul_quant_supported = hasattr(torch.ops._C, "silu_and_mul_quant")
+if silu_and_mul_quant_supported:
+    FUSED_OPS[kFp8StaticTensorSym] = torch.ops._C.silu_and_mul_quant.default  # noqa: E501
 silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
     torch.ops._C, "silu_and_mul_nvfp4_quant"
 )
 if silu_and_mul_nvfp4_quant_supported:
     FUSED_OPS[kNvfp4Dynamic] = torch.ops._C.silu_and_mul_nvfp4_quant.default  # noqa: E501
 
-if current_platform.is_cuda_alike():
+silu_and_mul_per_block_quant_supported = current_platform.is_cuda_alike() and hasattr(
+    torch.ops._C, "silu_and_mul_per_block_quant"
+)
+if silu_and_mul_per_block_quant_supported:
     FUSED_OPS[kFp8Dynamic128Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
     FUSED_OPS[kFp8Dynamic64Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
 
@@ -293,12 +300,13 @@ class ActivationQuantFusionPass(VllmFusionPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config, "activation_quant_fusion_pass")
 
-        self.register(SiluMulFp8StaticQuantPattern())
+        if silu_and_mul_quant_supported:
+            self.register(SiluMulFp8StaticQuantPattern())
 
         if silu_and_mul_nvfp4_quant_supported:
             self.register(SiluMulNvfp4QuantPattern())
 
-        if current_platform.is_cuda():
+        if current_platform.is_cuda() and silu_and_mul_per_block_quant_supported:
             for (
                 quant_key,
                 is_scale_transposed,
