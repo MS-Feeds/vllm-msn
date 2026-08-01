@@ -1594,7 +1594,9 @@ class Gemma4Model(nn.Module, EagleModelMixin):
         params_dict.update(dict(self.named_buffers()))
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
+            if self.quant_config is not None and hasattr(
+                self.quant_config, "get_cache_scale"
+            ) and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
                 param = params_dict[scale_name]
