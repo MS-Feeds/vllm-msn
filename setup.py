@@ -1014,15 +1014,34 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+def _scm_version() -> str:
+    # Resilient version resolution. setuptools_scm raises LookupError when the
+    # working tree has no git tags / no history (e.g. a `--depth 1` shallow
+    # clone on a CI runner), which aborts metadata generation and breaks the
+    # wheel build. In that case fall back to a pretend version so `_version.py`
+    # is still written and the build can proceed.
+    try:
+        return get_version(write_to="vllm/_version.py")
+    except Exception as e:  # noqa: BLE001 - LookupError and friends
+        fallback = os.getenv("SETUPTOOLS_SCM_PRETEND_VERSION", "0.0.0.dev0")
+        print(
+            f"setuptools_scm could not determine a version ({e}); "
+            f"falling back to {fallback}. Set SETUPTOOLS_SCM_PRETEND_VERSION "
+            f"or VLLM_VERSION_OVERRIDE to control this."
+        )
+        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = fallback
+        return get_version(write_to="vllm/_version.py")
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return _scm_version()
 
-    version = get_version(write_to="vllm/_version.py")
+    version = _scm_version()
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
