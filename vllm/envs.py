@@ -179,6 +179,8 @@ if TYPE_CHECKING:
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
+    VLLM_GEMMA4_FUSED_ROUTING_RETRY_INTERVAL: int = 512
+    VLLM_GEMMA4_ROUTING_SCRATCH_CACHE_SIZE: int = 8
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1459,6 +1461,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # if None, choose better gemm type automatically
     "VLLM_HUMMING_MOE_GEMM_TYPE": lambda: os.environ.get(
         "VLLM_HUMMING_MOE_GEMM_TYPE", None
+    ),
+    # Number of MoE forward calls to wait before re-probing the Gemma4
+    # fused topk-softmax routing path after a fallback-triggering failure.
+    "VLLM_GEMMA4_FUSED_ROUTING_RETRY_INTERVAL": lambda: int(
+        os.getenv("VLLM_GEMMA4_FUSED_ROUTING_RETRY_INTERVAL", "512")
+    ),
+    # Maximum number of per-shape/device Gemma4 routing scratch-buffer sets
+    # cached per MoE layer. Higher values reduce reallocations across varied
+    # batch shapes at the cost of more retained GPU memory.
+    "VLLM_GEMMA4_ROUTING_SCRATCH_CACHE_SIZE": lambda: int(
+        os.getenv("VLLM_GEMMA4_ROUTING_SCRATCH_CACHE_SIZE", "8")
     ),
     # Whether to use DeepEPLL kernels for NVFP4 quantization and dispatch method
     # only supported on Blackwell GPUs and with

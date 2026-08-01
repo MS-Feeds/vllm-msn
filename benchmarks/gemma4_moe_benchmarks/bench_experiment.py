@@ -44,6 +44,8 @@ CSV_PATH = OUT_DIR / "all_runs.csv"
 CSV_FIELDS = [
     "ts", "exp_id", "label", "scenario",
     "quantization", "kv_cache_dtype", "attention_backend",
+    "gemma4_fused_routing_retry_interval",
+    "gemma4_routing_scratch_cache_size",
     "enforce_eager", "mtp", "mtp_k",
     "max_num_seqs", "gpu_memory_utilization", "model_variant",
     "num_prompts", "output_len_cap", "max_model_len", "max_num_batched_tokens",
@@ -561,6 +563,14 @@ def run_experiment(
             "quantization": str(exp_cfg["quantization"]),
             "kv_cache_dtype": exp_cfg["kv_cache_dtype"],
             "attention_backend": os.environ.get("VLLM_ATTENTION_BACKEND", "unset"),
+            "gemma4_fused_routing_retry_interval": os.environ.get(
+                "VLLM_GEMMA4_FUSED_ROUTING_RETRY_INTERVAL",
+                "512",
+            ),
+            "gemma4_routing_scratch_cache_size": os.environ.get(
+                "VLLM_GEMMA4_ROUTING_SCRATCH_CACHE_SIZE",
+                "8",
+            ),
             "enforce_eager": exp_cfg["enforce_eager"],
             "mtp": exp_cfg["mtp"],
             "mtp_k": exp_cfg["mtp_k"],

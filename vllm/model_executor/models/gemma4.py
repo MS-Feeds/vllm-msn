@@ -18,6 +18,7 @@
 # limitations under the License.
 """Gemma 4 model implementation for vLLM."""
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
@@ -26,6 +27,7 @@ import regex as re
 import torch
 from torch import nn
 
+import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
@@ -41,6 +43,9 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
     fused_moe_make_expert_params_mapping,
+)
+from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+    dispatch_topk_softmax_func,
 )
 from vllm.model_executor.layers.gemma4_fused_ops import (
     gemma_dual_rmsnorm_residual_scalar,
@@ -162,13 +167,21 @@ def gemma4_fused_routing_kernel_triton(
     gating_output: torch.Tensor,
     topk: int,
     per_expert_scale: torch.Tensor,
+    out_weights: torch.Tensor | None = None,
+    out_ids: torch.Tensor | None = None,
     num_warps: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     gating_output = gating_output.contiguous()
     per_expert_scale = per_expert_scale.contiguous()
     T, E = gating_output.shape
-    weights = torch.empty(T, topk, dtype=torch.float32, device=gating_output.device)
-    ids = torch.empty(T, topk, dtype=torch.int32, device=gating_output.device)
+    if out_weights is None:
+        weights = torch.empty(T, topk, dtype=torch.float32, device=gating_output.device)
+    else:
+        weights = out_weights
+    if out_ids is None:
+        ids = torch.empty(T, topk, dtype=torch.int32, device=gating_output.device)
+    else:
+        ids = out_ids
     BLOCK_E = triton.next_power_of_2(E)
     _gemma4_routing_kernel[(T,)](
         gating_output,
@@ -183,22 +196,45 @@ def gemma4_fused_routing_kernel_triton(
     return weights, ids
 
 
+def gemma4_fused_routing_topk_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    per_expert_scale: torch.Tensor,
+    out_weights: torch.Tensor,
+    out_ids: torch.Tensor,
+    token_expert_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert out_weights.shape[1] == topk, (
+        f"Expected out_weights second dim == topk ({topk}), "
+        f"got {out_weights.shape[1]}."
+    )
+    assert out_ids.shape[1] == topk, (
+        f"Expected out_ids second dim == topk ({topk}), "
+        f"got {out_ids.shape[1]}."
+    )
+
+    topk_func = dispatch_topk_softmax_func()
+    topk_func(
+        out_weights,
+        out_ids,
+        token_expert_indices,
+        gating_output,
+        True,
+    )
+    out_weights.mul_(per_expert_scale[out_ids].to(out_weights.dtype))
+    return out_weights, out_ids
+
+
 def gemma4_routing_function_torch(
     gating_output: torch.Tensor,
     topk: int,
     per_expert_scale: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    _, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
-    router_probabilities = torch.nn.functional.softmax(gating_output, dim=-1)
-    indicator = torch.nn.functional.one_hot(
-        topk_ids, num_classes=gating_output.size(-1)
-    ).sum(dim=-2)
-    gate_weights = indicator * router_probabilities
-    renorm_factor = torch.sum(gate_weights, dim=-1, keepdim=True)
-    renorm_factor = torch.where(renorm_factor > 0.0, renorm_factor, 1.0)
-    dispatch_weights = gate_weights / renorm_factor
-
-    topk_weights = dispatch_weights.gather(1, topk_ids)
+    topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
+    # Gemma4 routing semantics are softmax over all experts followed by top-k
+    # and renormalization over the selected experts. This simplifies exactly
+    # to softmax over only the selected logits.
+    topk_weights = torch.nn.functional.softmax(topk_logits.to(torch.float32), dim=-1)
 
     # Fold per_expert_scale into routing weights
     expert_scales = per_expert_scale[topk_ids].to(topk_weights.dtype)
@@ -321,10 +357,45 @@ class Gemma4MoE(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
+        self.top_k = config.top_k_experts
 
         # Per-expert output scale folded into routing weights so that
         # FusedMoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
         self.per_expert_scale = nn.Parameter(torch.ones(config.num_experts))
+        self._routing_scratch_max_entries = max(
+            1, envs.VLLM_GEMMA4_ROUTING_SCRATCH_CACHE_SIZE
+        )
+        self._routing_scratch: "OrderedDict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]" = OrderedDict()
+        self._use_fused_topk_softmax: bool | None = None
+        self._fused_topk_softmax_retry_interval = max(
+            1, envs.VLLM_GEMMA4_FUSED_ROUTING_RETRY_INTERVAL
+        )
+        self._fused_topk_softmax_retry_counter = 0
+
+        def _get_or_create_routing_scratch(
+            num_tokens: int,
+            device: torch.device,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            key = (num_tokens, device)
+            if key in self._routing_scratch:
+                cached = self._routing_scratch.pop(key)
+                self._routing_scratch[key] = cached
+                return cached
+
+            if len(self._routing_scratch) >= self._routing_scratch_max_entries:
+                # LRU eviction keeps memory bounded across varying batch shapes.
+                self._routing_scratch.popitem(last=False)
+
+            weights = torch.empty(num_tokens, self.top_k, dtype=torch.float32, device=device)
+            ids = torch.empty(num_tokens, self.top_k, dtype=torch.int32, device=device)
+            token_expert_indices = torch.empty(
+                num_tokens,
+                self.top_k,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._routing_scratch[key] = (weights, ids, token_expert_indices)
+            return self._routing_scratch[key]
 
         # Gemma4 routing: softmax over ALL experts → top-k → renormalize.
         # FusedMoE's built-in fused_topk scopes softmax differently, so
@@ -339,8 +410,62 @@ class Gemma4MoE(nn.Module):
             renormalize: bool,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             if current_platform.is_cuda_alike() or current_platform.is_xpu():
+                del hidden_states, renormalize
+                assert topk == self.top_k, (
+                    f"Gemma4MoE expects fixed topk={self.top_k}, got {topk}."
+                )
+                weights, ids, token_expert_indices = _get_or_create_routing_scratch(
+                    gating_output.shape[0], gating_output.device
+                )
+
+                # If fused path was previously disabled, periodically re-probe
+                # it to recover from transient backend/runtime issues.
+                should_try_fused = self._use_fused_topk_softmax is not False
+                if not should_try_fused:
+                    self._fused_topk_softmax_retry_counter += 1
+                    if (
+                        self._fused_topk_softmax_retry_counter
+                        >= self._fused_topk_softmax_retry_interval
+                    ):
+                        self._fused_topk_softmax_retry_counter = 0
+                        should_try_fused = True
+
+                if should_try_fused:
+                    try:
+                        result = gemma4_fused_routing_topk_softmax(
+                            gating_output,
+                            topk,
+                            self.per_expert_scale,
+                            weights,
+                            ids,
+                            token_expert_indices,
+                        )
+                        self._use_fused_topk_softmax = True
+                        self._fused_topk_softmax_retry_counter = 0
+                        return result
+                    except Exception as exc:
+                        if self._use_fused_topk_softmax is None:
+                            logger.warning_once(
+                                "Gemma4MoE fused topk-softmax unavailable; "
+                                "falling back to Triton routing. error=%r",
+                                exc,
+                            )
+                        else:
+                            logger.warning_once(
+                                "Gemma4MoE fused topk-softmax failed at runtime; "
+                                "disabling fused path and falling back to Triton. "
+                                "error=%r",
+                                exc,
+                            )
+                        self._use_fused_topk_softmax = False
+                        self._fused_topk_softmax_retry_counter = 0
+
                 return gemma4_fused_routing_kernel_triton(
-                    gating_output, topk, self.per_expert_scale
+                    gating_output,
+                    topk,
+                    self.per_expert_scale,
+                    out_weights=weights,
+                    out_ids=ids,
                 )
 
             return gemma4_routing_function_torch(
