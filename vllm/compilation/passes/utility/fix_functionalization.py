@@ -132,7 +132,10 @@ class FixFunctionalizationPass(VllmInductorPass):
                 self.defunctionalize(
                     graph, node, mutated_args, args=("result", "input")
                 )
-            elif at_target == torch.ops._C.silu_and_mul_quant.default:
+            elif (
+                hasattr(torch.ops._C, "silu_and_mul_quant")
+                and at_target == torch.ops._C.silu_and_mul_quant.default
+            ):
                 mutated_args = {1: "result"}
                 self.defunctionalize(
                     graph, node, mutated_args, args=("result", "input", "scale")
