@@ -142,13 +142,18 @@ def prepare_fp8_layer_for_marlin(
         qweight = qweight.T.contiguous()
     qweight = marlin_pad_qweight(qweight, part_size_n, part_size_k, padded_n, padded_k)
 
-    marlin_qweight = ops.gptq_marlin_repack(
-        b_q_weight=qweight,
-        perm=perm,
-        size_k=padded_k,
-        size_n=padded_n,
-        num_bits=8,
-    )
+    if hasattr(torch.ops._C, "gptq_marlin_repack"):
+        marlin_qweight = ops.gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=padded_k,
+            size_n=padded_n,
+            num_bits=8,
+        )
+    else:
+        # Pre-built CUDA binary predates gptq_marlin_repack op.
+        # Use packed weight as-is (no tile reorganization).
+        marlin_qweight = qweight
     replace_parameter(layer, "weight", marlin_qweight)
 
     # WEIGHT SCALES
@@ -478,13 +483,17 @@ def prepare_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
     qweight = qweight.T.contiguous()
     qweight = marlin_pad_qweight(qweight, part_size_n, part_size_k, padded_n, padded_k)
 
-    marlin_qweight = ops.gptq_marlin_repack(
-        b_q_weight=qweight,
-        perm=perm,
-        size_k=padded_k,
-        size_n=padded_n,
-        num_bits=8,
-    )
+    if hasattr(torch.ops._C, "gptq_marlin_repack"):
+        marlin_qweight = ops.gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=padded_k,
+            size_n=padded_n,
+            num_bits=8,
+        )
+    else:
+        # Pre-built CUDA binary predates gptq_marlin_repack op.
+        marlin_qweight = qweight
     replace_parameter(layer, "weight", marlin_qweight)
 
     # WEIGHT SCALES
@@ -570,13 +579,17 @@ def prepare_mxfp8_moe_layer_for_marlin(
         for i in range(e):
             qweight = pack_fp8_to_int32(weight[i], size_k_first=False)
             qweight = qweight.T.contiguous()
-            marlin_qweight = ops.gptq_marlin_repack(
-                b_q_weight=qweight,
-                perm=perm,
-                size_k=size_k,
-                size_n=size_n,
-                num_bits=8,
-            )
+            if hasattr(torch.ops._C, "gptq_marlin_repack"):
+                marlin_qweight = ops.gptq_marlin_repack(
+                    b_q_weight=qweight,
+                    perm=perm,
+                    size_k=size_k,
+                    size_n=size_n,
+                    num_bits=8,
+                )
+            else:
+                # Pre-built CUDA binary predates gptq_marlin_repack op.
+                marlin_qweight = qweight
             tensor_list.append(marlin_qweight)
         return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
 
@@ -631,14 +644,18 @@ def marlin_quant_fp8_torch(weight, group_size, input_dtype=None):
 
     packed_weight = pack_fp8_to_int32(fp8_weight, False).T.contiguous()
     perm = torch.empty(0, dtype=torch.int, device=device)
-    marlin_qweight = ops.gptq_marlin_repack(
-        b_q_weight=packed_weight,
-        perm=perm,
-        size_k=size_k,
-        size_n=size_n,
-        num_bits=8,
-        is_a_8bit=is_a_8bit,
-    )
+    if hasattr(torch.ops._C, "gptq_marlin_repack"):
+        marlin_qweight = ops.gptq_marlin_repack(
+            b_q_weight=packed_weight,
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=8,
+            is_a_8bit=is_a_8bit,
+        )
+    else:
+        # Pre-built CUDA binary predates gptq_marlin_repack op.
+        marlin_qweight = packed_weight
 
     marlin_scales = marlin_permute_scales(
         s=scales.T,
