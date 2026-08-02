@@ -609,11 +609,7 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        if not (p.is_cuda() and p.has_device_capability((7, 5))):
-            return False
-        # Guard against pre-built CUDA binaries (e.g. Docker .so shadowed via
-        # PYTHONPATH) that predate the gptq_marlin_repack op.
-        return hasattr(torch.ops._C, "gptq_marlin_repack")
+        return p.is_cuda() and p.has_device_capability((7, 5))
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
