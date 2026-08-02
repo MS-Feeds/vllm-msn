@@ -351,9 +351,19 @@ def select_fp8_moe_backend(
                 "vLLM CUTLASS FP8 MoE backend is disabled for this configuration."
             )
 
-        return _return_or_raise(
-            requested_backend, config, weight_key, activation_key, activation_format
-        )
+        try:
+            return _return_or_raise(
+                requested_backend, config, weight_key, activation_key, activation_format
+            )
+        except ValueError:
+            # Guard: if the explicitly requested backend is unavailable on this
+            # binary (e.g. gptq_marlin_repack absent from a pre-built Docker .so),
+            # fall through to auto-selection rather than crashing.
+            logger.warning(
+                "Requested FP8 MoE backend '%s' is not supported on this binary "
+                "(missing CUDA op or kernel). Falling back to auto-selection.",
+                runner_backend,
+            )
 
     # Handle explicit DeepGEMM FP8 configuration.
     if envs.is_set("VLLM_USE_DEEP_GEMM") or envs.is_set("VLLM_MOE_USE_DEEP_GEMM"):
