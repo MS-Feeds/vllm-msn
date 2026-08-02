@@ -29,6 +29,11 @@ logger = init_logger(__name__)
 
 
 def is_fp8_marlin_supported():
+    # Also require marlin_gemm op to be present in the compiled binary.
+    # Pre-built Docker images (vllm 0.21.1rc1) lack this op; fall back to
+    # cutlass_scaled_mm in that case.
+    if not hasattr(torch.ops._C, "marlin_gemm"):
+        return False
     return current_platform.has_device_capability(75)
 
 
