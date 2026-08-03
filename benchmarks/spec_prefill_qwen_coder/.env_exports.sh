@@ -5,7 +5,14 @@ conda activate vllm-ablation
 # section -- that pipeline's run_experiments.sh sets this automatically,
 # this one doesn't have an equivalent wrapper yet, so it's set here instead).
 # $CONDA_PREFIX is set by `conda activate` above, so this must come after it.
-export LD_LIBRARY_PATH=$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
+# NOT hardcoded to python3.10 (unlike the sibling Llama/dense-Qwen3 ports'
+# copies of this line) -- this pipeline's conda env needs Python >=3.11
+# (../rlm/pyproject.toml's requires-python, since run_arm.py/run_all_arms.py
+# import the rlm package and vllm in the SAME process), so the real
+# site-packages path varies. Resolved from the active interpreter instead.
+_PYTHON_TAG="python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib/$_PYTHON_TAG/site-packages/nvidia/cu13/lib:$LD_LIBRARY_PATH
+unset _PYTHON_TAG
 export HF_HOME=/scratch/hf_cache
 export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN in shell before sourcing this file}
 export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
