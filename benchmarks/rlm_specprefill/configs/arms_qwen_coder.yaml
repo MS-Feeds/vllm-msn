@@ -1,0 +1,39 @@
+# Per-arm target-generation settings for the Qwen3-Coder-480B-A35B (target) /
+# Qwen3-Coder-30B-A3B (speculator) pairing -- sibling to arms.yaml (the
+# original Llama-3.1-8B/3.2-1B pairing), consumed by the same
+# target_stage/vllm_offline_engine.py and runner/run_arm.py, just pointed at
+# a different SpecPrefill port and model-path env vars. Arm identity (A/B/C)
+# follows ../rlm/rlm_specprefill_ablation_plan.md's EXPERIMENTAL DESIGN table,
+# same as arms.yaml:
+#   A: RLM -> target (no compression)
+#   B: RLM -> SpecPrefill always-on -> target
+#   C: RLM -> SpecPrefill gated (N > N_min) -> target
+#
+# All three arms consume the SAME cached RLM evidence per query (see
+# rlm_stage/evidence_cache.py) -- they differ only in what happens to that
+# evidence before it reaches the target model. Same as arms.yaml, this file
+# itself does not select the SpecPrefill port or set tensor_parallel_size --
+# pass --spec-prefill-dir-env=SPEC_PREFILL_QWEN_CODER_DIR and
+# --target-tensor-parallel-size=<N> to runner/run_arm.py or
+# runner/run_all_arms.py alongside this file (see
+# ../.env_exports_qwen_coder.sh, which sets SPEC_PREFILL_QWEN_CODER_DIR).
+
+target_model_path_env: QWEN3_CODER_480B_MODEL_PATH   # resolved at runtime from env (see .env_exports_qwen_coder.sh)
+speculator_model_path_env: QWEN3_CODER_30B_MODEL_PATH
+
+# Greedy decoding for the target answer call -- keeps arm-to-arm comparison
+# clean (no sampling-noise confound layered on top of the compression
+# variable under test). Same as arms.yaml.
+sampling:
+  temperature: 0.0
+  max_tokens: 512
+
+arms:
+  A:
+    spec_prefill: false
+  B:
+    spec_prefill: true
+    spec_config_path: configs/spec_config_always_on_qwen_coder.yaml
+  C:
+    spec_prefill: gated                        # decided per-query by target_stage/gate.py against configs/n_min.json
+    spec_config_path: configs/spec_config_always_on_qwen_coder.yaml

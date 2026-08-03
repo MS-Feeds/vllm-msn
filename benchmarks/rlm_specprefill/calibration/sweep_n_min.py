@@ -168,6 +168,9 @@ def run_sweep(
     spec_config_path: Path,
     *,
     max_tokens: int = 32,
+    target_tensor_parallel_size: int = 1,
+    target_enable_expert_parallel: bool = False,
+    spec_prefill_dir_env: str = "SPEC_PREFILL_LLAMA_DIR",
 ) -> list[BinTiming]:
     """Feeds each bin's fixed-size token sequence through both the plain
     and SpecPrefill target engines -- built and torn down sequentially,
@@ -209,7 +212,12 @@ def run_sweep(
         }
 
     print(f"[sweep_n_min] building plain engine for {len(bins)} bin(s) ...")
-    plain_engine = build_plain_target_engine(target_model_path, max_tokens=max_tokens)
+    plain_engine = build_plain_target_engine(
+        target_model_path,
+        max_tokens=max_tokens,
+        tensor_parallel_size=target_tensor_parallel_size,
+        enable_expert_parallel=target_enable_expert_parallel,
+    )
     plain_queries = build_queries(plain_engine.tokenizer)
     plain_times: dict[int, float] = {}
     for n, query in plain_queries.items():
@@ -220,9 +228,15 @@ def run_sweep(
     teardown_engine(plain_engine)
 
     print(f"[sweep_n_min] building SpecPrefill engine for {len(bins)} bin(s) ...")
-    spec_config = load_spec_config(spec_config_path)
+    spec_config = load_spec_config(spec_config_path, spec_prefill_dir_env=spec_prefill_dir_env)
     spec_engine = build_specprefill_target_engine(
-        target_model_path, speculator_model_path, spec_config, max_tokens=max_tokens
+        target_model_path,
+        speculator_model_path,
+        spec_config,
+        max_tokens=max_tokens,
+        tensor_parallel_size=target_tensor_parallel_size,
+        enable_expert_parallel=target_enable_expert_parallel,
+        spec_prefill_dir_env=spec_prefill_dir_env,
     )
     spec_queries = build_queries(spec_engine.tokenizer)
     spec_times: dict[int, float] = {}
@@ -246,6 +260,22 @@ def main() -> None:
     parser.add_argument("--spec-config", type=Path, default=DEFAULT_SPEC_CONFIG_PATH)
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--output", type=Path, default=DEFAULT_N_MIN_PATH)
+    parser.add_argument(
+        "--target-tensor-parallel-size",
+        type=int,
+        default=int(os.environ.get("TARGET_TENSOR_PARALLEL_SIZE", "1")),
+        help="See runner/run_arm.py's flag of the same name (defaults from $TARGET_TENSOR_PARALLEL_SIZE, e.g. 4 for Qwen3-Coder).",
+    )
+    parser.add_argument(
+        "--spec-prefill-dir-env",
+        default="SPEC_PREFILL_LLAMA_DIR",
+        help="See runner/run_arm.py's flag of the same name (e.g. 'SPEC_PREFILL_QWEN_CODER_DIR').",
+    )
+    parser.add_argument(
+        "--target-enable-expert-parallel",
+        action="store_true",
+        help="See runner/run_arm.py's flag of the same name -- required by some quantized MoE checkpoints at TP>1.",
+    )
     args = parser.parse_args()
 
     if not args.target_model or not args.speculator_model:
@@ -270,7 +300,16 @@ def main() -> None:
     if not bins:
         raise ValueError("No bins covered by the candidate pool -- nothing to sweep.")
 
-    bin_timings = run_sweep(bins, args.target_model, args.speculator_model, args.spec_config, max_tokens=args.max_tokens)
+    bin_timings = run_sweep(
+        bins,
+        args.target_model,
+        args.speculator_model,
+        args.spec_config,
+        max_tokens=args.max_tokens,
+        target_tensor_parallel_size=args.target_tensor_parallel_size,
+        target_enable_expert_parallel=args.target_enable_expert_parallel,
+        spec_prefill_dir_env=args.spec_prefill_dir_env,
+    )
 
     n_min = compute_crossover(bin_timings)
     if n_min is None:

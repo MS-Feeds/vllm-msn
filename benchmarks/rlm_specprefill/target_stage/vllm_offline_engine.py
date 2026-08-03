@@ -241,28 +241,48 @@ def resolve_max_num_batched_tokens(explicit: int | None, token_lengths: list[int
 # ---------------------------------------------------------------------------
 
 
-def ensure_spec_prefill_llama_on_path() -> None:
-    """`vllm_patch` (SpecPrefillWorker/proposer/pruner/config) lives in
-    ../spec_prefill_llama/, not an installed package -- resolved via
-    $SPEC_PREFILL_LLAMA_DIR (set by .env_exports.sh) rather than a hardcoded
-    relative path, matching that file's own rationale for target_stage/'s
-    dependency on it."""
-    spec_prefill_dir = os.environ.get("SPEC_PREFILL_LLAMA_DIR")
+DEFAULT_SPEC_PREFILL_DIR_ENV = "SPEC_PREFILL_LLAMA_DIR"
+
+
+def ensure_spec_prefill_on_path(env_var: str = DEFAULT_SPEC_PREFILL_DIR_ENV) -> None:
+    """`vllm_patch` (SpecPrefillWorker/proposer/pruner/config) lives in a
+    sibling port directory (e.g. ../spec_prefill_llama/ or
+    ../spec_prefill_qwen_coder/), not an installed package -- resolved via
+    an env var (set by that port's own .env_exports.sh, re-exported by this
+    directory's .env_exports*.sh) rather than a hardcoded relative path.
+
+    Generalized from the original `ensure_spec_prefill_llama_on_path` (kept
+    as a thin alias below for any external caller) so this module isn't
+    hardcoded to the Llama port -- callers pick which port's `vllm_patch`
+    to import by passing the matching env var name (e.g.
+    `SPEC_PREFILL_QWEN_CODER_DIR` for the Qwen3-Coder-480B/30B pairing),
+    defaulting to the original Llama pipeline's env var so every existing
+    call site keeps working unchanged."""
+    spec_prefill_dir = os.environ.get(env_var)
     if not spec_prefill_dir:
         raise RuntimeError(
-            "SPEC_PREFILL_LLAMA_DIR is not set -- source .env_exports.sh first "
-            "(it points this at ../spec_prefill_llama so vllm_patch/ is importable)."
+            f"{env_var} is not set -- source the matching .env_exports.sh "
+            f"first (it points this at the sibling SpecPrefill port "
+            f"directory so vllm_patch/ is importable)."
         )
     if spec_prefill_dir not in sys.path:
         sys.path.insert(0, spec_prefill_dir)
 
 
-def load_spec_config(path: Path):
+def ensure_spec_prefill_llama_on_path() -> None:
+    """Back-compat alias for `ensure_spec_prefill_on_path()`'s original,
+    Llama-only name -- unchanged behavior for any existing caller."""
+    ensure_spec_prefill_on_path(DEFAULT_SPEC_PREFILL_DIR_ENV)
+
+
+def load_spec_config(path: Path, spec_prefill_dir_env: str = DEFAULT_SPEC_PREFILL_DIR_ENV):
     """Loads a SpecConfig from YAML (e.g. configs/spec_config_always_on.yaml)
-    via spec_prefill_llama's own loader -- see that module's docstring for
-    why this file is pure Python/YAML with no vLLM engine dependency (safe
-    to call before the engine is constructed)."""
-    ensure_spec_prefill_llama_on_path()
+    via the selected SpecPrefill port's own loader -- see that module's
+    docstring for why this file is pure Python/YAML with no vLLM engine
+    dependency (safe to call before the engine is constructed).
+    `spec_prefill_dir_env` selects which port's vllm_patch to import from
+    (default preserves the original Llama-only behavior)."""
+    ensure_spec_prefill_on_path(spec_prefill_dir_env)
     from vllm_patch.config import SpecConfig
 
     return SpecConfig.from_path(str(path))
@@ -276,11 +296,28 @@ def build_plain_target_engine(
     max_model_len: int | None = None,
     max_tokens: int = 512,
     enforce_eager: bool = True,
+    tensor_parallel_size: int = 1,
+    enable_expert_parallel: bool = False,
 ) -> EngineHandle:
     """Arm A (and Arm C's "skip" bucket): no worker_cls, no proposer --
     SpecPrefillWorker is provably a no-op without a registered
     PruneRecord (`predict_longbench_v2.py`'s own rationale for skipping it
-    on baselines), so there's no correctness reason to pay for it here."""
+    on baselines), so there's no correctness reason to pay for it here.
+
+    `tensor_parallel_size` (new, default 1 preserves every existing
+    single-GPU call site's behavior unchanged): required > 1 for targets
+    that don't fit on one GPU (e.g. Qwen3-Coder-480B-A35B via
+    ../spec_prefill_qwen_coder/) -- passed straight through to vLLM's own
+    `LLM(...)`, which spawns one worker process per TP rank.
+
+    `enable_expert_parallel` (new, default False preserves prior behavior):
+    required for at least some quantized MoE checkpoints at TP>1 -- e.g.
+    QuantTrio's AWQ quant of Qwen3-Coder-480B-A35B-Instruct documents that
+    at --tensor-parallel-size 8, --enable-expert-parallel is REQUIRED or
+    "expert tensors cannot be evenly split across tensor parallel ranks"
+    (their model card's own wording). Confirmed a real `ParallelConfig`/
+    `LLM(...)` field in this fork (vllm/config/parallel.py: "Use expert
+    parallelism instead of tensor parallelism for MoE layers")."""
     from transformers import AutoTokenizer
     from vllm import LLM
 
@@ -296,6 +333,8 @@ def build_plain_target_engine(
         gpu_memory_utilization=gpu_memory_utilization,
         max_num_batched_tokens=resolved_max_num_batched_tokens,
         max_model_len=resolved_max_model_len,
+        tensor_parallel_size=tensor_parallel_size,
+        enable_expert_parallel=enable_expert_parallel,
     )
     return EngineHandle(
         llm=llm,
@@ -317,14 +356,32 @@ def build_specprefill_target_engine(
     max_tokens: int = 512,
     enforce_eager: bool = True,
     speculator_device: str | None = None,
+    tensor_parallel_size: int = 1,
+    enable_expert_parallel: bool = False,
+    spec_prefill_dir_env: str = DEFAULT_SPEC_PREFILL_DIR_ENV,
 ) -> EngineHandle:
     """Arm B (and Arm C's "compress" bucket): `worker_cls=vllm_patch.worker.SpecPrefillWorker`
     plus a standalone `SpecPrefillProposer` for the speculator -- mirrors
     `predict_longbench_v2.py::run_experiment`'s non-baseline branch exactly
     (speculator device selection, `torch.cuda.set_device` before model
     load -- confirmed real-hardware requirement that weight placement
-    follows torch's *current* device, not an explicit device arg)."""
-    ensure_spec_prefill_llama_on_path()
+    follows torch's *current* device, not an explicit device arg).
+
+    `tensor_parallel_size` (new, default 1 preserves every existing
+    single-GPU call site's behavior unchanged): required > 1 for targets
+    that don't fit on one GPU (e.g. Qwen3-Coder-480B-A35B). vLLM spawns one
+    `SpecPrefillWorker` per TP rank automatically -- `vllm_patch/worker.py`/
+    `model_runner.py` need no changes for this, they operate per-worker.
+
+    `enable_expert_parallel` (new, default False preserves prior behavior):
+    see `build_plain_target_engine`'s docstring -- some quantized MoE
+    checkpoints (e.g. QuantTrio's AWQ quant of Qwen3-Coder-480B-A35B) require
+    this at TP>1 or expert tensors fail to split evenly across TP ranks.
+
+    `spec_prefill_dir_env` selects which sibling port's `vllm_patch` to
+    import (default preserves the original Llama-only behavior) -- pass
+    e.g. `"SPEC_PREFILL_QWEN_CODER_DIR"` for the Qwen3-Coder pairing."""
+    ensure_spec_prefill_on_path(spec_prefill_dir_env)
     import torch
     from transformers import AutoTokenizer
     from vllm import LLM
@@ -344,17 +401,23 @@ def build_specprefill_target_engine(
         max_num_batched_tokens=resolved_max_num_batched_tokens,
         max_model_len=resolved_max_model_len,
         worker_cls="vllm_patch.worker.SpecPrefillWorker",
+        tensor_parallel_size=tensor_parallel_size,
+        enable_expert_parallel=enable_expert_parallel,
     )
 
     if speculator_device is not None:
         device = torch.device(speculator_device)
-    elif torch.cuda.is_available() and torch.cuda.device_count() >= 2:
-        device = torch.device("cuda:1")
+    elif torch.cuda.is_available() and torch.cuda.device_count() > tensor_parallel_size:
+        # Pick a GPU beyond the target's own TP group, not a hardcoded
+        # 'cuda:1' -- at tensor_parallel_size=1 (every pre-existing call
+        # site) this still resolves to cuda:1 exactly as before.
+        device = torch.device(f"cuda:{tensor_parallel_size}")
     else:
         device = torch.device("cuda")
         print(
-            f"WARNING: only {torch.cuda.device_count()} GPU(s) visible -- "
-            f"speculator will share the target's GPU."
+            f"WARNING: only {torch.cuda.device_count()} GPU(s) visible for a "
+            f"target using tensor_parallel_size={tensor_parallel_size} -- "
+            f"speculator will share a target GPU."
         )
     if device.type == "cuda":
         torch.cuda.set_device(device)

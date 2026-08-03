@@ -1,0 +1,30 @@
+# SpecConfig for Arm B (RLM -> SpecPrefill always-on -> target), Qwen3-Coder
+# pairing. Sibling to spec_config_always_on.yaml (the original Llama file) --
+# same schema (../../spec_prefill_qwen_coder/vllm_patch/config.py's
+# `SpecConfig` dataclass), different values.
+#
+# Values are the Qwen3-Coder predict script's own settings
+# (../../spec_prefill_qwen_coder/predict_longbench_v2.py: CHUNK_SIZE=64,
+# LOOK_AHEAD_CNT=8, POOL_KERNEL_SIZE=13 -- inherited unchanged from the
+# dense-Qwen3 port, itself matching the reference repo's own cited
+# config_p{1,3,5,7,9}_full_lah8.yaml configs), i.e. the same knobs already
+# exercised in that pipeline's own P002-P006 keep-rate sweep -- reusing them
+# here means Arm B isn't introducing an untested SpecPrefill configuration
+# on top of an already-unvalidated-on-hardware implementation. NOTE:
+# chunk_size=64 here is deliberately DOUBLE the sibling Llama pipeline's 32
+# -- see spec_config_always_on.yaml's own note on why that file's value is
+# Llama-specific; don't merge these two files or "align" the chunk sizes
+# without checking both pipelines' own predict scripts first.
+#
+# percentage=0.5 (keep 50%) is this file's own choice for "always-on",
+# matching spec_config_always_on.yaml's own rationale (midpoint of the
+# P001-P006 sweep). Override per-run if a different keep rate is wanted;
+# this file is the one Arm B loads by default for the Qwen3-Coder pairing.
+keep_strategy: percentage
+keep_kwargs:
+  chunk: true
+  chunk_size: 64
+  percentage: 0.5
+look_ahead_cnt: 8
+pool_kernel_size: 13
+ignore_eos: false

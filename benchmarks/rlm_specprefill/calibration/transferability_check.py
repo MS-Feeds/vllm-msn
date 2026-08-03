@@ -126,6 +126,9 @@ def run_rlm_format_sweep(
     look_ahead_cnt: int = 8,
     pool_kernel_size: int = 13,
     max_tokens: int = 64,
+    target_tensor_parallel_size: int = 1,
+    target_enable_expert_parallel: bool = False,
+    spec_prefill_dir_env: str = "SPEC_PREFILL_LLAMA_DIR",
 ) -> list[tuple[float, float]]:
     """For each keep percentage, builds a fresh SpecPrefill engine (a
     `SpecConfig` is fixed per engine -- IMPLEMENTATION_PLAN.md decision 3 --
@@ -135,7 +138,14 @@ def run_rlm_format_sweep(
     across samples. `chunk_size`/`look_ahead_cnt`/`pool_kernel_size` default
     to the SAME values `configs/spec_config_always_on.yaml` and
     `spec_prefill_llama`'s own sweep use, so this curve is comparable to the
-    reference one -- only `percentage` varies.
+    reference one -- only `percentage` varies. NOTE: these chunk_size/
+    look_ahead_cnt/pool_kernel_size defaults are Llama-specific (see
+    ../configs/spec_config_always_on.yaml's own note that chunk_size=32 was
+    set deliberately for Llama, not universal) -- pass the Qwen3-Coder
+    port's own values (chunk_size=64, matching
+    ../configs/spec_config_always_on_qwen_coder.yaml) explicitly when
+    `spec_prefill_dir_env` selects that port, rather than assuming these
+    defaults transfer.
 
     Returns `[(percentage, mean_recall), ...]`.
     """
@@ -143,11 +153,11 @@ def run_rlm_format_sweep(
         TargetQuery,
         answer_batch,
         build_specprefill_target_engine,
-        ensure_spec_prefill_llama_on_path,
+        ensure_spec_prefill_on_path,
         teardown_engine,
     )
 
-    ensure_spec_prefill_llama_on_path()
+    ensure_spec_prefill_on_path(spec_prefill_dir_env)
     from vllm_patch.config import SpecConfig
 
     queries = [
@@ -167,7 +177,13 @@ def run_rlm_format_sweep(
             pool_kernel_size=pool_kernel_size,
         )
         engine = build_specprefill_target_engine(
-            target_model_path, speculator_model_path, spec_config, max_tokens=max_tokens
+            target_model_path,
+            speculator_model_path,
+            spec_config,
+            max_tokens=max_tokens,
+            tensor_parallel_size=target_tensor_parallel_size,
+            enable_expert_parallel=target_enable_expert_parallel,
+            spec_prefill_dir_env=spec_prefill_dir_env,
         )
         answers = answer_batch(engine, queries)
         teardown_engine(engine)
@@ -258,6 +274,22 @@ def main() -> None:
     parser.add_argument("--speculator-model", default=os.environ.get("LLAMA32_1B_MODEL_PATH"))
     parser.add_argument("--threshold-pct", type=float, default=DEFAULT_DIVERGENCE_THRESHOLD_PCT)
     parser.add_argument("--output", type=Path, default=THIS_DIR / "results" / "transferability_check.json")
+    parser.add_argument(
+        "--target-tensor-parallel-size",
+        type=int,
+        default=int(os.environ.get("TARGET_TENSOR_PARALLEL_SIZE", "1")),
+        help="See runner/run_arm.py's flag of the same name (defaults from $TARGET_TENSOR_PARALLEL_SIZE, e.g. 4 for Qwen3-Coder).",
+    )
+    parser.add_argument(
+        "--spec-prefill-dir-env",
+        default="SPEC_PREFILL_LLAMA_DIR",
+        help="See runner/run_arm.py's flag of the same name (e.g. 'SPEC_PREFILL_QWEN_CODER_DIR').",
+    )
+    parser.add_argument(
+        "--target-enable-expert-parallel",
+        action="store_true",
+        help="See runner/run_arm.py's flag of the same name -- required by some quantized MoE checkpoints at TP>1.",
+    )
     args = parser.parse_args()
 
     if not args.target_model or not args.speculator_model:
@@ -271,7 +303,15 @@ def main() -> None:
         raise ValueError(f"No samples in {args.niah_samples} -- run eval_data/gen_synthetic_niah.py first.")
 
     percentages = [float(p) for p in args.percentages.split(",") if p.strip()]
-    ours = run_rlm_format_sweep(niah_samples, percentages, args.target_model, args.speculator_model)
+    ours = run_rlm_format_sweep(
+        niah_samples,
+        percentages,
+        args.target_model,
+        args.speculator_model,
+        target_tensor_parallel_size=args.target_tensor_parallel_size,
+        target_enable_expert_parallel=args.target_enable_expert_parallel,
+        spec_prefill_dir_env=args.spec_prefill_dir_env,
+    )
 
     comparison = compare_curves(reference, ours, threshold_pct=args.threshold_pct)
     print()
