@@ -1,0 +1,13 @@
+logs/*
+!logs/.gitkeep
+results/*
+!results/.gitkeep
+!results/evidence_cache/.gitkeep
+!results/A/.gitkeep
+!results/B/.gitkeep
+!results/C/.gitkeep
+__pycache__/
+eval_data/.cache/
+eval_data/*.jsonl
+!eval_data/*.jsonl.example
+.env

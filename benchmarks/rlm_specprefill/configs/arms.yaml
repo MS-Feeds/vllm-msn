@@ -1,0 +1,30 @@
+# Per-arm target-generation settings, consumed by target_stage/vllm_offline_engine.py
+# and runner/run_arm.py. Arm identity (A/B/C) follows
+# ../rlm/rlm_specprefill_ablation_plan.md's EXPERIMENTAL DESIGN table:
+#   A: RLM -> target (no compression)
+#   B: RLM -> SpecPrefill always-on -> target
+#   C: RLM -> SpecPrefill gated (N > N_min) -> target
+#
+# All three arms consume the SAME cached RLM evidence per query (see
+# rlm_stage/evidence_cache.py) -- they differ only in what happens to that
+# evidence before it reaches the target model.
+
+target_model_path_env: LLAMA31_8B_MODEL_PATH   # resolved at runtime from env (see .env_exports.sh)
+speculator_model_path_env: LLAMA32_1B_MODEL_PATH
+
+# Greedy decoding for the target answer call -- keeps arm-to-arm comparison
+# clean (no sampling-noise confound layered on top of the compression
+# variable under test).
+sampling:
+  temperature: 0.0
+  max_tokens: 512
+
+arms:
+  A:
+    spec_prefill: false
+  B:
+    spec_prefill: true
+    spec_config_path: configs/spec_config_always_on.yaml
+  C:
+    spec_prefill: gated                        # decided per-query by target_stage/gate.py against configs/n_min.json
+    spec_config_path: configs/spec_config_always_on.yaml

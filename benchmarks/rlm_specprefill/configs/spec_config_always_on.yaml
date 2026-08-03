@@ -1,0 +1,30 @@
+# SpecConfig for Arm B (RLM -> SpecPrefill always-on -> target).
+#
+# Schema/fields match ../../spec_prefill_llama/vllm_patch/config.py's
+# `SpecConfig` dataclass exactly -- `SpecConfig.from_path` rejects unknown
+# keys (raises ValueError listing them), so this file is validated by
+# tests/test_config_roundtrip.py round-tripping it through that loader.
+#
+# Values are the Llama predict script's own settings
+# (../../spec_prefill_llama/predict_longbench_v2.py: CHUNK_SIZE=32,
+# LOOK_AHEAD_CNT=8, POOL_KERNEL_SIZE=13), i.e. the same knobs already
+# exercised in that pipeline's own P002-P006 keep-rate sweep -- reusing them
+# here means Arm B isn't introducing an untested SpecPrefill configuration on
+# top of an already-unvalidated-on-hardware implementation. NOTE:
+# chunk_size=32 here is deliberately HALF the sibling Qwen3/Gemma4
+# pipelines' 64 -- that script's own docstring confirms this was set
+# explicitly for Llama, not inherited by accident, so don't "fix" it back
+# to 64 without checking that docstring first.
+#
+# percentage=0.5 (keep 50%) is this file's own choice for "always-on": the
+# ablation doc doesn't pin a specific keep rate for Arm B, and 0.5 is the
+# midpoint of that sweep (P004). Override per-run if a different keep rate is
+# wanted; this file is the one Arm B loads by default.
+keep_strategy: percentage
+keep_kwargs:
+  chunk: true
+  chunk_size: 32
+  percentage: 0.5
+look_ahead_cnt: 8
+pool_kernel_size: 13
+ignore_eos: false

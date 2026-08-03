@@ -1,0 +1,42 @@
+# Guardrail caps for the RLM evidence-extraction stage (rlm_stage/evidence_rlm.py).
+#
+# Each key maps directly onto an `RLM.__init__` kwarg of the same name
+# (see ../../rlm/rlm/core/rlm.py:49-81) -- no wrapper/translation layer needed.
+# Per IMPLEMENTATION_PLAN.md decision 5: this is deliberately NOT a full
+# reproduction of the ablation doc's guardrail list. `max_total_calls` and a
+# per-iteration fan-out cap are intentionally omitted -- there's no way to
+# abort mid-run from RLM's callback hooks (they're fire-and-forget), and
+# max_tokens/max_timeout/max_errors already bound worst-case cost. Realized
+# call count and fan-out are logged for reporting instead (see
+# rlm_stage/timing_decomposition.py), not enforced as a hard cap.
+
+# Recursion depth: depth 0 is the root; at depth >= max_depth, rlm_query()
+# falls back to a plain (non-recursive) LM call.
+max_depth: 2
+
+# Root-loop turns per RLM instance (root or any child).
+max_iterations: 30
+
+# Parallel threads for rlm_query_batched() sub-call fan-out. Matches the
+# ablation doc's own suggested starting value; also RLM's own default.
+max_concurrent_subcalls: 4
+
+# Wall-clock seconds. Checked before each root iteration; propagates as
+# *remaining* budget to child RLMs (rlm.py:706 `_subcall`), not the full value.
+max_timeout: 900
+
+# Total input+output tokens across the whole call tree. Token tracking is
+# correct for the Anthropic backend (unlike max_budget below).
+max_tokens: 4000000
+
+# Consecutive LM/REPL errors before aborting and returning the best partial
+# answer seen so far.
+max_errors: 5
+
+# USD budget cap. NO-OP for backend="anthropic": AnthropicClient never
+# populates ModelUsageSummary.total_cost (see ../rlm/rlm/clients/anthropic.py
+# _track_cost), so RLM's budget check always computes current_cost=0.0 and
+# can never fire. Kept here for schema completeness / in case the backend
+# changes later, but treat as advisory only -- compute real cost post-hoc
+# from token counts in analysis/aggregate_metrics.py, not from this cap.
+max_budget: null

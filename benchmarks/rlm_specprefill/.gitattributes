@@ -1,0 +1,8 @@
+# Normalize this project's own files to LF regardless of the client's
+# core.autocrlf -- avoids "LF would be replaced by CRLF" fatal errors from
+# `git add` on Windows installs with core.safecrlf=true (blocks staging any
+# pure-LF text file otherwise, since a future checkout would silently
+# convert it). Scoped to this directory only -- not applied repo-wide,
+# since the rest of vllm-msn's existing files/conventions aren't ours to
+# change.
+* text=auto eol=lf
