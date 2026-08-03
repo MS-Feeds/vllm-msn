@@ -69,12 +69,33 @@ if HAS_TRITON:
                 HAS_TRITON = False
     except ImportError:
         # This can occur if Triton is partially installed or triton.backends
-        # is missing.
-        logger.warning(
-            "Triton is installed, but `triton.backends` could not be imported. "
-            "Disabling Triton."
-        )
-        HAS_TRITON = False
+        # is missing.  However, triton.jit (the core compilation API) may
+        # still be fully functional — e.g. when the environment ships a Triton
+        # build whose internal backend plugin system is broken but whose JIT
+        # compiler works correctly (observed with azureml:vllm_gemma4:9).
+        # Fall back to checking whether triton.jit is actually callable before
+        # giving up entirely, so @triton.jit-decorated kernels continue to work.
+        try:
+            import triton as _triton_check
+            if callable(getattr(_triton_check, "jit", None)):
+                logger.warning(
+                    "Triton is installed and triton.jit is callable, but "
+                    "`triton.backends` could not be imported. Keeping Triton "
+                    "enabled — kernel compilation should still work."
+                )
+                # HAS_TRITON stays True
+            else:
+                logger.warning(
+                    "Triton is installed, but `triton.backends` could not be "
+                    "imported and triton.jit is not callable. Disabling Triton."
+                )
+                HAS_TRITON = False
+        except Exception:
+            logger.warning(
+                "Triton is installed, but `triton.backends` could not be "
+                "imported. Disabling Triton."
+            )
+            HAS_TRITON = False
     except Exception as e:
         # Catch any other unexpected errors during the check.
         logger.warning(
