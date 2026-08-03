@@ -12,6 +12,16 @@ if TYPE_CHECKING or HAS_TRITON:
     import triton
     import triton.language as tl
     import triton.language.extra.libdevice as tldevice
+
+    # triton.next_power_of_2 was removed in Triton >= 3.x.
+    # Inject a pure-Python fallback so all call sites continue to work
+    # regardless of the installed Triton version.
+    if not hasattr(triton, "next_power_of_2"):
+        def _next_power_of_2(n: int) -> int:
+            if n <= 1:
+                return 1
+            return 1 << (n - 1).bit_length()
+        triton.next_power_of_2 = _next_power_of_2
 else:
     triton = TritonPlaceholder()
     tl = TritonLanguagePlaceholder()
