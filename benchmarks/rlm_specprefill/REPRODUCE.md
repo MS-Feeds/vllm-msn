@@ -3,11 +3,22 @@
 Status: all 11 build-order steps in `IMPLEMENTATION_PLAN.md` are done (env
 setup, `eval_data/` prep, evidence-extraction, the evidence cache, timing
 decomposition, `target_stage/`, `runner/`, `calibration/`, and `analysis/`)
-— **85/85 unit tests pass**, plus real Anthropic API smoke tests for the
+— **93/93 unit tests pass**, plus real Anthropic API smoke tests for the
 RLM-evidence half. **Nothing in this project has been run against a GPU or
 vLLM** — it was built on a Windows machine with no GPU and `vllm` not
 installed there. Steps 0-4 below are runnable on any machine with Anthropic
-API access; steps 5 onward are GPU-node-only and have never been executed.
+API access when `--root-backend=anthropic` (the default below); steps 5
+onward are GPU-node-only and have never been executed.
+
+This runbook covers the original Llama pairing with a hosted-Claude root
+(`--root-backend=anthropic`, still the default). For the Qwen3-Coder-480B
+pairing with a **self-hosted root** (`--root-backend=vllm`, the paper's own
+default same-model-recursion design — the same checkpoint serves as both
+root and SpecPrefill target), see `README.md`'s "Root model backend"
+section and "Running with a different target/speculator pairing" example
+— steps 0-4 below don't apply as-is (no Anthropic API needed at all in
+that mode; a running `vllm serve` is needed instead, which `runner/
+run_arm.py` manages automatically around the evidence-collection stage).
 See `IMPLEMENTATION_PLAN.md`'s Verification section for the exact list of
 what's been checked vs. not, and its load-bearing findings for real issues
 already discovered along the way: two bugs in dependencies this project

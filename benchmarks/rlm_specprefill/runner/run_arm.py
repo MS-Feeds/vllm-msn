@@ -8,17 +8,25 @@ that evidence and the target model:
   B: SpecPrefill always-on
   C: SpecPrefill gated (N > N_min, target_stage/gate.py)
 
-Evidence collection (RLM + cache) needs only the Anthropic API -- runnable
-on any machine with network access, no GPU. The target-call stage needs a
-self-hosted vLLM engine -- GPU-only, deferred imports (target_stage/
-vllm_offline_engine.py's own convention) so this module stays importable
-without vllm installed.
+Evidence collection (RLM + cache) needs only the Anthropic API when
+`root_backend="anthropic"` (the default) -- runnable on any machine with
+network access, no GPU. With `root_backend="vllm"` (self-hosted root, see
+rlm_stage/root_vllm_server.py), evidence collection instead needs a real
+`vllm serve` process already up and healthy -- this function assumes the
+caller (below) already arranged that, it does not start one itself. The
+target-call stage needs a self-hosted vLLM engine of its own (a SEPARATE,
+non-overlapping serving instance even when it's the same checkpoint as
+root -- see root_vllm_server.py's module docstring for why) -- GPU-only,
+deferred imports (target_stage/vllm_offline_engine.py's own convention) so
+this module stays importable without vllm installed.
 
 `--dry-run` collects/caches evidence for every sample and stops there,
-never importing vllm at all -- a genuinely useful workflow split, not just
-a testing convenience: evidence can be pre-warmed on a machine with
-Anthropic API access but no GPU (this one), then the actual arm sweep run
-later on a GPU node that may have no internet access at all.
+never touching the target-call stage -- a genuinely useful workflow split,
+not just a testing convenience: evidence can be pre-warmed on a machine
+with Anthropic API access but no GPU (root_backend="anthropic" case), then
+the actual arm sweep run later on a GPU node that may have no internet
+access at all. (For root_backend="vllm", --dry-run still needs a GPU and a
+running root server -- see run_arm()'s own docstring below.)
 """
 
 from __future__ import annotations
@@ -55,21 +63,30 @@ def collect_evidence_for_dataset(
     *,
     guardrails: dict | None = None,
     cache_dir: Path = evidence_cache.DEFAULT_CACHE_DIR,
+    root_backend: str = "anthropic",
     model_name: str | None = None,
+    root_base_url: str | None = None,
 ) -> list[EvidenceCollectionResult]:
     """The RLM-evidence half of run_arm -- runnable on any machine with
-    Anthropic API access, no vLLM/GPU needed. Always goes through
-    `evidence_cache.get_or_run` (never calls `run_evidence_extraction`
-    directly), so calling this repeatedly across arms/runs never
-    re-invokes RLM for a query that's already cached
+    Anthropic API access, no vLLM/GPU needed, when `root_backend="anthropic"`
+    (the default). With `root_backend="vllm"`, this instead needs a real
+    `vllm serve` process already up and healthy at `root_base_url` -- see
+    run_arm()'s own docstring for where that gets started/stopped; this
+    function itself has no server-lifecycle awareness, it just calls
+    run_evidence_extraction with whichever backend it's told to use.
+    Always goes through `evidence_cache.get_or_run` (never calls
+    `run_evidence_extraction` directly), so calling this repeatedly across
+    arms/runs never re-invokes RLM for a query that's already cached
     (IMPLEMENTATION_PLAN.md decision 4 -- the confound-control guarantee).
     """
     guardrails = guardrails if guardrails is not None else load_guardrails()
 
     def run_fn(sample: EvalSample) -> EvidenceResult:
-        kwargs: dict = {"guardrails": guardrails}
+        kwargs: dict = {"guardrails": guardrails, "root_backend": root_backend}
         if model_name:
             kwargs["model_name"] = model_name
+        if root_base_url:
+            kwargs["root_base_url"] = root_base_url
         return run_evidence_extraction(sample.id, sample.question, sample.context, **kwargs)
 
     results: list[EvidenceCollectionResult] = []
@@ -114,6 +131,31 @@ def collect_evidence_for_dataset(
     return results
 
 
+def _all_samples_cached(
+    samples: list[EvalSample],
+    *,
+    guardrails: dict | None,
+    cache_dir: Path,
+) -> bool:
+    """Cheap, GPU/root-model-free pre-check: does every sample already have
+    a cache entry? Used to skip starting the root vLLM server entirely
+    when it would only ever answer cache hits -- e.g. run_all_arms.py's
+    Arm B/C calls, run after Arm A already populated the cache for the
+    same dataset, would otherwise spin up (and immediately tear down) a
+    480B-scale server for nothing, potentially costing many real minutes
+    per arm. Uses evidence_cache.load_cached directly (not
+    collect_evidence_for_dataset/get_or_run) specifically so this never
+    touches run_fn -- must be true GPU/root-free."""
+    guardrails = guardrails if guardrails is not None else load_guardrails()
+    return all(
+        evidence_cache.load_cached(
+            evidence_cache.compute_cache_key(sample, guardrails=guardrails), cache_dir
+        )
+        is not None
+        for sample in samples
+    )
+
+
 def _write_timing_row(f, sample: EvalSample, evidence_result: EvidenceResult) -> None:
     """One JSONL row per sample: the ../rlm_specprefill_ablation_plan.md
     LATENCY MODEL's T_RLM_root/T_REPL_compute/T_RLM_subcalls terms, derived
@@ -152,7 +194,28 @@ def run_arm(
     target_tensor_parallel_size: int = 1,
     target_enable_expert_parallel: bool = False,
     spec_prefill_dir_env: str = "SPEC_PREFILL_LLAMA_DIR",
+    root_backend: str = "anthropic",
+    root_model_path: str | None = None,
+    root_model_name: str | None = None,
+    root_base_url: str = "http://localhost:8000/v1",
+    root_port: int = 8000,
+    root_tensor_parallel_size: int | None = None,
+    root_enable_expert_parallel: bool = False,
+    root_server_startup_timeout_s: float = 1800.0,
 ) -> None:
+    """`root_backend='vllm'` (self-hosted root, e.g. Qwen3-Coder-480B-A35B
+    serving as both root and SpecPrefill target -- see rlm_stage/
+    evidence_rlm.py and rlm_stage/root_vllm_server.py) starts a `vllm serve`
+    subprocess BEFORE evidence collection, waits for it to become healthy,
+    then tears it down again before this function returns to its caller
+    (or before the target-model stage below, on the non-dry-run path) --
+    root-serving and target-answering are separate, non-overlapping vLLM
+    processes even when they're the same checkpoint (see
+    root_vllm_server.py's module docstring for why), so the server must be
+    fully torn down before target_stage tries to claim the same GPUs.
+    `root_model_path` defaults to `target_model_path` (the common case:
+    the same checkpoint serves both roles) if not given separately.
+    """
     if arm not in VALID_ARMS:
         raise ValueError(f"Unknown arm {arm!r}, must be one of {VALID_ARMS}")
 
@@ -165,8 +228,72 @@ def run_arm(
     arm_dir = results_dir / arm
     arm_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[run_arm] Arm {arm}: collecting evidence for {len(samples)} sample(s) ...")
-    evidence_results = collect_evidence_for_dataset(samples, cache_dir=results_dir / "evidence_cache")
+    root_server_proc = None
+    resolved_root_model_name = root_model_name
+    if root_backend == "vllm" and _all_samples_cached(
+        samples, guardrails=None, cache_dir=results_dir / "evidence_cache"
+    ):
+        print(
+            "[run_arm] all evidence already cached -- skipping root vLLM "
+            "server startup entirely (it would only ever answer cache hits)."
+        )
+    elif root_backend == "vllm":
+        from rlm_stage.root_vllm_server import (
+            start_root_vllm_server,
+            stop_root_vllm_server,
+            wait_for_server_healthy,
+        )
+
+        resolved_root_model_path = root_model_path or target_model_path
+        if not resolved_root_model_path:
+            raise ValueError(
+                "root_model_path (or target_model_path, since they're "
+                "typically the same checkpoint) is required when "
+                "root_backend='vllm'."
+            )
+        resolved_root_tp = (
+            root_tensor_parallel_size
+            if root_tensor_parallel_size is not None
+            else target_tensor_parallel_size
+        )
+        if not resolved_root_model_name:
+            resolved_root_model_name = Path(resolved_root_model_path).name
+
+        print(
+            f"[run_arm] root_backend='vllm': starting vllm serve for "
+            f"{resolved_root_model_path} on port {root_port} "
+            f"(tensor_parallel_size={resolved_root_tp}) ..."
+        )
+        root_server_proc = start_root_vllm_server(
+            resolved_root_model_path,
+            port=root_port,
+            tensor_parallel_size=resolved_root_tp,
+            enable_expert_parallel=root_enable_expert_parallel,
+            served_model_name=resolved_root_model_name,
+            log_path=results_dir / "root_vllm_server.log",
+        )
+        try:
+            wait_for_server_healthy(
+                root_base_url, process=root_server_proc, timeout_s=root_server_startup_timeout_s
+            )
+            print("[run_arm] root vLLM server healthy.")
+        except Exception:
+            stop_root_vllm_server(root_server_proc)
+            raise
+
+    try:
+        print(f"[run_arm] Arm {arm}: collecting evidence for {len(samples)} sample(s) ...")
+        evidence_results = collect_evidence_for_dataset(
+            samples,
+            cache_dir=results_dir / "evidence_cache",
+            root_backend=root_backend,
+            model_name=resolved_root_model_name,
+            root_base_url=root_base_url if root_backend == "vllm" else None,
+        )
+    finally:
+        if root_server_proc is not None:
+            print("[run_arm] stopping root vLLM server to free GPUs for the target stage ...")
+            stop_root_vllm_server(root_server_proc)
 
     n_cache_hits = sum(1 for r in evidence_results if r.was_cache_hit)
     print(f"[run_arm] evidence collection done: {n_cache_hits}/{len(evidence_results)} cache hits.")
@@ -335,6 +462,64 @@ def main() -> None:
             "checkpoints/TP sizes that don't need it."
         ),
     )
+    parser.add_argument(
+        "--root-backend",
+        choices=["anthropic", "vllm"],
+        default=os.environ.get("ROOT_BACKEND", "anthropic"),
+        help=(
+            "RLM's root model. 'anthropic' (default, or whatever "
+            "$ROOT_BACKEND is set to) is the original hosted-Claude "
+            "design. 'vllm' self-hosts the root instead (e.g. the same "
+            "Qwen3-Coder-480B-A35B checkpoint serving as both root and "
+            "SpecPrefill target, per the paper's default same-model "
+            "recursion) -- starts a real vllm serve subprocess for the "
+            "evidence-collection stage, see rlm_stage/root_vllm_server.py."
+        ),
+    )
+    parser.add_argument(
+        "--root-model-path",
+        default=os.environ.get("ROOT_MODEL_PATH"),
+        help="Checkpoint to serve when --root-backend=vllm. Defaults to --target-model (the common case: same checkpoint serves both roles).",
+    )
+    parser.add_argument(
+        "--root-model-name",
+        default=os.environ.get("ROOT_MODEL_NAME"),
+        help=(
+            "Model name for RLM's completion calls. For --root-backend=vllm, "
+            "must match what the server is launched with (its "
+            "--served-model-name) -- defaults to --root-model-path's "
+            "basename if not given. Also usable to override the Claude "
+            "model name for --root-backend=anthropic."
+        ),
+    )
+    parser.add_argument(
+        "--root-base-url",
+        default=os.environ.get("ROOT_BASE_URL", "http://localhost:8000/v1"),
+        help="Only used for --root-backend=vllm -- the vllm serve endpoint RLM's root-model calls hit.",
+    )
+    parser.add_argument(
+        "--root-port",
+        type=int,
+        default=int(os.environ.get("ROOT_PORT", "8000")),
+        help="Only used for --root-backend=vllm -- the port to launch vllm serve on.",
+    )
+    parser.add_argument(
+        "--root-tensor-parallel-size",
+        type=int,
+        default=None,
+        help="Only used for --root-backend=vllm. Defaults to --target-tensor-parallel-size (the common case: same checkpoint, same TP degree).",
+    )
+    parser.add_argument(
+        "--root-enable-expert-parallel",
+        action="store_true",
+        help="Only used for --root-backend=vllm -- see --target-enable-expert-parallel's help for why this might be needed.",
+    )
+    parser.add_argument(
+        "--root-server-startup-timeout-s",
+        type=float,
+        default=1800.0,
+        help="Only used for --root-backend=vllm -- how long to wait for vllm serve to become healthy before giving up. A large checkpoint can legitimately take a while to load.",
+    )
     args = parser.parse_args()
 
     run_arm(
@@ -350,6 +535,14 @@ def main() -> None:
         target_tensor_parallel_size=args.target_tensor_parallel_size,
         target_enable_expert_parallel=args.target_enable_expert_parallel,
         spec_prefill_dir_env=args.spec_prefill_dir_env,
+        root_backend=args.root_backend,
+        root_model_path=args.root_model_path,
+        root_model_name=args.root_model_name,
+        root_base_url=args.root_base_url,
+        root_port=args.root_port,
+        root_tensor_parallel_size=args.root_tensor_parallel_size,
+        root_enable_expert_parallel=args.root_enable_expert_parallel,
+        root_server_startup_timeout_s=args.root_server_startup_timeout_s,
     )
 
 

@@ -47,7 +47,23 @@ def run_all_arms(
     target_tensor_parallel_size: int = 1,
     target_enable_expert_parallel: bool = False,
     spec_prefill_dir_env: str = "SPEC_PREFILL_LLAMA_DIR",
+    root_backend: str = "anthropic",
+    root_model_path: str | None = None,
+    root_model_name: str | None = None,
+    root_base_url: str = "http://localhost:8000/v1",
+    root_port: int = 8000,
+    root_tensor_parallel_size: int | None = None,
+    root_enable_expert_parallel: bool = False,
+    root_server_startup_timeout_s: float = 1800.0,
 ) -> None:
+    """When `root_backend='vllm'`, each `run_arm()` call below independently
+    starts/stops its own root vLLM server -- Arm A's call will actually use
+    it (cache misses on a fresh dataset), but Arms B/C's calls should be
+    all cache hits (per this module's own confound-control guarantee) and
+    will skip server startup entirely via run_arm.py's `_all_samples_cached`
+    pre-check, not pay for a second/third restart. That pre-check is what
+    makes it safe to just pass the same root_* args through unconditionally
+    here, rather than hoisting server lifecycle up into this function."""
     ordered_arms = sorted(set(arms), key=lambda a: VALID_ARMS.index(a))  # A first, see module docstring
 
     for arm in ordered_arms:
@@ -65,6 +81,14 @@ def run_all_arms(
             target_tensor_parallel_size=target_tensor_parallel_size,
             target_enable_expert_parallel=target_enable_expert_parallel,
             spec_prefill_dir_env=spec_prefill_dir_env,
+            root_backend=root_backend,
+            root_model_path=root_model_path,
+            root_model_name=root_model_name,
+            root_base_url=root_base_url,
+            root_port=root_port,
+            root_tensor_parallel_size=root_tensor_parallel_size,
+            root_enable_expert_parallel=root_enable_expert_parallel,
+            root_server_startup_timeout_s=root_server_startup_timeout_s,
         )
 
 
@@ -112,6 +136,50 @@ def main() -> None:
             "tensor-parallel-size 8. Default off preserves prior behavior."
         ),
     )
+    parser.add_argument(
+        "--root-backend",
+        choices=["anthropic", "vllm"],
+        default=os.environ.get("ROOT_BACKEND", "anthropic"),
+        help="See runner/run_arm.py's flag of the same name.",
+    )
+    parser.add_argument(
+        "--root-model-path",
+        default=os.environ.get("ROOT_MODEL_PATH"),
+        help="See runner/run_arm.py's flag of the same name -- defaults to --target-model.",
+    )
+    parser.add_argument(
+        "--root-model-name",
+        default=os.environ.get("ROOT_MODEL_NAME"),
+        help="See runner/run_arm.py's flag of the same name.",
+    )
+    parser.add_argument(
+        "--root-base-url",
+        default=os.environ.get("ROOT_BASE_URL", "http://localhost:8000/v1"),
+        help="See runner/run_arm.py's flag of the same name.",
+    )
+    parser.add_argument(
+        "--root-port",
+        type=int,
+        default=int(os.environ.get("ROOT_PORT", "8000")),
+        help="See runner/run_arm.py's flag of the same name.",
+    )
+    parser.add_argument(
+        "--root-tensor-parallel-size",
+        type=int,
+        default=None,
+        help="See runner/run_arm.py's flag of the same name -- defaults to --target-tensor-parallel-size.",
+    )
+    parser.add_argument(
+        "--root-enable-expert-parallel",
+        action="store_true",
+        help="See runner/run_arm.py's flag of the same name.",
+    )
+    parser.add_argument(
+        "--root-server-startup-timeout-s",
+        type=float,
+        default=1800.0,
+        help="See runner/run_arm.py's flag of the same name.",
+    )
     args = parser.parse_args()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -132,6 +200,14 @@ def main() -> None:
         target_tensor_parallel_size=args.target_tensor_parallel_size,
         target_enable_expert_parallel=args.target_enable_expert_parallel,
         spec_prefill_dir_env=args.spec_prefill_dir_env,
+        root_backend=args.root_backend,
+        root_model_path=args.root_model_path,
+        root_model_name=args.root_model_name,
+        root_base_url=args.root_base_url,
+        root_port=args.root_port,
+        root_tensor_parallel_size=args.root_tensor_parallel_size,
+        root_enable_expert_parallel=args.root_enable_expert_parallel,
+        root_server_startup_timeout_s=args.root_server_startup_timeout_s,
     )
 
 

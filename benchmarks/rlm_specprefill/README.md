@@ -32,10 +32,47 @@ coupling, without owning either:
     --target-tensor-parallel-size=<N>` flags — see "Running with a
     different target/speculator pairing" below.
 
-Root model for this ablation is hosted Claude via the Anthropic API (root
-doesn't need local attention access). Target + speculator are self-hosted
-via vLLM's offline `LLM` class (SpecPrefill needs local attention access,
-which only a self-hosted model can give it) — see above for which pairing.
+Root model is selectable via `--root-backend` on `runner/run_arm.py`/
+`run_all_arms.py` (see "Root model backend" below):
+- `anthropic` (original default) — hosted Claude via the Anthropic API,
+  since root doesn't strictly need local attention access for this design.
+- `vllm` (the Qwen-Coder pairing's default) — self-hosted, e.g. the same
+  Qwen3-Coder-480B-A35B checkpoint serving as both root and SpecPrefill
+  target, matching the RLM paper's own default (one model recursing on
+  itself) rather than a two-tier hosted-root/self-hosted-target split.
+
+Target + speculator are always self-hosted via vLLM's offline `LLM` class
+(SpecPrefill needs local attention access, which only a self-hosted model
+can give it) — see above for which pairing.
+
+## Root model backend
+
+`--root-backend=vllm` starts a real `vllm serve` subprocess
+(`rlm_stage/root_vllm_server.py`) before the RLM evidence stage, waits for
+it to become healthy, then tears it down before the target-model stage
+gets built — root-model calls happen interactively throughout RLM's REPL
+loop (arbitrary recursive sub-calls, not one precomputed batch), so they
+need a real HTTP endpoint, unlike `target_stage/vllm_offline_engine.py`'s
+offline batch engine (which needs `worker_cls=SpecPrefillWorker`, kept off
+server mode since that path is unvalidated). This means root-serving and
+target-answering are two separate, non-overlapping vLLM processes even
+when they're the same checkpoint — the server must fully exit before the
+target stage tries to claim the same GPUs.
+
+`runner/run_arm.py` skips starting the server entirely when every sample
+in the dataset is already cache-hit (`_all_samples_cached`) — this is what
+keeps `run_all_arms.py` cheap: Arm A's call actually uses the server (fresh
+evidence), but Arms B/C should be all cache hits per the confound-control
+guarantee above, and never pay for a second/third server restart.
+
+Relevant flags (all optional, all default to prior/anthropic-compatible
+behavior): `--root-backend {anthropic,vllm}`, `--root-model-path` (defaults
+to `--target-model` — the common case: same checkpoint serves both roles),
+`--root-model-name`, `--root-base-url` (default
+`http://localhost:8000/v1`), `--root-port` (default `8000`),
+`--root-tensor-parallel-size` (defaults to `--target-tensor-parallel-size`),
+`--root-enable-expert-parallel`, `--root-server-startup-timeout-s` (default
+1800s — a large checkpoint can legitimately take a while to load).
 
 ## Layout
 
@@ -59,7 +96,8 @@ All 11 build-order steps in `IMPLEMENTATION_PLAN.md` are done: scaffolding,
 cache/replay layer, the RLM-trajectory timing decomposition, `target_stage/`
 (vLLM offline engine, gate, query routing), `runner/` (CLI entry points),
 `calibration/` (N_min sweep, transferability check), and `analysis/`
-(metrics aggregation). **85/85 unit tests pass**, plus real Anthropic API
+(metrics aggregation). **93/93 unit tests pass** (85 original + 8 for the
+self-hosted root-model backend added since), plus real Anthropic API
 smoke tests (`rlm_stage/evidence_rlm.py --smoke-test`, `runner/smoke_test.py`)
 and a real end-to-end `run_arm.py --arm A --dry-run` CLI run confirming the
 evidence-cache confound-control mechanism works in practice (cache miss on
@@ -109,18 +147,25 @@ speculator-placement trade-off at `tensor_parallel_size=8`):
 ```bash
 source .env_exports_qwen_coder.sh   # sets SPEC_PREFILL_QWEN_CODER_DIR,
                                      # QWEN3_CODER_480B_MODEL_PATH,
-                                     # TARGET_TENSOR_PARALLEL_SIZE=4, etc.
+                                     # TARGET_TENSOR_PARALLEL_SIZE=4,
+                                     # ROOT_BACKEND=vllm, ROOT_MODEL_PATH,
+                                     # ROOT_BASE_URL, ROOT_PORT, etc.
 python3 runner/run_arm.py --arm A \
     --dataset eval_data/<your-dataset>.jsonl \
     --target-model "$QWEN3_CODER_480B_MODEL_PATH" \
     --speculator-model "$QWEN3_CODER_30B_MODEL_PATH" \
     --spec-prefill-dir-env SPEC_PREFILL_QWEN_CODER_DIR
     # --target-tensor-parallel-size not needed -- defaults to 4 from
-    # $TARGET_TENSOR_PARALLEL_SIZE above. Override with an explicit flag
-    # (e.g. --target-tensor-parallel-size 8 --target-enable-expert-parallel,
-    # the AWQ checkpoint's own tested config) once the speculator's GPU
-    # placement at TP=8 is resolved -- see the "Resource requirements" link
-    # above.
+    # $TARGET_TENSOR_PARALLEL_SIZE above. --root-backend/--root-model-path/
+    # --root-base-url/--root-port also not needed -- default from
+    # $ROOT_BACKEND/$ROOT_MODEL_PATH/$ROOT_BASE_URL/$ROOT_PORT above, so
+    # this single command runs the WHOLE pipeline self-hosted: Qwen3-Coder-
+    # 480B-A35B as root (via a vllm serve subprocess run_arm.py manages
+    # automatically), then again as SpecPrefill target. Override with an
+    # explicit flag (e.g. --target-tensor-parallel-size 8
+    # --target-enable-expert-parallel, the AWQ checkpoint's own tested
+    # config) once the speculator's GPU placement at TP=8 is resolved --
+    # see the "Resource requirements" link above.
 ```
 
 `configs/arms_qwen_coder.yaml` documents this pairing's per-arm settings

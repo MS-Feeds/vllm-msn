@@ -25,9 +25,15 @@ import pytest  # noqa: E402
 
 from eval_data.schema import EvalSample, write_jsonl  # noqa: E402
 from rlm.core.types import RLMChatCompletion, UsageSummary  # noqa: E402
+from rlm_stage import evidence_cache  # noqa: E402
 from rlm_stage.evidence_rlm import EvidenceResult  # noqa: E402
 from runner import run_arm as run_arm_module  # noqa: E402
-from runner.run_arm import VALID_ARMS, collect_evidence_for_dataset, run_arm  # noqa: E402
+from runner.run_arm import (  # noqa: E402
+    VALID_ARMS,
+    _all_samples_cached,
+    collect_evidence_for_dataset,
+    run_arm,
+)
 from runner.run_all_arms import run_all_arms  # noqa: E402
 
 
@@ -154,3 +160,78 @@ def test_run_all_arms_dedupes_and_respects_subset(tmp_path, monkeypatch):
 
     assert call_order == ["A", "B"]  # deduped, and still A-first
     assert set(call_order).issubset(set(VALID_ARMS))
+
+
+def test_all_samples_cached_false_then_true(tmp_path):
+    samples = [
+        EvalSample(id="a", source="test", context="ctx a", question="qa?", answer="a"),
+        EvalSample(id="b", source="test", context="ctx b", question="qb?", answer="b"),
+    ]
+    cache_dir = tmp_path / "cache"
+
+    assert _all_samples_cached(samples, guardrails={}, cache_dir=cache_dir) is False
+
+    for sample in samples:
+        key = evidence_cache.compute_cache_key(sample, guardrails={})
+        evidence_cache.save_cached(key, _fake_run_evidence_extraction(sample.id, sample.question, sample.context), cache_dir)
+
+    assert _all_samples_cached(samples, guardrails={}, cache_dir=cache_dir) is True
+
+
+def test_all_samples_cached_false_if_only_some_cached(tmp_path):
+    samples = [
+        EvalSample(id="a", source="test", context="ctx a", question="qa?", answer="a"),
+        EvalSample(id="b", source="test", context="ctx b", question="qb?", answer="b"),
+    ]
+    cache_dir = tmp_path / "cache"
+    key_a = evidence_cache.compute_cache_key(samples[0], guardrails={})
+    evidence_cache.save_cached(key_a, _fake_run_evidence_extraction("a", "qa?", "ctx a"), cache_dir)
+
+    assert _all_samples_cached(samples, guardrails={}, cache_dir=cache_dir) is False
+
+
+def test_run_arm_vllm_root_backend_skips_server_when_fully_cached(tmp_path, monkeypatch):
+    """The whole point of _all_samples_cached's pre-check: a run_arm() call
+    with root_backend='vllm' over an already-fully-cached dataset (e.g.
+    Arm B/C after Arm A already populated the cache) must never even try to
+    start a vllm serve subprocess -- confirmed here by making
+    start_root_vllm_server raise if it's ever called at all."""
+    monkeypatch.setattr(run_arm_module, "run_evidence_extraction", _fake_run_evidence_extraction)
+
+    samples = [EvalSample(id="a", source="test", context="ctx a", question="qa?", answer="a")]
+    dataset_path = tmp_path / "samples.jsonl"
+    write_jsonl(samples, dataset_path)
+    results_dir = tmp_path / "results"
+
+    # Pre-warm the cache exactly like Arm A would have -- using the SAME
+    # guardrails run_arm()'s own _all_samples_cached/collect_evidence_for_dataset
+    # calls resolve to by default (load_guardrails()'s real config file, not
+    # an empty dict), since compute_cache_key hashes guardrails in: a
+    # mismatched guardrails dict here would produce a different cache key
+    # and defeat the whole point of this test.
+    from rlm_stage.evidence_rlm import load_guardrails
+
+    real_guardrails = load_guardrails()
+    key = evidence_cache.compute_cache_key(samples[0], guardrails=real_guardrails)
+    evidence_cache.save_cached(
+        key, _fake_run_evidence_extraction("a", "qa?", "ctx a"), results_dir / "evidence_cache"
+    )
+
+    import rlm_stage.root_vllm_server as root_vllm_server_module
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("start_root_vllm_server must not be called when the cache is fully warm")
+
+    monkeypatch.setattr(root_vllm_server_module, "start_root_vllm_server", _explode)
+
+    # dry_run=True: stops before the target stage, which is all this test
+    # needs -- it only cares whether the root server was (correctly) never
+    # started, not about the target-model path.
+    run_arm(
+        "A",
+        dataset_path,
+        results_dir=results_dir,
+        dry_run=True,
+        root_backend="vllm",
+        root_model_path="/fake/model/path",
+    )

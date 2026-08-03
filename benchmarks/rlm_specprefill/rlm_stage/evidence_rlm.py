@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
-"""Runs RLM (root = hosted Claude, per IMPLEMENTATION_PLAN.md decision on
-root-model hosting) as the retrieval front-end described in
+"""Runs RLM as the retrieval front-end described in
 ../prompts/evidence_extraction.py, over one (context, question) sample.
+
+Root model is selectable via `root_backend`: `"anthropic"` (hosted Claude,
+the original default -- see IMPLEMENTATION_PLAN.md's decision record) or
+`"vllm"` (self-hosted, e.g. Qwen3-Coder-480B-A35B serving as both root and
+SpecPrefill target -- see ../rlm_stage/root_vllm_server.py for the serving
+lifecycle this requires, and ../runner/run_arm.py for how the two are
+sequenced around each other). The vendored `rlm` package already supports
+this natively (`rlm/clients/__init__.py`'s `backend="vllm"` case, which
+just points its OpenAI-compatible client at a custom `base_url`) -- no
+changes needed there, only this module gained the selection.
 
 This module deliberately does ONE query per call and returns the raw
 `RLMChatCompletion` alongside the parsed evidence -- caching/replay across
@@ -99,36 +108,62 @@ def run_evidence_extraction(
     context: str,
     *,
     guardrails: dict[str, Any] | None = None,
+    root_backend: str = "anthropic",
     model_name: str = DEFAULT_MODEL_NAME,
     api_key: str | None = None,
+    root_base_url: str | None = None,
     log_dir: Path | None = DEFAULT_LOG_DIR,
     verbose: bool = False,
 ) -> EvidenceResult:
     """Runs one RLM evidence-extraction query and returns the parsed result.
 
-    Loads ../../rlm/.env for ANTHROPIC_API_KEY if `api_key` isn't passed
-    explicitly (load_dotenv() with an explicit path -- NOT relying on
-    python-dotenv's cwd-relative auto-discovery, since this module may be
-    invoked from a different working directory than benchmarks/rlm/).
-    """
-    if api_key is None:
-        load_dotenv(dotenv_path=RLM_DOTENV_PATH)
-        import os
+    `root_backend="anthropic"` (default): loads ../../rlm/.env for
+    ANTHROPIC_API_KEY if `api_key` isn't passed explicitly (load_dotenv()
+    with an explicit path -- NOT relying on python-dotenv's cwd-relative
+    auto-discovery, since this module may be invoked from a different
+    working directory than benchmarks/rlm/).
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
+    `root_backend="vllm"`: routes to the same `rlm.clients.OpenAIClient`
+    the package uses for hosted OpenAI, just pointed at `root_base_url`
+    (a self-hosted `vllm serve` endpoint -- see root_vllm_server.py; the
+    caller, typically runner/run_arm.py, is responsible for that server
+    already being up and healthy before this is called). `model_name` here
+    must match whatever the server was launched with (its
+    `--served-model-name`, or the model path/repo id if that wasn't set).
+    `api_key` is ignored for this backend -- vLLM's OpenAI-compatible
+    server doesn't validate keys, but the underlying `openai` SDK still
+    requires a non-empty string, so a placeholder is always sent.
+    """
+    if root_backend == "anthropic":
+        if api_key is None:
+            load_dotenv(dotenv_path=RLM_DOTENV_PATH)
+            import os
+
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+            if not api_key:
+                raise ValueError(
+                    f"ANTHROPIC_API_KEY not set and not found in {RLM_DOTENV_PATH}. "
+                    "Set it in that file or pass api_key= explicitly."
+                )
+        backend_kwargs = {"model_name": model_name, "api_key": api_key}
+    elif root_backend == "vllm":
+        if not root_base_url:
             raise ValueError(
-                f"ANTHROPIC_API_KEY not set and not found in {RLM_DOTENV_PATH}. "
-                "Set it in that file or pass api_key= explicitly."
+                "root_base_url is required when root_backend='vllm' (e.g. "
+                "'http://localhost:8000/v1', matching the port a real "
+                "vllm serve process is answering on)."
             )
+        backend_kwargs = {"model_name": model_name, "base_url": root_base_url, "api_key": "EMPTY"}
+    else:
+        raise ValueError(f"Unknown root_backend {root_backend!r}, expected 'anthropic' or 'vllm'.")
 
     guardrails = dict(guardrails or load_guardrails())
 
     logger = RLMLogger(log_dir=str(log_dir)) if log_dir else None
 
     rlm_instance = RLM(
-        backend="anthropic",
-        backend_kwargs={"model_name": model_name, "api_key": api_key},
+        backend=root_backend,
+        backend_kwargs=backend_kwargs,
         environment="local",
         custom_system_prompt=EVIDENCE_SYSTEM_PROMPT,
         logger=logger,
