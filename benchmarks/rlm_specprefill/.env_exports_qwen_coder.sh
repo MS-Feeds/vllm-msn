@@ -54,7 +54,15 @@ fi
 # runner/run_arm.py starts/stops it around the RLM evidence stage
 # automatically).
 export ROOT_BACKEND=vllm
-export ROOT_BASE_URL="http://localhost:8000/v1"
+# 127.0.0.1, NOT "localhost" -- confirmed real-hardware bug (2026-08-05):
+# rlm's OpenAIClient (httpx under the hood) and root_vllm_server.py's own
+# health check (plain `requests`) can resolve "localhost" to different
+# addresses (IPv4 127.0.0.1 vs IPv6 ::1, or disagree on NO_PROXY exemption
+# if this node sets HTTP_PROXY/HTTPS_PROXY) -- the health check passed
+# while every real completion request failed instantly with
+# `APIConnectionError: Connection error.`, for every sample, every time.
+# Hardcoding the loopback IP sidesteps the ambiguity for both clients.
+export ROOT_BASE_URL="http://127.0.0.1:8000/v1"
 export ROOT_PORT=8000
 # Same checkpoint as the target -- UNCONDITIONALLY overwritten, not
 # `${ROOT_MODEL_PATH:-...}`. Confirmed real footgun (2026-08-04): with the

@@ -68,8 +68,12 @@ guarantee above, and never pay for a second/third server restart.
 Relevant flags (all optional, all default to prior/anthropic-compatible
 behavior): `--root-backend {anthropic,vllm}`, `--root-model-path` (defaults
 to `--target-model` — the common case: same checkpoint serves both roles),
-`--root-model-name`, `--root-base-url` (default
-`http://localhost:8000/v1`), `--root-port` (default `8000`),
+`--root-model-name`, `--root-base-url` (default `http://127.0.0.1:8000/v1`
+— the loopback IP, not `localhost`: confirmed real-hardware bug (2026-08-05)
+where the health check (plain `requests`) and RLM's actual completion
+calls (openai SDK/httpx) resolved `localhost` to different addresses,
+making the health check pass while every real request failed with
+`APIConnectionError`), `--root-port` (default `8000`),
 `--root-tensor-parallel-size` (defaults to `--target-tensor-parallel-size`),
 `--root-enable-expert-parallel`, `--root-server-startup-timeout-s` (default
 1800s — a large checkpoint can legitimately take a while to load).

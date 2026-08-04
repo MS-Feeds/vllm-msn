@@ -152,7 +152,12 @@ def run_evidence_extraction(
         if not root_base_url:
             raise ValueError(
                 "root_base_url is required when root_backend='vllm' (e.g. "
-                "'http://localhost:8000/v1', matching the port a real "
+                "'http://127.0.0.1:8000/v1' -- use the loopback IP, not "
+                "'localhost': confirmed real-hardware bug where this "
+                "client (openai SDK/httpx) and the health check (plain "
+                "requests) resolved 'localhost' to different addresses, "
+                "so the health check passed while every real request "
+                "failed with APIConnectionError -- match the port a real "
                 "vllm serve process is answering on)."
             )
         backend_kwargs = {"model_name": model_name, "base_url": root_base_url, "api_key": "EMPTY"}

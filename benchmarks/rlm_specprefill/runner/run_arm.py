@@ -337,7 +337,7 @@ def run_arm(
     root_backend: str = "anthropic",
     root_model_path: str | None = None,
     root_model_name: str | None = None,
-    root_base_url: str = "http://localhost:8000/v1",
+    root_base_url: str = "http://127.0.0.1:8000/v1",
     root_port: int = 8000,
     root_tensor_parallel_size: int | None = None,
     root_enable_expert_parallel: bool | None = None,
@@ -664,8 +664,17 @@ def main() -> None:
     )
     parser.add_argument(
         "--root-base-url",
-        default=os.environ.get("ROOT_BASE_URL", "http://localhost:8000/v1"),
-        help="Only used for --root-backend=vllm -- the vllm serve endpoint RLM's root-model calls hit.",
+        default=os.environ.get("ROOT_BASE_URL", "http://127.0.0.1:8000/v1"),
+        help=(
+            "Only used for --root-backend=vllm -- the vllm serve endpoint "
+            "RLM's root-model calls hit. 127.0.0.1, not 'localhost' -- "
+            "confirmed real-hardware bug (2026-08-05): the health check "
+            "(plain `requests`) and RLM's actual completion calls (openai "
+            "SDK/httpx) can resolve 'localhost' to different addresses "
+            "(IPv4 vs IPv6, or disagree on NO_PROXY exemption), causing "
+            "the health check to pass while every real request fails with "
+            "APIConnectionError."
+        ),
     )
     parser.add_argument(
         "--root-port",

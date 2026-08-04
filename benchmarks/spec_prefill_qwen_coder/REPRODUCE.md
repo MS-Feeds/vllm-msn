@@ -32,11 +32,26 @@ assumes single-GPU target loading, expect to add
 
 ## 1. This fork's vLLM environment (for the target/speculator serving side)
 
-Same conda env and install steps as `../evaluation_pipeline/REPRODUCE.md`:
+Same conda env and install steps as `../evaluation_pipeline/REPRODUCE.md`,
+**except Python 3.11, not 3.10** — confirmed real-hardware requirement
+(2026-08): `../rlm/pyproject.toml` pins `requires-python = ">=3.11"`, and
+`../rlm_specprefill/runner/run_arm.py` imports the `rlm` package in the
+same process as this port's `vllm_patch/`, so the one shared env needs to
+satisfy both. Creating the env with 3.10 (this file's own old default)
+doesn't fail immediately — `pip install -e .`/`pip install datasets` etc.
+all succeed against 3.10 — it only surfaces later as a confusing wall of
+`ModuleNotFoundError`s once something imports `rlm`, because pip silently
+refuses to install the `rlm` package itself into a too-old interpreter
+(`ERROR: Package 'rlms' requires a different Python: 3.10.x not in
+'>=3.11'`), and if that step gets skipped/missed, every downstream import
+of `rlm` (and anything reinstalled afterward while troubleshooting, if
+done in a different shell that isn't actually the intended env) can look
+like an unrelated cascade of missing packages instead of the one real
+root cause:
 
 ```bash
 source /opt/conda/etc/profile.d/conda.sh
-conda create -n vllm-ablation python=3.10 -y   # skip if it already exists
+conda create -n vllm-ablation python=3.11 -y   # skip if it already exists
 conda activate vllm-ablation
 pip install torch==2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 git clone https://github.com/overwindows/vllm-msn

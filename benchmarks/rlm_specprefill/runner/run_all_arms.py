@@ -51,7 +51,7 @@ def run_all_arms(
     root_backend: str = "anthropic",
     root_model_path: str | None = None,
     root_model_name: str | None = None,
-    root_base_url: str = "http://localhost:8000/v1",
+    root_base_url: str = "http://127.0.0.1:8000/v1",
     root_port: int = 8000,
     root_tensor_parallel_size: int | None = None,
     root_enable_expert_parallel: bool | None = None,
@@ -161,7 +161,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--root-base-url",
-        default=os.environ.get("ROOT_BASE_URL", "http://localhost:8000/v1"),
+        default=os.environ.get("ROOT_BASE_URL", "http://127.0.0.1:8000/v1"),
         help="See runner/run_arm.py's flag of the same name.",
     )
     parser.add_argument(
