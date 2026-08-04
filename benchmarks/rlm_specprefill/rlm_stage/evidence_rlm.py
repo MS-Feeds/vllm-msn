@@ -23,6 +23,7 @@ result) makes it independently testable and matches
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -46,7 +47,10 @@ from prompts.evidence_extraction import (  # noqa: E402
 
 THIS_DIR = Path(__file__).resolve().parent.parent  # benchmarks/rlm_specprefill/
 DEFAULT_GUARDRAILS_PATH = THIS_DIR / "configs" / "guardrails.yaml"
-DEFAULT_LOG_DIR = THIS_DIR / "logs"
+# Honors $RLM_SPECPREFILL_LOG_DIR (see runner/run_arm.py's
+# DEFAULT_RESULTS_DIR for the matching fix and fuller writeup -- this
+# module's own default was equally vestigial-until-fixed).
+DEFAULT_LOG_DIR = Path(os.environ.get("RLM_SPECPREFILL_LOG_DIR", str(THIS_DIR / "logs")))
 
 # Loaded from ../../rlm/.env (that project's own dotenv file, which already
 # has a real ANTHROPIC_API_KEY -- see ../../rlm/examples/quickstart_anthropic.py
@@ -137,8 +141,6 @@ def run_evidence_extraction(
     if root_backend == "anthropic":
         if api_key is None:
             load_dotenv(dotenv_path=RLM_DOTENV_PATH)
-            import os
-
             api_key = os.environ.get("ANTHROPIC_API_KEY")
             if not api_key:
                 raise ValueError(

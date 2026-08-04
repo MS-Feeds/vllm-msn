@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -319,7 +320,15 @@ def render_arm_summary(arm: str, agg: dict[str, Any]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--results-dir", type=Path, default=THIS_DIR / "results")
+    # Matches runner/run_arm.py's DEFAULT_RESULTS_DIR fix -- both must honor
+    # $RLM_SPECPREFILL_RESULTS_DIR the same way, or a run_arm.py invocation
+    # that picked it up (e.g. the Qwen-Coder pairing's results/qwen_coder/
+    # namespacing) silently can't be found by this script's own default.
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path(os.environ.get("RLM_SPECPREFILL_RESULTS_DIR", str(THIS_DIR / "results"))),
+    )
     parser.add_argument("--arms", default="A,B,C")
     parser.add_argument(
         "--dataset",

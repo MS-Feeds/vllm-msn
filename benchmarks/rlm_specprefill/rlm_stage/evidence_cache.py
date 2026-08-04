@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -33,7 +34,11 @@ from eval_data.schema import EvalSample  # noqa: E402
 from rlm_stage.evidence_rlm import PROMPT_VERSION, EvidenceResult  # noqa: E402
 
 THIS_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_CACHE_DIR = THIS_DIR / "results" / "evidence_cache"
+# Honors $RLM_SPECPREFILL_RESULTS_DIR (see runner/run_arm.py's
+# DEFAULT_RESULTS_DIR for the fuller writeup of why -- this module's own
+# default was equally vestigial-until-fixed, even though run_arm.py itself
+# never actually relies on it, always passing cache_dir= explicitly).
+DEFAULT_CACHE_DIR = Path(os.environ.get("RLM_SPECPREFILL_RESULTS_DIR", str(THIS_DIR / "results"))) / "evidence_cache"
 
 
 def compute_cache_key(

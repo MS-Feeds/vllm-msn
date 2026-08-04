@@ -252,7 +252,16 @@ def run_sweep(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--evidence-cache", type=Path, default=THIS_DIR / "results" / "evidence_cache")
+    # Matches runner/run_arm.py's DEFAULT_RESULTS_DIR fix -- honor
+    # $RLM_SPECPREFILL_RESULTS_DIR the same way, or this can't find the
+    # cache a run_arm.py invocation that picked it up actually wrote to
+    # (e.g. the Qwen-Coder pairing's results/qwen_coder/ namespacing).
+    parser.add_argument(
+        "--evidence-cache",
+        type=Path,
+        default=Path(os.environ.get("RLM_SPECPREFILL_RESULTS_DIR", str(THIS_DIR / "results")))
+        / "evidence_cache",
+    )
     parser.add_argument("--synthetic-niah", type=Path, default=THIS_DIR / "eval_data" / "synthetic_niah_samples.jsonl")
     parser.add_argument("--bin-sizes", default=",".join(str(b) for b in DEFAULT_BIN_SIZES))
     parser.add_argument("--target-model", default=os.environ.get("LLAMA31_8B_MODEL_PATH"))

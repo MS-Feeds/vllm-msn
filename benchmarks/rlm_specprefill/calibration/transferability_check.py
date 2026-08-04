@@ -273,7 +273,15 @@ def main() -> None:
     parser.add_argument("--target-model", default=os.environ.get("LLAMA31_8B_MODEL_PATH"))
     parser.add_argument("--speculator-model", default=os.environ.get("LLAMA32_1B_MODEL_PATH"))
     parser.add_argument("--threshold-pct", type=float, default=DEFAULT_DIVERGENCE_THRESHOLD_PCT)
-    parser.add_argument("--output", type=Path, default=THIS_DIR / "results" / "transferability_check.json")
+    # Matches runner/run_arm.py's DEFAULT_RESULTS_DIR fix -- honor
+    # $RLM_SPECPREFILL_RESULTS_DIR the same way for output-location
+    # consistency across pairings.
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path(os.environ.get("RLM_SPECPREFILL_RESULTS_DIR", str(THIS_DIR / "results")))
+        / "transferability_check.json",
+    )
     parser.add_argument(
         "--target-tensor-parallel-size",
         type=int,

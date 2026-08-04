@@ -47,7 +47,15 @@ from rlm_stage.evidence_rlm import EvidenceResult, load_guardrails, run_evidence
 from rlm_stage.root_vllm_server import DEFAULT_ROOT_MAX_MODEL_LEN as _DEFAULT_ROOT_MAX_MODEL_LEN  # noqa: E402
 from rlm_stage.timing_decomposition import decompose_trajectory  # noqa: E402
 
-DEFAULT_RESULTS_DIR = THIS_DIR / "results"
+# Confirmed real gap (2026-08-04): .env_exports.sh/.env_exports_qwen_coder.sh
+# both export RLM_SPECPREFILL_RESULTS_DIR (the latter specifically
+# namespaced under results/qwen_coder/ so a Qwen-Coder sweep can't clobber
+# an existing Llama arm's results) but neither this module nor any other
+# script ever actually read it -- purely vestigial/documentation-only
+# before this fix, so results silently landed in plain results/ regardless
+# of which pairing's env was sourced. Now honored as the default, still
+# overridable via --results-dir.
+DEFAULT_RESULTS_DIR = Path(os.environ.get("RLM_SPECPREFILL_RESULTS_DIR", str(THIS_DIR / "results")))
 DEFAULT_SPEC_CONFIG_PATH = THIS_DIR / "configs" / "spec_config_always_on.yaml"
 VALID_ARMS = ("A", "B", "C")
 
