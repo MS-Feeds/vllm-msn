@@ -579,7 +579,33 @@ def main() -> None:
             "that don't need it."
         ),
     )
+    parser.add_argument(
+        "--target-max-model-len",
+        type=int,
+        default=None,
+        help=(
+            "Confirmed real-hardware requirement (2026-08-04): without "
+            "this, LLM(...) leaves max_model_len unset and vLLM defaults "
+            "to the checkpoint's full native context (262144 for "
+            "Qwen3-Coder-480B-A35B) -- at tensor_parallel_size=4 this asked "
+            "for more KV cache (15.5 GiB) than was available (9.72 GiB), "
+            "raising ValueError before the engine could even start. "
+            "Defaults to --target-max-num-batched-tokens + 1024 (a margin "
+            "for the sampled output) if not given -- this script's own "
+            "test prompts are small (~5400-5500 kept tokens, see the "
+            "module docstring), so it never needs the model's full native "
+            "context. Raise explicitly if a real (non-test) prompt needs "
+            "more, but check available KV cache at your tensor_parallel_size "
+            "first, same as this default had to."
+        ),
+    )
     args = parser.parse_args()
+
+    resolved_target_max_model_len = (
+        args.target_max_model_len
+        if args.target_max_model_len is not None
+        else args.target_max_num_batched_tokens + 1024
+    )
 
     device = torch.device(args.device)
 
@@ -607,7 +633,8 @@ def main() -> None:
     print(f"Loading target model {args.target_model} via SpecPrefillWorker "
           f"(gpu_memory_utilization={target_gpu_memory_utilization}, "
           f"tensor_parallel_size={args.target_tensor_parallel_size}, "
-          f"enable_expert_parallel={args.target_enable_expert_parallel}) on {device}...")
+          f"enable_expert_parallel={args.target_enable_expert_parallel}, "
+          f"max_model_len={resolved_target_max_model_len}) on {device}...")
     llm = LLM(
         model=args.target_model,
         worker_cls="vllm_patch.worker.SpecPrefillWorker",
@@ -617,6 +644,7 @@ def main() -> None:
         tensor_parallel_size=args.target_tensor_parallel_size,
         enable_expert_parallel=args.target_enable_expert_parallel,
         max_num_batched_tokens=args.target_max_num_batched_tokens,
+        max_model_len=resolved_target_max_model_len,
         # enable_chunked_prefill deliberately left unset (model's own
         # supported default) for now. The sibling Gemma4 pipeline confirmed
         # on real hardware that vLLM warns against disabling chunked

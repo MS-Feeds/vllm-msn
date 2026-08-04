@@ -44,6 +44,7 @@ sys.path.insert(0, str(THIS_DIR))
 from eval_data.schema import EvalSample, read_jsonl  # noqa: E402
 from rlm_stage import evidence_cache  # noqa: E402
 from rlm_stage.evidence_rlm import EvidenceResult, load_guardrails, run_evidence_extraction  # noqa: E402
+from rlm_stage.root_vllm_server import DEFAULT_ROOT_MAX_MODEL_LEN as _DEFAULT_ROOT_MAX_MODEL_LEN  # noqa: E402
 from rlm_stage.timing_decomposition import decompose_trajectory  # noqa: E402
 
 DEFAULT_RESULTS_DIR = THIS_DIR / "results"
@@ -201,6 +202,7 @@ def run_arm(
     root_port: int = 8000,
     root_tensor_parallel_size: int | None = None,
     root_enable_expert_parallel: bool = False,
+    root_max_model_len: int | None = _DEFAULT_ROOT_MAX_MODEL_LEN,
     root_server_startup_timeout_s: float = 1800.0,
 ) -> None:
     """`root_backend='vllm'` (self-hosted root, e.g. Qwen3-Coder-480B-A35B
@@ -215,6 +217,12 @@ def run_arm(
     fully torn down before target_stage tries to claim the same GPUs.
     `root_model_path` defaults to `target_model_path` (the common case:
     the same checkpoint serves both roles) if not given separately.
+    `root_max_model_len` defaults to `root_vllm_server.DEFAULT_ROOT_MAX_MODEL_LEN`
+    (131072, NOT the checkpoint's native max) -- confirmed real-hardware
+    requirement: leaving it unset makes vLLM reserve KV cache for the full
+    native context, which can exceed what's actually available at a given
+    tensor_parallel_size (see that constant's own docstring for the exact
+    failure and how to size a real override for your node).
     """
     if arm not in VALID_ARMS:
         raise ValueError(f"Unknown arm {arm!r}, must be one of {VALID_ARMS}")
@@ -262,7 +270,8 @@ def run_arm(
         print(
             f"[run_arm] root_backend='vllm': starting vllm serve for "
             f"{resolved_root_model_path} on port {root_port} "
-            f"(tensor_parallel_size={resolved_root_tp}) ..."
+            f"(tensor_parallel_size={resolved_root_tp}, "
+            f"max_model_len={root_max_model_len}) ..."
         )
         root_server_proc = start_root_vllm_server(
             resolved_root_model_path,
@@ -270,6 +279,7 @@ def run_arm(
             tensor_parallel_size=resolved_root_tp,
             enable_expert_parallel=root_enable_expert_parallel,
             served_model_name=resolved_root_model_name,
+            max_model_len=root_max_model_len,
             log_path=results_dir / "root_vllm_server.log",
         )
         try:
@@ -515,6 +525,24 @@ def main() -> None:
         help="Only used for --root-backend=vllm -- see --target-enable-expert-parallel's help for why this might be needed.",
     )
     parser.add_argument(
+        "--root-max-model-len",
+        type=int,
+        default=int(os.environ.get("ROOT_MAX_MODEL_LEN", str(_DEFAULT_ROOT_MAX_MODEL_LEN))),
+        help=(
+            "Only used for --root-backend=vllm. Confirmed real-hardware "
+            "requirement (2026-08-04): NOT the checkpoint's native max "
+            "(262144) -- leaving this unset makes vLLM reserve KV cache "
+            "for a full-native-context request, which can exceed what's "
+            "actually available at your --root-tensor-parallel-size "
+            "(a real ValueError, not hypothetical). Defaults to 131072 "
+            f"(currently {_DEFAULT_ROOT_MAX_MODEL_LEN}) unless "
+            "$ROOT_MAX_MODEL_LEN is set -- raise it only after confirming "
+            "your node's real KV-cache budget at the chosen TP degree "
+            "supports it (a first failed attempt's own error message "
+            "reports the achievable ceiling)."
+        ),
+    )
+    parser.add_argument(
         "--root-server-startup-timeout-s",
         type=float,
         default=1800.0,
@@ -541,6 +569,7 @@ def main() -> None:
         root_base_url=args.root_base_url,
         root_port=args.root_port,
         root_tensor_parallel_size=args.root_tensor_parallel_size,
+        root_max_model_len=args.root_max_model_len,
         root_enable_expert_parallel=args.root_enable_expert_parallel,
         root_server_startup_timeout_s=args.root_server_startup_timeout_s,
     )

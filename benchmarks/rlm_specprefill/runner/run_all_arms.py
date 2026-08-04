@@ -30,6 +30,7 @@ from pathlib import Path
 THIS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(THIS_DIR))
 
+from rlm_stage.root_vllm_server import DEFAULT_ROOT_MAX_MODEL_LEN  # noqa: E402
 from runner.run_arm import DEFAULT_RESULTS_DIR, VALID_ARMS, run_arm  # noqa: E402
 
 
@@ -54,6 +55,7 @@ def run_all_arms(
     root_port: int = 8000,
     root_tensor_parallel_size: int | None = None,
     root_enable_expert_parallel: bool = False,
+    root_max_model_len: int | None = DEFAULT_ROOT_MAX_MODEL_LEN,
     root_server_startup_timeout_s: float = 1800.0,
 ) -> None:
     """When `root_backend='vllm'`, each `run_arm()` call below independently
@@ -88,6 +90,7 @@ def run_all_arms(
             root_port=root_port,
             root_tensor_parallel_size=root_tensor_parallel_size,
             root_enable_expert_parallel=root_enable_expert_parallel,
+            root_max_model_len=root_max_model_len,
             root_server_startup_timeout_s=root_server_startup_timeout_s,
         )
 
@@ -175,6 +178,12 @@ def main() -> None:
         help="See runner/run_arm.py's flag of the same name.",
     )
     parser.add_argument(
+        "--root-max-model-len",
+        type=int,
+        default=int(os.environ.get("ROOT_MAX_MODEL_LEN", str(DEFAULT_ROOT_MAX_MODEL_LEN))),
+        help="See runner/run_arm.py's flag of the same name -- NOT the checkpoint's native max, see that flag's help for why.",
+    )
+    parser.add_argument(
         "--root-server-startup-timeout-s",
         type=float,
         default=1800.0,
@@ -207,6 +216,7 @@ def main() -> None:
         root_port=args.root_port,
         root_tensor_parallel_size=args.root_tensor_parallel_size,
         root_enable_expert_parallel=args.root_enable_expert_parallel,
+        root_max_model_len=args.root_max_model_len,
         root_server_startup_timeout_s=args.root_server_startup_timeout_s,
     )
 

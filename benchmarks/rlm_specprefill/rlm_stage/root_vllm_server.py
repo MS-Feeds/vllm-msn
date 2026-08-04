@@ -42,6 +42,24 @@ class RootServerStartupError(RuntimeError):
     before the configured startup timeout."""
 
 
+#: Not the checkpoint's native max (262144 for Qwen3-Coder-480B-A35B) --
+#: confirmed real-hardware requirement (2026-08-04, discovered via
+#: validate_runner_integration.py hitting the identical issue): leaving
+#: max_model_len unset makes vLLM reserve enough KV cache for at least one
+#: full-native-context request, which at tensor_parallel_size=4 asked for
+#: more (15.5 GiB) than was actually available (9.72 GiB) -- ValueError
+#: before the server could even start. This default sits comfortably under
+#: that node's own observed ceiling (vLLM's own error message estimated
+#: ~164448 tokens fit in the available KV cache at that TP degree) while
+#: still clearing the ablation's own >131K-token eval-set floor -- not a
+#: profiled value for every possible GPU/TP combination, just a safer
+#: starting point than "unset". Override via `max_model_len=`/
+#: `--root-max-model-len` if your node's real KV-cache budget allows more
+#: (check the same "estimated maximum model length is N" message from a
+#: first failed attempt) or needs less.
+DEFAULT_ROOT_MAX_MODEL_LEN = 131072
+
+
 def build_vllm_serve_command(
     model_path: str,
     *,
@@ -50,16 +68,23 @@ def build_vllm_serve_command(
     enable_expert_parallel: bool = False,
     served_model_name: str | None = None,
     gpu_memory_utilization: float = 0.9,
+    max_model_len: int | None = DEFAULT_ROOT_MAX_MODEL_LEN,
     extra_args: list[str] | None = None,
 ) -> list[str]:
     """Builds the `vllm serve` argv. Mirrors the flags
     target_stage/vllm_offline_engine.py's build_plain_target_engine passes
     to the offline `LLM(...)` class where an equivalent `vllm serve` flag
     exists (--tensor-parallel-size, --enable-expert-parallel,
-    --gpu-memory-utilization, --trust-remote-code, --enforce-eager) -- kept
-    consistent so root-serving and target-answering behave predictably the
-    same way for the same checkpoint, not because either was independently
-    tuned for this serving mode.
+    --gpu-memory-utilization, --max-model-len, --trust-remote-code,
+    --enforce-eager) -- kept consistent so root-serving and target-answering
+    behave predictably the same way for the same checkpoint, not because
+    either was independently tuned for this serving mode.
+
+    `max_model_len=None` leaves it unset (vLLM's own default: the
+    checkpoint's native max) -- pass this explicitly only if you've
+    confirmed your node's real KV-cache budget at the chosen
+    tensor_parallel_size actually supports it (see
+    DEFAULT_ROOT_MAX_MODEL_LEN's docstring for how to check).
 
     `served_model_name` is what the OpenAI-compatible API expects in a
     completion request's `model` field -- without `--served-model-name`,
@@ -82,6 +107,8 @@ def build_vllm_serve_command(
         "--trust-remote-code",
         "--enforce-eager",
     ]
+    if max_model_len is not None:
+        cmd += ["--max-model-len", str(max_model_len)]
     if enable_expert_parallel:
         cmd.append("--enable-expert-parallel")
     if served_model_name:
@@ -99,6 +126,7 @@ def start_root_vllm_server(
     enable_expert_parallel: bool = False,
     served_model_name: str | None = None,
     gpu_memory_utilization: float = 0.9,
+    max_model_len: int | None = DEFAULT_ROOT_MAX_MODEL_LEN,
     extra_args: list[str] | None = None,
     log_path: Path | None = None,
 ) -> subprocess.Popen:
@@ -121,6 +149,7 @@ def start_root_vllm_server(
         enable_expert_parallel=enable_expert_parallel,
         served_model_name=served_model_name,
         gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
         extra_args=extra_args,
     )
     print(f"[root_vllm_server] launching: {' '.join(cmd)}", flush=True)
