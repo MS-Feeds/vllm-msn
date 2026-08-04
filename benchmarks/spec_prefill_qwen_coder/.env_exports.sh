@@ -85,7 +85,8 @@ export TARGET_TENSOR_PARALLEL_SIZE=4
 # only supports tensor_model_parallel_size=1 for the speculator (see
 # vllm_patch/proposer.py's _ensure_distributed_environment docstring; TP/PP
 # > 1 for the speculator remains out of scope for this pass).
-export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/snapshots/b2cff646eb4bb1d68355c01b18ae02e7cf42d120
+#export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/snapshots/b2cff646eb4bb1d68355c01b18ae02e7cf42d120
+export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/models--cyankiwi--Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit/snapshots/4bd30395b72ea6045edd04806c4fea448d4467b3
 
 # Unlike the sibling Gemma4 pipeline's .env_exports.sh, there is no
 # QWEN3_CODER_TEXT_ONLY_MODEL_PATH here -- these are text-only checkpoints
