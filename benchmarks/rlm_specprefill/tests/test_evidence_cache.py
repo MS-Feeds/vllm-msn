@@ -99,8 +99,14 @@ def test_cache_key_sensitive_to_context_question_and_guardrails():
     different_guardrails = evidence_cache.compute_cache_key(base, guardrails={"max_depth": 3})
     assert different_guardrails != key_base
 
+    # "not-the-real-default-v99" rather than a hardcoded real version string
+    # (e.g. "v2") -- the real PROMPT_VERSION changes over time (see
+    # prompts/evidence_extraction.py's own version-bump history), and a
+    # hardcoded literal that happens to collide with the CURRENT real
+    # default would make this assertion trivially (and misleadingly) pass
+    # for the wrong reason.
     different_prompt_version = evidence_cache.compute_cache_key(
-        base, guardrails={"max_depth": 2}, prompt_version="v2"
+        base, guardrails={"max_depth": 2}, prompt_version="not-the-real-default-v99"
     )
     assert different_prompt_version != key_base
 

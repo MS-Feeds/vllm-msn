@@ -31,7 +31,23 @@ from typing import Any
 # expected JSON structure) -- rlm_stage/evidence_cache.py includes this in its
 # cache key so a prompt-design change invalidates stale cached evidence
 # instead of silently reusing evidence gathered under different instructions.
-PROMPT_VERSION = "v1"
+#
+# v1 -> v2 (2026-08-05): confirmed on real hardware against a self-hosted
+# Qwen3-Coder-480B root (root_backend='vllm') that asking the model to
+# hand-author "a JSON string" directly produces a real parse-failure rate
+# (~1/3 of samples in one small run) -- sometimes it just answers directly
+# with no JSON wrapper at all, sometimes it emits a Python-dict-repr string
+# (single quotes, invalid JSON) with an EMPTY excerpts list, a real evidence
+# loss, not just a formatting miss. RLM's own core loop (rlm/core/rlm.py +
+# rlm/environments/local_repl.py's exec()) already avoids exactly this class
+# of failure for its own `answer` mechanism by having the model manipulate a
+# live Python object via real code rather than emit free-text that has to be
+# parsed -- v2 extends that same guarantee one level deeper: instead of
+# asking the model to type out JSON text by hand, it's now asked to build a
+# native Python dict in the REPL and call `json.dumps(...)` on it, so
+# syntactic validity comes from Python's own stdlib serializer, not from the
+# model correctly imitating JSON formatting in prose.
+PROMPT_VERSION = "v2"
 
 EVIDENCE_SYSTEM_PROMPT = textwrap.dedent(
     """You are a Recursive Language Model (RLM) acting as a RETRIEVAL FRONT-END, not an answerer: a language model with a prompt, and a very important context stored in a Python REPL related to that prompt.
@@ -46,7 +62,7 @@ To use the REPL, you need to write code in ```repl``` blocks; the REPL persists 
 - `llm_query_batched(prompts: list[str], model=None) -> list[str]`: concurrently call several LLM calls in parallel over a list of prompts; same order out as in.
 - `rlm_query(prompt, model=None)` / `rlm_query_batched(prompts, model=None)`: recursive RLM sub-calls for evidence-gathering subtasks that themselves need multi-step search. Fall back to `llm_query` / `llm_query_batched` when recursion is disabled.
 - `SHOW_VARS() -> str`: list every variable currently in the REPL.
-- `answer`: dict initialized to `{{"content": "", "ready": False}}`. To submit your evidence, set `answer["content"]` to a JSON string (see "Submitting your evidence" below) and `answer["ready"] = True` inside a ```repl``` block.
+- `answer`: dict initialized to `{{"content": "", "ready": False}}`. To submit your evidence, `import json`, build a Python dict, and serialize it with `json.dumps(...)` to set `answer["content"]` (see "Submitting your evidence" below), then `answer["ready"] = True` inside a ```repl``` block.
 {custom_tools_section}
 
 REPL outputs over ~20K characters are truncated, so for longer payloads slice `context` and pass slices through `llm_query` rather than `print`-ing them whole. The REPL is NOT a Jupyter cell — only `print(...)` output (stdout) is shown back to you between turns; a bare expression on the last line is silently discarded. Always wrap inspections in `print(...)`.
@@ -54,9 +70,9 @@ REPL outputs over ~20K characters are truncated, so for longer payloads slice `c
 As a general strategy, start by probing your context to understand its shape (e.g. print a few lines, count them). Then use the REPL to search, chunk, and query sub-LLMs to locate the passages relevant to the question below — treat this exactly like a retrieval task, not a question-answering task.
 
 Submitting your evidence:
-When (and only when) you have located sufficient evidence, set `answer["content"]` to a JSON string of this exact shape:
+When (and only when) you have located sufficient evidence, build a Python dict of this exact shape:
 {{"excerpts": [{{"text": "<verbatim or lightly-trimmed excerpt>", "loc_hint": "<where in context this came from, e.g. a section heading or approximate line range>"}}], "question": "<the original question, copied verbatim>"}}
-then `answer["ready"] = True`. Keep excerpts verbatim from `context` wherever possible (do not paraphrase the evidence itself) and include enough surrounding text that each excerpt is self-contained without the rest of `context`. Prefer a small number of well-chosen excerpts over exhaustively dumping large sections — a downstream model still has to read whatever you return.
+then set `answer["content"] = json.dumps(that_dict)` and `answer["ready"] = True`. Do NOT hand-type the JSON text yourself — always construct it as a real Python dict/list first and pass it through `json.dumps(...)`, so the result is guaranteed valid JSON regardless of quote characters or special characters inside the excerpt text. Keep excerpts verbatim from `context` wherever possible (do not paraphrase the evidence itself) and include enough surrounding text that each excerpt is self-contained without the rest of `context`. Prefer a small number of well-chosen excerpts over exhaustively dumping large sections — a downstream model still has to read whatever you return.
 
 Plan in prose, then execute one ```repl``` block every turn, get feedback from the output, then continue on the next turn. Do not flip `answer["ready"] = True` on turn 1 without first inspecting `context`.
 """
