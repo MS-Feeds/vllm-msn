@@ -31,6 +31,7 @@ necessarily a real bug.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -40,6 +41,40 @@ from pathlib import Path
 class RootServerStartupError(RuntimeError):
     """Raised when the vLLM server process exits, or never becomes healthy,
     before the configured startup timeout."""
+
+
+def _subprocess_env() -> dict[str, str]:
+    """Confirmed real-hardware bug (2026-08-04, tensor_parallel_size=4):
+    `vllm/model_executor/layers/vocab_parallel_embedding.py`'s
+    `get_masked_input_and_mask` is decorated `@torch.compile(...)`
+    UNCONDITIONALLY -- independent of `--enforce-eager`/`enforce_eager=True`
+    -- and only exercised when `tp_size > 1` (exactly this pipeline's
+    scope). Under vLLM's multiproc TP executor, that ends up compiling from
+    inside a daemon worker process; PyTorch Inductor's async-compile tries
+    to spawn its own subprocess pool for it, which Python's multiprocessing
+    hard-blocks for daemon processes: `AssertionError: daemonic processes
+    are not allowed to have children`.
+
+    vLLM's own `vllm/env_override.py` already sets
+    `TORCHINDUCTOR_COMPILE_THREADS=1` unconditionally on `import vllm` for
+    exactly this class of bug (citing
+    github.com/vllm-project/vllm/issues/10480 and /10619) -- confirmed
+    insufficient to prevent it here on this torch/vLLM version combination
+    (the crash still happened with that already in effect). `TORCHDYNAMO_
+    DISABLE=1` is the more robust fix: it's a hard kill-switch that makes
+    every `@torch.compile`-decorated call (not just this one) execute
+    plain eager PyTorch, never invoking Dynamo/Inductor at all -- sidesteps
+    the whole subprocess-pool code path rather than tuning its thread
+    count. Consistent with this pipeline's own `--enforce-eager` intent
+    everywhere else, not a new behavioral compromise -- this function was
+    simply never covered by that flag to begin with.
+
+    Merged into `os.environ` (not replacing it) so the subprocess still
+    inherits everything else (HF_HOME, HF_TOKEN, LD_LIBRARY_PATH, etc.)
+    that `.env_exports*.sh` already set in this process before launch."""
+    env = dict(os.environ)
+    env["TORCHDYNAMO_DISABLE"] = "1"
+    return env
 
 
 #: Not the checkpoint's native max (262144 for Qwen3-Coder-480B-A35B) --
@@ -153,14 +188,15 @@ def start_root_vllm_server(
         extra_args=extra_args,
     )
     print(f"[root_vllm_server] launching: {' '.join(cmd)}", flush=True)
+    env = _subprocess_env()
 
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_file = open(log_path, "w", encoding="utf-8")
         print(f"[root_vllm_server] logging server output to {log_path}", flush=True)
-        return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
 
-    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+    return subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr, env=env)
 
 
 def wait_for_server_healthy(

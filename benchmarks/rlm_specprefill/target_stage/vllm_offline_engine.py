@@ -244,6 +244,34 @@ def resolve_max_num_batched_tokens(explicit: int | None, token_lengths: list[int
 DEFAULT_SPEC_PREFILL_DIR_ENV = "SPEC_PREFILL_LLAMA_DIR"
 
 
+def _disable_torchdynamo_for_multiproc_tp() -> None:
+    """Confirmed real-hardware bug (2026-08-04, tensor_parallel_size=4, via
+    rlm_stage/root_vllm_server.py hitting the identical crash):
+    `vllm/model_executor/layers/vocab_parallel_embedding.py`'s
+    `get_masked_input_and_mask` is decorated `@torch.compile(...)`
+    unconditionally -- independent of `enforce_eager` -- and only
+    exercised when `tp_size > 1`. Under vLLM's multiproc TP executor this
+    compiles from inside a daemon worker process; PyTorch Inductor's
+    async-compile tries to spawn its own subprocess pool for it, which
+    Python's multiprocessing hard-blocks for daemon processes
+    (`AssertionError: daemonic processes are not allowed to have
+    children`). vLLM's own `vllm/env_override.py` already sets
+    `TORCHINDUCTOR_COMPILE_THREADS=1` unconditionally for this exact class
+    of bug -- confirmed insufficient on the torch/vLLM version combination
+    that hit this. `TORCHDYNAMO_DISABLE=1` is the more robust fix (skips
+    Dynamo/Inductor entirely for every `@torch.compile` call, not just
+    tuning thread count) -- see root_vllm_server.py's `_subprocess_env` for
+    the fuller writeup (same root cause, different launch mechanism: that
+    module sets this in a subprocess's environment for `vllm serve`; this
+    one sets it in the current process's environment since `LLM(...)`'s TP
+    workers are spawned in-process and inherit it from here).
+
+    Not scoped to only TP>1 callers -- harmless at tensor_parallel_size=1
+    too (this compiled function is simply never called with a single TP
+    rank, so disabling Dynamo globally changes nothing observable there)."""
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
+
 def ensure_spec_prefill_on_path(env_var: str = DEFAULT_SPEC_PREFILL_DIR_ENV) -> None:
     """`vllm_patch` (SpecPrefillWorker/proposer/pruner/config) lives in a
     sibling port directory (e.g. ../spec_prefill_llama/ or
@@ -318,6 +346,7 @@ def build_plain_target_engine(
     (their model card's own wording). Confirmed a real `ParallelConfig`/
     `LLM(...)` field in this fork (vllm/config/parallel.py: "Use expert
     parallelism instead of tensor parallelism for MoE layers")."""
+    _disable_torchdynamo_for_multiproc_tp()
     from transformers import AutoTokenizer
     from vllm import LLM
 
@@ -381,6 +410,7 @@ def build_specprefill_target_engine(
     `spec_prefill_dir_env` selects which sibling port's `vllm_patch` to
     import (default preserves the original Llama-only behavior) -- pass
     e.g. `"SPEC_PREFILL_QWEN_CODER_DIR"` for the Qwen3-Coder pairing."""
+    _disable_torchdynamo_for_multiproc_tp()
     ensure_spec_prefill_on_path(spec_prefill_dir_env)
     import torch
     from transformers import AutoTokenizer

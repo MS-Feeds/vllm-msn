@@ -630,6 +630,24 @@ def main() -> None:
     target_gpu_memory_utilization = (
         args.target_gpu_memory_utilization if speculator_device == device else 0.9
     )
+    # Confirmed real-hardware bug (2026-08-04, tensor_parallel_size=4):
+    # vllm/model_executor/layers/vocab_parallel_embedding.py's
+    # get_masked_input_and_mask is decorated @torch.compile(...)
+    # unconditionally (independent of enforce_eager=True above) and only
+    # exercised when tp_size > 1 -- under vLLM's multiproc TP executor this
+    # compiles from inside a daemon worker process, and PyTorch Inductor's
+    # async-compile subprocess-pool spawn is hard-blocked for daemon
+    # processes ("AssertionError: daemonic processes are not allowed to
+    # have children"). vLLM's own vllm/env_override.py already sets
+    # TORCHINDUCTOR_COMPILE_THREADS=1 unconditionally for this exact class
+    # of bug (github.com/vllm-project/vllm/issues/10480, /10619) --
+    # confirmed insufficient on the torch/vLLM version combination that hit
+    # this. TORCHDYNAMO_DISABLE=1 is the more robust fix (skips Dynamo/
+    # Inductor entirely rather than tuning thread count) -- see
+    # ../rlm_specprefill/target_stage/vllm_offline_engine.py's
+    # _disable_torchdynamo_for_multiproc_tp for the identical fix applied
+    # to the production (run_arm.py) target-engine path.
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
     print(f"Loading target model {args.target_model} via SpecPrefillWorker "
           f"(gpu_memory_utilization={target_gpu_memory_utilization}, "
           f"tensor_parallel_size={args.target_tensor_parallel_size}, "
