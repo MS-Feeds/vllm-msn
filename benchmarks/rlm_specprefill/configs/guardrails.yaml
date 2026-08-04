@@ -12,10 +12,29 @@
 
 # Recursion depth: depth 0 is the root; at depth >= max_depth, rlm_query()
 # falls back to a plain (non-recursive) LM call.
-max_depth: 2
+#
+# 2 -> 1 (2026-08-05): confirmed real-hardware cost against a self-hosted
+# Qwen3-Coder-480B root over 150K-500K-token S-NIAH contexts -- at
+# max_depth=2, a depth-0 root's own rlm_query()/rlm_query_batched() calls
+# (depth 1, still < 2) can spawn a FULL nested RLM sub-instance with its own
+# up-to-max_iterations budget, multiplying worst-case wall-clock time rather
+# than just adding to it. At max_depth=1, the root's own sub-calls (depth 1
+# >= max_depth) fall back to plain (non-recursive) LM calls instead --
+# still usable for delegation, just without spawning another full iteration
+# loop underneath. This was the single biggest lever for cutting the
+# 1200s-hard-timeout skip rate observed in practice; try raising back to 2
+# only if search quality (not just speed) turns out to need the extra
+# recursion depth once samples are reliably completing under the new caps.
+max_depth: 1
 
 # Root-loop turns per RLM instance (root or any child).
-max_iterations: 30
+#
+# 30 -> 15 (2026-08-05): halves the worst-case number of sequential root-
+# model round trips per sample -- each round trip to the self-hosted vLLM
+# root server has real latency (queueing/generation), and 30 turns' worth of
+# accumulating conversation history was a major contributor to samples
+# exceeding run_arm.py's hard per-sample timeout on large S-NIAH contexts.
+max_iterations: 15
 
 # Parallel threads for rlm_query_batched() sub-call fan-out. Matches the
 # ablation doc's own suggested starting value; also RLM's own default.
@@ -23,7 +42,13 @@ max_concurrent_subcalls: 4
 
 # Wall-clock seconds. Checked before each root iteration; propagates as
 # *remaining* budget to child RLMs (rlm.py:706 `_subcall`), not the full value.
-max_timeout: 900
+#
+# 900 -> 600 (2026-08-05): tightened alongside max_depth/max_iterations above
+# -- with recursion and iteration count both cut, a genuinely-converging
+# sample should comfortably finish well inside 10 minutes; this also shrinks
+# run_arm.py's hard-timeout backstop (max_timeout + _HARD_TIMEOUT_BUFFER_S)
+# from 1200s to 900s, so a truly stuck sample gets force-killed sooner.
+max_timeout: 600
 
 # Total input+output tokens across the whole call tree. Token tracking is
 # correct for the Anthropic backend (unlike max_budget below).
