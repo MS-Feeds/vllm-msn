@@ -56,9 +56,20 @@ fi
 export ROOT_BACKEND=vllm
 export ROOT_BASE_URL="http://localhost:8000/v1"
 export ROOT_PORT=8000
-# Same checkpoint as the target by default -- set explicitly only if you
-# want a different model/quantization serving as root than as target.
-export ROOT_MODEL_PATH="${ROOT_MODEL_PATH:-$QWEN3_CODER_480B_MODEL_PATH}"
+# Same checkpoint as the target -- UNCONDITIONALLY overwritten, not
+# `${ROOT_MODEL_PATH:-...}`. Confirmed real footgun (2026-08-04): with the
+# `:-` form, re-sourcing this file in a shell that already had
+# ROOT_MODEL_PATH set from an earlier source (e.g. before
+# QWEN3_CODER_480B_MODEL_PATH was updated to a real snapshot path) silently
+# keeps the STALE value forever -- `:-` only fills in when the variable is
+# unset/empty, so an already-set-but-wrong value never gets corrected by
+# re-sourcing, only by a fresh shell or an explicit `unset`. There's no
+# legitimate reason to want ROOT_MODEL_PATH to persist independently of
+# QWEN3_CODER_480B_MODEL_PATH across re-sources -- if you genuinely want a
+# different root checkpoint than the target, pass --root-model-path
+# directly to runner/run_arm.py at invocation time instead of relying on
+# this env var to hold a manual override.
+export ROOT_MODEL_PATH="$QWEN3_CODER_480B_MODEL_PATH"
 
 # --- This project's own additions ---
 # target_stage/vllm_offline_engine.py's ensure_spec_prefill_on_path() needs
