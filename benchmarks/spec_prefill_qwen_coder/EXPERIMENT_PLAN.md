@@ -298,12 +298,13 @@ divide evenly for this architecture (verified against
 checkpoint's own card was tested against.
 
 **The speculator/target GPU-placement conflict this creates, and the
-current default**: Qwen3-Coder-30B-A3B-Instruct (speculator) is kept
-**unquantized** by `vllm_patch/proposer.py`'s design
-(`_create_speculator_vllm_config` clears `quant_config`) and needs its own
-~60GB GPU. At `tensor_parallel_size=8` the target occupies *every* GPU,
-leaving none free for the speculator — stacking it onto a GPU already
-holding a ~30GB (4-bit) target shard would exceed 80GB.
+current default**: Qwen3-Coder-30B-A3B-Instruct (speculator) is
+**unquantized by default** here (whatever precision `QWEN3_CODER_30B_MODEL_PATH`
+points at -- BF16 unless you point it at a quantized checkpoint instead,
+see below) and at BF16 needs its own ~60GB GPU. At `tensor_parallel_size=8`
+the target occupies *every* GPU, leaving none free for the speculator —
+stacking a BF16 speculator onto a GPU already holding a ~30GB (4-bit)
+target shard would exceed 80GB.
 
 **Current default: `tensor_parallel_size=4`**, not the checkpoint's own
 tested 8 (still a valid divisor per the head-count check above) — target
@@ -320,13 +321,30 @@ off unless an "expert tensors don't split evenly" error appears.
 
 To move to `tensor_parallel_size=8` (the checkpoint's own tested config,
 using all 8 GPUs) later, the speculator's placement needs to be resolved
-first — untested here, but two paths:
-1. Quantize the speculator too, to fit alongside a target shard on one
-   GPU — `proposer.py`'s `quant_config=None` only strips the field it
-   would otherwise inherit from the *target's* `VllmConfig`, not
-   necessarily anything the speculator's own `ModelConfig` would
-   auto-detect from a quantized speculator checkpoint's own `config.json`
-   — verify this is actually decoupled before relying on it.
+first. Two paths:
+1. **Quantize the speculator too, to fit alongside a target shard on one
+   GPU.** Confirmed (2026-08-04, reading `vllm/config/vllm.py` directly,
+   not assumed) that `proposer.py`'s `quant_config=None` in
+   `_create_speculator_vllm_config`'s `replace(...)` call does NOT force
+   the speculator unquantized: `VllmConfig.__post_init__` re-derives
+   `quant_config` from `self.model_config.quantization` whenever
+   `quant_config is None`, and the `model_config` passed there is the
+   *speculator's own* freshly-constructed `ModelConfig` (built from
+   `speculator_model_path`), not the target's. So `quant_config=None` only
+   clears whatever the speculator's `VllmConfig` would otherwise have
+   inherited from the target's own `base_vllm_config` -- it then correctly
+   re-derives from the speculator checkpoint's own `config.json`
+   `quantization_config` block if one exists. Pointing
+   `QWEN3_CODER_30B_MODEL_PATH` at an AWQ (or GPTQ) quant of
+   Qwen3-Coder-30B-A3B-Instruct should therefore just work, no code changes
+   needed -- this repo's own `FusedMoE` AWQ-Marlin/GPTQ-Marlin quant
+   methods already apply to MoE layers (same confirmation as the target's
+   own AWQ quant, see the table above). At 4-bit (~15-18GB) this fits
+   comfortably alongside a ~29.5GB target shard (repo-size/8) within 80GB,
+   with room for KV cache. Not yet run on real hardware -- the config-level
+   decoupling is confirmed by reading vLLM's source, not by an actual
+   successful load, so treat this as "should work" rather than "confirmed
+   working" until tried.
 2. Accept a 9-GPU-equivalent layout isn't possible on an 8-GPU node and
    stay at TP=4 (or another divisor <8) permanently for this hardware.
 
