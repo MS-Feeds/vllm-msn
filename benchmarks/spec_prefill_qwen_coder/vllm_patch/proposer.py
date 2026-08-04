@@ -151,6 +151,53 @@ def _ensure_distributed_environment(device: torch.device) -> None:
     )
 
 
+def _ensure_workspace_manager_initialized(
+    device: torch.device, vllm_config: VllmConfig
+) -> None:
+    """Confirmed real-hardware requirement (2026-08-04), a genuinely new
+    gap for the MoE speculator this dense-Qwen3-port function never had:
+    `vllm/model_executor/layers/fused_moe/modular_kernel.py`'s
+    `_allocate_buffers` calls `current_workspace_manager()`
+    (`vllm/v1/worker/workspace.py`), which asserts a global `_manager` has
+    already been set via `init_workspace_manager(device)` -- normally done
+    once, automatically, inside `Worker.init_device()`
+    (`vllm/v1/worker/gpu_worker.py:311-313`, right before the model runner
+    is constructed) for any model loaded through the normal `LLM(...)`/
+    `Worker` lifecycle. `SpecPrefillProposer` deliberately bypasses that
+    whole lifecycle (see `_ensure_distributed_environment`'s own docstring
+    for why -- it loads the speculator directly via `get_model()`), so
+    nothing else in this file ever calls `init_workspace_manager()`.
+
+    Dense Qwen3 (the port this file was carried over from) never exercised
+    this: it has no `FusedMoE` layers, so `current_workspace_manager()` was
+    simply never reached for that speculator. Qwen3-Coder-30B-A3B (MoE) hits
+    it on its very first forward pass -- confirmed via the real traceback:
+    `AssertionError: WorkspaceManager not initialized` from inside
+    `Qwen3MoeSparseMoeBlock`'s `self.experts(...)` call, the first time
+    `run_lookahead_steps` runs the speculator's bootstrap prefill.
+
+    `is not None` idempotency isn't needed here the way it is in
+    `_ensure_distributed_environment` -- `init_workspace_manager` itself
+    already just re-warns-and-reinitializes if called twice
+    (`workspace.py:229-236`), and the global `_manager` it sets is
+    process-local: the target model's own `init_workspace_manager()` call
+    (inside its own `Worker.init_device()`) runs in a genuinely separate OS
+    process (`EngineCore`, confirmed by `worker.py`'s own module
+    docstring), so there's no cross-process clobbering between the two.
+
+    `num_ubatches` mirrors `gpu_worker.py:312`'s own derivation exactly
+    (`2 if parallel_config.enable_dbo else 1`) -- not independently chosen,
+    since a mismatch here could under-size buffers for a code path this
+    speculator doesn't otherwise exercise (dual-batch-overlap is a decode-
+    time optimization irrelevant to SpecPrefill's prefill-only lookahead
+    loop, so this should always resolve to 1 in practice, but computed the
+    same way the real code does rather than hardcoded)."""
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    num_ubatches = 2 if vllm_config.parallel_config.enable_dbo else 1
+    init_workspace_manager(device, num_ubatches)
+
+
 @dataclass
 class LookaheadMetadata:
     """Everything `run_lookahead_steps` needs for one single-request
@@ -259,6 +306,7 @@ class SpecPrefillProposer:
         # otherwise).
         with set_current_vllm_config(self.vllm_config):
             _ensure_distributed_environment(device)
+            _ensure_workspace_manager_initialized(device, self.vllm_config)
             self.model: nn.Module = get_model(
                 vllm_config=self.vllm_config, prefix="spec_prefill_speculator"
             )
