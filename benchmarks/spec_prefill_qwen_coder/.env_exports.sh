@@ -58,7 +58,7 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 # mode only (matches predict_longbench_v2.py's enable_thinking=False
 # assumption -- still worth re-verifying against the real chat template,
 # see that file's render_chat docstring).
-export QWEN3_CODER_480B_MODEL_PATH=/scratch/hf_cache/hub/models--Qwen--Qwen3-Coder-480B-A35B-Instruct/snapshots/REPLACE_WITH_REAL_SNAPSHOT_HASH
+export QWEN3_CODER_480B_MODEL_PATH=/scratch/hf_cache/models--QuantTrio--Qwen3-Coder-480B-A35B-Instruct-AWQ/snapshots/9ce3eaa67fe88609afec235117e97eb03d9b3cda
 
 # Starting tensor-parallel size for the target: 4, not the AWQ card's own
 # tested 8 -- at TP=8 the target occupies every GPU on an 8-GPU node,
@@ -85,7 +85,7 @@ export TARGET_TENSOR_PARALLEL_SIZE=4
 # only supports tensor_model_parallel_size=1 for the speculator (see
 # vllm_patch/proposer.py's _ensure_distributed_environment docstring; TP/PP
 # > 1 for the speculator remains out of scope for this pass).
-export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/hub/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/snapshots/REPLACE_WITH_REAL_SNAPSHOT_HASH
+export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/snapshots/b2cff646eb4bb1d68355c01b18ae02e7cf42d120
 
 # Unlike the sibling Gemma4 pipeline's .env_exports.sh, there is no
 # QWEN3_CODER_TEXT_ONLY_MODEL_PATH here -- these are text-only checkpoints

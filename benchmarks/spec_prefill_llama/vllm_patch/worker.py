@@ -24,7 +24,7 @@ engine, e.g.:
     )
 
 `resolve_obj_by_qualname` imports the module by name, so the driver process
-needs `benchmarks/spec_prefill` on `sys.path` (or run from within that
+needs `benchmarks/spec_prefill_llama` on `sys.path` (or run from within that
 directory) for `vllm_patch.worker` to resolve -- same requirement as every
 other `vllm_patch` import in this package.
 
@@ -67,19 +67,6 @@ class SpecPrefillWorker(Worker):
         directly from the driver) for `model_runner.py` to see it -- see
         module docstring."""
         pruning_registry.register(request_id, kept_positions, orig_len)
-        # TEMPORARY diagnostic (2026-07-28), round 2 -- re-added to
-        # correlate against model_runner.py's lookup-side print (pid + a
-        # timestamp, to check ordering/timing against the first step() that
-        # tries to look this record up, given Step B2 has now failed with
-        # the write branch never firing at all).
-        import os as _os
-        import time as _time
-        print(
-            f"[spec_prefill DEBUG worker] pid={_os.getpid()} t={_time.time():.6f} "
-            f"registered req_id={request_id!r} num_kept={len(kept_positions)} "
-            f"orig_len={orig_len}",
-            flush=True,
-        )
 
     def discard_prune_record(self, request_id: str) -> None:
         """RPC-callable, same reasoning as `register_prune_record` above."""

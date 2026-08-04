@@ -6,6 +6,9 @@ export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 export GEMMA4_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-26B-A4B-it/snapshots/5305c1e72ea29c01f31a81230d52b375ba88b409
 export GEMMA4_TEXT_ONLY_MODEL_PATH=/scratch/hf_cache/gemma-4-26B-A4B-it-text-only
 export GEMMA4_ASSISTANT_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-26B-A4B-it-assistant/snapshots/d8888482e6d3cc4637fa8b25c1033cd3573b88ba
+# NOTE: SpecPrefill (../spec_prefill/) has its own .env_exports.sh with its
+# own GEMMA4_E2B_MODEL_PATH -- that speculator path isn't needed by
+# gemma4_moe_benchmarks or evaluation_pipeline, so it doesn't live here.
 # NOTE: no "hub/" in these paths -- `hf download --cache-dir X` (the CLI
 # used to fetch these after the 2026-07-14 node wipe) places snapshots
 # directly under X, not X/hub/ (that hub/ nesting is what HF_HOME-based

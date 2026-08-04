@@ -119,20 +119,6 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             record = pruning_registry.get(req_id)
-            # TEMPORARY diagnostic (2026-07-28), round 2 -- the write-site
-            # print below never fired on the latest FAIL, which only tells us
-            # we took the `record is None` or `kept_slice is None` branch,
-            # not which -- this print (unconditional, every request/step)
-            # disambiguates. Prime suspect: a race between the cross-process
-            # collective_rpc registration and the first engine step() landing
-            # before it, despite pruner.py's docstring claiming that's safe.
-            import time as _time
-            print(
-                f"[spec_prefill DEBUG model_runner] t={_time.time():.6f} "
-                f"req_id={req_id!r} record_found={record is not None} "
-                f"registry_keys={list(pruning_registry._registry.keys())!r}",
-                flush=True,
-            )
             if record is None:
                 continue  # not a pruned request -- stock positions stand.
 
@@ -145,39 +131,11 @@ class SpecPrefillGPUModelRunner(GPUModelRunner):
             num_computed_before = int(self.input_batch.num_computed_tokens_cpu[req_idx])
 
             kept_slice = record.positions_for_step(num_computed_before, num_scheduled_this_step)
-            # TEMPORARY diagnostic (2026-07-28), round 2 -- distinguishes the
-            # decode branch (kept_slice is None) from the prefill/write branch.
-            print(
-                f"[spec_prefill DEBUG model_runner] req_id={req_id!r} "
-                f"num_computed_before={num_computed_before} "
-                f"num_scheduled_this_step={num_scheduled_this_step} "
-                f"num_kept={record.num_kept} kept_slice_is_none={kept_slice is None}",
-                flush=True,
-            )
             if kept_slice is not None:
                 kept_positions_gpu = torch.tensor(
                     kept_slice, dtype=self.positions.dtype, device=self.device
                 )
                 self.positions[start:end] = kept_positions_gpu
-                # TEMPORARY diagnostic (2026-07-28) -- remove once Step B2's
-                # intermittent (FAIL/PASS/FAIL across three otherwise-identical
-                # runs) failure is root-caused. `.tolist()` forces a CUDA
-                # sync, so this readback proves whether the write already
-                # took effect by the time THIS line runs, in THIS process --
-                # if this prints the correct scattered values but the
-                # attention-layer hook still captures stock, the bug is
-                # downstream (backend/staging clobbers or races the write
-                # between here and the model's forward call); if this ALREADY
-                # prints stock/wrong values, the bug is upstream (kept_slice
-                # itself, or the write/dtype/device conversion above).
-                readback = self.positions[start : min(start + 5, end)].tolist()
-                print(
-                    f"[spec_prefill DEBUG model_runner] req_id={req_id!r} "
-                    f"kept_slice[:5]={list(kept_slice[:5])!r} "
-                    f"readback_after_write={readback!r} "
-                    f"num_kept={record.num_kept} orig_len={record.orig_len}",
-                    flush=True,
-                )
             else:
                 self.positions[start:end] += record.decode_offset
 

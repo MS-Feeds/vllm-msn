@@ -2,11 +2,9 @@
 
 Status: the full algorithm (lines 1, 3-16, 18-20) is implemented, grounded
 directly in this fork's verified V1 source (see ../EXPERIMENT_PLAN.md's
-"Implementation status" and the two approved plans in
-`c-users-v-dialan-desktop-protocol-specu-logical-fox.md`). Not yet run on
-real hardware (no GPU on the machine this was written on) -- see
-`../validate_proposer.py` and each new module's own "residual risk" notes
-for what to check first.
+"Implementation status"). Not yet run on real hardware for Llama (no GPU on
+the machine this was written on) -- see `../validate_proposer.py` and each
+module's own "residual risk" notes for what to check first.
 
 This package replaces an earlier stub round that mirrored the paper's
 reference repo's v0-era dual-`Worker`/`parallel_config.worker_cls` design

@@ -80,7 +80,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import torch
 
-from vllm.config import CacheConfig, ModelConfig, VllmConfig, replace
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm_patch.proposer import SpecPrefillProposer
 from vllm_patch.pruner import _last_token_only, _make_next_positions_fn
 
