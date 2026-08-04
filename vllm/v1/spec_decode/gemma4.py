@@ -187,25 +187,47 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
 
         super().load_model(target_model)
 
-        # Re-derive backbone_hidden_size from the loaded pre_projection weight.
-        # The HF config backbone_hidden_size may be stale (e.g. 2304) while the
-        # actual checkpoint pre_projection weight has shape (out, 2*backbone) —
-        # i.e. in_features = 2 * backbone_hidden_size_actual.  If the config
-        # value differs from the weight-derived value the dummy_run combined
-        # tensor will have the wrong width and cause a shape-mismatch error
-        # during torch.compile AOT tracing.  Fix by resizing the buffers here,
-        # after weights are already loaded.
-        if (
-            hasattr(self.model, "model")
-            and hasattr(self.model.model, "pre_projection")
-        ):
-            pre_proj_weight = self.model.model.pre_projection.weight
-            # weight shape: (out_features, in_features) = (hidden_size, 2*backbone)
-            actual_backbone_hidden_size = pre_proj_weight.shape[1] // 2
+        # Re-derive backbone_hidden_size from the target model's embed_tokens
+        # weight, which reliably reflects the actual checkpoint dimension.
+        #
+        # Background: the HF config backbone_hidden_size may be stale (e.g.
+        # 2304) while the actual checkpoint uses a larger backbone dim (e.g.
+        # 2816).  The pre_projection weight is a BasevLLMParameter whose
+        # `.shape` returns the *pre-allocated* shape based on the stale config
+        # value — reading `pre_projection.weight.shape[1] // 2` therefore
+        # returns the stale config value, not the actual checkpoint size.
+        #
+        # The target model's embed_tokens weight is loaded directly from the
+        # backbone checkpoint and always has the correct dimension, so we use
+        # that as the authoritative source.
+        actual_backbone_hidden_size = None
+        try:
+            actual_backbone_hidden_size = int(
+                target_model.model.embed_tokens.weight.shape[-1]
+            )
+            logger.info(
+                "Gemma4 MTP: actual backbone_hidden_size=%d "
+                "(from target embed_tokens; config has backbone_hidden_size=%d, "
+                "self.hidden_size=%d).",
+                actual_backbone_hidden_size,
+                getattr(
+                    self.speculative_config.draft_model_config.hf_config,
+                    "backbone_hidden_size",
+                    -1,
+                ),
+                self.hidden_size,
+            )
+        except AttributeError:
+            logger.warning(
+                "Gemma4 MTP: could not access "
+                "target_model.model.embed_tokens.weight to verify "
+                "backbone_hidden_size. Proposer buffers may be mis-sized."
+            )
+
+        if actual_backbone_hidden_size is not None:
             if actual_backbone_hidden_size != self.hidden_size:
                 logger.info(
-                    "Gemma4 MTP: re-sizing hidden_states buffer from "
-                    "config backbone_hidden_size=%d to weight-derived %d.",
+                    "Gemma4 MTP: re-sizing hidden_states buffer %d → %d.",
                     self.hidden_size,
                     actual_backbone_hidden_size,
                 )
@@ -216,12 +238,11 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                     device=self.device,
                 )
             # inputs_embeds must also equal backbone_hidden_size so that
-            # cat([inputs_embeds, hidden_states], dim=-1) = 2 * backbone_hidden_size
+            # cat([inputs_embeds, hidden_states], dim=-1) = 2*backbone_hidden_size
             # which is exactly what pre_projection expects.
             if actual_backbone_hidden_size != self.inputs_embeds_size:
                 logger.info(
-                    "Gemma4 MTP: re-sizing inputs_embeds buffer from "
-                    "inputs_embeds_size=%d to backbone_hidden_size=%d.",
+                    "Gemma4 MTP: re-sizing inputs_embeds buffer %d → %d.",
                     self.inputs_embeds_size,
                     actual_backbone_hidden_size,
                 )
