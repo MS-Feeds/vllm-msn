@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
 import os
 import sys
 from dataclasses import dataclass
@@ -59,12 +60,127 @@ DEFAULT_RESULTS_DIR = Path(os.environ.get("RLM_SPECPREFILL_RESULTS_DIR", str(THI
 DEFAULT_SPEC_CONFIG_PATH = THIS_DIR / "configs" / "spec_config_always_on.yaml"
 VALID_ARMS = ("A", "B", "C")
 
+# Confirmed real-hardware bug (2026-08-05): RLM's own `max_timeout` guardrail
+# (guardrails.yaml) only checks wall-clock elapsed *between* root-loop
+# iterations (rlm/core/rlm.py's `_check_timeout`) -- it does NOT protect
+# against a single iteration hanging forever, e.g. model-generated REPL code
+# with an infinite loop (confirmed via py-spy: a real sample stuck for over
+# an hour inside `exec(code, ...)` in rlm/environments/local_repl.py,
+# `max_timeout` never even got a chance to fire since that iteration never
+# returned). A per-sample hard wall-clock timeout is the backstop --
+# `_HARD_TIMEOUT_BUFFER_S` added on top of whatever `max_timeout` a given
+# run's guardrails.yaml specifies, so RLM's own (working, just insufficient
+# alone) soft check gets first chance to produce a clean TimeoutExceededError
+# before this cruder hard kill ever needs to fire.
+_HARD_TIMEOUT_BUFFER_S = 300.0
+
 
 @dataclass
 class EvidenceCollectionResult:
     sample: EvalSample
     evidence_result: EvidenceResult
     was_cache_hit: bool
+
+
+def _evidence_extraction_subprocess_target(
+    result_queue,
+    sample_id: str,
+    question: str,
+    context: str,
+    kwargs: dict,
+) -> None:
+    """Module-level (NOT a nested closure) so multiprocessing's fork start
+    method (Linux default, used explicitly below) can hand this off to the
+    child cleanly. Deliberately calls the bare name `run_evidence_extraction`
+    (resolved from this module's own namespace at call time, not a captured
+    reference) so a test's `monkeypatch.setattr(run_arm_module,
+    "run_evidence_extraction", stub)` -- done in the PARENT before forking --
+    is still in effect in the forked child too (fork copies the parent's
+    already-patched module state at the moment `Process.start()` runs).
+
+    `kwargs` is forwarded to `run_evidence_extraction` as-is (built by the
+    caller, e.g. `collect_evidence_for_dataset`'s `run_fn`, using the SAME
+    conditional-inclusion pattern the pre-existing direct call used) rather
+    than accepting fixed named params here -- several of
+    `run_evidence_extraction`'s keyword args (e.g. `model_name`) default to
+    a non-`None` sentinel (`DEFAULT_MODEL_NAME`), so explicitly passing
+    `model_name=None` here when the caller didn't set one would incorrectly
+    override that default instead of inheriting it."""
+    try:
+        result = run_evidence_extraction(sample_id, question, context, **kwargs)
+        result_queue.put(("ok", result))
+    except Exception as e:
+        result_queue.put(("error", f"{type(e).__name__}: {e}"))
+
+
+def run_evidence_extraction_with_hard_timeout(
+    sample_id: str,
+    question: str,
+    context: str,
+    *,
+    timeout_s: float,
+    **kwargs,
+) -> EvidenceResult:
+    """Runs `run_evidence_extraction` in a forked subprocess with a REAL
+    wall-clock timeout that force-kills the subprocess if exceeded --
+    confirmed necessary (see `_HARD_TIMEOUT_BUFFER_S`'s own comment) because
+    RLM's own `max_timeout` guardrail can't interrupt a single stuck
+    iteration (e.g. model-generated REPL code with an infinite loop). A
+    thread-based timeout can't reliably solve this either -- Python can't
+    forcibly kill a thread stuck in a CPU-bound `exec()`, only a whole
+    process can be killed reliably (`Process.terminate()`/`.kill()`).
+
+    Uses `multiprocessing.get_context("fork")` explicitly (Linux's own
+    default, but pinned rather than left implicit) -- fork, not spawn,
+    is what makes monkeypatch-based testing of this function work (see
+    `_evidence_extraction_subprocess_target`'s docstring) and avoids the
+    overhead of re-importing this whole module in a fresh interpreter per
+    sample. This project's whole scope is GPU-cluster/Linux already, so a
+    POSIX-only mechanism isn't a new platform constraint.
+
+    `**kwargs` (e.g. `guardrails`, `root_backend`, optionally `model_name`/
+    `root_base_url`) is forwarded verbatim to `run_evidence_extraction`
+    inside the subprocess -- see `_evidence_extraction_subprocess_target`'s
+    docstring for why this isn't a set of fixed named params.
+    """
+    ctx = multiprocessing.get_context("fork")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_evidence_extraction_subprocess_target,
+        args=(result_queue, sample_id, question, context, kwargs),
+        daemon=True,
+    )
+    proc.start()
+    proc.join(timeout=timeout_s)
+
+    if proc.is_alive():
+        print(
+            f"[run_arm]   sample id={sample_id!r} exceeded the {timeout_s}s "
+            f"hard timeout -- force-killing its evidence-extraction subprocess.",
+            flush=True,
+        )
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        raise TimeoutError(
+            f"evidence extraction for sample {sample_id!r} exceeded the "
+            f"{timeout_s}s hard wall-clock timeout (RLM's own max_timeout "
+            f"guardrail didn't catch this -- see run_arm.py's "
+            f"_HARD_TIMEOUT_BUFFER_S comment for why) and was force-killed."
+        )
+
+    if result_queue.empty():
+        raise RuntimeError(
+            f"evidence-extraction subprocess for sample {sample_id!r} exited "
+            f"(code={proc.exitcode}) without producing a result -- likely crashed "
+            f"(e.g. OOM) rather than raising a normal Python exception."
+        )
+    status, payload = result_queue.get()
+    if status == "error":
+        raise RuntimeError(payload)
+    return payload
 
 
 def collect_evidence_for_dataset(
@@ -75,6 +191,7 @@ def collect_evidence_for_dataset(
     root_backend: str = "anthropic",
     model_name: str | None = None,
     root_base_url: str | None = None,
+    evidence_extraction_timeout_s: float | None = None,
 ) -> list[EvidenceCollectionResult]:
     """The RLM-evidence half of run_arm -- runnable on any machine with
     Anthropic API access, no vLLM/GPU needed, when `root_backend="anthropic"`
@@ -87,8 +204,20 @@ def collect_evidence_for_dataset(
     `run_evidence_extraction` directly), so calling this repeatedly across
     arms/runs never re-invokes RLM for a query that's already cached
     (IMPLEMENTATION_PLAN.md decision 4 -- the confound-control guarantee).
+
+    `evidence_extraction_timeout_s`: hard per-sample wall-clock timeout
+    (see `run_evidence_extraction_with_hard_timeout`'s own docstring for why
+    this backstop exists on top of RLM's own `max_timeout` guardrail).
+    Defaults to `guardrails["max_timeout"] + _HARD_TIMEOUT_BUFFER_S` when not
+    given explicitly, so a caller only needs to override this if they want a
+    tighter/looser buffer than the default.
     """
     guardrails = guardrails if guardrails is not None else load_guardrails()
+    resolved_timeout_s = (
+        evidence_extraction_timeout_s
+        if evidence_extraction_timeout_s is not None
+        else guardrails.get("max_timeout", 900.0) + _HARD_TIMEOUT_BUFFER_S
+    )
 
     def run_fn(sample: EvalSample) -> EvidenceResult:
         kwargs: dict = {"guardrails": guardrails, "root_backend": root_backend}
@@ -96,7 +225,9 @@ def collect_evidence_for_dataset(
             kwargs["model_name"] = model_name
         if root_base_url:
             kwargs["root_base_url"] = root_base_url
-        return run_evidence_extraction(sample.id, sample.question, sample.context, **kwargs)
+        return run_evidence_extraction_with_hard_timeout(
+            sample.id, sample.question, sample.context, timeout_s=resolved_timeout_s, **kwargs
+        )
 
     results: list[EvidenceCollectionResult] = []
     for i, sample in enumerate(samples):
@@ -212,6 +343,7 @@ def run_arm(
     root_enable_expert_parallel: bool | None = None,
     root_max_model_len: int | None = _DEFAULT_ROOT_MAX_MODEL_LEN,
     root_server_startup_timeout_s: float = 1800.0,
+    evidence_extraction_timeout_s: float | None = None,
 ) -> None:
     """`root_backend='vllm'` (self-hosted root, e.g. Qwen3-Coder-480B-A35B
     serving as both root and SpecPrefill target -- see rlm_stage/
@@ -237,6 +369,9 @@ def run_arm(
     native context, which can exceed what's actually available at a given
     tensor_parallel_size (see that constant's own docstring for the exact
     failure and how to size a real override for your node).
+    `evidence_extraction_timeout_s` is passed straight through to
+    `collect_evidence_for_dataset` -- see its own docstring for the default
+    (guardrails' `max_timeout` + `_HARD_TIMEOUT_BUFFER_S`) when left unset.
     """
     if arm not in VALID_ARMS:
         raise ValueError(f"Unknown arm {arm!r}, must be one of {VALID_ARMS}")
@@ -319,6 +454,7 @@ def run_arm(
             root_backend=root_backend,
             model_name=resolved_root_model_name,
             root_base_url=root_base_url if root_backend == "vllm" else None,
+            evidence_extraction_timeout_s=evidence_extraction_timeout_s,
         )
     finally:
         if root_server_proc is not None:
@@ -580,6 +716,21 @@ def main() -> None:
         default=1800.0,
         help="Only used for --root-backend=vllm -- how long to wait for vllm serve to become healthy before giving up. A large checkpoint can legitimately take a while to load.",
     )
+    parser.add_argument(
+        "--evidence-extraction-timeout-s",
+        type=float,
+        default=None,
+        help=(
+            "Hard per-sample wall-clock timeout that force-kills a stuck "
+            "evidence-extraction subprocess. Confirmed real-hardware bug "
+            "(2026-08-05, see _HARD_TIMEOUT_BUFFER_S's own comment): RLM's "
+            "own guardrails.yaml max_timeout can't interrupt a single stuck "
+            "iteration (e.g. model-generated REPL code with an infinite "
+            "loop) -- py-spy confirmed a real sample stuck for over an hour "
+            "inside exec(). Defaults to guardrails['max_timeout'] + "
+            f"{_HARD_TIMEOUT_BUFFER_S}s when not given explicitly."
+        ),
+    )
     args = parser.parse_args()
 
     run_arm(
@@ -604,6 +755,7 @@ def main() -> None:
         root_max_model_len=args.root_max_model_len,
         root_enable_expert_parallel=args.root_enable_expert_parallel,
         root_server_startup_timeout_s=args.root_server_startup_timeout_s,
+        evidence_extraction_timeout_s=args.evidence_extraction_timeout_s,
     )
 
 

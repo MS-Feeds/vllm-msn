@@ -57,6 +57,7 @@ def run_all_arms(
     root_enable_expert_parallel: bool | None = None,
     root_max_model_len: int | None = DEFAULT_ROOT_MAX_MODEL_LEN,
     root_server_startup_timeout_s: float = 1800.0,
+    evidence_extraction_timeout_s: float | None = None,
 ) -> None:
     """When `root_backend='vllm'`, each `run_arm()` call below independently
     starts/stops its own root vLLM server -- Arm A's call will actually use
@@ -92,6 +93,7 @@ def run_all_arms(
             root_enable_expert_parallel=root_enable_expert_parallel,
             root_max_model_len=root_max_model_len,
             root_server_startup_timeout_s=root_server_startup_timeout_s,
+            evidence_extraction_timeout_s=evidence_extraction_timeout_s,
         )
 
 
@@ -192,6 +194,12 @@ def main() -> None:
         default=1800.0,
         help="See runner/run_arm.py's flag of the same name.",
     )
+    parser.add_argument(
+        "--evidence-extraction-timeout-s",
+        type=float,
+        default=None,
+        help="See runner/run_arm.py's flag of the same name.",
+    )
     args = parser.parse_args()
 
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
@@ -221,6 +229,7 @@ def main() -> None:
         root_enable_expert_parallel=args.root_enable_expert_parallel,
         root_max_model_len=args.root_max_model_len,
         root_server_startup_timeout_s=args.root_server_startup_timeout_s,
+        evidence_extraction_timeout_s=args.evidence_extraction_timeout_s,
     )
 
 

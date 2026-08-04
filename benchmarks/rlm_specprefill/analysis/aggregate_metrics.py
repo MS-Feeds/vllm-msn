@@ -213,8 +213,10 @@ def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSa
     - `synthetic_niah` samples have well-defined ground truth (exact needle
       values in `sample.extra["needles"]`) -- scored via needle recall,
       reusing calibration/transferability_check.py's `compute_recall`.
-    - `longbench_v2_long` samples have a lettered multiple-choice ground
-      truth, but this project's target prompt
+    - `longbench_v2_*` samples (source is bucket-specific -- `longbench_v2_long`,
+      `_short`, or `_medium`, per eval_data/prep_longbench_v2_long.py's
+      `--length` flag; matched here by prefix, not tied to any one bucket)
+      have a lettered multiple-choice ground truth, but this project's target prompt
       (target_stage/vllm_offline_engine.py) asks for a free-text answer,
       not a letter (see that module's docstring for why -- RLM's evidence
       excerpts, not a rendered multiple-choice prompt, are what the target
@@ -246,7 +248,7 @@ def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSa
         if sample.source == "synthetic_niah":
             needle_values = [n["value"] for n in sample.extra.get("needles", [])]
             niah_recalls.append(compute_recall(needle_values, m.pred))
-        elif sample.source == "longbench_v2_long":
+        elif sample.source.startswith("longbench_v2"):
             choices = sample.extra.get("choices", [])
             letter_index = {"A": 0, "B": 1, "C": 2, "D": 3}.get(sample.answer)
             correct_text = (
@@ -259,13 +261,16 @@ def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSa
     return {
         "synthetic_niah_mean_recall": (sum(niah_recalls) / len(niah_recalls)) if niah_recalls else None,
         "synthetic_niah_n": len(niah_recalls),
-        "longbench_v2_long_approx_accuracy": (
+        "longbench_v2_approx_accuracy": (
             (sum(longbench_matches) / len(longbench_matches)) if longbench_matches else None
         ),
-        "longbench_v2_long_n": len(longbench_matches),
-        "longbench_v2_long_scoring_note": (
+        "longbench_v2_n": len(longbench_matches),
+        "longbench_v2_scoring_note": (
             "best-effort substring match, NOT grade_longbench_v2.py's exact-letter "
-            "scoring -- see score_accuracy's docstring"
+            "scoring -- see score_accuracy's docstring. Covers any LongBench-v2 "
+            "length bucket (source prefix-matched), not just 'long' -- check "
+            "the underlying samples' own sample.source / sample.extra['length'] "
+            "if you need to know which bucket these numbers came from."
         ),
         "n_no_prediction": n_no_prediction,
         "n_unscored_source": n_unscored_source,
@@ -310,10 +315,10 @@ def render_arm_summary(arm: str, agg: dict[str, Any]) -> str:
         acc = agg["accuracy"]
         if acc["synthetic_niah_n"]:
             lines.append(f"  NIAH mean recall: {acc['synthetic_niah_mean_recall']:.2%} (n={acc['synthetic_niah_n']})")
-        if acc["longbench_v2_long_n"]:
+        if acc["longbench_v2_n"]:
             lines.append(
-                f"  LongBench-v2-long approx. accuracy: {acc['longbench_v2_long_approx_accuracy']:.2%} "
-                f"(n={acc['longbench_v2_long_n']}, best-effort scoring, see note)"
+                f"  LongBench-v2 approx. accuracy: {acc['longbench_v2_approx_accuracy']:.2%} "
+                f"(n={acc['longbench_v2_n']}, best-effort scoring, bucket per sample.source, see note)"
             )
     return "\n".join(lines)
 

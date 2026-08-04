@@ -110,7 +110,29 @@ python3 eval_data/gen_synthetic_niah.py --context-tokens 150000,300000,500000 --
 Per `../rlm/rlm_specprefill_ablation_plan.md`'s EVAL SET CONSTRAINTS: only
 contexts comfortably above ~131K tokens go into the eval set — below that,
 prior work shows RLM underperforms the base model, which would confound
-"SpecPrefill didn't help" with "RLM shouldn't have been used here."
+"SpecPrefill didn't help" with "RLM shouldn't have been used here." This is
+the "long" bucket (`prep_longbench_v2_long.py`'s default `--length long`) —
+the only one that satisfies this constraint, and the only one that should
+feed real, reported ablation results.
+
+**For faster pipeline iteration/debugging** (e.g. while chasing operational
+issues like a self-hosted root taking a very long time or hanging on a
+single sample — see IMPLEMENTATION_PLAN.md's note on RLM's REPL `exec()`
+having no internal timeout), `--length short` produces a much smaller
+LongBench v2 bucket instead — far fewer RLM REPL turns needed per sample,
+far less exposure to slow/hung samples, at the cost of stepping outside the
+ablation's own eval-set constraint above:
+
+```bash
+python3 eval_data/prep_longbench_v2_long.py --length short --max-keep -1
+# Skip filter_by_token_length.py for this bucket -- its whole point is
+# enforcing the >131K-token floor, which short-bucket contexts won't
+# reach; running it here would just filter everything out.
+```
+
+Not a substitute for the "long" bucket when actually reporting this
+ablation's results — only for getting the pipeline itself working reliably
+first.
 
 **For the GPU-node smoke tests in steps 5-6 below, don't start with this
 full eval set** — generate a tiny dataset first (cheap, fast, isolates

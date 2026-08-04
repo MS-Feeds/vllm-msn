@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
-"""Prepares the "long" (>128k word) subset of LongBench v2 for the RLM +
-SpecPrefill ablation's eval set.
+"""Prepares a length-bucketed subset of LongBench v2 for the RLM +
+SpecPrefill ablation's eval set. Default bucket is "long" (>128k word)
+-- the file/function names below still say "long" for that reason (the
+original, still-primary use case), but `--length` accepts any of
+LongBench v2's own buckets (`short`/`medium`/`long`).
 
 This is `../../spec_prefill_llama/datasets/prep_longbench_v2.py` with the
-length filter flipped from `"short"` to `"long"` -- that script's own
-docstring explains why LongBench v2's `length` categorical field (not a
-recomputed word count) is the authoritative filter, why `context`/`question`
-are kept separate rather than folded into one formatted prompt string, and
-why the real column schema was never verified against a live download in
-the environment that script was written in (no network/HF access there) --
-all of that carries over unchanged here; only the target bucket differs.
+length filter made selectable instead of hardcoded to `"short"` -- that
+script's own docstring explains why LongBench v2's `length` categorical
+field (not a recomputed word count) is the authoritative filter, why
+`context`/`question` are kept separate rather than folded into one
+formatted prompt string, and why the real column schema was never verified
+against a live download in the environment that script was written in (no
+network/HF access there) -- all of that carries over unchanged here.
 
 Per ../rlm_specprefill_ablation_plan.md's EVAL SET CONSTRAINTS: RLM is only
 worth using well above the point where a base model would do fine on its
-own, so this ablation restricts to contexts comfortably above ~131K tokens.
-LongBench v2's own "long" bucket (>128k *words*) is the closest existing
-categorical label to that -- but words != tokens, so this script's output is
-an intermediate candidate pool, NOT the final filtered eval set. Run
-filter_by_token_length.py on its output to apply the real >131K-*token*
-threshold against Llama's actual tokenizer before trusting any sample here
-satisfies the ablation's own constraint.
+own, so the ablation's OWN reported numbers should restrict to contexts
+comfortably above ~131K tokens -- `--length long` (the default) is the
+closest existing categorical label to that, but words != tokens, so its
+output is an intermediate candidate pool, NOT the final filtered eval set
+without also running filter_by_token_length.py on it. `--length short`
+(or `medium`) deliberately steps outside that constraint -- useful for
+fast pipeline iteration/debugging (much smaller contexts, far fewer RLM
+REPL turns needed per sample, so far less exposure to slow/hung samples),
+but NOT a substitute for the long-bucket eval set when actually reporting
+this ablation's results -- see the constraints doc for why a short context
+confounds "SpecPrefill didn't help" with "RLM shouldn't have been used
+here at all."
 
 Usage:
-    python3 prep_longbench_v2_long.py --max-keep -1   # keep all "long" rows
+    python3 prep_longbench_v2_long.py --max-keep -1                # long bucket (default)
+    python3 prep_longbench_v2_long.py --length short --max-keep -1  # short bucket
 """
 
 from __future__ import annotations
@@ -37,7 +46,14 @@ from schema import EvalSample, write_jsonl  # noqa: E402
 
 HF_DATASET_NAME = "THUDM/LongBench-v2"
 DEFAULT_CACHE_DIR = Path(__file__).parent / ".cache"
-DEFAULT_OUTPUT = Path(__file__).parent / "longbench_v2_long_samples.jsonl"
+VALID_LENGTHS = ("short", "medium", "long")
+
+
+def default_output_for(length: str) -> Path:
+    """Length-aware output path so `--length short` and the default
+    `--length long` runs don't clobber each other's output file."""
+    return Path(__file__).parent / f"longbench_v2_{length}_samples.jsonl"
+
 
 CHOICE_LETTERS = ["A", "B", "C", "D"]
 _REQUIRED_COLUMNS = [
@@ -56,9 +72,13 @@ _REQUIRED_COLUMNS = [
 ]
 
 # LongBench v2's own definition of "long" (paper: >128k words). Used only as
-# a sanity cross-check below, not to re-derive the filter -- `length ==
-# "long"` (the dataset's own label) is authoritative, matching the sibling
-# "short" prep script's convention.
+# a sanity cross-check below when length="long" specifically, not to
+# re-derive the filter -- `length == "long"` (the dataset's own label) is
+# authoritative, matching the sibling "short" prep script's convention. No
+# equivalent cross-check threshold is defined for "short"/"medium" -- their
+# own categorical label is trusted as-is without a secondary word-count
+# sanity check, since this script was never validated against a live
+# download to derive one.
 _LONG_WORD_THRESHOLD = 128_000
 
 
@@ -82,17 +102,25 @@ def load_longbench_v2_rows(cache_dir: Path, hf_token: str | None) -> list[dict]:
     return rows
 
 
-def build_long_samples(rows: list[dict], max_keep: int = -1, seed: int = 42) -> list[EvalSample]:
-    """Filters to the "long" length bucket and formats each row as an
-    EvalSample, with multiple-choice fields kept in `extra`."""
+def build_long_samples(
+    rows: list[dict], max_keep: int = -1, seed: int = 42, length: str = "long"
+) -> list[EvalSample]:
+    """Filters to the given length bucket (`short`/`medium`/`long`, LongBench
+    v2's own categorical label) and formats each row as an EvalSample, with
+    multiple-choice fields kept in `extra`. Name kept as `build_long_samples`
+    for backward compatibility with existing callers/tests -- `length`
+    controls which bucket is actually built, `long` remains the default."""
+    if length not in VALID_LENGTHS:
+        raise ValueError(f"length must be one of {VALID_LENGTHS}, got {length!r}")
+
     samples: list[EvalSample] = []
-    skipped_not_long = 0
+    skipped_wrong_length = 0
     skipped_bad_row = 0
     word_count_mismatches = 0
 
     for row in rows:
-        if row.get("length") != "long":
-            skipped_not_long += 1
+        if row.get("length") != length:
+            skipped_wrong_length += 1
             continue
 
         question = (row.get("question") or "").strip()
@@ -103,15 +131,19 @@ def build_long_samples(rows: list[dict], max_keep: int = -1, seed: int = 42) -> 
             skipped_bad_row += 1
             continue
 
-        # Sanity cross-check only -- length == "long" above is authoritative.
         word_count = len(context.split()) + len(question.split())
-        if word_count < _LONG_WORD_THRESHOLD:
+        # Sanity cross-check only, and only meaningful for "long" -- no
+        # equivalent LongBench-v2-published threshold exists for
+        # short/medium to cross-check against (see _LONG_WORD_THRESHOLD's
+        # own comment), so this is skipped entirely for those buckets
+        # rather than checking against a made-up number.
+        if length == "long" and word_count < _LONG_WORD_THRESHOLD:
             word_count_mismatches += 1
 
         samples.append(
             EvalSample(
                 id=str(row.get("_id")),
-                source="longbench_v2_long",
+                source=f"longbench_v2_{length}",
                 context=context,
                 question=question,
                 answer=answer,
@@ -127,8 +159,8 @@ def build_long_samples(rows: list[dict], max_keep: int = -1, seed: int = 42) -> 
         )
 
     print(
-        f"[prep_longbench_v2_long] loaded={len(rows)} kept_long={len(samples)} "
-        f"skipped_not_long={skipped_not_long} skipped_bad_row={skipped_bad_row}"
+        f"[prep_longbench_v2_long] loaded={len(rows)} kept_{length}={len(samples)} "
+        f"skipped_wrong_length={skipped_wrong_length} skipped_bad_row={skipped_bad_row}"
     )
     if word_count_mismatches:
         print(
@@ -149,25 +181,46 @@ def build_long_samples(rows: list[dict], max_keep: int = -1, seed: int = 42) -> 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prepare LongBench v2 'long' eval samples")
+    parser = argparse.ArgumentParser(description="Prepare a length-bucketed LongBench v2 eval sample set")
     parser.add_argument("--hf-token", default=None, help="Defaults to $HF_TOKEN")
     parser.add_argument("--cache-dir", type=Path, default=DEFAULT_CACHE_DIR)
+    parser.add_argument(
+        "--length",
+        choices=VALID_LENGTHS,
+        default="long",
+        help=(
+            "Which LongBench v2 length bucket to filter to. 'long' (default) "
+            "is what the RLM+SpecPrefill ablation's own eval-set constraint "
+            "calls for (see module docstring). 'short'/'medium' step outside "
+            "that constraint -- useful for fast pipeline iteration/debugging "
+            "(much smaller contexts, far less exposure to slow/hung RLM "
+            "samples), not a substitute for 'long' when reporting real "
+            "ablation results."
+        ),
+    )
     parser.add_argument(
         "--max-keep",
         type=int,
         default=-1,
-        help="Cap on number of samples; -1 keeps all available 'long' rows.",
+        help="Cap on number of samples; -1 keeps all available rows in the selected bucket.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Defaults to longbench_v2_<length>_samples.jsonl (length-aware, so different buckets don't clobber each other).",
+    )
     args = parser.parse_args()
+
+    output = args.output if args.output is not None else default_output_for(args.length)
 
     token = _resolve_hf_token(args.hf_token)
     rows = load_longbench_v2_rows(args.cache_dir, token)
-    samples = build_long_samples(rows, max_keep=args.max_keep, seed=args.seed)
+    samples = build_long_samples(rows, max_keep=args.max_keep, seed=args.seed, length=args.length)
 
-    write_jsonl(samples, args.output)
-    print(f"[prep_longbench_v2_long] wrote {len(samples)} rows -> {args.output}")
+    write_jsonl(samples, output)
+    print(f"[prep_longbench_v2_long] wrote {len(samples)} rows -> {output}")
 
 
 if __name__ == "__main__":

@@ -292,8 +292,8 @@ def test_score_accuracy_longbench_substring_match(tmp_path):
     metrics = load_arm_metrics(arm_dir)
     acc = score_accuracy(metrics, {"lb1": sample})
 
-    assert acc["longbench_v2_long_approx_accuracy"] == 1.0
-    assert acc["longbench_v2_long_n"] == 1
+    assert acc["longbench_v2_approx_accuracy"] == 1.0
+    assert acc["longbench_v2_n"] == 1
 
 
 def test_score_accuracy_longbench_wrong_answer_not_matched(tmp_path):
@@ -309,7 +309,33 @@ def test_score_accuracy_longbench_wrong_answer_not_matched(tmp_path):
     metrics = load_arm_metrics(arm_dir)
     acc = score_accuracy(metrics, {"lb1": sample})
 
-    assert acc["longbench_v2_long_approx_accuracy"] == 0.0
+    assert acc["longbench_v2_approx_accuracy"] == 0.0
+
+
+def test_score_accuracy_matches_any_longbench_length_bucket_by_prefix(tmp_path):
+    """eval_data/prep_longbench_v2_long.py's --length flag can produce
+    longbench_v2_short/_medium/_long sources -- score_accuracy must match
+    all of them (prefix check), not just the original "_long" exact
+    string, or switching to a shorter bucket for faster iteration would
+    silently stop being scored at all (falling into n_unscored_source)."""
+    arm_dir = tmp_path / "A"
+    _write_jsonl_rows([_timing_row("lb1")], arm_dir / "timing.jsonl")
+    _write_jsonl_rows(
+        [_prediction_row("lb1", pred="Based on the excerpts, the capital of France is Paris.")],
+        arm_dir / "predictions.jsonl",
+    )
+
+    sample = EvalSample(
+        id="lb1", source="longbench_v2_short", context="...", question="What is the capital?", answer="B",
+        extra={"choices": ["London", "Paris", "Berlin", "Madrid"]},
+    )
+
+    metrics = load_arm_metrics(arm_dir)
+    acc = score_accuracy(metrics, {"lb1": sample})
+
+    assert acc["longbench_v2_approx_accuracy"] == 1.0
+    assert acc["longbench_v2_n"] == 1
+    assert acc["n_unscored_source"] == 0
 
 
 def test_score_accuracy_counts_missing_predictions_and_unscored_sources(tmp_path):

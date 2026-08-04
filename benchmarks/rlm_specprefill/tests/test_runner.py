@@ -16,6 +16,7 @@ Verification section).
 from __future__ import annotations
 
 import json
+import multiprocessing
 import sys
 from pathlib import Path
 
@@ -35,6 +36,17 @@ from runner.run_arm import (  # noqa: E402
     run_arm,
 )
 from runner.run_all_arms import run_all_arms  # noqa: E402
+
+# collect_evidence_for_dataset routes each sample through
+# run_evidence_extraction_with_hard_timeout (run_arm.py), which forks a real
+# subprocess for a hard wall-clock timeout backstop -- 'fork' is POSIX-only
+# and unavailable on Windows (this project's target is GPU-cluster/Linux
+# already, see run_evidence_extraction_with_hard_timeout's own docstring).
+# Any test that exercises that path needs 'fork' available to run at all.
+requires_fork = pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="run_evidence_extraction_with_hard_timeout forks a real subprocess; 'fork' is unavailable on this (non-POSIX) platform.",
+)
 
 
 def _fake_run_evidence_extraction(sample_id, question, context, **kwargs):
@@ -67,11 +79,19 @@ def test_run_arm_rejects_empty_dataset(tmp_path):
         run_arm("A", dataset_path)
 
 
+@requires_fork
 def test_collect_evidence_for_dataset_uses_cache_across_calls(tmp_path, monkeypatch):
-    calls: list[str] = []
+    # collect_evidence_for_dataset routes through run_evidence_extraction_with_hard_timeout,
+    # which runs the (monkeypatched) stub in a FORKED subprocess -- a plain
+    # Python list appended to inside that child is never visible back in
+    # this (parent) process (fork gives the child its own copy of memory;
+    # writes don't propagate back), so the call count is tracked via a file
+    # instead, which both processes genuinely share on disk.
+    calls_log = tmp_path / "calls.log"
 
     def counting_stub(sample_id, question, context, **kwargs):
-        calls.append(sample_id)
+        with open(calls_log, "a", encoding="utf-8") as f:
+            f.write(sample_id + "\n")
         return _fake_run_evidence_extraction(sample_id, question, context, **kwargs)
 
     monkeypatch.setattr(run_arm_module, "run_evidence_extraction", counting_stub)
@@ -82,12 +102,14 @@ def test_collect_evidence_for_dataset_uses_cache_across_calls(tmp_path, monkeypa
     results_1 = collect_evidence_for_dataset([sample], cache_dir=cache_dir, guardrails={})
     results_2 = collect_evidence_for_dataset([sample], cache_dir=cache_dir, guardrails={})
 
+    calls = calls_log.read_text(encoding="utf-8").splitlines() if calls_log.exists() else []
     assert calls == ["s1"]  # RLM only ever invoked once
     assert results_1[0].was_cache_hit is False
     assert results_2[0].was_cache_hit is True
     assert results_2[0].evidence_result.completion.response == results_1[0].evidence_result.completion.response
 
 
+@requires_fork
 def test_run_arm_dry_run_writes_timing_jsonl_and_stops_before_target(tmp_path, monkeypatch):
     monkeypatch.setattr(run_arm_module, "run_evidence_extraction", _fake_run_evidence_extraction)
 
@@ -113,6 +135,7 @@ def test_run_arm_dry_run_writes_timing_jsonl_and_stops_before_target(tmp_path, m
     assert not (results_dir / "A" / "predictions.jsonl").exists()
 
 
+@requires_fork
 def test_run_arm_dry_run_respects_max_samples(tmp_path, monkeypatch):
     monkeypatch.setattr(run_arm_module, "run_evidence_extraction", _fake_run_evidence_extraction)
 
