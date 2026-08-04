@@ -48,11 +48,11 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 # (4-bit AWQ, ~236GB total, i.e. ~30GB/GPU shard at tensor_parallel_size=8).
 # That model card documents (as of the version checked here) REQUIRING
 # --enable-expert-parallel at tensor-parallel-size 8 ("otherwise, the expert
-# tensors cannot be evenly split across tensor parallel ranks") -- pass
-# --target-enable-expert-parallel to runner/run_arm.py or
-# validate_runner_integration.py when using this checkpoint at TP>1 (96 Q
-# heads / 8 KV heads means TP in {1,2,4,8} all divide evenly for this
-# architecture; TP=8 is what the checkpoint's own card was tested against).
+# tensors cannot be evenly split across tensor parallel ranks") -- exported
+# as TARGET_ENABLE_EXPERT_PARALLEL below (no flag needs passing by hand) (96
+# Q heads / 8 KV heads means TP in {1,2,4,8} all divide evenly for this
+# architecture; TP=8 is what the checkpoint's own card was tested against,
+# and what TARGET_TENSOR_PARALLEL_SIZE below is currently set to).
 # Also documented on that card: vLLM >=0.9.2, transformers >=4.51.0,
 # trust_remote_code=True (already always passed by this port), non-thinking
 # mode only (matches predict_longbench_v2.py's enable_thinking=False
@@ -60,31 +60,54 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 # see that file's render_chat docstring).
 export QWEN3_CODER_480B_MODEL_PATH=/scratch/hf_cache/models--QuantTrio--Qwen3-Coder-480B-A35B-Instruct-AWQ/snapshots/9ce3eaa67fe88609afec235117e97eb03d9b3cda
 
-# Starting tensor-parallel size for the target: 4, not the AWQ card's own
-# tested 8 -- at TP=8 the target occupies every GPU on an 8-GPU node,
-# leaving none free for the speculator (kept unquantized, ~60GB, per
-# vllm_patch/proposer.py's design) without exceeding 80GB when sharing a
-# GPU with a target shard. TP=4 uses 4 GPUs for the target (~59GB/GPU for
-# the AWQ checkpoint, repo-size/4), leaves a dedicated GPU for the
-# speculator among the remaining 4, and 3 GPUs spare -- see
-# EXPERIMENT_PLAN.md's "Resource requirements" for the full trade-off.
-# Both 4 and 8 are valid divisors of this model's 96 Q-heads/8 KV-heads
-# (confirmed against Qwen3MoeAttention.__init__'s own assertions), so
-# switching back to 8 later (e.g. once the speculator is also quantized to
-# fit alongside a target shard) is just a matter of overriding this.
+# Tensor-parallel size for the target: 8, the AWQ card's own tested config,
+# using all 8 GPUs on an 8-GPU node -- valid now that the speculator is
+# ALSO quantized (see QWEN3_CODER_30B_MODEL_PATH below): a ~29.5GB target
+# shard (repo-size/8) plus a ~15GB 4-bit speculator comfortably shares one
+# GPU (~45GB of 80GB), unlike the original unquantized ~60GB speculator
+# this was set to 4 to work around (see git history / EXPERIMENT_PLAN.md's
+# "Resource requirements" for that prior trade-off, still valid guidance if
+# you ever revert to a BF16 speculator). 96 Q-heads/8 KV-heads divides
+# evenly at both 4 and 8 (confirmed against Qwen3MoeAttention.__init__'s
+# own assertions), so switching back to 4 later is just a matter of
+# overriding this, no other constraint blocks it.
 # Consumed by run_arm.py/run_all_arms.py/calibration scripts'
 # --target-tensor-parallel-size CLI default, and by
 # validate_runner_integration.py's flag of the same name.
-export TARGET_TENSOR_PARALLEL_SIZE=4
+export TARGET_TENSOR_PARALLEL_SIZE=8
+
+# Required at TARGET_TENSOR_PARALLEL_SIZE=8 for this checkpoint -- the AWQ
+# card's own wording: "otherwise, the expert tensors cannot be evenly split
+# across tensor parallel ranks". NOT required at TP=4 (where this was off
+# by default before). Consumed by --target-enable-expert-parallel's CLI
+# default on run_arm.py/run_all_arms.py/calibration scripts/
+# validate_runner_integration.py; root_backend='vllm' runs inherit this via
+# --root-enable-expert-parallel's own default (see run_arm.py's docstring)
+# since root serves the same checkpoint at the same TP degree by default.
+export TARGET_ENABLE_EXPERT_PARALLEL=1
 
 # Speculator model (Qwen3-Coder-30B-A3B-Instruct, MoE -- ~30B total/~3B
 # active params, SpecPrefill-specific -- not used by gemma4_moe_benchmarks or
-# evaluation_pipeline). Same "fill in once downloaded on this node" caveats
-# as QWEN3_CODER_480B_MODEL_PATH above apply here too. Unlike the target,
-# this fits standalone on a single GPU in BF16 -- SpecPrefillProposer still
-# only supports tensor_model_parallel_size=1 for the speculator (see
-# vllm_patch/proposer.py's _ensure_distributed_environment docstring; TP/PP
-# > 1 for the speculator remains out of scope for this pass).
+# evaluation_pipeline). SpecPrefillProposer only supports
+# tensor_model_parallel_size=1 for the speculator regardless of precision
+# (see vllm_patch/proposer.py's _ensure_distributed_environment docstring;
+# TP/PP > 1 for the speculator remains out of scope for this pass) -- it
+# always needs to fit on ONE GPU.
+#
+# Using cyankiwi/Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit (4-bit AWQ, ~15GB)
+# instead of the original BF16 checkpoint (~60GB, commented out below) --
+# this is what makes TARGET_TENSOR_PARALLEL_SIZE=8 above viable: confirmed
+# (2026-08-04, reading vllm/config/vllm.py directly) that
+# vllm_patch/proposer.py's _create_speculator_vllm_config clearing
+# quant_config on the speculator's VllmConfig does NOT force it
+# unquantized -- VllmConfig.__post_init__ re-derives quant_config from the
+# SPECULATOR's own ModelConfig (built from this path), independent of the
+# target's, so this quantized checkpoint's own config.json is what actually
+# gets applied. At 4-bit, a ~15GB speculator comfortably shares one GPU
+# with a ~29.5GB target shard (repo-size/8) within 80GB. If reverting to a
+# BF16 speculator, drop TARGET_TENSOR_PARALLEL_SIZE back to 4 first (see
+# that export's own comment) -- a 60GB BF16 speculator does NOT fit
+# alongside a target shard at TP=8.
 #export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/models--Qwen--Qwen3-Coder-30B-A3B-Instruct/snapshots/b2cff646eb4bb1d68355c01b18ae02e7cf42d120
 export QWEN3_CODER_30B_MODEL_PATH=/scratch/hf_cache/models--cyankiwi--Qwen3-Coder-30B-A3B-Instruct-AWQ-4bit/snapshots/4bd30395b72ea6045edd04806c4fea448d4467b3
 

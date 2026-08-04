@@ -54,7 +54,7 @@ def run_all_arms(
     root_base_url: str = "http://localhost:8000/v1",
     root_port: int = 8000,
     root_tensor_parallel_size: int | None = None,
-    root_enable_expert_parallel: bool = False,
+    root_enable_expert_parallel: bool | None = None,
     root_max_model_len: int | None = DEFAULT_ROOT_MAX_MODEL_LEN,
     root_server_startup_timeout_s: float = 1800.0,
 ) -> None:
@@ -131,12 +131,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--target-enable-expert-parallel",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("TARGET_ENABLE_EXPERT_PARALLEL", "0") == "1",
         help=(
             "Required by at least some quantized MoE target checkpoints at "
             "--target-tensor-parallel-size > 1 -- e.g. QuantTrio's AWQ quant "
             "of Qwen3-Coder-480B-A35B-Instruct documents this as REQUIRED at "
-            "tensor-parallel-size 8. Default off preserves prior behavior."
+            "tensor-parallel-size 8. Falls back to False unless "
+            "$TARGET_ENABLE_EXPERT_PARALLEL=1 is set."
         ),
     )
     parser.add_argument(
@@ -174,8 +176,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--root-enable-expert-parallel",
-        action="store_true",
-        help="See runner/run_arm.py's flag of the same name.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="See runner/run_arm.py's flag of the same name -- defaults to --target-enable-expert-parallel.",
     )
     parser.add_argument(
         "--root-max-model-len",

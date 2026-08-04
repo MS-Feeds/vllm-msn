@@ -566,7 +566,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--target-enable-expert-parallel",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("TARGET_ENABLE_EXPERT_PARALLEL", "0") == "1",
         help=(
             "Required by at least some quantized MoE checkpoints of this "
             "target at TP>1 -- e.g. QuantTrio's AWQ quant of "
@@ -575,8 +576,9 @@ def main() -> None:
             "cannot be evenly split across tensor parallel ranks', their "
             "model card's own wording). Confirmed a real `ParallelConfig`/ "
             "`LLM(...)` field in this fork (vllm/config/parallel.py). "
-            "Default off preserves prior behavior for checkpoints/TP sizes "
-            "that don't need it."
+            "Falls back to False unless $TARGET_ENABLE_EXPERT_PARALLEL=1 is "
+            "set -- .env_exports.sh sets this alongside "
+            "TARGET_TENSOR_PARALLEL_SIZE=8."
         ),
     )
     parser.add_argument(

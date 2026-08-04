@@ -209,7 +209,7 @@ def run_arm(
     root_base_url: str = "http://localhost:8000/v1",
     root_port: int = 8000,
     root_tensor_parallel_size: int | None = None,
-    root_enable_expert_parallel: bool = False,
+    root_enable_expert_parallel: bool | None = None,
     root_max_model_len: int | None = _DEFAULT_ROOT_MAX_MODEL_LEN,
     root_server_startup_timeout_s: float = 1800.0,
 ) -> None:
@@ -225,6 +225,12 @@ def run_arm(
     fully torn down before target_stage tries to claim the same GPUs.
     `root_model_path` defaults to `target_model_path` (the common case:
     the same checkpoint serves both roles) if not given separately.
+    `root_enable_expert_parallel` defaults to `target_enable_expert_parallel`
+    (same reasoning as `root_tensor_parallel_size` above: root and target
+    are typically the same checkpoint, so whatever MoE expert-splitting
+    requirement applies to one at a given TP degree applies to the other)
+    -- pass it explicitly only to make root's setting diverge from the
+    target's.
     `root_max_model_len` defaults to `root_vllm_server.DEFAULT_ROOT_MAX_MODEL_LEN`
     (131072, NOT the checkpoint's native max) -- confirmed real-hardware
     requirement: leaving it unset makes vLLM reserve KV cache for the full
@@ -272,6 +278,11 @@ def run_arm(
             if root_tensor_parallel_size is not None
             else target_tensor_parallel_size
         )
+        resolved_root_ep = (
+            root_enable_expert_parallel
+            if root_enable_expert_parallel is not None
+            else target_enable_expert_parallel
+        )
         if not resolved_root_model_name:
             resolved_root_model_name = Path(resolved_root_model_path).name
 
@@ -279,13 +290,14 @@ def run_arm(
             f"[run_arm] root_backend='vllm': starting vllm serve for "
             f"{resolved_root_model_path} on port {root_port} "
             f"(tensor_parallel_size={resolved_root_tp}, "
+            f"enable_expert_parallel={resolved_root_ep}, "
             f"max_model_len={root_max_model_len}) ..."
         )
         root_server_proc = start_root_vllm_server(
             resolved_root_model_path,
             port=root_port,
             tensor_parallel_size=resolved_root_tp,
-            enable_expert_parallel=root_enable_expert_parallel,
+            enable_expert_parallel=resolved_root_ep,
             served_model_name=resolved_root_model_name,
             max_model_len=root_max_model_len,
             log_path=results_dir / "root_vllm_server.log",
@@ -470,14 +482,18 @@ def main() -> None:
     )
     parser.add_argument(
         "--target-enable-expert-parallel",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("TARGET_ENABLE_EXPERT_PARALLEL", "0") == "1",
         help=(
             "Required by at least some quantized MoE target checkpoints at "
             "--target-tensor-parallel-size > 1 -- e.g. QuantTrio's AWQ quant "
             "of Qwen3-Coder-480B-A35B-Instruct documents this as REQUIRED at "
             "tensor-parallel-size 8, or expert tensors don't split evenly "
-            "across ranks. Default off preserves prior behavior for "
-            "checkpoints/TP sizes that don't need it."
+            "across ranks. Falls back to False unless $TARGET_ENABLE_EXPERT_PARALLEL=1 "
+            "is set -- .env_exports.sh sets this alongside TARGET_TENSOR_PARALLEL_SIZE=8 "
+            "(both flipped together, since the requirement is specifically "
+            "documented at that TP degree). Pass --no-target-enable-expert-parallel "
+            "to force it off even if the env var is set."
         ),
     )
     parser.add_argument(
@@ -529,8 +545,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--root-enable-expert-parallel",
-        action="store_true",
-        help="Only used for --root-backend=vllm -- see --target-enable-expert-parallel's help for why this might be needed.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Only used for --root-backend=vllm. Defaults to "
+            "--target-enable-expert-parallel's resolved value (same "
+            "reasoning as --root-tensor-parallel-size's own default: root "
+            "and target are typically the same checkpoint) -- pass "
+            "--root-enable-expert-parallel / --no-root-enable-expert-parallel "
+            "explicitly only to make root's setting diverge from the target's."
+        ),
     )
     parser.add_argument(
         "--root-max-model-len",

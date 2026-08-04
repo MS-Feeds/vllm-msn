@@ -295,8 +295,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--target-enable-expert-parallel",
-        action="store_true",
-        help="See runner/run_arm.py's flag of the same name -- required by some quantized MoE checkpoints at TP>1.",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("TARGET_ENABLE_EXPERT_PARALLEL", "0") == "1",
+        help="See runner/run_arm.py's flag of the same name -- required by some quantized MoE checkpoints at TP>1. Falls back to $TARGET_ENABLE_EXPERT_PARALLEL.",
     )
     args = parser.parse_args()
 
