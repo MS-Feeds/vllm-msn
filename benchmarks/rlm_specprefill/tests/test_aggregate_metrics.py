@@ -274,6 +274,27 @@ def test_score_accuracy_niah_recall(tmp_path):
 
     assert acc["synthetic_niah_mean_recall"] == 1.0
     assert acc["synthetic_niah_n"] == 1
+    # s_niah must stay unaffected -- these two sources are scored/reported separately.
+    assert acc["s_niah_n"] == 0
+
+
+def test_score_accuracy_s_niah_recall_reported_separately_from_synthetic_niah(tmp_path):
+    arm_dir = tmp_path / "A"
+    _write_jsonl_rows([_timing_row("s1")], arm_dir / "timing.jsonl")
+    _write_jsonl_rows([_prediction_row("s1", pred="crimson falcon")], arm_dir / "predictions.jsonl")
+
+    sample = EvalSample(
+        id="s1", source="s_niah", context="...", question="find it", answer="crimson falcon",
+        extra={"needles": [{"label": "NIAH_SECRET_1", "value": "crimson falcon"}]},
+    )
+
+    metrics = load_arm_metrics(arm_dir)
+    acc = score_accuracy(metrics, {"s1": sample})
+
+    assert acc["s_niah_mean_recall"] == 1.0
+    assert acc["s_niah_n"] == 1
+    # synthetic_niah must stay unaffected -- these two sources are scored/reported separately.
+    assert acc["synthetic_niah_n"] == 0
 
 
 def test_score_accuracy_longbench_substring_match(tmp_path):

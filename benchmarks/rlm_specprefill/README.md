@@ -83,7 +83,7 @@ making the health check pass while every real request failed with
 ```
 configs/       guardrails, SpecConfig, N_min, per-arm generation params
 prompts/       the "RLM as retrieval front-end" system prompt + target-answer template
-eval_data/     >131K-token eval-set prep (LongBench v2 "long" bucket + synthetic NIAH)
+eval_data/     >131K-token eval-set prep (LongBench v2 "long" bucket + synthetic NIAH + RULER S-NIAH)
 rlm_stage/     runs RLM to produce cached "candidate evidence" per query
 target_stage/  drives vLLM's offline engine (plain and SpecPrefill-pruned) over that evidence
 runner/        CLI entry points that run one arm / all arms end-to-end

@@ -207,12 +207,20 @@ def aggregate_arm_metrics(metrics: list[SampleMetrics]) -> dict[str, Any]:
 
 
 def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSample]) -> dict[str, Any]:
-    """Per-source scoring, since this project's eval sets mix two ground-
+    """Per-source scoring, since this project's eval sets mix three ground-
     truth shapes (see eval_data/schema.py):
 
-    - `synthetic_niah` samples have well-defined ground truth (exact needle
-      values in `sample.extra["needles"]`) -- scored via needle recall,
-      reusing calibration/transferability_check.py's `compute_recall`.
+    - `synthetic_niah` samples (eval_data/gen_synthetic_niah.py's free-form,
+      scaled multi-needle generator) and `s_niah` samples (eval_data/
+      gen_s_niah.py's RULER-faithful single-needle S-NIAH generator, Hsieh
+      et al. 2024 -- source prefix-matched, not tied to any one variant)
+      both have well-defined ground truth (exact needle values in
+      `sample.extra["needles"]`) -- scored via needle recall, reusing
+      calibration/transferability_check.py's `compute_recall`. Reported
+      under SEPARATE keys (not blended together): S-NIAH is a distinct,
+      citable RULER benchmark whose numbers shouldn't be averaged in with
+      the free-form multi-needle generator's (different needle count,
+      different haystack style, different O() scaling).
     - `longbench_v2_*` samples (source is bucket-specific -- `longbench_v2_long`,
       `_short`, or `_medium`, per eval_data/prep_longbench_v2_long.py's
       `--length` flag; matched here by prefix, not tied to any one bucket)
@@ -232,6 +240,7 @@ def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSa
     from calibration.transferability_check import compute_recall
 
     niah_recalls: list[float] = []
+    s_niah_recalls: list[float] = []
     longbench_matches: list[bool] = []
     n_no_prediction = 0
     n_unscored_source = 0
@@ -248,6 +257,9 @@ def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSa
         if sample.source == "synthetic_niah":
             needle_values = [n["value"] for n in sample.extra.get("needles", [])]
             niah_recalls.append(compute_recall(needle_values, m.pred))
+        elif sample.source.startswith("s_niah"):
+            needle_values = [n["value"] for n in sample.extra.get("needles", [])]
+            s_niah_recalls.append(compute_recall(needle_values, m.pred))
         elif sample.source.startswith("longbench_v2"):
             choices = sample.extra.get("choices", [])
             letter_index = {"A": 0, "B": 1, "C": 2, "D": 3}.get(sample.answer)
@@ -261,6 +273,8 @@ def score_accuracy(metrics: list[SampleMetrics], samples_by_id: dict[str, EvalSa
     return {
         "synthetic_niah_mean_recall": (sum(niah_recalls) / len(niah_recalls)) if niah_recalls else None,
         "synthetic_niah_n": len(niah_recalls),
+        "s_niah_mean_recall": (sum(s_niah_recalls) / len(s_niah_recalls)) if s_niah_recalls else None,
+        "s_niah_n": len(s_niah_recalls),
         "longbench_v2_approx_accuracy": (
             (sum(longbench_matches) / len(longbench_matches)) if longbench_matches else None
         ),
@@ -315,6 +329,8 @@ def render_arm_summary(arm: str, agg: dict[str, Any]) -> str:
         acc = agg["accuracy"]
         if acc["synthetic_niah_n"]:
             lines.append(f"  NIAH mean recall: {acc['synthetic_niah_mean_recall']:.2%} (n={acc['synthetic_niah_n']})")
+        if acc["s_niah_n"]:
+            lines.append(f"  S-NIAH mean recall: {acc['s_niah_mean_recall']:.2%} (n={acc['s_niah_n']})")
         if acc["longbench_v2_n"]:
             lines.append(
                 f"  LongBench-v2 approx. accuracy: {acc['longbench_v2_approx_accuracy']:.2%} "

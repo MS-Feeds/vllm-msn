@@ -105,7 +105,19 @@ python3 eval_data/filter_by_token_length.py \
     --tokenizer-path $LLAMA31_8B_MODEL_PATH \
     --min-tokens 131000
 python3 eval_data/gen_synthetic_niah.py --context-tokens 150000,300000,500000 --n-needles 3
+python3 eval_data/gen_s_niah.py --context-tokens 150000,300000,500000 --n-tasks 50
 ```
+
+`gen_s_niah.py` and `gen_synthetic_niah.py` serve different jobs, both
+worth running — not a discrepancy to reconcile: `gen_s_niah.py` implements
+RULER's single-needle S-NIAH task (Hsieh et al., 2024, "RULER: What's the
+Real Context Size of Your Long-Context Language Models?") as cited by the
+RLM paper — exactly one needle per sample (a fixed-size number or phrase,
+O(1) in context length), 50 tasks per context-size bucket, a citable,
+standard-shaped benchmark. `gen_synthetic_niah.py` remains the free-form,
+scaled multi-needle generator this project also uses as
+`calibration/sweep_n_min.py`'s day-1 candidate-text pool — a different,
+non-standard role S-NIAH's fixed-shape samples aren't meant to serve.
 
 Per `../rlm/rlm_specprefill_ablation_plan.md`'s EVAL SET CONSTRAINTS: only
 contexts comfortably above ~131K tokens go into the eval set — below that,
@@ -325,7 +337,8 @@ bucket — at most one vLLM `LLM` instance is ever live (see
 `aggregate_metrics.py` prints one summary block per arm (`f`-distribution,
 `T_RLM_root`/`T_REPL_compute`/`T_RLM_subcalls`, realized depth/fan-out,
 keep rate `r`, gate invoked/skipped split for Arm C, TTFT, and accuracy —
-NIAH recall exactly, LongBench-v2 via a best-effort substring match, see
+NIAH and S-NIAH recall exactly (reported as separate numbers, not blended),
+LongBench-v2 via a best-effort substring match, see
 that module's `score_accuracy` docstring for why it's not
 `grade_longbench_v2.py`'s exact-letter scoring) and writes the full report
 to `--output` as JSON. Compare the three arms' `f` and accuracy side by
