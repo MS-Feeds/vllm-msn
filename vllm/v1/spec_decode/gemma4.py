@@ -187,42 +187,40 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
 
         super().load_model(target_model)
 
-        # Re-derive backbone_hidden_size from the loaded pre_projection weight.
-        # The MTP checkpoint's projection is authoritative for the dimensions
-        # of the tensors concatenated by this proposer.
-        pre_proj_weight = None
+        # Re-derive backbone_hidden_size from the target model's embed_tokens
+        # weight, which reliably reflects the actual checkpoint dimension.
+        # ColumnParallelLinear's pre_projection weight shape is not reliable
+        # here: its allocated shape can reflect stale config values and its
+        # second dimension is the output width (the draft width), not the
+        # concatenated input width.
+        actual_backbone_hidden_size = None
+        try:
+            actual_backbone_hidden_size = int(
+                target_model.model.embed_tokens.weight.shape[-1]
+            )
+            logger.info(
+                "Gemma4 MTP: actual backbone_hidden_size=%d "
+                "(from target embed_tokens; config has backbone_hidden_size=%d, "
+                "self.hidden_size=%d).",
+                actual_backbone_hidden_size,
+                getattr(
+                    self.speculative_config.draft_model_config.hf_config,
+                    "backbone_hidden_size",
+                    -1,
+                ),
+                self.hidden_size,
+            )
+        except AttributeError:
+            logger.warning(
+                "Gemma4 MTP: could not access target_model.model.embed_tokens.weight "
+                "to verify backbone_hidden_size. Proposer buffers may be mis-sized."
+            )
 
-        # Runtime wrappers can nest the draft model (e.g. torch-compile wrappers).
-        # Walk through a small chain of .unwrap() / .model links to find
-        # Gemma4MultiTokenPredictor.pre_projection reliably.
-        cur_model = self.model
-        for _ in range(8):
-            if hasattr(cur_model, "pre_projection"):
-                pre_proj_weight = cur_model.pre_projection.weight
-                break
-            if hasattr(cur_model, "model") and hasattr(cur_model.model, "pre_projection"):
-                pre_proj_weight = cur_model.model.pre_projection.weight
-                break
-            if hasattr(cur_model, "unwrap"):
-                next_model = cur_model.unwrap()
-                if next_model is cur_model:
-                    break
-                cur_model = next_model
-                continue
-            if hasattr(cur_model, "model"):
-                next_model = cur_model.model
-                if next_model is cur_model:
-                    break
-                cur_model = next_model
-                continue
-            break
-
-        if pre_proj_weight is not None:
-            actual_backbone_hidden_size = pre_proj_weight.shape[1] // 2
+        if actual_backbone_hidden_size is not None:
             if actual_backbone_hidden_size != self.hidden_size:
                 logger.info(
                     "Gemma4 MTP: re-sizing hidden_states buffer from "
-                    "config backbone_hidden_size=%d to weight-derived %d.",
+                    "%d to weight-derived %d.",
                     self.hidden_size,
                     actual_backbone_hidden_size,
                 )
@@ -248,11 +246,6 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                     dtype=self.dtype,
                     device=self.device,
                 )
-        else:
-            logger.warning(
-                "Gemma4 MTP: could not locate pre_projection on draft model; "
-                "using configured hidden_sizes (may mismatch checkpoint dimensions)."
-            )
 
         self._setup_gemma4_kv_sharing(target_attn_layer_names)
 
