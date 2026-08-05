@@ -68,7 +68,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
-    async_copy_to_gpu,
+    PinnedStagingPool,
     set_default_max_concurrency,
 )
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -166,6 +166,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Size the UVA buffer pools to the max number of concurrent in-flight
         # steps. Must run before any pooled buffer is constructed
         set_default_max_concurrency(vllm_config.max_concurrent_batches)
+
+        # Pinned staging for the per-step index copies in prepare_inputs. Each
+        # site gets its own pool so a buffer is recycled once per
+        # max_concurrency steps, not once per max_concurrency copies. Sizes are
+        # exact upper bounds, so these never grow during serving.
+        self._idx_mapping_staging = PinnedStagingPool(torch.int32)
+        self._cu_num_logits_staging = PinnedStagingPool(torch.int32)
+        self._query_start_loc_staging = PinnedStagingPool(torch.int32)
+        self._idx_mapping_staging.reserve(self.max_num_reqs)
+        self._cu_num_logits_staging.reserve(self.max_num_reqs + 1)
+        self._query_start_loc_staging.reserve(self.max_num_reqs + 1)
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
@@ -728,6 +739,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             else:
                 self._dummy_pooler_run(hidden_states)
 
+        # Grow the grammar-bitmask staging pool before serving. One row per
+        # request covers any batch without spec decode outright, and ~10x the
+        # rows a c16 burst uses; a fuller batch costs a bounded number of
+        # one-time growths rather than a per-step allocation.
+        if self.structured_outputs_worker is not None:
+            self.structured_outputs_worker.warmup_staging(self.max_num_reqs)
+
         torch.accelerator.synchronize()
         del hidden_states, sample_hidden_states
         self.reset_encoder_cache()
@@ -952,7 +970,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
         idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
+        # A fresh device tensor per step, as before: idx_mapping is held on the
+        # InputBatch until sample_tokens, which is a later RPC, so it must not
+        # alias a buffer the next step can overwrite. Only the pinned staging
+        # is pooled.
+        idx_mapping = self._idx_mapping_staging.copy_to_gpu(
+            idx_mapping_np,
+            out=torch.empty(num_reqs, dtype=torch.int32, device=self.device),
+        )
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -982,7 +1007,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits = self._cu_num_logits_staging.copy_to_gpu(
+                cu_num_logits_np,
+                out=torch.empty(num_reqs + 1, dtype=torch.int32, device=self.device),
+            )
 
             max_expand_len = self.decode_query_len
             expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
@@ -998,7 +1026,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pad for full CUDA graph mode.
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
-        async_copy_to_gpu(query_start_loc_np, out=self.input_buffers.query_start_loc)
+        self._query_start_loc_staging.copy_to_gpu(
+            query_start_loc_np, out=self.input_buffers.query_start_loc
+        )
         query_start_loc_np = query_start_loc_np[: num_reqs_padded + 1]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs_padded + 1]
         prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]

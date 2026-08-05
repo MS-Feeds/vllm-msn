@@ -159,9 +159,14 @@ class XgrammarGrammar(StructuredOutputGrammar):
             return False
         for token in tokens:
             if not self.matcher.accept_token(token):
-                logger.error(
-                    "Failed to advance FSM for request %s "
-                    "for tokens %s. Please file an issue.",
+                # Expected under spec decode when reasoning ends mid-window:
+                # drafts made before the grammar engaged may be invalid and
+                # the caller tolerates the rejection (structured_output
+                # advance loop). The FATAL variant is logged by the scheduler
+                # ("Unexpected: grammar rejected tokens ... Terminating"), so
+                # this stays quiet.
+                logger.debug(
+                    "FSM did not advance for request %s on token %s.",
                     request_id,
                     token,
                 )

@@ -351,8 +351,21 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
             prompt += thinking_end_token if thinking_mode != "thinking" else thinking_start_token
             prompt += task_sp_token
 
-    elif messages[index].get("role") in ["user", "developer"]:
-        # Normal generation: append Assistant + thinking token
+    elif messages[index].get("role") in ["user", "developer"] or (
+        messages[index].get("role") == "system" and index + 1 == len(messages)
+    ):
+        # Normal generation: append Assistant + thinking token.
+        #
+        # For user/developer this token is both the inter-turn separator and the
+        # generation prompt. A trailing `system` message needs only the latter:
+        # agent frameworks routinely append a context/reminder system message
+        # after the last user turn, and without the generation prompt the model
+        # sees no assistant boundary and continues the prompt as a document
+        # instead of answering. The `index + 1 == len(messages)` guard keeps a
+        # non-final system message from emitting a separator it does not own --
+        # a system message followed by `latest_reminder` reaches this branch
+        # (that role is exempt from the early return above), and unconditionally
+        # appending there corrupts the reference-golden layouts.
         prompt += ASSISTANT_SP_TOKEN
         if not drop_thinking and thinking_mode == "thinking":
             prompt += thinking_start_token

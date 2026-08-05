@@ -12,6 +12,7 @@ from vllm.models.deepseek_v4.nvidia.model import (
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
+from vllm.utils.import_utils import has_deep_gemm
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda(),
@@ -111,6 +112,11 @@ def test_deepseek_v4_mega_moe_weight_loader_uses_ep_expert_ownership():
     not torch.cuda.is_available(),
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",
 )
+@pytest.mark.skipif(
+    not has_deep_gemm(),
+    reason="the reference per_token_cast_to_fp8 comes from deep_gemm, which "
+    "production itself treats as optional (is_deep_gemm_supported)",
+)
 def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
     from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8
 
@@ -188,6 +194,11 @@ def test_deepseek_v4_mega_moe_fused_input_staging_is_bitwise_exact():
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="DeepSeek V4 MegaMoE fused input staging requires CUDA.",
+)
+@pytest.mark.skipif(
+    not has_deep_gemm(),
+    reason="the reference per_token_cast_to_fp8 comes from deep_gemm, which "
+    "production itself treats as optional (is_deep_gemm_supported)",
 )
 def test_deepseek_v4_mega_moe_fused_input_staging_masks_padding():
     from vllm.third_party.deep_gemm.utils import per_token_cast_to_fp8

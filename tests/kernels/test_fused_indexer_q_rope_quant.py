@@ -24,7 +24,8 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     per_token_group_quant_fp8,
 )
 from vllm.models.deepseek_v4.common.ops import fused_indexer_q_rope_quant
-from vllm.utils.import_utils import has_cutedsl
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import is_cutedsl_supported
 
 HEAD_DIM = 128
 ROPE_DIM = 64
@@ -126,14 +127,33 @@ def _reference(
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 257, 1023])
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("use_fp4", [False, True])
+@pytest.mark.parametrize(
+    "use_fp4",
+    [
+        False,
+        # The MXFP4 kernel emits Blackwell-only PTX
+        # (cvt.rn.satfinite.e2m1x2.f32); ptxas exits 255 on older archs.
+        # Production double-gates this path at SM100 (nvidia/model.py
+        # use_fp4_indexer_cache validation), same as the compressor suite.
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif(
+                not current_platform.has_device_capability(100),
+                reason="MXFP4 indexer q kernel requires SM100+",
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("use_cutedsl", [False, True])
 @torch.inference_mode()
 def test_fused_indexer_q_rope_quant_matches_unfused(
     num_tokens, cache_dtype, use_fp4, use_cutedsl
 ):
-    if use_cutedsl and not has_cutedsl():
-        pytest.skip("cutedsl (cutlass) not installed")
+    if use_cutedsl and not is_cutedsl_supported():
+        # Package presence is not the dispatch gate -- the kernels need SM90+,
+        # so on older arches `has_cutedsl()` is True while the dispatcher still
+        # takes the Triton path, and this arm would test it under the wrong name.
+        pytest.skip("cutedsl unsupported here (needs the package and SM90+)")
 
     device = "cuda"
     torch.manual_seed(0)
@@ -167,11 +187,12 @@ def test_fused_indexer_q_rope_quant_matches_unfused(
                 torch.empty_like(q_quant_ref),
                 torch.empty_like(weights_ref),
             )
-    # use_cutedsl=False: force the triton path even when cutedsl is installed
-    # by patching the dispatcher's has_cutedsl() binding to return False.
+    # use_cutedsl=False: force the triton path even when cutedsl is usable, by
+    # patching the binding the dispatcher actually calls (fused_indexer_q.py
+    # imports `is_cutedsl_supported`, and never bound `has_cutedsl`).
     cutedsl_patch = (
         mock.patch(
-            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.has_cutedsl",
+            "vllm.models.deepseek_v4.common.ops.fused_indexer_q.is_cutedsl_supported",
             return_value=False,
         )
         if not use_cutedsl

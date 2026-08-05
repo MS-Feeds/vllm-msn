@@ -29,6 +29,7 @@ from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserSt
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
+    collect_tool_names,
     extract_types_from_schema,
     find_tool_name,
     find_tool_properties,
@@ -83,6 +84,12 @@ class ParserEngine(Parser):
     complete output format for a model (reasoning + tool calls).
     """
 
+    # Set True by parsers whose chat template opens the reasoning block in
+    # the PROMPT (the model output then carries only the end marker). Gates
+    # _orphan_reasoning_prefix_events: formats that use end-marker-like
+    # tokens in ordinary text (e.g. Inkling) must leave this False.
+    prompt_may_open_reasoning: bool = False
+
     def __init__(
         self,
         tokenizer: TokenizerLike,
@@ -107,6 +114,7 @@ class ParserEngine(Parser):
         self._engine = StreamingParserEngine(
             parser_engine_config, tokenizer, vocab=self.vocab
         )
+        self._engine.allowed_tool_names = self._declared_tool_names()
 
         self._has_reasoning = (
             "THINK_END" in parser_engine_config.token_id_terminals
@@ -401,6 +409,11 @@ class ParserEngine(Parser):
 
     # ── Private helpers ─────────────────────────────────────────────
 
+    def _declared_tool_names(self) -> frozenset[str] | None:
+        if not self._tools:
+            return None
+        return collect_tool_names(self._tools) or None
+
     def _check_skip_tool_parsing(
         self,
         request: ChatCompletionRequest | ResponsesRequest,
@@ -408,10 +421,21 @@ class ParserEngine(Parser):
         tools = getattr(request, "tools", None)
         if tools:
             self._tools = tools
+            self._engine.allowed_tool_names = self._declared_tool_names()
+        else:
+            # The engine is reused across requests and reset() keeps this
+            # field, so it has to be cleared here.  Otherwise a request
+            # that declares no tools would inherit the names of the
+            # previous one and could recover a tool it never asked for.
+            self._engine.allowed_tool_names = None
         if not self.skip_tool_parsing and not self._suppress_tool_calls:
             tool_choice = getattr(request, "tool_choice", None)
             if tool_choice == "none" and tools:
                 self._suppress_tool_calls = True
+        # The engine needs the suppression state too: recovery
+        # transitions must not consume text that will never be allowed
+        # to become a tool call.
+        self._engine.suppress_tool_calls = self._suppress_tool_calls
 
     def _strip_content_whitespace(
         self,
@@ -496,7 +520,9 @@ class ParserEngine(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
     ) -> tuple[str | None, str | None]:
         self._reset()
-        events = self._feed(model_output, [])
+        events: list[SemanticEvent] = []
+        events.extend(self._orphan_reasoning_prefix_events(model_output))
+        events.extend(self._feed(model_output, []))
         events.extend(self._engine.finish())
 
         reasoning_parts: list[str] = []
@@ -645,6 +671,30 @@ class ParserEngine(Parser):
 
     # ── Single-pass parse helper ────────────────────────────────────────
 
+    def _orphan_reasoning_prefix_events(self, text: str) -> list[SemanticEvent]:
+        """Seed the state machine when reasoning was opened in the PROMPT.
+
+        DSv4's thinking template ends the prompt with the reasoning start
+        marker, so the model output starts mid-reasoning and carries only the
+        end marker. Without seeding, the prefix leaks into content and the
+        reasoning is lost. Same orphan-marker recovery the DSML tool path
+        applies. No-op when the output opens its own reasoning block, when
+        no end marker is present, or when the parser has no reasoning.
+        """
+        if not self.prompt_may_open_reasoning:
+            return []
+        start = self.reasoning_start_str
+        end = self.reasoning_end_str
+        if (
+            self._has_reasoning
+            and start
+            and end
+            and end in text
+            and (start not in text or text.find(start) > text.find(end))
+        ):
+            return self._feed(start, [])
+        return []
+
     def _single_pass_parse(
         self,
         text: str,
@@ -657,7 +707,10 @@ class ParserEngine(Parser):
         state that ``_build_extracted_result`` reads.
         """
         self._reset(initial_state=initial_state)
-        events = self._feed(text, token_ids)
+        events: list[SemanticEvent] = []
+        if initial_state is None:
+            events.extend(self._orphan_reasoning_prefix_events(text))
+        events.extend(self._feed(text, token_ids))
         events.extend(self._engine.finish())
 
         delta = self._events_to_delta(events, finished=True)

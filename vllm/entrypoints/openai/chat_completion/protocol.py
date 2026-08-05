@@ -75,6 +75,10 @@ class ChatMessage(OpenAIBaseModel):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        # DeepSeek-API-compatible clients read ``reasoning_content``; the
+        # request side already accepts it as an alias, so mirror on output.
+        if data.get("reasoning") is not None:
+            data.setdefault("reasoning_content", data["reasoning"])
         return data
 
 

@@ -310,7 +310,8 @@ class Scheduler(SchedulerInterface):
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         # Blocks that async KV loads will overwrite this step, skipped from
         # zeroing since the zeroing could race the out-of-band write.
-        self._skip_zero_block_ids: set[int] = set()
+        # Keyed by kv-cache group id: block ids are group-scoped.
+        self._skip_zero_block_ids: dict[int, set[int]] = {}
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
@@ -1043,13 +1044,17 @@ class Scheduler(SchedulerInterface):
                     if self.needs_kv_cache_zeroing:
                         # Skip zeroing of the blocks the async load will
                         # overwrite; the zeroing could race the write.
-                        self._skip_zero_block_ids.update(
-                            self.kv_cache_manager.get_zeroing_block_ids_in_range(
-                                request.request_id,
-                                num_new_local_computed_tokens,
-                                num_computed_tokens,
-                            )
+                        mgr = self.kv_cache_manager
+                        per_group = mgr.get_zeroing_block_ids_in_range(
+                            request.request_id,
+                            num_new_local_computed_tokens,
+                            num_computed_tokens,
                         )
+                        for group_id, ids in enumerate(per_group):
+                            if ids:
+                                self._skip_zero_block_ids.setdefault(
+                                    group_id, set()
+                                ).update(ids)
                     continue
 
                 self.running.append(request)
@@ -1257,7 +1262,7 @@ class Scheduler(SchedulerInterface):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
-    def _get_new_block_ids_to_zero(self) -> list[int] | None:
+    def _get_new_block_ids_to_zero(self) -> list[list[int]] | None:
         # Drain new attention block ids every step so the manager-side list
         # does not grow unbounded; only kv-cache zeroing consumes them.
         new_block_ids_to_zero = self.kv_cache_manager.take_new_block_ids()
@@ -1266,10 +1271,15 @@ class Scheduler(SchedulerInterface):
 
         if self._skip_zero_block_ids:
             skip = self._skip_zero_block_ids
-            new_block_ids_to_zero = [b for b in new_block_ids_to_zero if b not in skip]
+            new_block_ids_to_zero = [
+                [b for b in ids if b not in skip.get(group_id, ())]
+                for group_id, ids in enumerate(new_block_ids_to_zero)
+            ]
             skip.clear()
 
-        return new_block_ids_to_zero or None
+        if not any(new_block_ids_to_zero):
+            return None
+        return new_block_ids_to_zero
 
     def _preempt_request(
         self, request: Request, timestamp: float, drop_stale_output: bool = False

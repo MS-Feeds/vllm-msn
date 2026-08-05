@@ -7,6 +7,10 @@ import vllm._custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.kernels.linear.gemv_triton import (
+    bf16_gemv,
+    should_use_triton_gemv,
+)
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -211,6 +215,20 @@ class GateLinear(ReplicatedLinear):
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)
             return output, None
+
+        # Tier 5.5: one-launch Triton GEMV for pre-Hopper decode. Every tier
+        # above requires SM90+, so SM80 otherwise lands on tier 6, which is
+        # F.linear in bf16 *plus* a separate cast when out_dtype is fp32 --
+        # two launches, and an fp32 output that has already been rounded
+        # through bf16. Accumulating in fp32 and storing fp32 in one launch
+        # is both faster (7.5 -> 3.1 us at M=1, K=4096, E=256) and closer to
+        # the reference (4.8e-7 vs 7.4e-3 against an fp32 matmul).
+        if (
+            not self.allow_specialized_router_gemm
+            and self.weight.dtype == torch.bfloat16
+            and should_use_triton_gemv(x, self.weight)
+        ):
+            return bf16_gemv(x, self.weight, self.out_dtype), None
 
         # Tier 6: F.linear (ReplicatedLinear)
         if self.out_dtype is not None and x.dtype != self.weight.dtype:

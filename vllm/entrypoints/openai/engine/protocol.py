@@ -402,6 +402,9 @@ class DeltaMessage(OpenAIBaseModel):
         data = handler(self)
         if len(data.get("tool_calls", [])) == 0:
             data.pop("tool_calls", None)
+        # Mirror for DeepSeek-API-compatible clients (see ChatMessage).
+        if data.get("reasoning") is not None:
+            data.setdefault("reasoning_content", data["reasoning"])
         return data
 
 

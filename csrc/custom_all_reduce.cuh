@@ -74,6 +74,167 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
+// ---------------------------------------------------------------------------
+// int8 blockwise-compressed two-shot all-reduce (task #35).
+//
+// Transports the payload as int8 + one bf16 scale per 32 elements, halving the
+// wire against bf16. Measured on 8xA100: the collective lands at 0.547x the
+// bf16 path at the real 34 MiB compressed payload.
+//
+// Buffer layout, for both the peer inputs and the result: `nblk` blocks of 32
+// int8 codes, then `nblk` bf16 scales at `scale_off` bytes from the base.
+// ---------------------------------------------------------------------------
+
+constexpr int kQBlock = 32;
+
+// One quantization block: 32 int8 codes, loaded as two 16-byte vectors so a
+// warp's 32 threads cover 1024 contiguous bytes.
+struct __align__(16) QBlock {
+  int4 lo, hi;
+};
+
+// ABSOLUTE=true sums peers in absolute rank order, making a block's fp32
+// accumulation order a property of the BLOCK rather than of which rank owns it.
+// The rotated order is an indexing convenience (i=0 maps to target==rank), and
+// it costs reproducibility: change the shard boundaries -- as chunking does --
+// and ownership moves, the summation order moves with it, and the result
+// changes. Measured on REAL captured activations, that is observable: per-rank
+// block scales diverge by up to 120x, so the fp32 sum is not exact and the
+// rotations disagree. (On random-normal data the scales agree to ~2x, the sum
+// IS exact, and the difference is invisible -- which is why this was validated
+// on captured tensors, not on a distribution.)
+//
+// Self's tmp buffer is hoisted into a scalar BEFORE the loop in both paths, so
+// neither indexes a local pointer array with a runtime value -- indexing one
+// with a runtime rank causes a register spill that would confound the
+// rotated-vs-absolute comparison.
+template <int ngpus, bool ABSOLUTE = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_int8(RankData* _dp, RankSignals sg,
+                                    Signal* self_sg,
+                                    int8_t* __restrict__ result,
+                                    nv_bfloat16* __restrict__ result_s,
+                                    int rank, int nblk, int64_t scale_off,
+                                    int64_t tmp_scale_off) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = gridDim.x * blockDim.x;
+  // Shard by quantization BLOCK, never by element: a block's codes and its
+  // scale must be reduced by the same rank, or the requantize would need a max
+  // spanning two ranks.
+  int part = nblk / ngpus;
+  int start = rank * part;
+  int end = rank == ngpus - 1 ? nblk : start + part;
+  int largest_part = part + nblk % ngpus;
+
+  const QBlock* qptr[ngpus];
+  const nv_bfloat16* sptr[ngpus];
+  QBlock* tmp_q[ngpus];
+  nv_bfloat16* tmp_s[ngpus];
+#pragma unroll
+  for (int i = 0; i < ngpus; i++) {
+    int target = ABSOLUTE ? i : (rank + i) % ngpus;
+    auto base = (const char*)_dp->ptrs[target];
+    qptr[i] = (const QBlock*)base;
+    sptr[i] = (const nv_bfloat16*)(base + scale_off);
+    auto t = (char*)get_tmp_buf<QBlock>(sg.signals[target]);
+    tmp_q[i] = (QBlock*)t;
+    tmp_s[i] = (nv_bfloat16*)(t + tmp_scale_off);
+  }
+  // Self's tmp buffer, resolved once as a scalar rather than via the array.
+  auto self_t = (char*)get_tmp_buf<QBlock>(sg.signals[rank]);
+  auto self_q = (QBlock*)self_t;
+  auto self_s = (nv_bfloat16*)(self_t + tmp_scale_off);
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+
+  // stage 1: reduce scatter, with dequant -> fp32 sum -> requant in kernel.
+  for (int idx = start + tid; idx < end; idx += stride) {
+    float acc[kQBlock];
+#pragma unroll
+    for (int j = 0; j < kQBlock; j++) acc[j] = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ngpus; i++) {
+      QBlock v = qptr[i][idx];
+      float sc = __bfloat162float(sptr[i][idx]);
+      auto b = reinterpret_cast<const int8_t*>(&v);
+#pragma unroll
+      for (int j = 0; j < kQBlock; j++) acc[j] += float(b[j]) * sc;
+    }
+    // Recompute the output scale from the SUMMED shard rather than deriving it
+    // from the input scales. Then no value can exceed its own block max, so the
+    // clamp below is unreachable by construction and any saturation is a bug.
+    // The max is over this thread's own 32 accumulators, so it costs no shuffle
+    // and no shared memory.
+    float amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kQBlock; j++) amax = fmaxf(amax, fabsf(acc[j]));
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    QBlock o;
+    auto ob = reinterpret_cast<int8_t*>(&o);
+#pragma unroll
+    for (int j = 0; j < kQBlock; j++) {
+      int q = __float2int_rn(acc[j] * inv);
+      ob[j] = (int8_t)min(max(q, -127), 127);
+    }
+    self_q[idx - start] = o;
+    self_s[idx - start] = __float2bfloat16(amax / 127.0f);
+  }
+  barrier_at_end<ngpus>(sg, self_sg, rank);
+
+  // stage 2: allgather. tid must match stage 1 for the same reason as the bf16
+  // kernel -- cross-device visibility is only guaranteed between equal tids.
+  for (int idx = tid; idx < largest_part; idx += stride) {
+#pragma unroll
+    for (int i = 0; i < ngpus; i++) {
+      int gather_from_rank = ABSOLUTE ? i : ((rank + i) % ngpus);
+      if (gather_from_rank == ngpus - 1 || idx < part) {
+        int dst_idx = gather_from_rank * part + idx;
+        ((QBlock*)result)[dst_idx] = tmp_q[i][idx];
+        result_s[dst_idx] = tmp_s[i][idx];
+      }
+    }
+  }
+}
+
+// Quantize a bf16 payload into the IPC buffer's int8 + scale layout. This
+// replaces the d2d copy the eager custom-AR path already pays (96 MiB of
+// traffic against 128 MiB), so it is cheaper than the copy it displaces.
+// One thread per 32-element block keeps the block max in registers.
+// static: this header is included by more than one translation unit, and unlike
+// the templated kernels a plain __global__ would get external linkage in each.
+static __global__ void __launch_bounds__(256)
+    quantize_blockwise_int8(const nv_bfloat16* __restrict__ inp,
+                            int8_t* __restrict__ out, int nblk,
+                            int64_t scale_off) {
+  auto out_s = (nv_bfloat16*)(out + scale_off);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < nblk;
+       idx += gridDim.x * blockDim.x) {
+    const int4* src = (const int4*)(inp + (int64_t)idx * kQBlock);
+    int4 v0 = src[0], v1 = src[1], v2 = src[2], v3 = src[3];
+    nv_bfloat16 raw[kQBlock];
+    reinterpret_cast<int4*>(raw)[0] = v0;
+    reinterpret_cast<int4*>(raw)[1] = v1;
+    reinterpret_cast<int4*>(raw)[2] = v2;
+    reinterpret_cast<int4*>(raw)[3] = v3;
+
+    float x[kQBlock], amax = 0.0f;
+#pragma unroll
+    for (int j = 0; j < kQBlock; j++) {
+      x[j] = __bfloat162float(raw[j]);
+      amax = fmaxf(amax, fabsf(x[j]));
+    }
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    QBlock o;
+    auto ob = reinterpret_cast<int8_t*>(&o);
+#pragma unroll
+    for (int j = 0; j < kQBlock; j++) {
+      int q = __float2int_rn(x[j] * inv);
+      ob[j] = (int8_t)min(max(q, -127), 127);
+    }
+    ((QBlock*)out)[idx] = o;
+    out_s[idx] = __float2bfloat16(amax / 127.0f);
+  }
+}
+
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
@@ -288,25 +449,47 @@ class CustomAllreduce {
 #define KL(ngpus, name)                                                       \
   name<T, ngpus><<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
                                                  rank_, size);
-#define REDUCE_CASE(ngpus)                              \
-  case ngpus: {                                         \
-    if (force_1stage) {                                 \
-      KL(ngpus, cross_device_reduce_1stage);            \
-    } else if (force_2stage) {                          \
-      KL(ngpus, cross_device_reduce_2stage);            \
-    } else {                                            \
-      if (world_size_ == 2) {                           \
-        KL(ngpus, cross_device_reduce_1stage);          \
-      } else if (fully_connected_) {                    \
-        if ((world_size_ <= 4 && bytes < 512 * 1024) || \
-            (world_size_ <= 8 && bytes < 256 * 1024)) { \
-          KL(ngpus, cross_device_reduce_1stage);        \
-        } else {                                        \
-          KL(ngpus, cross_device_reduce_2stage);        \
-        }                                               \
-      }                                                 \
-    }                                                   \
-    break;                                              \
+    // One-shot has every rank read the whole payload from all N-1 peers;
+    // two-shot reduce-scatters then all-gathers, moving ~4x less over the links
+    // but paying an extra barrier round. Below this size the barrier dominates
+    // and one-shot wins. Measured on 8xA100 NVLink (hidden 4096, bf16,
+    // cudagraph-captured, us/call, in-tree communicator bench / an independent
+    // probe):
+    //
+    //     128 KB  1stage 12 / 22.8   2stage 19 / 24.2
+    //     256 KB  1stage 16 / 26.2   2stage 23 / 28.2
+    //     384 KB  1stage 20 / 28.1   2stage 23 / 29.1
+    //     512 KB  1stage 24 / 30.1   2stage 23 / 29.1   <- crossover
+    //       1 MB  1stage 40 / 48.3   2stage 24 / 33.8
+    //
+    // The previous 256 KB put [256 KB, 512 KB) on two-shot while one-shot was
+    // still faster there. This threshold was measured at world_size 8;
+    // world_size 4 already used 512 KB. NOTE the value is applied to world_size
+    // 6 WITHOUT a measurement -- it sits between a shipped 512 (ws 4) and a
+    // measured 512 (ws 8), and one-shot's cost grows with N (N-1 peer reads),
+    // so a monotone crossover puts ws 6 at or above ws 8's 512.
+    // TODO: A100-derived (NVLink3). The crossover tracks link bandwidth;
+    // re-measure on SM90+/NVSwitch before trusting it there.
+    constexpr size_t kOneShotMaxBytes = 512 * 1024;
+
+#define REDUCE_CASE(ngpus)                       \
+  case ngpus: {                                  \
+    if (force_1stage) {                          \
+      KL(ngpus, cross_device_reduce_1stage);     \
+    } else if (force_2stage) {                   \
+      KL(ngpus, cross_device_reduce_2stage);     \
+    } else {                                     \
+      if (world_size_ == 2) {                    \
+        KL(ngpus, cross_device_reduce_1stage);   \
+      } else if (fully_connected_) {             \
+        if (bytes < kOneShotMaxBytes) {          \
+          KL(ngpus, cross_device_reduce_1stage); \
+        } else {                                 \
+          KL(ngpus, cross_device_reduce_2stage); \
+        }                                        \
+      }                                          \
+    }                                            \
+    break;                                       \
   }
 
     switch (world_size_) {
@@ -323,6 +506,90 @@ class CustomAllreduce {
     }
 #undef REDUCE_CASE
 #undef KL
+  }
+
+  /**
+   * int8 blockwise-compressed two-shot all-reduce (task #35).
+   *
+   * `input` must be the IPC-registered buffer already holding the quantized
+   * payload (see quantize_blockwise_int8); `output` takes the reduced payload
+   * in the same int8 + bf16-scale layout, which mhc_post consumes directly.
+   * Two-shot only: this is a prefill-sized path by construction, far above the
+   * 512 KB one-shot crossover.
+   */
+  void allreduce_int8(cudaStream_t stream, int8_t* input, int8_t* output,
+                      nv_bfloat16* output_scales, int nblk, int64_t scale_off,
+                      int64_t tmp_scale_off, int threads = 512,
+                      int block_limit = defaultBlockLimit) {
+    if (block_limit > kMaxBlocks)
+      throw std::runtime_error("max supported block limit is " +
+                               std::to_string(kMaxBlocks) + ". Got " +
+                               std::to_string(block_limit));
+    if (nblk % world_size_ != 0)
+      throw std::runtime_error(
+          "int8 custom allreduce requires the block count to be divisible by "
+          "the world size; got " +
+          std::to_string(nblk) + " blocks on " + std::to_string(world_size_) +
+          " ranks");
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end())
+        throw std::runtime_error(
+            "buffer address " +
+            std::to_string(reinterpret_cast<uint64_t>(input)) +
+            " is not registered!");
+      ptrs = it->second;
+    }
+    int blocks = std::min(block_limit, (nblk + threads - 1) / threads);
+
+    // DEFAULT IS ROTATED: that is the order v12 was gated on, and the tree's
+    // shipping numerics must stay bit-identical to what was measured. Absolute
+    // order exists only for #39, where chunking moves shard ownership and would
+    // otherwise change results; it costs +12.22% (measured, clean impl) and is
+    // opt-in. Read per call, NOT static: verify_default_rotated.py toggles the
+    // env between calls in one process to prove the flag is live (rule 6).
+    const char* abs_env = std::getenv("VLLM_AR_INT8_ABSOLUTE_ORDER");
+    bool absolute = abs_env != nullptr && std::strcmp(abs_env, "1") == 0;
+
+#define KL_INT8(ngpus)                                                \
+  if (absolute)                                                       \
+    cross_device_reduce_2stage_int8<ngpus, true>                      \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
+                                         output_scales, rank_, nblk,  \
+                                         scale_off, tmp_scale_off);   \
+  else                                                                \
+    cross_device_reduce_2stage_int8<ngpus, false>                     \
+        <<<blocks, threads, 0, stream>>>(ptrs, sg_, self_sg_, output, \
+                                         output_scales, rank_, nblk,  \
+                                         scale_off, tmp_scale_off);
+
+    switch (world_size_) {
+      case 2:
+        KL_INT8(2);
+        break;
+      case 4:
+        KL_INT8(4);
+        break;
+      case 6:
+        KL_INT8(6);
+        break;
+      case 8:
+        KL_INT8(8);
+        break;
+      default:
+        throw std::runtime_error(
+            "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+            "gpus = " +
+            std::to_string(world_size_));
+    }
+#undef KL_INT8
   }
 
   void allgather(cudaStream_t stream, void* input, void* output, int size_bytes,

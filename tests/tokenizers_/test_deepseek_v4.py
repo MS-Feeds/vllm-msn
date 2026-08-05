@@ -288,3 +288,71 @@ def test_deepseek_v4_matches_reference_golden_fixtures(case_id, kwargs):
 
     expected = (FIXTURES_DIR / f"test_output_{case_id}.txt").read_text()
     assert prompt == expected
+
+
+def _render(messages, **kwargs):
+    return _tokenizer().apply_chat_template(
+        conversation=messages, messages=messages, tokenize=False, **kwargs
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_tail"),
+    [({}, "</think>"), ({"thinking": True}, "<think>")],
+)
+def test_deepseek_v4_trailing_system_gets_generation_prompt(kwargs, expected_tail):
+    """A system message after the last user turn must still open an assistant turn.
+
+    Agent frameworks append context/reminder system messages after the user
+    turn. Without the generation prompt the model sees no assistant boundary
+    and continues the prompt as a document instead of answering.
+    """
+    prompt = _render(
+        [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "write the report"},
+            {"role": "system", "content": "Available agent types: ..."},
+        ],
+        **kwargs,
+    )
+
+    assert prompt.endswith("<｜Assistant｜>" + expected_tail)
+
+
+def test_deepseek_v4_system_only_conversation_gets_generation_prompt():
+    prompt = _render([{"role": "system", "content": "just a system prompt"}])
+
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_mid_conversation_system_does_not_open_a_turn():
+    """A system message that is not last must not emit a spurious turn marker."""
+    prompt = _render(
+        [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "system", "content": "extra context"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+    assert prompt.count("<｜Assistant｜>") == 1
+    assert prompt.endswith("<｜Assistant｜></think>")
+
+
+def test_deepseek_v4_system_before_latest_reminder_emits_no_turn_marker():
+    """Regression: a non-final system message must not open an assistant turn.
+
+    `latest_reminder` is exempt from the "what may follow" early return, so a
+    system message preceding one reaches the generation-prompt branch. Treating
+    it as a turn boundary injects a stray marker mid-prompt.
+    """
+    prompt = _render(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "latest_reminder", "content": "2026-08-04"},
+            {"role": "user", "content": "hi"},
+        ]
+    )
+
+    assert prompt.index("<｜latest_reminder｜>") < prompt.index("<｜Assistant｜>")
+    assert prompt.count("<｜Assistant｜>") == 1

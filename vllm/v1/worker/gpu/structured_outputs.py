@@ -5,7 +5,7 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.buffer_utils import PinnedStagingPool
 from vllm.v1.worker.gpu.input_batch import InputBatch
 
 
@@ -20,6 +20,20 @@ class StructuredOutputsWorker:
         self.device = device
         self.copy_stream = torch.cuda.Stream()
 
+        # Both per-step copies below used to pin freshly allocated host memory.
+        self._indices_staging = PinnedStagingPool(torch.int32)
+        self._bitmask_staging = PinnedStagingPool(torch.int32)
+        # logits_indices is exactly bounded, so reserve it outright. The bitmask
+        # is bounded only by max_num_logits rows, which at this vocab is ~99 MiB
+        # per buffer; reserve one row per request and let a larger batch grow it
+        # once (see warmup_staging).
+        self._indices_staging.reserve(max_num_logits)
+        self._bitmask_row = cdiv(vocab_size, 32)
+
+    def warmup_staging(self, num_rows: int) -> None:
+        """Pre-grow the bitmask staging pool so serving never allocates."""
+        self._bitmask_staging.reserve(num_rows * self._bitmask_row)
+
     def apply_grammar_bitmask(
         self,
         logits: torch.Tensor,
@@ -32,7 +46,7 @@ class StructuredOutputsWorker:
 
         # Asynchronously copy the bitmask to GPU.
         with torch.cuda.stream(self.copy_stream):
-            bitmask = async_copy_to_gpu(
+            bitmask = self._bitmask_staging.copy_to_gpu(
                 grammar_bitmask, out=self.grammar_bitmask[: grammar_bitmask.shape[0]]
             )
 
@@ -49,11 +63,9 @@ class StructuredOutputsWorker:
 
         # Asynchronously copy the mapping to GPU.
         with torch.cuda.stream(self.copy_stream):
-            logits_indices = torch.tensor(
-                mapping, dtype=torch.int32, device="cpu", pin_memory=True
-            )
-            logits_indices = self.logits_indices[: len(mapping)].copy_(
-                logits_indices, non_blocking=True
+            mapping_np = np.asarray(mapping, dtype=np.int32)
+            logits_indices = self._indices_staging.copy_to_gpu(
+                mapping_np, out=self.logits_indices[: len(mapping)]
             )
 
         # Ensure all async copies are complete before launching the kernel.

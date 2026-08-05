@@ -5,9 +5,11 @@
 import torch
 import torch.nn.functional as F
 
+from vllm import envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
     tensor_model_parallel_gather,
 )
 from vllm.model_executor.custom_op import PluggableLayer
@@ -16,6 +18,32 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.platforms import current_platform
+
+
+def reduce_global_argmax(
+    values: torch.Tensor,
+    global_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Reduce per-shard maxima that already carry global vocab ids.
+
+    ``values`` and ``global_ids`` are ``[..., num_shards]``; the result is
+    ``[...]``. Ties resolve to the lowest global id, taken as the minimum id
+    among the shards that reach the maximum, so the result depends neither on
+    shard order nor on ``torch.argmax``'s tie-break. That rule is the one that
+    matches a replicated argmax over the concatenated vocab, which returns the
+    first -- i.e. lowest -- maximal index.
+
+    The masked-out lanes carry the row's largest id rather than a sentinel, so
+    the result is always an id some shard offered. That matters for a NaN row,
+    where ``values == best`` is false everywhere: an out-of-vocab id would be
+    returned into an embedding lookup and fail as an async device-side assert,
+    while a replicated ``argmax`` on the same row returns a valid (if
+    meaningless) token.
+    """
+    best = values.max(dim=-1, keepdim=True).values
+    fallback = global_ids.amax(dim=-1, keepdim=True).expand_as(global_ids)
+    candidates = torch.where(values == best, global_ids, fallback)
+    return candidates.min(dim=-1).values
 
 
 # --8<-- [start:logits_processor]
@@ -72,13 +100,14 @@ class LogitsProcessor(PluggableLayer):
             # Get the logits for the next tokens.
             logits = self._get_logits(hidden_states, lm_head, embedding_bias)
         if logits is not None:
-            if self.soft_cap is not None:
-                logits = logits / self.soft_cap
-                logits = torch.tanh(logits)
-                logits = logits * self.soft_cap
+            logits = self._apply_cap_and_scale(logits)
+        return logits
 
-            if self.scale != 1.0:
-                logits *= self.scale
+    def _apply_cap_and_scale(self, logits: torch.Tensor) -> torch.Tensor:
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
         return logits
 
     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
@@ -152,11 +181,46 @@ class LogitsProcessor(PluggableLayer):
             logits = logits[..., : self.org_vocab_size]
         return logits
 
+    def get_shard_logits(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+        extra_logits: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """This rank's slice of the logits, stopping before the vocab gather.
+
+        Everything :meth:`forward` applies elementwise (soft cap, scale) but
+        without the all-gather, plus the padding mask that makes an argmax over
+        the slice safe. The mask is not cosmetic: a shard whose vocab range
+        runs past ``org_vocab_size`` holds rows the weight loader zero-fills
+        (``vocab_parallel_embedding.py:485``), so a padded column scores 0 and
+        wins outright whenever every real logit is negative. :meth:`forward`
+        avoids this by truncating *after* the gather, which a sharded consumer
+        cannot do.
+
+        ``extra_logits`` is an optional ``[*, shard_width]`` term added before
+        the mask, for a selection that spans the sum of two vocab-parallel
+        projections over the same shard layout -- DSpark's Markov transition
+        bias on top of the base draft logits.
+        """
+        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
+        logits = self._apply_cap_and_scale(logits)
+        if extra_logits is not None:
+            logits = logits + extra_logits
+
+        # Mask out padding entries beyond org_vocab_size on this shard.
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+        return logits
+
     def get_top_tokens(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         embedding_bias: torch.Tensor | None = None,
+        extra_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Vocab-parallel argmax without all-gathering full logits.
 
@@ -171,16 +235,9 @@ class LogitsProcessor(PluggableLayer):
             )
         tp_size = lm_head.tp_size
 
-        logits = self._apply_head(lm_head, hidden_states, embedding_bias)
-        if self.soft_cap is not None:
-            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
-        if self.scale != 1.0:
-            logits = logits * self.scale
-
-        # Mask out padding entries beyond org_vocab_size on this shard.
-        num_pad = lm_head.shard_indices.num_org_vocab_padding
-        if num_pad > 0:
-            logits[..., -num_pad:] = -float("inf")
+        logits = self.get_shard_logits(
+            lm_head, hidden_states, embedding_bias, extra_logits
+        )
 
         local_max_vals, local_max_indices = logits.max(dim=-1)
 
@@ -191,18 +248,46 @@ class LogitsProcessor(PluggableLayer):
         if tp_size == 1:
             return global_indices
 
-        # All-gather (value, index) pairs, then reduce to global argmax.
+        # Exchange (value, index) pairs, then reduce to global argmax.
         # Use float32 to avoid bf16 precision loss on large vocab indices.
         local_pair = torch.stack(
             [local_max_vals.float(), global_indices.float()], dim=-1
         )
-        # [batch, 2] -> [batch, 2 * tp_size]
-        gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
+        num_rows = hidden_states.shape[0]
+        # envs re-reads os.environ per attribute access; bind once per call.
+        use_allreduce = envs.VLLM_LOCAL_ARGMAX_ALLREDUCE
+        if use_allreduce:
+            # A sum-all_reduce over a buffer each rank zeroes outside its own
+            # two lanes carries exactly what the all_gather carried: lane
+            # 2r holds rank r's value and 2r+1 its global id, because every
+            # other rank adds exact +0.0 there and x + 0.0 == x for every
+            # float, inf and NaN included. Worth the wider payload: [B, 2]
+            # takes the pynccl branch plus an all_gather temporary and a
+            # movedim copy, while [B, 2 * tp] is still small enough for the
+            # one-shot custom all-reduce.
+            scattered = torch.zeros(
+                num_rows, tp_size, 2, dtype=torch.float32, device=local_pair.device
+            )
+            scattered[:, lm_head.tp_rank] = local_pair
+            gathered = tensor_model_parallel_all_reduce(scattered.view(num_rows, -1))
+        else:
+            # [batch, 2] -> [batch, 2 * tp_size]
+            gathered = tensor_model_parallel_all_gather(local_pair, dim=-1)
         # [batch, tp_size, 2] where [:, :, 0]=values, [:, :, 1]=indices
-        gathered = gathered.view(hidden_states.shape[0], tp_size, 2)
-        max_rank_idx = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
-        top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
-        return top_tokens.squeeze(-1).to(torch.int64)
+        gathered = gathered.view(num_rows, tp_size, 2)
+        selected = reduce_global_argmax(
+            gathered[:, :, 0], gathered[:, :, 1].to(torch.int64)
+        )
+        if use_allreduce:
+            # A no-op on real values -- every candidate is some rank's
+            # `local_argmax + vocab_start`. It bounds the one case that is not
+            # real: CustomAllreduce.custom_all_reduce's non-capturing warm-up
+            # branch returns `torch.empty_like` (uninitialised). Every caller
+            # turns this result into a token id and looks it up in an
+            # embedding, so unclamped that warm-up dies on a device-side
+            # assert. `all_gather` has no such path, hence the condition.
+            selected = selected.clamp_(0, self.org_vocab_size - 1)
+        return selected
 
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"

@@ -383,12 +383,53 @@ class CudaGraphManager:
                     effective_loras,
                 ):
                     return desc
+
+        # Nothing in this token count's candidate list fits. The staging table
+        # built above gives each token count exactly one bucket -- the smallest
+        # captured size >= it -- so when that bucket happens to be a decode-only
+        # one (its key is round_up(capture_size, decode_query_len), which lands
+        # between two mixed capture sizes), a mixed step in that range sees only
+        # uniform-decode descriptors and falls all the way to eager. Pad up to
+        # the smallest mixed graph that can absorb the batch instead; the runner
+        # already pads its inputs to desc.num_tokens for every step
+        # (model_runner.prepare_inputs).
+        padded = self._pad_up_candidate(
+            num_reqs, num_tokens, uniform_token_count, effective_loras
+        )
+        if padded is not None:
+            return padded
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
             num_tokens=num_tokens,
             num_reqs=num_reqs,
             num_active_loras=effective_loras,
         )
+
+    def _pad_up_candidate(
+        self,
+        num_reqs: int,
+        num_tokens: int,
+        uniform_token_count: int | None,
+        num_active_loras: int,
+    ) -> BatchExecutionDescriptor | None:
+        """Smallest captured PIECEWISE graph that can absorb `num_tokens`.
+
+        FULL graphs are deliberately excluded: they carry request padding and a
+        uniform-token-count contract that padding up would also have to satisfy.
+        """
+        if not self._graphs_captured or num_tokens <= 0:
+            return None
+        best: BatchExecutionDescriptor | None = None
+        # _capture_descs is sorted by num_tokens descending, so the last
+        # compatible descriptor at or above num_tokens is the smallest one.
+        for desc in self._capture_descs.get(CUDAGraphMode.PIECEWISE, ()):
+            if desc.num_tokens < num_tokens:
+                break
+            if _is_compatible(
+                desc, num_reqs, num_tokens, uniform_token_count, num_active_loras
+            ):
+                best = desc
+        return best
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
         """Replay a captured FULL cudagraph."""

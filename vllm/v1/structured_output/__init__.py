@@ -56,6 +56,10 @@ class StructuredOutputManager:
 
         self._grammar_bitmask: torch.Tensor | None = None
         self._full_mask = torch.tensor(-1, dtype=torch.int32)
+        # Set when the configured backend is explicit; see _start_eager_init.
+        self._backend_init_future: (
+            Future[tuple[StructuredOutputBackend, torch.Tensor]] | None
+        ) = None
 
         max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
         self.fill_bitmask_parallel_threshold = 128
@@ -92,8 +96,107 @@ class StructuredOutputManager:
                     reasoning_parser
                 )
 
+            self._start_eager_init()
+
         self.enable_in_reasoning = (
             self.vllm_config.structured_outputs_config.enable_in_reasoning
+        )
+
+    def _start_eager_init(self) -> None:
+        """Build the backend off the critical path when it is known up front.
+
+        Backend construction is lazy because `auto` is only resolved per
+        request. When the backend is configured explicitly, the value is fixed
+        at startup (`SamplingParams._validate_structured_outputs` rejects any
+        request asking for a different one), so there is nothing to wait for
+        and the work can move to the executor. It is worth moving: building
+        `TokenizerInfo` and allocating the token bitmask cost several hundred
+        ms, and today the first structured-output request pays all of it —
+        `TokenizerInfo` synchronously on the input thread, the bitmask on the
+        engine loop.
+
+        Safe under external_launcher despite the determinism carve-out above:
+        this only moves *backend construction* earlier. Grammar creation stays
+        on whichever path `_use_async_grammar_compilation` selects, so the
+        WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR transition still happens at the
+        same point on every rank.
+        """
+        backend = self.vllm_config.structured_outputs_config.backend
+        if backend == "auto":
+            return
+        self._backend_init_future = self.executor.submit(self._build_backend, backend)
+
+    def _build_backend(
+        self, backend: str
+    ) -> tuple[StructuredOutputBackend, "torch.Tensor"]:
+        instance = self._construct_backend(backend)
+        return instance, self._allocate_bitmask(instance)
+
+    def _construct_backend(self, backend: str) -> StructuredOutputBackend:
+        vocab_size = self.vllm_config.model_config.get_vocab_size()
+        if backend == "xgrammar":
+            return XgrammarBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        elif backend == "guidance":
+            return GuidanceBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        elif backend == "outlines":
+            from vllm.v1.structured_output.backend_outlines import OutlinesBackend
+
+            return OutlinesBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        elif backend == "lm-format-enforcer":
+            from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+                LMFormatEnforcerBackend,
+            )
+
+            return LMFormatEnforcerBackend(
+                self.vllm_config,
+                tokenizer=self.tokenizer,
+                vocab_size=vocab_size,
+            )
+        else:
+            raise ValueError(f"Unsupported structured output backend: {backend}")
+
+    def _allocate_bitmask(self, backend: StructuredOutputBackend) -> "torch.Tensor":
+        # One row per speculative position plus one for the bonus token.
+        return backend.allocate_token_bitmask(
+            self.vllm_config.scheduler_config.max_num_seqs
+            * (1 + self.vllm_config.num_speculative_tokens)
+        )
+
+    def _ensure_backend(self, request: "Request") -> None:
+        """Resolve `self.backend`, adopting the eager result when there is one.
+
+        Called only from `grammar_init`, i.e. only from the input processing
+        thread, so the assignments below are not racing another writer. The
+        engine loop reads `_grammar_bitmask` in `grammar_bitmask()`, but it can
+        only see a structured-output request after that request has been handed
+        to the scheduler, which is ordered after this returns.
+        """
+        if self.backend is not None:
+            return
+
+        if self._backend_init_future is not None:
+            # Re-raises a construction failure here rather than at startup, so
+            # a bad backend still surfaces on the request that needs it.
+            self.backend, bitmask = self._backend_init_future.result()
+            if self._grammar_bitmask is None:
+                self._grammar_bitmask = bitmask
+            return
+
+        assert request.sampling_params is not None
+        self.backend = self._construct_backend(
+            request.sampling_params.structured_outputs._backend
         )
 
     def _get_reasoner(self, request: "Request") -> "ReasoningParser | None":
@@ -121,47 +224,13 @@ class StructuredOutputManager:
                 and request.sampling_params.structured_outputs is not None
             )
 
-        # Initialize the backend the first time it is needed.
+        # Initialize the backend the first time it is needed, unless
+        # _start_eager_init already has it in flight.
         #
         # NOTE: We only support a single backend. We do NOT support different
         # backends on a per-request basis in V1 (for now, anyway...).
         # _backend is set in Processor._validate_structured_output
-        if self.backend is None:
-            assert request.sampling_params is not None
-            backend = request.sampling_params.structured_outputs._backend
-            vocab_size = self.vllm_config.model_config.get_vocab_size()
-            if backend == "xgrammar":
-                self.backend = XgrammarBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "guidance":
-                self.backend = GuidanceBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "outlines":
-                from vllm.v1.structured_output.backend_outlines import OutlinesBackend
-
-                self.backend = OutlinesBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            elif backend == "lm-format-enforcer":
-                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
-                    LMFormatEnforcerBackend,
-                )
-
-                self.backend = LMFormatEnforcerBackend(
-                    self.vllm_config,
-                    tokenizer=self.tokenizer,
-                    vocab_size=vocab_size,
-                )
-            else:
-                raise ValueError(f"Unsupported structured output backend: {backend}")
+        self._ensure_backend(request)
 
         grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
         if self._use_async_grammar_compilation:
@@ -224,14 +293,10 @@ class StructuredOutputManager:
 
         if self._grammar_bitmask is None:
             assert self.backend is not None
-            max_batch_size = self.vllm_config.scheduler_config.max_num_seqs
-
             # Allocate a bitmask for each token needing to be checked:
             # one for each speculative position, and one more for the
             # bonus token / non-speculative token.
-            self._grammar_bitmask = self.backend.allocate_token_bitmask(
-                max_batch_size * (1 + max_num_spec_tokens)
-            )
+            self._grammar_bitmask = self._allocate_bitmask(self.backend)
 
         # Generate a batched bitmask for all structured output requests.
         # When speculative decoding is enabled, we need to include multiple
@@ -486,5 +551,14 @@ class StructuredOutputManager:
         return new_token_ids[num_reasoning:]
 
     def clear_backend(self) -> None:
+        if self._backend_init_future is not None:
+            # Shutdown may land before any request touched the backend; adopt
+            # an eagerly-built one so it is still destroyed rather than leaked.
+            future, self._backend_init_future = self._backend_init_future, None
+            if not future.cancel() and self.backend is None:
+                try:
+                    self.backend, _ = future.result()
+                except Exception:
+                    logger.exception("Eager structured-output backend init failed")
         if self.backend is not None:
             self.backend.destroy()

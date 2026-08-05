@@ -41,6 +41,78 @@ def async_copy_to_gpu(
     return out.copy_(pinned, non_blocking=True)
 
 
+class PinnedStagingPool:
+    """Round-robin pinned staging buffers for repeated host-to-device copies.
+
+    `x.pin_memory()` on a fresh host array allocates from torch's caching host
+    allocator, which serves a request only from a cached block of sufficient
+    size; a request larger than anything cached calls `cudaHostAlloc`, and
+    page-locking is slow enough (tens of ms observed under load) to stall a
+    step. Staging through buffers owned here means the allocator sees no
+    per-step requests at all.
+
+    Capacity grows to powers of two so a pool allocates O(log n) times over its
+    lifetime and stops entirely once it has seen its largest batch; `reserve()`
+    moves that growth to startup.
+
+    One pool per call site. Buffers are recycled every `max_concurrency` calls,
+    so the reuse distance is that many steps only if the site is reached once
+    per step, which is the same contract `UvaBufferPool` relies on: the depth
+    must be >= the number of in-flight steps (engine batch_queue_size). Not
+    thread-safe; intended for the worker's main thread.
+    """
+
+    def __init__(
+        self,
+        dtype: torch.dtype,
+        max_concurrency: int | None = None,
+    ):
+        if max_concurrency is None:
+            max_concurrency = _DEFAULT_MAX_CONCURRENCY
+        self.dtype = dtype
+        self.max_concurrency = max_concurrency
+        self._bufs: list[torch.Tensor] = []
+        self._capacity = 0
+        self._curr = 0
+        self.num_allocations = 0
+        # Superseded buffers, kept alive because a copy issued from one may
+        # still be in flight when growth replaces it. Freeing them here would
+        # hand the pages back while the device is reading them. The power-of-two
+        # schedule bounds the whole retained series at ~2x the final capacity.
+        self._retired: list[list[torch.Tensor]] = []
+
+    def reserve(self, numel: int) -> None:
+        """Grow to hold `numel` elements now, so serving does not have to."""
+        if numel > self._capacity:
+            capacity = 1 << max(int(numel) - 1, 0).bit_length()
+            if self._bufs:
+                self._retired.append(self._bufs)
+            self._bufs = [
+                torch.empty(capacity, dtype=self.dtype, device="cpu", pin_memory=True)
+                for _ in range(self.max_concurrency)
+            ]
+            self._capacity = capacity
+            self._curr = 0
+            self.num_allocations += self.max_concurrency
+
+    def stage(self, x: torch.Tensor) -> torch.Tensor:
+        """Copy `x` into the next pinned buffer and return that view."""
+        self.reserve(x.numel())
+        self._curr = (self._curr + 1) % self.max_concurrency
+        staged = self._bufs[self._curr][: x.numel()].view(x.shape)
+        staged.copy_(x)
+        return staged
+
+    def copy_to_gpu(
+        self,
+        x: torch.Tensor | np.ndarray,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x)
+        return out.copy_(self.stage(x), non_blocking=True)
+
+
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():

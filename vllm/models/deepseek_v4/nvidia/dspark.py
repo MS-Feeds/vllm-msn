@@ -202,14 +202,21 @@ class DSparkDeepseekV4Model(nn.Module):
 
         residual = post_mix = res_mix = None
         for layer in self.layers:
-            hidden_states, residual, post_mix, res_mix = layer(
+            # Keyword args: the layer's mHC state params keep growing (x_scales
+            # was appended for the int8 AR), and a positional call would
+            # silently bind a future addition to the wrong slot.
+            hidden_states, residual, post_mix, res_mix, x_scales = layer(
                 hidden_states,
                 positions,
                 input_ids,
-                post_mix,
-                res_mix,
-                residual,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                residual=residual,
             )
+            assert x_scales is None, (
+                "DSpark drafter is decode-only; the int8 AR is prefill-only"
+            )
+
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         if self.use_sequence_parallel:
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
@@ -360,6 +367,20 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         # Full-vocab draft: base logits, no d2t scatter.
         return self.compute_logits(hidden_states)
 
+    def compute_draft_logits_shard(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Same logits, this rank's vocab columns only (no gather). The norm is
+        # part of the head, so it stays on this side of the split.
+        return self.logits_processor.get_shard_logits(
+            self.lm_head, self.model.norm(hidden_states)
+        )
+
+    def select_draft_token_shard(
+        self, markov_embed: torch.Tensor, base_shard_logits: torch.Tensor
+    ) -> torch.Tensor:
+        return self.model.markov_head.select_top_tokens(
+            markov_embed, base_shard_logits, self.logits_processor
+        )
+
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids  # full-vocab: draft ids are target ids
 
@@ -368,6 +389,9 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.logits_processor)
+
+    def markov_fusion_operands(self):
+        return self.model.markov_head.fusion_operands(self.logits_processor)
 
     # --- Weight loading ----------------------------------------------------
 

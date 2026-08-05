@@ -269,19 +269,28 @@ class DraftModelSpeculator(BaseSpeculator):
         )
         return attn_metadata
 
+    # Model hooks a speculator needs for the local-argmax reduction;
+    # subclasses whose selection spans different hooks override this.
+    _local_argmax_hooks: tuple[str, ...] = ("get_top_tokens",)
+
     def _validate_local_argmax_reduction(self) -> None:
         if not self.use_local_argmax_reduction:
             return
         if self.speculative_config.draft_sample_method == "probabilistic":
             raise ValueError(
                 "use_local_argmax_reduction is not compatible with "
-                "draft_sample_method='probabilistic'."
+                "draft_sample_method='probabilistic': verification needs whole "
+                "processed logit rows, which is exactly what the reduction "
+                "avoids materializing."
             )
-        if not hasattr(self.model, "get_top_tokens"):
+        missing = [
+            name for name in self._local_argmax_hooks if not hasattr(self.model, name)
+        ]
+        if missing:
             raise ValueError(
                 "use_local_argmax_reduction is enabled but draft model "
                 f"{self.model.__class__.__name__} does not implement "
-                "get_top_tokens()."
+                f"{', '.join(missing)}()."
             )
         logger.info(
             "Using local argmax reduction for draft token generation "

@@ -16,8 +16,17 @@ from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.distributed.communication_op import (
+    tensor_model_parallel_all_reduce,
+)
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.model_executor.kernels.mhc.ar_int8 import (
+    ar_hoisted,
+    assert_hoist_preconditions,
+    int8_all_reduce,
+    use_int8_for,
+)
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
     mhc_fused_post_pre_tilelang,
@@ -680,6 +689,10 @@ class DeepseekV4MoE(nn.Module):
         self.physical_expert_start = self.experts_start_idx
         self.physical_expert_end = self.experts_end_idx
 
+        # One predicate owns both halves of the hoist: the sites suppressed here
+        # must be exactly the sites the decoder layer re-adds.
+        hoisted = ar_hoisted(vllm_config)
+
         self.experts = FusedMoEFactory(
             shared_experts=self.shared_experts,
             gate=self.gate,
@@ -699,7 +712,23 @@ class DeepseekV4MoE(nn.Module):
             enable_eplb=parallel_config.enable_eplb,
             num_redundant_experts=eplb_config.num_redundant_experts,
             is_sequence_parallel=self.use_sequence_parallel,
+            reduce_results=not hoisted,
         )
+
+        if hoisted:
+            # Verify the RESOLVED outcome, never predict it. skip_final_all_reduce
+            # is a four-term conjunction (fused_moe/layer.py:232-237) and
+            # reduce_results=False is necessary but not sufficient -- expert or
+            # sequence parallelism silently defeats it, which would leave the MoE
+            # reducing a tensor the decoder layer also reduces (a double
+            # all-reduce: wrong values, no crash).
+            assert_hoist_preconditions(
+                vllm_config,
+                moe_config=self.experts.moe_config,
+                routed_output_transform=getattr(
+                    self.experts, "routed_output_transform", None
+                ),
+            )
 
     def forward(
         self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None
@@ -778,6 +807,24 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     """
     backend = vllm_config.attention_config.backend
     device_capability = current_platform.get_device_capability()
+    if device_capability is not None and device_capability.major == 8:
+        if backend is not None and (
+            backend != AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4
+        ):
+            raise ValueError(
+                f"{backend.name} is not supported for DeepSeek V4 on SM8x; "
+                "use TRITON_MLA_SPARSE_DSV4 (default)."
+            )
+        if vllm_config.attention_config.use_fp4_indexer_cache:
+            raise ValueError(
+                "attention_config.use_fp4_indexer_cache requires SM100; "
+                "the MXFP4 indexer kernels emit Blackwell-only PTX."
+            )
+        from vllm.models.deepseek_v4.ampere.ampere_sparse import (
+            DeepseekV4AmpereMLAAttention,
+        )
+
+        return DeepseekV4AmpereMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
@@ -825,6 +872,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
+        # Same predicate function as the MoE and wo_b halves -- one source of
+        # truth, evaluated per construction site. This layer re-adds exactly the
+        # all-reduces those two suppressed.
+        self._ar_hoisted = ar_hoisted(vllm_config)
         self.hidden_size = config.hidden_size
         self.use_sequence_parallel = _use_sequence_parallel(vllm_config)
 
@@ -896,6 +947,31 @@ class DeepseekV4DecoderLayer(nn.Module):
             requires_grad=False,
         )
 
+    def _hoisted_all_reduce(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Re-add the all-reduce suppressed at construction.
+
+        Returns (x, None) for the bf16 path and (codes, scales) for the int8
+        path. Once hoisted, EVERY forward must reduce here -- decode included --
+        because reduce_results was decided at construction, before any token
+        count existed.
+
+        `x` is passed through untouched: any reshape/view/.contiguous()/slice
+        before the reduction can flip is_weak_contiguous or change nbytes and
+        silently re-dispatch to a different communicator with a different
+        reduction order and no crash.
+        """
+        if not self._ar_hoisted:
+            return x, None
+        # Discriminator from shapes only, never values: the bf16 custom-AR
+        # warm-up (CustomAllreduce.custom_all_reduce's non-capturing branch)
+        # returns uninitialised memory, so a value-derived branch could
+        # diverge across ranks.
+        if use_int8_for(x):
+            return int8_all_reduce(x)
+        return tensor_model_parallel_all_reduce(x), None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -904,7 +980,23 @@ class DeepseekV4DecoderLayer(nn.Module):
         post_mix: torch.Tensor | None = None,
         res_mix: torch.Tensor | None = None,
         residual: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x_scales: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Returns (x, residual, post_mix, res_mix, x_scales).
+
+        ``x_scales`` carries the int8 all-reduce's per-block scales alongside
+        ``x`` when VLLM_MHC_AR_INT8 hoists the reduction (task #35); it is None
+        on the bf16 path, which is every decode step and every flag-off run.
+        It is part of the return contract because the FFN-side reduced tensor
+        crosses the layer boundary -- the NEXT layer's mhc_fused_post_pre is its
+        consumer, so the codes and their scales have to travel together.
+        """
         attn_norm_weight = self.attn_norm.weight.data
         attn_norm_eps = self.attn_norm.variance_epsilon
         if residual is None:
@@ -958,6 +1050,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 tile_n=1,
                 norm_weight=attn_norm_weight,
                 norm_eps=attn_norm_eps,
+                x_scales=x_scales,
             )
 
         if self.use_sequence_parallel:
@@ -966,6 +1059,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         x = self.attn(positions, x, None)
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
+        x, x_scales = self._hoisted_all_reduce(x)
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
@@ -986,10 +1080,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             tile_n=1,
             norm_weight=ffn_norm_weight,
             norm_eps=ffn_norm_eps,
+            x_scales=x_scales,
         )
 
         x = self.ffn(x, input_ids)
-        return x, residual, post_mix, res_mix
+        x, x_scales = self._hoisted_all_reduce(x)
+        return x, residual, post_mix, res_mix, x_scales
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
@@ -1158,24 +1254,28 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = sp_shard(input_ids)
 
         residual, post_mix, res_mix = None, None, None
+        # Carries the int8 all-reduce's block scales across the layer boundary;
+        # None on every bf16 path (all decode, and every flag-off run).
+        x_scales: torch.Tensor | None = None
         aux_hidden_states: list[torch.Tensor] = []
         final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
-            hidden_states, residual, post_mix, res_mix = layer(
+            hidden_states, residual, post_mix, res_mix, x_scales = layer(
                 hidden_states,
                 positions,
                 input_ids,
                 post_mix,
                 res_mix,
                 residual,
+                x_scales,
             )
             if idx + 1 in self.aux_hidden_state_layers:
                 # Reconstruct the aux hidden state for draft models
                 aux_recon = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                    hidden_states, residual, post_mix, res_mix, x_scales=x_scales
                 )
                 aux_hidden_state = aux_recon.mean(dim=1)
                 if self.use_sequence_parallel:
@@ -1188,7 +1288,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = final_aux_recon
             else:
                 hidden_states = mhc_post_tilelang(
-                    hidden_states, residual, post_mix, res_mix
+                    hidden_states, residual, post_mix, res_mix, x_scales=x_scales
                 )
 
         if not get_pp_group().is_last_rank:
@@ -1539,10 +1639,16 @@ class DeepseekV4ForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
-        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def process_weights_after_loading(self) -> None:
+        # Model-level post-load hook: runs for every loader, including
+        # DummyModelLoader, which never calls load_weights(). Per-layer input
+        # GEMM fusion runs in the loader's AttentionLayerBase pass instead
+        # (DeepseekV4Attention.process_weights_after_loading), which wraps it
+        # in device_loading_context.
         self.model.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
-        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
