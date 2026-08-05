@@ -107,3 +107,54 @@ def test_explicit_anthropic_client_overrides_respected(monkeypatch):
     backend_kwargs = _StubRLM.captured_kwargs["backend_kwargs"]
     assert backend_kwargs["timeout"] == 45.0
     assert backend_kwargs["max_retries"] == 1
+
+
+def test_root_max_tokens_per_turn_defaults_to_a_real_cap(monkeypatch):
+    """Confirmed real-hardware bug (2026-08-05): with no max_tokens cap on
+    the root's own completion calls, a non-terminating generation can run
+    for as long as the server allows (nvidia-smi showed 100% GPU util for
+    the full 900s hard-timeout duration on a real stuck sample) -- the
+    default here must actually be a real, finite number, not None/uncapped."""
+    monkeypatch.setattr(evidence_rlm_module, "RLM", _StubRLM)
+
+    evidence_rlm_module.run_evidence_extraction(
+        "s1", "find it", "ctx", guardrails={}, root_backend="anthropic", api_key="fake-key", log_dir=None
+    )
+
+    sampling_args = _StubRLM.captured_kwargs["sampling_args"]
+    assert sampling_args == {"max_tokens": evidence_rlm_module._DEFAULT_ROOT_MAX_TOKENS_PER_TURN}
+    assert evidence_rlm_module._DEFAULT_ROOT_MAX_TOKENS_PER_TURN > 0
+
+
+def test_root_max_tokens_per_turn_explicit_override_respected(monkeypatch):
+    monkeypatch.setattr(evidence_rlm_module, "RLM", _StubRLM)
+
+    evidence_rlm_module.run_evidence_extraction(
+        "s1",
+        "find it",
+        "ctx",
+        guardrails={},
+        root_backend="anthropic",
+        api_key="fake-key",
+        root_max_tokens_per_turn=1234,
+        log_dir=None,
+    )
+
+    assert _StubRLM.captured_kwargs["sampling_args"] == {"max_tokens": 1234}
+
+
+def test_root_max_tokens_per_turn_none_opts_out_uncapped(monkeypatch):
+    monkeypatch.setattr(evidence_rlm_module, "RLM", _StubRLM)
+
+    evidence_rlm_module.run_evidence_extraction(
+        "s1",
+        "find it",
+        "ctx",
+        guardrails={},
+        root_backend="anthropic",
+        api_key="fake-key",
+        root_max_tokens_per_turn=None,
+        log_dir=None,
+    )
+
+    assert _StubRLM.captured_kwargs["sampling_args"] is None

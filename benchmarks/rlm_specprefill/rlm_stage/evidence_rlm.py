@@ -103,6 +103,30 @@ DEFAULT_MODEL_NAME = "claude-haiku-4-5-20251001"  # matches quickstart_anthropic
 _DEFAULT_VLLM_CLIENT_TIMEOUT_S = 300.0
 _DEFAULT_VLLM_CLIENT_MAX_RETRIES = 0
 
+# Confirmed real-hardware bug (2026-08-05): raising the client timeout above
+# didn't fix samples still hanging to the full 900s hard-kill at 50K-token
+# S-NIAH contexts -- nvidia-smi showed 100% GPU utilization for the entire
+# duration (ruling out both a stuck exec() -- would show 0% GPU -- and a
+# network/queue stall -- the client timeout would have fired). 100% GPU for
+# 900s straight is the signature of RUNAWAY GENERATION: RLM's own
+# constructor accepts a top-level `sampling_args` param that gets forwarded
+# as the ROOT model's per-call sampling kwargs (rlm/core/rlm.py:117-127),
+# and this module never set one -- meaning root completion calls had NO
+# max_tokens cap at all, inheriting whatever the underlying
+# openai.chat.completions.create(...) call defaults to when max_tokens/
+# max_completion_tokens isn't passed (effectively "generate until EOS or
+# until hitting the server's own max context length" on vLLM's
+# OpenAI-compatible server). If the model fails to naturally terminate on a
+# given turn (a real, known failure mode, more likely on agentic/REPL-style
+# turns over large contexts), that single completion call can run for as
+# long as the server allows, burning real GPU compute the whole time --
+# guardrails.yaml's own `max_tokens: 4000000` does NOT protect against this,
+# since that caps CUMULATIVE tokens across the whole call tree, not a single
+# turn's own generation length. Capped here at a value generous enough for
+# a REPL code block + short reasoning (this task's actual turns), but far
+# short of "until the model happens to stop or hits max_model_len."
+_DEFAULT_ROOT_MAX_TOKENS_PER_TURN = 4096
+
 
 def load_guardrails(path: Path = DEFAULT_GUARDRAILS_PATH) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
@@ -161,6 +185,7 @@ def run_evidence_extraction(
     root_base_url: str | None = None,
     root_client_timeout_s: float | None = None,
     root_client_max_retries: int | None = None,
+    root_max_tokens_per_turn: int | None = _DEFAULT_ROOT_MAX_TOKENS_PER_TURN,
     log_dir: Path | None = DEFAULT_LOG_DIR,
     verbose: bool = False,
 ) -> EvidenceResult:
@@ -190,6 +215,15 @@ def run_evidence_extraction(
     why) unless explicitly overridden; for `root_backend='anthropic'`
     they're left at the client's own default (300s/2 retries) unless
     explicitly passed, since that path has never shown this failure mode.
+
+    `root_max_tokens_per_turn` caps a single root-model turn's own
+    generation length (see `_DEFAULT_ROOT_MAX_TOKENS_PER_TURN`'s own
+    comment for why this matters -- a real, observed runaway-generation
+    failure mode, distinct from and not fixed by the client timeout above).
+    Applied for BOTH backends (unlike the vllm-only client-timeout
+    defaults) since an uncapped turn is a real risk regardless of backend,
+    even though it's only been observed against the self-hosted root so
+    far. Pass `None` to opt out entirely (uncapped, the old behavior).
     """
     if root_backend == "anthropic":
         if api_key is None:
@@ -236,6 +270,10 @@ def run_evidence_extraction(
 
     logger = RLMLogger(log_dir=str(log_dir)) if log_dir else None
 
+    sampling_args = (
+        {"max_tokens": root_max_tokens_per_turn} if root_max_tokens_per_turn is not None else None
+    )
+
     rlm_instance = RLM(
         backend=root_backend,
         backend_kwargs=backend_kwargs,
@@ -243,6 +281,7 @@ def run_evidence_extraction(
         custom_system_prompt=EVIDENCE_SYSTEM_PROMPT,
         logger=logger,
         verbose=verbose,
+        sampling_args=sampling_args,
         **guardrails,
     )
 
