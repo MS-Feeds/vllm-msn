@@ -84,11 +84,23 @@ DEFAULT_MODEL_NAME = "claude-haiku-4-5-20251001"  # matches quickstart_anthropic
 # `lm_handler.completion(...)` propagates straight out of `RLM.completion()`
 # uncaught. The real win here is turnaround speed and diagnosability: a
 # fast, loud client timeout means run_arm.py's own exception handler SKIPs
-# the sample in ~60s with a clear error instead of silently consuming the
-# sample's entire wall-clock budget on one hung HTTP call that no guardrail
-# can preempt (RLM's max_timeout is only checked between root-loop iterations,
+# the sample with a clear error instead of silently consuming the sample's
+# entire wall-clock budget on one hung HTTP call that no guardrail can
+# preempt (RLM's max_timeout is only checked between root-loop iterations,
 # never inside one -- see run_arm.py's _HARD_TIMEOUT_BUFFER_S comment).
-_DEFAULT_VLLM_CLIENT_TIMEOUT_S = 60.0
+#
+# 60s -> 300s (2026-08-05): the 60s value was too aggressive in practice --
+# even tiny 500-1000-token S-NIAH contexts were timing out at a ~50% rate
+# against the self-hosted Qwen3-Coder-480B root, consistent with genuine
+# request queuing/contention on that single vllm serve instance (e.g. from
+# guardrails.yaml's max_concurrent_subcalls=4 firing several parallel
+# sub-calls at one server) rather than a stuck exec()/infinite loop (which
+# wouldn't produce a clean APITimeoutError). 300s matches BaseLM's own
+# DEFAULT_TIMEOUT -- the fix that matters is keeping max_retries=0 (below),
+# which is what actually removes the 900s (3x300s) worst case; the timeout
+# value itself doesn't need to be shorter than the client's normal default,
+# just not silently retried on top of it.
+_DEFAULT_VLLM_CLIENT_TIMEOUT_S = 300.0
 _DEFAULT_VLLM_CLIENT_MAX_RETRIES = 0
 
 
