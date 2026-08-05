@@ -60,6 +60,37 @@ RLM_DOTENV_PATH = THIS_DIR.parent / "rlm" / ".env"
 
 DEFAULT_MODEL_NAME = "claude-haiku-4-5-20251001"  # matches quickstart_anthropic.py
 
+# Confirmed real-hardware bug (2026-08-05): rlm's BaseLM.DEFAULT_TIMEOUT is
+# 300s (../../rlm/rlm/clients/base_lm.py), and neither OpenAIClient nor
+# AnthropicClient overrides the underlying SDK's own default max_retries
+# (2, both openai-python and anthropic-python) -- worst case for a single
+# stuck LM call: (1 + 2 retries) x 300s = 900s, which matched EXACTLY the
+# hard-timeout ceiling observed against a self-hosted Qwen3-Coder-480B root
+# over 150K-500K-token S-NIAH contexts (every sample was reaching precisely
+# that ceiling, not a spread of times -- the signature of a silent
+# client-level retry-and-rewait chain, not legitimate multi-turn search
+# that would vary sample to sample). Hosted Claude essentially never
+# approaches a 300s single-request timeout, so this retry path is
+# effectively invisible for root_backend='anthropic' -- these defaults are
+# only applied for 'vllm' below, where a queued/overloaded self-hosted
+# server is a real, observed risk, not a hypothetical one.
+#
+# NOTE this does NOT make a stuck call internally retried/recovered by RLM
+# itself -- confirmed by reading rlm/core/rlm.py's completion() loop
+# directly: the only exception handler around the whole iteration loop is
+# `except KeyboardInterrupt`, and guardrails.yaml's own `max_errors`
+# threshold (`_check_iteration_limits`) only counts REPL/code-execution
+# stderr errors, never LM-completion-call exceptions -- an exception from
+# `lm_handler.completion(...)` propagates straight out of `RLM.completion()`
+# uncaught. The real win here is turnaround speed and diagnosability: a
+# fast, loud client timeout means run_arm.py's own exception handler SKIPs
+# the sample in ~60s with a clear error instead of silently consuming the
+# sample's entire wall-clock budget on one hung HTTP call that no guardrail
+# can preempt (RLM's max_timeout is only checked between root-loop iterations,
+# never inside one -- see run_arm.py's _HARD_TIMEOUT_BUFFER_S comment).
+_DEFAULT_VLLM_CLIENT_TIMEOUT_S = 60.0
+_DEFAULT_VLLM_CLIENT_MAX_RETRIES = 0
+
 
 def load_guardrails(path: Path = DEFAULT_GUARDRAILS_PATH) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
@@ -116,6 +147,8 @@ def run_evidence_extraction(
     model_name: str = DEFAULT_MODEL_NAME,
     api_key: str | None = None,
     root_base_url: str | None = None,
+    root_client_timeout_s: float | None = None,
+    root_client_max_retries: int | None = None,
     log_dir: Path | None = DEFAULT_LOG_DIR,
     verbose: bool = False,
 ) -> EvidenceResult:
@@ -137,6 +170,14 @@ def run_evidence_extraction(
     `api_key` is ignored for this backend -- vLLM's OpenAI-compatible
     server doesn't validate keys, but the underlying `openai` SDK still
     requires a non-empty string, so a placeholder is always sent.
+
+    `root_client_timeout_s`/`root_client_max_retries` override the
+    underlying client's per-request HTTP timeout/retry count. For
+    `root_backend='vllm'`, these default to `_DEFAULT_VLLM_CLIENT_TIMEOUT_S`/
+    `_DEFAULT_VLLM_CLIENT_MAX_RETRIES` (see that constant's own comment for
+    why) unless explicitly overridden; for `root_backend='anthropic'`
+    they're left at the client's own default (300s/2 retries) unless
+    explicitly passed, since that path has never shown this failure mode.
     """
     if root_backend == "anthropic":
         if api_key is None:
@@ -163,6 +204,21 @@ def run_evidence_extraction(
         backend_kwargs = {"model_name": model_name, "base_url": root_base_url, "api_key": "EMPTY"}
     else:
         raise ValueError(f"Unknown root_backend {root_backend!r}, expected 'anthropic' or 'vllm'.")
+
+    # See _DEFAULT_VLLM_CLIENT_TIMEOUT_S's own comment for why 'vllm' gets a
+    # fast-fail default and 'anthropic' doesn't -- both remain overridable
+    # via the explicit kwargs regardless of backend.
+    resolved_timeout_s = root_client_timeout_s
+    resolved_max_retries = root_client_max_retries
+    if root_backend == "vllm":
+        if resolved_timeout_s is None:
+            resolved_timeout_s = _DEFAULT_VLLM_CLIENT_TIMEOUT_S
+        if resolved_max_retries is None:
+            resolved_max_retries = _DEFAULT_VLLM_CLIENT_MAX_RETRIES
+    if resolved_timeout_s is not None:
+        backend_kwargs["timeout"] = resolved_timeout_s
+    if resolved_max_retries is not None:
+        backend_kwargs["max_retries"] = resolved_max_retries
 
     guardrails = dict(guardrails or load_guardrails())
 
