@@ -134,6 +134,8 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
 
     all_output_tps = []
     all_total_tps = []
+    all_elapsed_times = []
+    all_qps = []
     best_row = None
 
     for rep in range(1, reps + 1):
@@ -163,13 +165,17 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
         output_tps = output_total / elapsed
         total_tps = total / elapsed
         prompt_tps = prompt_total / elapsed
+        qps = len(outputs) / elapsed
 
         all_output_tps.append(output_tps)
         all_total_tps.append(total_tps)
+        all_elapsed_times.append(elapsed)
+        all_qps.append(qps)
 
         print(
-            f"  elapsed={elapsed:.1f}s  output_tps={output_tps:.1f}  "
-            f"total_tps={total_tps:.1f}  prompt_tps={prompt_tps:.1f}",
+            f"  elapsed_time={elapsed:.1f}s  qps={qps:.2f}  "
+            f"output_tps={output_tps:.1f}  total_tps={total_tps:.1f}  "
+            f"prompt_tps={prompt_tps:.1f}",
             flush=True,
         )
 
@@ -179,6 +185,7 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
                 "output_tps": round(output_tps, 2),
                 "total_tps": round(total_tps, 2),
                 "prompt_tps": round(prompt_tps, 2),
+                "qps": round(qps, 2),
                 "elapsed_time": round(elapsed, 2),
                 "num_prompts": len(prompts),
                 "prompt_tokens_total": prompt_total,
@@ -207,6 +214,8 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
         "mean_output_tps": round(mean_output_tps, 2),
         "mean_total_tps": round(mean_total_tps, 2),
         "stdev_output_tps": round(stdev_output_tps, 2),
+        "mean_qps": round(statistics.mean(all_qps), 2),
+        "mean_elapsed_time": round(statistics.mean(all_elapsed_times), 2),
         "reps": reps,
         "num_prompts": num_prompts,
         "engine_build_time": round(engine_time, 1),
@@ -217,6 +226,8 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     print(f"\n--- RESULT ---", flush=True)
     print(f"output_tps: {mean_output_tps:.2f} ± {stdev_output_tps:.2f}", flush=True)
     print(f"total_tps: {mean_total_tps:.2f}", flush=True)
+    print(f"qps: {statistics.mean(all_qps):.2f}", flush=True)
+    print(f"elapsed_time: {statistics.mean(all_elapsed_times):.2f}s", flush=True)
 
     return result
 
