@@ -165,6 +165,29 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
             )
         return base
 
+    def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
+        """Use target-width token embeddings for Gemma4 MTP.
+
+        Gemma4's MTP pre_projection consumes a concatenation of target-model
+        embeddings and target hidden states. Its draft embedding checkpoint is
+        draft-width, so the generic base-class width guard would leave it at
+        1024 and produce a malformed 2816 + 1024 input.
+        """
+        target_model = getattr(target_language_model, "model", None)
+        target_embed = getattr(target_model, "embed_tokens", None)
+        draft_model = getattr(self.model, "model", None)
+        if target_embed is None or draft_model is None:
+            raise AttributeError(
+                "Gemma4 MTP requires target and draft embed_tokens for KV sharing."
+            )
+
+        draft_model.embed_tokens = target_embed
+        logger.info(
+            "Gemma4 MTP: sharing target embedding weights for MTP projection "
+            "(target_dim=%d).",
+            target_embed.weight.shape[-1],
+        )
+
     def _maybe_share_lm_head(self, target_language_model: nn.Module) -> None:
         """Gemma4 MTP always keeps its own draft-dim lm_head.
 
