@@ -92,6 +92,7 @@ def percentile(sorted_vals: list, q: float):
 
 def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     """Run benchmark with the given config. Returns result dict."""
+    import torch
     from vllm import LLM, SamplingParams
     from transformers import AutoTokenizer
 
@@ -120,11 +121,15 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     # Use local_files_only=True for absolute local paths (e.g. /tmp/models/...)
     # to avoid HFValidationError: Repo id must be in 'namespace/repo' form.
     _is_local = model.startswith("/") or (len(model) > 1 and model[1] == ":")
+    tokenizer_start = time.time()
     tok = AutoTokenizer.from_pretrained(
         model, trust_remote_code=True, local_files_only=_is_local
     )
+    tokenizer_load_time = time.time() - tokenizer_start
+    prompt_prepare_start = time.time()
     raw_prompts = load_prompts(num_prompts)
     prompts = render_chat(tok, raw_prompts)
+    prompt_prepare_time = time.time() - prompt_prepare_start
     print(f"Loaded {len(prompts)} prompts", flush=True)
 
     t_engine = time.time()
@@ -132,10 +137,24 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     engine_time = time.time() - t_engine
     print(f"Engine built in {engine_time:.1f}s", flush=True)
 
+    cuda_available = torch.cuda.is_available()
+    engine_memory = {}
+    if cuda_available:
+        device = torch.cuda.current_device()
+        torch.cuda.synchronize(device)
+        engine_memory = {
+            "device": torch.cuda.get_device_name(device),
+            "allocated_gib": round(torch.cuda.memory_allocated(device) / 2**30, 3),
+            "reserved_gib": round(torch.cuda.memory_reserved(device) / 2**30, 3),
+        }
+
     all_output_tps = []
     all_total_tps = []
     all_elapsed_times = []
     all_qps = []
+    all_prompt_tps = []
+    all_peak_allocated_gib = []
+    all_peak_reserved_gib = []
     best_row = None
 
     for rep in range(1, reps + 1):
@@ -147,8 +166,13 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
             ignore_eos=False,
         )
         print(f"\n--- Rep {rep}/{reps} ---", flush=True)
+        if cuda_available:
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
         t0 = time.time()
         outputs = llm.generate(prompts, sampling, use_tqdm=True)
+        if cuda_available:
+            torch.cuda.synchronize(device)
         elapsed = time.time() - t0
 
         prompt_total = 0
@@ -171,13 +195,27 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
         all_total_tps.append(total_tps)
         all_elapsed_times.append(elapsed)
         all_qps.append(qps)
+        all_prompt_tps.append(prompt_tps)
+        peak_allocated_gib = 0.0
+        peak_reserved_gib = 0.0
+        if cuda_available:
+            peak_allocated_gib = torch.cuda.max_memory_allocated(device) / 2**30
+            peak_reserved_gib = torch.cuda.max_memory_reserved(device) / 2**30
+            all_peak_allocated_gib.append(peak_allocated_gib)
+            all_peak_reserved_gib.append(peak_reserved_gib)
 
         print(
             f"  elapsed_time={elapsed:.1f}s  qps={qps:.2f}  "
             f"output_tps={output_tps:.1f}  total_tps={total_tps:.1f}  "
-            f"prompt_tps={prompt_tps:.1f}",
+            f"prompt_tps={prompt_tps:.1f}  output_tokens={output_total}",
             flush=True,
         )
+        if cuda_available:
+            print(
+                f"  peak_allocated_gib={peak_allocated_gib:.2f}  "
+                f"peak_reserved_gib={peak_reserved_gib:.2f}",
+                flush=True,
+            )
 
         if best_row is None or output_tps > best_row["output_tps"]:
             out_lens_sorted = sorted(out_lens)
@@ -187,25 +225,24 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
                 "prompt_tps": round(prompt_tps, 2),
                 "qps": round(qps, 2),
                 "elapsed_time": round(elapsed, 2),
+                "request_latency_mean_s": round(elapsed / len(outputs), 3),
+                "peak_allocated_gib": round(peak_allocated_gib, 3),
+                "peak_reserved_gib": round(peak_reserved_gib, 3),
                 "num_prompts": len(prompts),
                 "prompt_tokens_total": prompt_total,
                 "output_tokens_total": output_total,
+                "total_tokens": total,
                 "out_len_mean": round(statistics.mean(out_lens), 1),
+                "out_len_min": min(out_lens),
                 "out_len_p50": int(percentile(out_lens_sorted, 0.5)),
                 "out_len_p90": int(percentile(out_lens_sorted, 0.9)),
+                "out_len_p99": int(percentile(out_lens_sorted, 0.99)),
+                "out_len_max": max(out_lens),
             }
 
     mean_output_tps = statistics.mean(all_output_tps)
     mean_total_tps = statistics.mean(all_total_tps)
     stdev_output_tps = statistics.stdev(all_output_tps) if len(all_output_tps) > 1 else 0.0
-
-    del llm
-    gc.collect()
-    try:
-        import torch
-        torch.cuda.empty_cache()
-    except Exception:
-        pass
 
     result = {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -216,6 +253,32 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
         "stdev_output_tps": round(stdev_output_tps, 2),
         "mean_qps": round(statistics.mean(all_qps), 2),
         "mean_elapsed_time": round(statistics.mean(all_elapsed_times), 2),
+        "mean_prompt_tps": round(statistics.mean(all_prompt_tps), 2),
+        "request_latency_mean_s": round(
+            statistics.mean(all_elapsed_times) / num_prompts, 3
+        ),
+        "phase_times_s": {
+            "tokenizer_load": round(tokenizer_load_time, 2),
+            "prompt_prepare": round(prompt_prepare_time, 2),
+            "engine_build": round(engine_time, 2),
+            "generation_total": round(sum(all_elapsed_times), 2),
+            "end_to_end": round(
+                tokenizer_load_time
+                + prompt_prepare_time
+                + engine_time
+                + sum(all_elapsed_times),
+                2,
+            ),
+        },
+        "gpu_memory": {
+            **engine_memory,
+            "peak_allocated_gib": round(
+                statistics.mean(all_peak_allocated_gib), 3
+            ) if all_peak_allocated_gib else None,
+            "peak_reserved_gib": round(
+                statistics.mean(all_peak_reserved_gib), 3
+            ) if all_peak_reserved_gib else None,
+        },
         "reps": reps,
         "num_prompts": num_prompts,
         "engine_build_time": round(engine_time, 1),
@@ -228,6 +291,25 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     print(f"total_tps: {mean_total_tps:.2f}", flush=True)
     print(f"qps: {statistics.mean(all_qps):.2f}", flush=True)
     print(f"elapsed_time: {statistics.mean(all_elapsed_times):.2f}s", flush=True)
+    print(f"prompt_tps: {statistics.mean(all_prompt_tps):.2f}", flush=True)
+    print(
+        "phase_times_s: "
+        f"tokenizer_load={tokenizer_load_time:.2f} "
+        f"prompt_prepare={prompt_prepare_time:.2f} engine_build={engine_time:.2f}",
+        flush=True,
+    )
+    if all_peak_allocated_gib:
+        print(
+            "gpu_memory_gib: "
+            f"peak_allocated={statistics.mean(all_peak_allocated_gib):.2f} "
+            f"peak_reserved={statistics.mean(all_peak_reserved_gib):.2f}",
+            flush=True,
+        )
+
+    del llm
+    gc.collect()
+    if cuda_available:
+        torch.cuda.empty_cache()
 
     return result
 
