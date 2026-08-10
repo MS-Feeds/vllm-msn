@@ -89,9 +89,6 @@ def validate_config(cfg: dict) -> tuple[bool, str]:
         return False, f"max_model_len ({mml}) too small for 8192-token outputs"
 
     spec = cfg.get("spec_tokens", 0)
-    if spec > 0 and cfg.get("quantization") is None:
-        return False, "MTP requires quantization=fp8 (assistant model is FP8)"
-
     # Known crashes on A100
     moe_be = cfg.get("moe_backend", "auto")
     if moe_be == "triton":
