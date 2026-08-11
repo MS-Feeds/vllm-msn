@@ -1,0 +1,319 @@
+# Top-K KV Cache Selection for Multi-Turn Conversation — Experiment Plan
+
+Status: **new pipeline, built on top of `../spec_prefill_llama/`'s
+single-turn SpecPrefill port — code-complete but NOT run on real hardware**
+(no GPU on the machine this was written on, same caveat as every
+`spec_prefill*` pipeline in this repo). The multi-turn extension
+(`vllm_patch/speculator_worker.py`'s persistent speculator engine,
+`vllm_patch/conversation_state.py`'s absolute-position ledger) has no
+single-turn precedent to lean on, so treat it as LESS validated than the
+already-unvalidated single-turn baseline it's built on — see "Implementation
+status" below and `REPRODUCE.md`'s validation steps.
+
+| | |
+|---|---|
+| **Target model** | Llama-3.1-8B-Instruct (greedy decoding) |
+| **Speculator** | Llama-3.2-1B-Instruct |
+| **Precision** | BF16 |
+| **Infra** | vLLM (this fork, V1 engine) |
+| **Benchmark** | SCBench — `scbench_qa_eng` / `scbench_kv` / `scbench_summary` configs |
+| **Hardware** | 2x A100 80GB (per the protocol; not yet empirically confirmed necessary) |
+| **ETA** | TBD |
+
+Reference the paper in this directory (`spec_prefill_paper.pdf`, same
+SpecPrefill paper as `../spec_prefill_llama/`'s — this experiment extends
+that algorithm, it isn't a different one) and the original research
+protocol document this plan was built from (see chat history / plan file
+`protocol-top-k-kv-dreamy-panda.md` if available).
+
+---
+
+## Motivation
+
+SpecPrefill accelerates single-shot long-context prefill by using a small
+speculator model to identify important tokens and prefilling only those into
+the target model. This experiment asks whether the same idea generalizes to
+**long, growing multi-turn conversations**, where context/prompt size is the
+serving bottleneck across many sequential turns, not just once. Concretely:
+
+1. Can a speculator that "keeps its own KV cache mirroring the whole
+   [currently relevant] context" score a growing conversation cheaply --
+   each turn costing roughly a short decode/prefill step, not a full
+   re-scoring of the entire history?
+2. Does re-pruning the SAME conversation's growing context, turn after
+   turn, preserve accuracy for both the current turn's question AND
+   unrelated future questions -- i.e., does the compression generalize, or
+   does it overfit to whatever the most recent question happened to be?
+3. Two settings for what survives across turns -- **KEEP** (rescored fresh
+   from the full original history every turn) vs. **DISCARD** (the kept set
+   only ever shrinks) -- which trades accuracy for speed better, and by how
+   much? Per the protocol, KEEP is evaluated first.
+
+---
+
+## Algorithm reference
+
+Same core algorithm as `../spec_prefill_llama/EXPERIMENT_PLAN.md`'s
+"Algorithm reference" section (draft-scoring via lookahead decode →
+softmax/pool/max/mean importance aggregation → chunked top-k selection →
+sparse prefill with RoPE position restoration) -- not re-derived here. What's
+NEW for multi-turn is entirely about WHEN and WITH WHAT CANDIDATE POOL that
+algorithm runs, not the scoring math itself (`vllm_patch/scoring.py` is
+reused verbatim, unmodified).
+
+### Key architectural decisions
+
+**1. Golden-context mode.** Each turn's target generation is what gets
+graded, but the token sequence carried forward into FUTURE turns' history is
+SCBench's own reference answer, not the model's own output (matches SCBench's
+own official reference harness's default `disable_golden_context=False`
+behavior). This makes every turn's token sequence for every conversation
+knowable statically up front, enabling a tractable, batchable driver instead
+of a fully serialized "wait for generation, then build the next prompt" loop.
+A self-generated-history mode is a documented future extension
+(`predict_scbench.py`'s module docstring), not built in this pass.
+
+**2. Speculator persistence: a real, persistent `vllm.LLM()`, not a
+hand-extended scratch cache.** `vllm_patch/speculator_worker.py` runs the
+speculator as a genuine `vllm.LLM(enable_prefix_caching=True)`, wired via the
+same `worker_cls` + `collective_rpc` extension points
+`../spec_prefill_llama/vllm_patch/worker.py` already proved out for the
+TARGET model, applied here to the SPECULATOR for the first time. Each turn's
+request is submitted under a **stable per-conversation `cache_salt`**, so
+vLLM's own prefix-cache matching gives "only prefill the new tokens" for
+free -- `RequestOutput.num_cached_tokens` is logged per turn
+(`predict_scbench.py`'s CSV output) as the real, measured version of this
+claim, not an assumption. The `look_ahead_cnt` lookahead-decode steps used
+for scoring are captured via query-capture hooks installed once inside the
+Worker process (`speculator_worker.py`'s `SpeculatorGPUModelRunner`) --
+capture is switched on only AFTER the bootstrap prefill's own first token is
+observed, so (mirroring the single-turn pipeline's "discard the bootstrap's
+own capture" rule) the prefill itself is never scored.
+
+**Real, measured tradeoff, not assumed uniform across modes**: KEEP mode's
+per-turn speculator prompt is a literal, monotonic extension of the previous
+turn's (new content = previous turn's golden answer + this turn's query),
+so prefix-cache hits are expected to be large. **DISCARD mode's candidate
+pool is a COMPACTED (gap-removed) subsequence of history**, which is
+generally NOT a literal continuation of anything submitted before -- so
+DISCARD is expected to get little or no prefix-cache benefit on the
+speculator side, recomputing its (smaller) candidate pool from scratch each
+turn. This is an inherent consequence of what DISCARD mode IS (compaction
+removes literal-content continuity), not an implementation gap -- DISCARD's
+efficiency case rests on having fewer tokens to consider each turn, not on
+cache reuse. `num_cached_tokens` logged per turn is where this becomes a
+measured fact rather than a guess.
+
+**3. KEEP vs. DISCARD candidate pools** (`vllm_patch/conversation_state.py`):
+
+- **KEEP**: candidate pool at turn N = the FULL original conversation
+  history (context + every prior turn's query + golden answer), rescored
+  fresh every turn. A token dropped at turn 2 can be picked back up at turn
+  5.
+- **DISCARD**: candidate pool at turn N = turn N-1's own kept subset + turn
+  N-1's own query (now ordinary, no longer force-kept) -- monotonically
+  shrinking, never regrows. Turn N-1's golden answer is deliberately NOT
+  retained in this pool (a documented modeling choice, not an oversight --
+  see `conversation_state.py`'s docstring for the reasoning and how to
+  revisit it if DISCARD's accuracy degrades faster than expected).
+
+**RoPE positions are absolute-conversation-relative, not turn-local**:
+`vllm_patch/pruning_registry.py`'s `PruneRecord.kept_positions` (consumed,
+unmodified, by `model_runner.py`/`worker.py`) must be each kept token's
+position in the ENTIRE conversation so far, not an index into the current
+turn's own already-pruned prompt -- this is the one place a turn-2-onward
+multi-turn request differs from a single-turn one, and it's handled entirely
+upstream, in `conversation_state.py`'s append-only absolute-position ledger
+and `pruner.py`'s use of it -- `pruning_registry.py`/`model_runner.py`/
+`worker.py` themselves are copied verbatim, unchanged.
+
+**4. Force-keep.** Each turn's own new query is never subject to pruning --
+scored for signal (alongside the candidate pool) but always force-included
+in the final prompt regardless of what the scorer decided, mirroring the
+single-turn pipeline's confirmed-on-hardware fix for its own
+question/instruction suffix (`../spec_prefill_llama/predict_longbench_v2.py`'s
+documented gibberish-output bug at aggressive keep rates).
+
+**5. Oracle upper bound.** Reuses the SAME `vllm_patch/scoring.py`/
+`vllm_patch/kv_cache_utils.py` machinery, but scores using the TARGET
+model's own attention (a teacher-forced forward pass over the NEXT turn's
+already-known golden query, only possible because of golden-context mode)
+instead of the speculator's estimate -- `vllm_patch/pruner.py`'s
+`compute_oracle_kept_pairs` implements the shared scoring/selection core;
+`predict_scbench.py`'s oracle-mode driving loop (installing the query-capture
+hook on the TARGET's own attention layers) is flagged as **not yet wired up**
+in this pass -- see that script's `run_experiment`'s oracle branch.
+
+**6. KV entry granularity.** Maps directly onto the existing `chunk_size`
+parameter (`token` = flat/non-chunked selection, `16`/`32`/`64` = the
+corresponding `chunk_size`) -- no new mechanism needed.
+
+**7. Baseline methods (H2O, StreamingLLM, Quest, KVzip, HeadKV) — explicitly
+out of scope for this pass**, confirmed with the user. The natural seam for
+adding them later is `pruner.py`'s `(pruned_token_ids, kept_positions)`
+return contract -- a future baseline selector is a sibling function with the
+same return shape, not a new abstraction layer (no `BaseSelector` interface
+built now, on the theory that a real second implementation should inform its
+shape, not guesswork against zero real implementations).
+
+---
+
+## Implementation status
+
+Built directly on `../spec_prefill_llama/vllm_patch/` (Llama-3.1-8B target /
+Llama-3.2-1B speculator, the exact pair this protocol calls for):
+
+1. **Carried over unchanged**: `scoring.py`, `kv_cache_utils.py`,
+   `prefill_split.py`, `pruning_registry.py` (docstrings updated to describe
+   multi-turn absolute-position semantics; zero logic changes),
+   `model_runner.py`, `worker.py` (docstrings updated; zero logic changes --
+   the RoPE-position-override mechanism is correct as designed once
+   `PruneRecord`'s fields carry absolute conversation positions, a fix that
+   lives entirely upstream in `pruner.py`/`conversation_state.py`).
+2. **New**: `conversation_state.py` (absolute-position ledger + KEEP/DISCARD
+   candidate-pool construction -- pure Python, no vLLM dependency, fully
+   unit-tested, see `test_vllm_patch.py`), `speculator_worker.py` (persistent
+   speculator engine via `worker_cls`, query capture + KV read-back via
+   `collective_rpc` -- the least-precedented, least-validated new piece of
+   this whole port, see its own "Known risk areas" docstring section).
+3. **Rewritten**: `proposer.py` (driver-facing orchestration over the
+   persistent speculator engine, replacing the single-turn pipeline's
+   standalone-model + hand-rolled-lookahead-loop design), `pruner.py`
+   (conversation-aware: threads `conversation_state.py` through, plus a
+   shared scoring core for the oracle path), `config.py` (+1 field,
+   `keep_mode`).
+4. **Not yet wired up**: the oracle path's driving loop in
+   `predict_scbench.py` (needs a query-capture hook installed on the
+   TARGET's own attention layers, mirroring `speculator_worker.py`'s
+   speculator-side hook -- `vllm_patch/pruner.py::compute_oracle_kept_pairs`
+   is ready to consume the resulting Q/K, but nothing in `predict_scbench.py`
+   produces them yet). Run the baseline (`M000`) and SpecPrefill
+   (`M-k*-g*`) experiments first.
+5. **Multi-conversation batching -- not attempted.** Both the speculator
+   (`proposer.py`) and the target driver (`predict_scbench.py`) run ONE
+   conversation's ONE in-flight request at a time, by deliberate MVP-scope
+   choice (see each module's own docstring) -- sacrifices throughput
+   (no cross-conversation batching) for a much simpler, easier-to-validate
+   sequential driving loop. A natural follow-up once correctness is
+   confirmed on real hardware.
+
+---
+
+## SpecPrefill settings
+
+- BF16 precision
+- Chunk-based attention scoring, look-ahead count **8**, `pool_kernel_size`
+  **13** (same values as `../spec_prefill_llama/`'s matrix -- these are
+  algorithm hyperparameters, not re-derived for the multi-turn extension).
+- `enforce_eager=True` on both the target and speculator engines (same
+  `functools.partial`-hook-vs-torch.compile reasoning as the single-turn
+  pipeline, now applying to BOTH engines since the speculator is hooked
+  in-process too, not just the target).
+- `keep_mode="keep"` for the MVP sweep (protocol's "FIRST: KEEP") --
+  `discard` is implemented (`conversation_state.py`, unit-tested) but not
+  yet run as part of the default experiment matrix below.
+
+---
+
+## Experiment matrix
+
+Confirmed MVP scope (with the user): 3 SCBench configs
+(`scbench_qa_eng`/`scbench_kv`/`scbench_summary`), no baseline methods
+implemented this pass.
+
+| ID | Label | Keep rate | KV granularity | Keep mode |
+|---|---|---:|---:|---|
+| M000 | Baseline (no pruning) | 100% | — | — |
+| M-k80-g{token,16,32,64} | Keep 80% | 80% | token/16/32/64 | keep |
+| M-k60-g{token,16,32,64} | Keep 60% | 60% | token/16/32/64 | keep |
+| M-k40-g{token,16,32,64} | Keep 40% | 40% | token/16/32/64 | keep |
+| M-k20-g{token,16,32,64} | Keep 20% | 20% | token/16/32/64 | keep |
+| ORACLE-k{80,60,40,20} | Oracle upper bound | 80/60/40/20% | 32 (representative) | keep |
+
+`predict_scbench.py --list` prints this matrix (generated programmatically,
+not hand-enumerated -- see that script's `_build_experiments`).
+
+Metrics captured per turn: per-config metric (`grade_scbench.py` --
+`in_match` for `scbench_kv`, `qa_f1_score` for `scbench_qa_eng`, ROUGE-L for
+`scbench_summary`), TTFT, `num_cached_tokens` (speculator), actual keep
+rate. Broken down by `(config, turn_idx)` in grading -- the `turn_idx` axis
+is the multi-turn-specific signal (does accuracy degrade as the conversation
+lengthens?) that a single-turn benchmark never needed.
+
+`DISCARD` mode and the `ORACLE` rows' full granularity cross are natural
+next steps once `M000`/`M-k*-g*` are validated and run — not part of this
+pass's default sweep.
+
+---
+
+## Benchmark
+
+**SCBench** (arXiv:2412.10319, `microsoft/SCBench` on Hugging Face) --
+`scbench_qa_eng` (semantic retrieval / free-form QA), `scbench_kv` (string /
+exact retrieval), `scbench_summary` (global-information / summarization).
+Dataset prep (`datasets/prep_scbench.py`), prediction generation
+(`predict_scbench.py`), and grading (`grade_scbench.py`) are all new for
+this pipeline (SCBench's genuinely multi-turn structure -- 2-4 turns sharing
+one long context per row -- has no analog in the single-turn LongBench-v2
+pipelines this was built from).
+
+---
+
+## Success criteria
+
+- Score drop ≤5% (per-config metric, see `grade_scbench.py`) at each
+  keep-rate row compared to M000, broken down by `turn_idx` -- report
+  whether degradation is uniform across turns or concentrated in later
+  turns (the multi-turn-specific failure mode this whole experiment exists
+  to check for).
+- Report TTFT/throughput improvement over M000 for each keep-rate row (no
+  fixed pass/fail threshold -- the sweep itself is the signal).
+- Report the oracle rows as an accuracy ceiling reference once wired up
+  (see "Implementation status" #4).
+
+---
+
+## Resource requirements
+
+**2x A100 80GB**, per the protocol document this plan was built from. Not
+yet empirically re-derived for this specific pipeline (Llama-3.1-8B target +
+Llama-3.2-1B speculator, same combined ~9B-parameter footprint as
+`../spec_prefill_llama/`'s single-turn version, which itself estimates "likely
+fits on a single GPU" but hasn't confirmed it) -- follow the protocol's
+stated requirement rather than the single-turn sibling's smaller estimate
+until this pipeline's own validation scripts (`REPRODUCE.md` step 5) confirm
+otherwise, since the multi-turn speculator's growing, long-lived KV cache
+(vs. the single-turn pipeline's per-call throwaway one) is a real, new
+memory-footprint variable that estimate didn't have to account for.
+
+**ETA**: TBD
+
+---
+
+## References
+
+- [SpecPrefill: Turbocharging TTFT with Lightweight and Training-Free Token Importance Estimation](https://arxiv.org/abs/2502.02789) (ICML 2025)
+- [SCBench: A KV Cache-Centric Analysis of Long-Context Methods](https://arxiv.org/pdf/2412.10319)
+- `microsoft/SCBench` (Hugging Face) / `microsoft/MInference` (GitHub, `scbench/` -- reference harness `eval_utils.py`'s metric functions ported into `grade_scbench.py`)
+- `../spec_prefill_llama/EXPERIMENT_PLAN.md` -- the single-turn pipeline this was built on top of
+- `../spec_prefill_llama/REPRODUCE.md` -- environment setup this pipeline's own `REPRODUCE.md` follows the same conventions as
+
+---
+
+## Files in this directory
+
+| File | Purpose |
+|---|---|
+| `EXPERIMENT_PLAN.md` | This file |
+| `README.md` | Overview / index |
+| `REPRODUCE.md` | Environment setup + reproduction steps |
+| `.env_exports.sh` | Local env config (model paths, HF token) |
+| `vllm_patch/` | The multi-turn Algorithm 1 implementation -- see its own `__init__.py` module map for the copied/new/rewritten breakdown |
+| `test_vllm_patch.py` | Unit tests -- engine-agnostic pieces + `conversation_state.py` (no GPU needed) |
+| `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
+| `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
+| `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
+| `predict_scbench.py` | Runs the M000/M-k*-g*/ORACLE-k* matrix, writes a per-turn predictions JSONL per experiment |
+| `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
+| `datasets/` | SCBench prep output (gitignored) |
+| `results/` | Output directory (gitignored) |
