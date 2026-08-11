@@ -33,6 +33,7 @@ from vllm_patch.conversation_state import ConversationState
 from vllm_patch.kv_cache_utils import (
     _find_kv_split_dim,
     gather_keys_for_slots,
+    stack_decode_only_steps,
     tensor_from_wire,
     tensor_to_wire,
 )
@@ -158,6 +159,65 @@ def test_tensor_wire_roundtrip_empty_tensor():
     restored = tensor_from_wire(tensor_to_wire(original))
     assert restored.shape == original.shape
     assert restored.dtype == original.dtype
+
+
+def test_stack_decode_only_steps_drops_single_bootstrap_entry():
+    """Regression guard for a real bug found on real hardware: capture used
+    to be enabled reactively (in response to observed output progress),
+    which raced against EngineCore's own autonomous stepping and silently
+    dropped real decode steps (requested look_ahead_cnt=8, actually captured
+    6). Fixed by always capturing from before add_request and filtering the
+    bootstrap's own entry out by SHAPE here instead of by timing -- this
+    test exercises that filter directly (no GPU/engine needed)."""
+    HD = 16
+    bootstrap = torch.randn(5, HD)  # 5-token prefill chunk -- must be dropped
+    decode_steps = [torch.randn(1, HD) for _ in range(8)]
+    steps = [bootstrap] + decode_steps
+
+    result = stack_decode_only_steps(steps, hidden_dim_fallback=HD)
+    assert result.shape == (1, 8, HD)
+    for i, expected in enumerate(decode_steps):
+        assert torch.equal(result[0, i], expected[0])
+
+
+def test_stack_decode_only_steps_drops_multiple_leading_chunks():
+    """Chunked prefill: several multi-token entries can precede real decode
+    -- not just a single bootstrap entry. Filtering by shape (not "drop
+    index 0") must handle this regardless of how many chunks preceded."""
+    HD = 8
+    chunk1 = torch.randn(10, HD)
+    chunk2 = torch.randn(7, HD)
+    decode_steps = [torch.randn(1, HD) for _ in range(3)]
+    steps = [chunk1, chunk2] + decode_steps
+
+    result = stack_decode_only_steps(steps, hidden_dim_fallback=HD)
+    assert result.shape == (1, 3, HD)
+
+
+def test_stack_decode_only_steps_no_decode_steps_returns_empty():
+    """Bootstrap-only (e.g. immediate EOS on the bootstrap's own candidate
+    token) -- zero decode steps captured, must return an empty tensor with
+    the right hidden dim, not crash on torch.stack([])."""
+    HD = 12
+    steps = [torch.randn(4, HD)]  # only a prefill chunk, no decode at all
+    result = stack_decode_only_steps(steps, hidden_dim_fallback=HD)
+    assert result.shape == (1, 0, HD)
+
+
+def test_stack_decode_only_steps_no_prefill_chunk_all_decode():
+    """Degenerate case: the entire prompt was already prefix-cache-hit, so
+    even the "bootstrap" forward call is itself a genuine 1-token decode
+    step -- no multi-token entry to filter out at all. Must not
+    special-case this away."""
+    HD = 4
+    decode_steps = [torch.randn(1, HD) for _ in range(5)]
+    result = stack_decode_only_steps(list(decode_steps), hidden_dim_fallback=HD)
+    assert result.shape == (1, 5, HD)
+
+
+def test_stack_decode_only_steps_empty_input():
+    result = stack_decode_only_steps([], hidden_dim_fallback=6)
+    assert result.shape == (1, 0, 6)
 
 
 def test_gather_keys_for_slots():

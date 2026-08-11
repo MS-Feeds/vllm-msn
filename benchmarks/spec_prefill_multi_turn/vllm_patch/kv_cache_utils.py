@@ -171,6 +171,43 @@ def tensor_from_wire(d: dict) -> torch.Tensor:
     return flat.reshape(d["shape"])
 
 
+def stack_decode_only_steps(
+    steps: List[torch.Tensor], hidden_dim_fallback: int
+) -> torch.Tensor:
+    """Pure-tensor core of `speculator_worker.py`'s `SpeculatorGPUModelRunner
+    .end_capture` bootstrap-exclusion logic -- lives here (not in
+    `speculator_worker.py`, which imports vLLM at module level and so can't
+    be imported without vLLM's full runtime installed) specifically so it's
+    unit-testable without a live `GPUModelRunner` or a GPU at all -- see
+    `end_capture`'s own docstring for the full reasoning behind filtering by
+    shape rather than by capture timing (a real race, confirmed on hardware,
+    that an earlier "reactively enable capture" design had), and
+    `test_vllm_patch.py` for the CPU-only tests this enables.
+
+    Args:
+        steps: one request's raw per-forward-call captured query slices for
+            ONE layer, in call order -- each `[num_tokens_this_step, H*D]`.
+            May include leading multi-token entries (prefill / prefill-
+            continuation chunks) before any number of single-token decode
+            entries; may also be empty (nothing ever captured) or contain
+            only multi-token entries (request ended before any real decode
+            step, e.g. bootstrap-only + immediate EOS).
+        hidden_dim_fallback: H*D to use for the returned empty tensor's last
+            dim when there are no decode-shaped entries to infer it from.
+
+    Returns:
+        `[1, num_decode_steps, H*D]` -- only the entries where
+        `step.shape[0] == 1` survive, stacked in original order along a new
+        dim 1 (matching the shape `scoring.compute_attention_score` expects,
+        num_samples=1). `[1, 0, hidden_dim_fallback]` if no decode-shaped
+        entries exist.
+    """
+    decode_steps = [s for s in steps if s.shape[0] == 1]
+    if decode_steps:
+        return torch.stack(decode_steps, dim=1)
+    return torch.empty(1, 0, hidden_dim_fallback)
+
+
 def retrieve_keys_per_sample(
     attn_layer,
     block_size: int,

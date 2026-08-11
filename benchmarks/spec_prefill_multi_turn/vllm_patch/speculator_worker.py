@@ -119,7 +119,12 @@ import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
-from .kv_cache_utils import gather_keys_for_slots, read_layer_keys, tensor_to_wire
+from .kv_cache_utils import (
+    gather_keys_for_slots,
+    read_layer_keys,
+    stack_decode_only_steps,
+    tensor_to_wire,
+)
 
 
 def _conversation_salt_from_request_id(request_id: str) -> Optional[str]:
@@ -220,27 +225,83 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             )
 
     def begin_capture(self, request_id: str) -> None:
+        """Must be called BEFORE `add_request` for this `request_id`, not
+        reactively in response to observing the request's own progress.
+
+        **Confirmed on real hardware, a second real occurrence of a race
+        already documented once in this codebase (`pruner.py`'s "Correction
+        #2"): `EngineCore` runs its own autonomous stepping loop, decoupled
+        from the driver's own `step()` calls.** An earlier version of this
+        method's caller (`proposer.py::run_turn`) called `begin_capture`
+        REACTIVELY -- inside the driver's stepping loop, in response to
+        first observing the bootstrap prefill's own output token -- on the
+        theory that this correctly excludes the bootstrap from capture (the
+        same goal the single-turn pipeline achieves by discarding a buffer
+        instead). That reasoning silently assumed EngineCore only advances
+        when the driver calls `step()`. It doesn't: by the time the
+        driver's blocking `collective_rpc("begin_capture", ...)` round-trip
+        actually lands and takes effect inside THIS process, EngineCore may
+        have already run several more decode steps in the background,
+        which were never captured -- confirmed exactly this shape of bug on
+        real hardware (`look_ahead_cnt=8` requested, generation genuinely
+        ran the full length, only 6 steps captured -- 2 decode steps
+        silently missed between "driver observed token 1" and "begin_capture
+        actually took effect").
+
+        Fixed the same way `pruner.py`'s analogous race was fixed: register
+        BEFORE the request can be scheduled at all (before `add_request`),
+        so there is no window for EngineCore to run ahead uncaptured.
+        Capturing now starts from the request's very first forward call
+        (the bootstrap prefill itself) -- `end_capture` is responsible for
+        excluding that entry from the returned decode-only stack (see its
+        own docstring), not this method.
+        """
         self._capturing_request_ids.add(request_id)
         self._query_buffer[request_id] = [[] for _ in self._hooked_layers]
 
     def end_capture(self, request_id: str) -> List[torch.Tensor]:
         """Stops capturing for `request_id` and returns its per-layer
-        captured queries, each stacked to [1, num_captured_steps, H*D] --
-        num_captured_steps may be less than look_ahead_cnt if the request
-        ended early (EOS). Moved to CPU before returning -- collective_rpc
-        results cross a process boundary; a CUDA tensor's storage isn't
-        valid to reconstruct in the driver process's own (different) CUDA
-        context, and the tensors here are small (bounded by
-        look_ahead_cnt * num_layers * hidden_size) so the CPU copy is cheap
-        relative to the forward passes that produced them."""
+        captured DECODE-ONLY queries, each stacked to [1,
+        num_captured_decode_steps, H*D] -- num_captured_decode_steps may be
+        less than look_ahead_cnt if the request ended early (EOS or
+        max_tokens).
+
+        Since `begin_capture` now runs before the request even exists (see
+        that method's docstring), every one of this request's forward
+        calls gets captured, INCLUDING the bootstrap prefill's own -- which
+        must be excluded here, not by timing. The bootstrap's own capture
+        is NOT reliably "just the first entry": if the new-suffix being
+        prefilled this turn is long enough to need more than one scheduler
+        step (chunked prefill), there could be several leading multi-token
+        entries before real single-token decode begins. Filtering by SHAPE
+        (keep only entries whose captured-token count is exactly 1) is
+        robust to this regardless of how many prefill chunks preceded
+        decode -- every genuine decode step captures exactly 1 new token's
+        query; every prefill/prefill-continuation step captures more than 1
+        (or, in the degenerate case where the entire prompt was already
+        prefix-cache-hit and the very first forward call IS a 1-token
+        decode step, there is no multi-token entry to filter out at all,
+        which this same rule handles correctly with no special-casing).
+
+        Moved to CPU before returning -- collective_rpc results cross a
+        process boundary; a CUDA tensor's storage isn't valid to
+        reconstruct in the driver process's own (different) CUDA context,
+        and the tensors here are small (bounded by look_ahead_cnt *
+        num_layers * hidden_size) so the CPU copy is cheap relative to the
+        forward passes that produced them."""
         self._capturing_request_ids.discard(request_id)
         per_layer_steps = self._query_buffer.pop(request_id, None)
         if per_layer_steps is None:
             return [torch.empty(1, 0, 0) for _ in self._hooked_layers]
-        return [
-            torch.stack(steps, dim=1).to("cpu") if steps else torch.empty(1, 0, 0)
-            for steps in per_layer_steps
-        ]
+
+        result = []
+        for layer_idx, steps in enumerate(per_layer_steps):
+            hidden_dim_fallback = (
+                self._hooked_layers[layer_idx].num_heads
+                * self._hooked_layers[layer_idx].head_dim
+            )
+            result.append(stack_decode_only_steps(steps, hidden_dim_fallback).to("cpu"))
+        return result
 
     def _capture_queries_by_request(self, layer_idx: int, q: torch.Tensor) -> None:
         if not self._capturing_request_ids:

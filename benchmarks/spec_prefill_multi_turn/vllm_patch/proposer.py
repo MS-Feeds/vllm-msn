@@ -7,13 +7,17 @@ entirely) and manually drove a fixed-shape lookahead loop against a
 throwaway per-call dummy KV cache. This version runs the speculator as a
 genuine persistent `vllm.LLM(enable_prefix_caching=True)` (see
 `speculator_worker.py`'s module docstring for the full "why a real engine"
-reasoning) -- this class's job is reduced to: submit one request per turn,
-detect when that request's bootstrap prefill has finished (so query capture
-can be switched on for exactly the lookahead decode steps, not the prefill
-itself -- mirroring the single-turn pipeline's "discard the bootstrap's own
-capture" rule, just achieved by *timing* the RPC call instead of discarding
-a buffer), and retrieve the resulting Q/K via `collective_rpc` into
-`speculator_worker.py`'s `SpeculatorWorker`.
+reasoning) -- this class's job is reduced to: submit one request per turn
+(registering capture BEFORE `add_request`, not reactively -- see
+`speculator_worker.py::begin_capture`'s docstring for a real race this
+fixes), drive it to completion, and retrieve the resulting Q/K via
+`collective_rpc` into `speculator_worker.py`'s `SpeculatorWorker`, which is
+responsible for excluding the bootstrap prefill's own capture from the
+returned decode-only stack (by shape, not by capture timing -- see
+`speculator_worker.py::end_capture`'s docstring) -- mirroring the
+single-turn pipeline's "discard the bootstrap's own capture" rule, just
+implemented as a filter on the way out instead of a timing gate on the way
+in.
 
 ## Why the speculator never needs a RoPE-position override (unlike the target)
 
@@ -213,6 +217,21 @@ class SpecPrefillProposer:
         from vllm.inputs import TokensPrompt
 
         request_id = f"{conversation_salt}::turn{turn_idx}"
+
+        # Register capture BEFORE add_request -- NOT reactively, in response
+        # to observed output progress, as an earlier version of this method
+        # did. Confirmed on real hardware: EngineCore runs its own
+        # autonomous stepping loop, decoupled from the driver's own step()
+        # calls, so a reactive begin_capture can miss steps that already ran
+        # in the background before the RPC round-trip lands (a second real
+        # occurrence of the exact race pruner.py's "Correction #2" already
+        # documents and fixes the same way -- see
+        # speculator_worker.py::begin_capture's docstring for the full
+        # history and speculator_worker.py::end_capture's docstring for how
+        # the bootstrap prefill's own (now-always-captured) entry gets
+        # excluded on the way out instead of by capture timing).
+        self.llm_engine.collective_rpc("begin_capture", args=(request_id,))
+
         prompt = TokensPrompt(
             prompt_token_ids=full_sequence_token_ids, cache_salt=conversation_salt
         )
@@ -226,7 +245,6 @@ class SpecPrefillProposer:
             f"import time) but got {real_request_id!r} back instead."
         )
 
-        capturing = False
         num_cached_tokens = 0
         final_output = None
         # Same "never break early / never abort" discipline as
@@ -246,30 +264,12 @@ class SpecPrefillProposer:
                 final_output = output
                 if output.num_cached_tokens:
                     num_cached_tokens = output.num_cached_tokens
-                if not capturing and len(output.outputs[0].token_ids) >= 1:
-                    # The forward pass that just produced this first token
-                    # (the bootstrap prefill's own next-token prediction)
-                    # has already happened WITHOUT capture enabled -- this
-                    # is what makes capture start "after the bootstrap",
-                    # the same rule the single-turn pipeline enforces by
-                    # discarding a buffer instead. Every step from here
-                    # onward is a genuine one-new-token decode step.
-                    self.llm_engine.collective_rpc("begin_capture", args=(request_id,))
-                    capturing = True
 
-        # Diagnostic, not (yet) a hard assertion -- confirmed on real
-        # hardware that actual_look_ahead_cnt can come back short even with
-        # ignore_eos=True (still under investigation, see EXPERIMENT_PLAN.md/
-        # this method's own issue tracking). This print exists to pin down
-        # WHICH of the two candidate root causes it actually is: if
-        # total_generated is also short (< 1 + look_ahead_cnt), the request
-        # itself stopped early -- check finish_reason (a real EOS despite
-        # ignore_eos would mean ignore_eos isn't reaching SamplingParams as
-        # intended; "length" would mean something is capping max_tokens/
-        # max_model_len below what was requested). If total_generated is
-        # the full 1 + look_ahead_cnt but the CAPTURED step count is still
-        # short, the bug is in query capture itself (_capture_queries_by_
-        # request silently missing some steps), not in generation length.
+        # Diagnostic, not a hard assertion -- still worth surfacing if
+        # generation itself stopped short of the requested length (distinct
+        # from end_capture's own decode-step count, which is now expected to
+        # match generation length exactly since capture timing is no longer
+        # the limiting factor -- see speculator_worker.py::end_capture).
         if final_output is not None:
             total_generated = len(final_output.outputs[0].token_ids)
             if total_generated != 1 + look_ahead_cnt:
@@ -279,8 +279,11 @@ class SpecPrefillProposer:
                     f"{1 + look_ahead_cnt} = 1 bootstrap + {look_ahead_cnt} "
                     f"lookahead), finish_reason="
                     f"{final_output.outputs[0].finish_reason!r}, "
-                    f"ignore_eos={ignore_eos} -- see this method's docstring "
-                    f"comment just above this print for how to interpret this."
+                    f"ignore_eos={ignore_eos} -- if finish_reason is 'stop' "
+                    f"despite ignore_eos=True, ignore_eos isn't reaching "
+                    f"SamplingParams as intended; if 'length', something is "
+                    f"capping max_tokens/max_model_len below what was "
+                    f"requested."
                 )
 
         # collective_rpc returns one result per worker (TP ranks) -- this
