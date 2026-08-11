@@ -2,20 +2,21 @@
 """Prepares SCBench samples for the multi-turn Top-K KV Cache Selection sweep
 (see ../EXPERIMENT_PLAN.md). SCBench (arXiv:2412.10319, `microsoft/SCBench`
 on Hugging Face) is a genuinely MULTI-TURN benchmark: each row is one long
-shared context plus a list of 2-4 sequential turns (question + reference
-answer, and for multiple-choice configs, options) -- unlike
+shared context plus a list of sequential turns (question + reference answer,
+and for multiple-choice configs, options) -- unlike
 `../../spec_prefill_llama/datasets/prep_longbench_v2.py`'s LongBench-v2
 loader, this script writes ONE ROW PER CONTEXT, not one row per question,
 because a conversation's turns are not independent samples (turn N's prompt
 depends on turns 1..N-1 -- see ../vllm_patch/conversation_state.py).
 
-Schema (confirmed directly against the live `microsoft/SCBench` dataset
-card on Hugging Face, not assumed -- see REPRODUCE.md for how to
-re-verify): each row is `{"id": int, "context": str, "multi_turns": [{"input":
-str, "answer": str, "options": [str, ...]}, ...]}`, 2-4 turns per row.
-`options` is only meaningful for multiple-choice configs (e.g.
-scbench_choice_eng); empty/absent for free-form QA/retrieval/summarization
-configs.
+Schema: each row is `{"id": int, "context": str, "multi_turns": [{"input":
+str, "answer": str, "options": [str, ...]}, ...]}`. **Confirmed empirically
+(2026-08-11, real `prep_scbench.py` run against all 3 MVP configs): exactly
+5 turns per row, uniformly** -- NOT the HF dataset card's stated "2-4 turns"
+(that description was wrong, or described a different SCBench release; see
+`_EXPECTED_MIN_TURNS`/`_EXPECTED_MAX_TURNS` below, now set to 5). `options`
+is only meaningful for multiple-choice configs (e.g. scbench_choice_eng);
+empty/absent for free-form QA/retrieval/summarization configs.
 
 Per the approved plan's confirmed MVP scope, this script loads 3
 representative configs (out of SCBench's 12), one per capability area:
@@ -55,13 +56,14 @@ DEFAULT_OUTPUT = Path(__file__).parent / "scbench_samples.jsonl"
 DEFAULT_CONFIGS = ["scbench_qa_eng", "scbench_kv", "scbench_summary"]
 
 _REQUIRED_FIELDS = ["id", "context", "multi_turns"]
-# NOT enforced as a hard filter (see build_scbench_samples) -- the HF
-# dataset card describes "2-4 turns per row" but this was confirmed wrong
-# for at least scbench_summary in practice (a real run: 70/70 rows had a
-# turn count outside this range, silently dropping the entire config).
-# Kept only as the threshold for a loud warning, not a skip.
-_EXPECTED_MIN_TURNS = 2
-_EXPECTED_MAX_TURNS = 4
+# NOT enforced as a hard filter (see build_scbench_samples) -- kept only as
+# the threshold for a loud warning, not a skip, since the HF dataset card's
+# stated "2-4 turns per row" was already confirmed wrong once (a real run
+# against scbench_summary: 70/70 rows fell outside that range). Set to 5/5
+# per a confirmed real run across all 3 MVP configs (2026-08-11): every row,
+# every config, has exactly 5 turns.
+_EXPECTED_MIN_TURNS = 5
+_EXPECTED_MAX_TURNS = 5
 
 
 def _resolve_hf_token(explicit: str | None) -> str | None:

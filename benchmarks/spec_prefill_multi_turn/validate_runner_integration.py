@@ -66,15 +66,29 @@ def _install_position_capture_hook(model):
 
 
 def main() -> None:
+    import os
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target-model", required=True)
-    parser.add_argument("--speculator-model", required=True)
+    parser.add_argument(
+        "--target-model",
+        default=os.environ.get("LLAMA31_8B_MODEL_PATH"),
+        help="Defaults to $LLAMA31_8B_MODEL_PATH (see .env_exports.sh).",
+    )
+    parser.add_argument(
+        "--speculator-model",
+        default=os.environ.get("LLAMA32_1B_MODEL_PATH"),
+        help="Defaults to $LLAMA32_1B_MODEL_PATH (see .env_exports.sh).",
+    )
     parser.add_argument("--target-device", default="cuda:0")
     parser.add_argument("--speculator-device", default="cuda:1")
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument("--look-ahead-cnt", type=int, default=8)
     args = parser.parse_args()
+    if not args.target_model:
+        parser.error("--target-model or $LLAMA31_8B_MODEL_PATH is required (source .env_exports.sh first)")
+    if not args.speculator_model:
+        parser.error("--speculator-model or $LLAMA32_1B_MODEL_PATH is required (source .env_exports.sh first)")
 
     import torch
     from transformers import AutoTokenizer

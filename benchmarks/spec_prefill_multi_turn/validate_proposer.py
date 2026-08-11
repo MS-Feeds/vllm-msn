@@ -60,12 +60,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 
 def main() -> None:
+    import os
+
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Speculator model path (Llama-3.2-1B)")
+    parser.add_argument(
+        "--model",
+        default=os.environ.get("LLAMA32_1B_MODEL_PATH"),
+        help="Speculator model path (Llama-3.2-1B). Defaults to $LLAMA32_1B_MODEL_PATH "
+             "(see .env_exports.sh) -- pass explicitly to override.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.3)
     parser.add_argument("--look-ahead-cnt", type=int, default=8)
     args = parser.parse_args()
+    if not args.model:
+        parser.error("--model or $LLAMA32_1B_MODEL_PATH is required (source .env_exports.sh first)")
 
     import torch
 

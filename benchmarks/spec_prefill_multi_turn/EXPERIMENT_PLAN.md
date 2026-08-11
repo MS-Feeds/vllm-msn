@@ -253,9 +253,10 @@ pass's default sweep.
 exact retrieval), `scbench_summary` (global-information / summarization).
 Dataset prep (`datasets/prep_scbench.py`), prediction generation
 (`predict_scbench.py`), and grading (`grade_scbench.py`) are all new for
-this pipeline (SCBench's genuinely multi-turn structure -- 2-4 turns sharing
-one long context per row -- has no analog in the single-turn LongBench-v2
-pipelines this was built from).
+this pipeline (SCBench's genuinely multi-turn structure -- confirmed
+empirically as exactly 5 turns sharing one long context per row, across all
+3 MVP configs, not the HF dataset card's stated "2-4" -- has no analog in
+the single-turn LongBench-v2 pipelines this was built from).
 
 ---
 
