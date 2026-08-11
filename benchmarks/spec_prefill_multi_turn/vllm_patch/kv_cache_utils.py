@@ -130,6 +130,47 @@ def gather_keys_for_slots(
     return flat_keys[slot_mapping.to(flat_keys.device)]
 
 
+def tensor_to_wire(t: torch.Tensor) -> dict:
+    """Plain-Python-native (dict of str/list) encoding for a tensor that
+    needs to cross `collective_rpc`'s process boundary.
+
+    **Confirmed on real hardware**: a `torch.Tensor` returned directly as
+    (or nested inside) a `collective_rpc` RPC-method's return value does
+    NOT round-trip as a `Tensor` in this fork -- it comes back as a bare
+    nested Python list, silently losing dtype/shape metadata
+    (`AttributeError: 'list' object has no attribute 'to'` at the call
+    site). Root cause, traced through `vllm/v1/serial_utils.py`'s
+    `MsgpackEncoder.enc_hook`: utility/collective_rpc results are wrapped in
+    a `UtilityResult`, whose encoding only emits the type information needed
+    to reconstruct nested tensors on decode when
+    `envs.VLLM_ALLOW_INSECURE_SERIALIZATION` is set (`_encode_type_info_
+    recursive(result)`); without it (the default, and not something this
+    package should depend on toggling just to move Q/K tensors around) it
+    encodes as `(None, result)` -- no type info, so the decoder has no way
+    to know a deeply-nested value was ever a `Tensor` rather than a
+    plain list.
+
+    Encoding explicitly here (dtype string + shape + a flat Python list of
+    values) sidesteps that flag entirely -- this is plain, unambiguous
+    msgpack-native data (str/int/float/list), no custom type hook needed on
+    either side of the RPC boundary. Reconstruct with `tensor_from_wire`.
+    """
+    t = t.detach().to("cpu")
+    return {
+        "dtype": str(t.dtype).removeprefix("torch."),
+        "shape": list(t.shape),
+        "data": t.flatten().tolist(),
+    }
+
+
+def tensor_from_wire(d: dict) -> torch.Tensor:
+    """Inverse of `tensor_to_wire` -- reconstructs a CPU tensor with the
+    original dtype and shape from its plain-Python-native encoding."""
+    dtype = getattr(torch, d["dtype"])
+    flat = torch.tensor(d["data"], dtype=dtype)
+    return flat.reshape(d["shape"])
+
+
 def retrieve_keys_per_sample(
     attn_layer,
     block_size: int,

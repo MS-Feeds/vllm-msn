@@ -30,7 +30,12 @@ import torch
 
 from vllm_patch.config import SpecConfig
 from vllm_patch.conversation_state import ConversationState
-from vllm_patch.kv_cache_utils import _find_kv_split_dim, gather_keys_for_slots
+from vllm_patch.kv_cache_utils import (
+    _find_kv_split_dim,
+    gather_keys_for_slots,
+    tensor_from_wire,
+    tensor_to_wire,
+)
 from vllm_patch.prefill_split import split_prefill_decode_requests
 from vllm_patch import pruning_registry
 from vllm_patch.pruning_registry import PruneRecord
@@ -126,6 +131,33 @@ def test_kv_split_dim_triton_layout():
     kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_size)
     split_dim = _find_kv_split_dim(FakeTritonBackend, kv_cache, block_size, num_kv_heads, head_size)
     assert split_dim == 1
+
+
+def test_tensor_wire_roundtrip_preserves_shape_dtype_values():
+    """Regression guard for a real bug found on real hardware: a raw
+    torch.Tensor returned through collective_rpc silently degrades to a
+    bare nested list (AttributeError: 'list' object has no attribute 'to'
+    at the call site) -- see kv_cache_utils.tensor_to_wire's docstring.
+    Doesn't exercise collective_rpc itself (no vLLM engine here), just the
+    encode/decode round-trip these RPC boundaries are built on."""
+    original = torch.randn(3, 4, 5, dtype=torch.bfloat16)
+    wire = tensor_to_wire(original)
+    assert isinstance(wire, dict)
+    assert wire["dtype"] == "bfloat16"
+    assert wire["shape"] == [3, 4, 5]
+    assert isinstance(wire["data"], list)
+
+    restored = tensor_from_wire(wire)
+    assert restored.shape == original.shape
+    assert restored.dtype == original.dtype
+    assert torch.equal(restored, original)
+
+
+def test_tensor_wire_roundtrip_empty_tensor():
+    original = torch.empty(1, 0, 8, dtype=torch.float32)
+    restored = tensor_from_wire(tensor_to_wire(original))
+    assert restored.shape == original.shape
+    assert restored.dtype == original.dtype
 
 
 def test_gather_keys_for_slots():

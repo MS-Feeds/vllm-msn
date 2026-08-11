@@ -72,6 +72,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .kv_cache_utils import gather_keys_for_slots  # noqa: F401  (re-exported for callers that want the raw utility)
+from .kv_cache_utils import tensor_from_wire
 
 # Same reasoning/placement as the single-turn pipeline's pruner.py: must be
 # set before any add_request() call reads it. Both the speculator's and the
@@ -237,8 +238,12 @@ class SpecPrefillProposer:
 
         # collective_rpc returns one result per worker (TP ranks) -- this
         # pipeline is TP=1 only (see module docstring), so unwrap index 0.
-        query_buffer_cpu = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
-        query_buffer = [q.to(self.device) for q in query_buffer_cpu]
+        # Wire-decode -- see kv_cache_utils.tensor_from_wire's docstring:
+        # SpeculatorWorker.end_capture returns plain dicts, not raw Tensors
+        # (collective_rpc doesn't preserve Tensor type across the process
+        # boundary in this fork, confirmed on real hardware).
+        query_buffer_wire = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
+        query_buffer = [tensor_from_wire(q).to(self.device) for q in query_buffer_wire]
         actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
         return query_buffer, actual_look_ahead_cnt, num_cached_tokens
 
@@ -249,10 +254,10 @@ class SpecPrefillProposer:
         tensors on `self.device`, for LOCAL positions within
         `conversation_salt`'s own speculator prompt (see module docstring's
         "Local positions vs. absolute conversation positions")."""
-        keys_cpu = self.llm_engine.collective_rpc(
+        keys_wire = self.llm_engine.collective_rpc(
             "retrieve_keys", args=(conversation_salt, local_positions)
         )[0]
-        return [k.to(self.device) for k in keys_cpu]
+        return [tensor_from_wire(k).to(self.device) for k in keys_wire]
 
     def discard_conversation(self, conversation_salt: str) -> None:
         """Call once a whole conversation (not just one turn) is finished,
