@@ -368,7 +368,7 @@ def run_specprefill(
 
 
 def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
-    from transformers import AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
     from vllm_patch.config import SpecConfig
 
@@ -383,14 +383,46 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     conversations = load_conversations(args.samples, args.max_conversations)
     tok = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
 
+    # Clamp both max_num_batched_tokens and max_model_len to the checkpoint's
+    # own native max_position_embeddings -- ported from the single-turn
+    # pipeline's predict_longbench_v2.py (a real failure this fixes, not a
+    # defensive guess): vLLM's own ModelConfig validation rejects a
+    # user-specified max_model_len that exceeds the checkpoint's derived
+    # ceiling outright (confirmed: --target-max-num-batched-tokens's default
+    # 131072 + --max-tokens's default 64 = 131136, 64 over Llama-3.1-8B's
+    # native 131072, on the very first M000 smoke test).
+    # VLLM_ALLOW_LONG_MAX_MODEL_LEN would bypass this, but is NOT safe for a
+    # RoPE model (positions beyond the trained range produce NaN, per vLLM's
+    # own error message) -- not used here, same reasoning as the single-turn
+    # pipeline. A single request can never need a batched-token budget larger
+    # than the model's own max context anyway, so clamping only
+    # max_model_len while leaving max_num_batched_tokens larger would be
+    # internally inconsistent, not a real fix -- both are clamped together.
+    native_max_model_len = AutoConfig.from_pretrained(
+        args.target_model, trust_remote_code=True
+    ).max_position_embeddings
+    target_max_num_batched_tokens = args.target_max_num_batched_tokens
+    if native_max_model_len is not None and target_max_num_batched_tokens > native_max_model_len:
+        print(
+            f"[predict_scbench] --target-max-num-batched-tokens "
+            f"({target_max_num_batched_tokens}) exceeds {args.target_model}'s "
+            f"native max_position_embeddings ({native_max_model_len}) -- "
+            f"clamping down to it."
+        )
+        target_max_num_batched_tokens = int(native_max_model_len)
+
+    max_model_len = target_max_num_batched_tokens + args.max_tokens
+    if native_max_model_len is not None:
+        max_model_len = min(max_model_len, int(native_max_model_len))
+
     llm_kwargs = dict(
         model=args.target_model,
         trust_remote_code=True,
         enforce_eager=True,
         disable_log_stats=False,
         gpu_memory_utilization=args.target_gpu_memory_utilization,
-        max_num_batched_tokens=args.target_max_num_batched_tokens,
-        max_model_len=args.target_max_num_batched_tokens + args.max_tokens,
+        max_num_batched_tokens=target_max_num_batched_tokens,
+        max_model_len=max_model_len,
     )
     if mode != "baseline":
         llm_kwargs["worker_cls"] = "vllm_patch.worker.SpecPrefillWorker"
@@ -464,7 +496,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "pool_kernel_size": POOL_KERNEL_SIZE if mode != "baseline" else None,
                 "target_gpu_memory_utilization": args.target_gpu_memory_utilization,
                 "speculator_gpu_memory_utilization": args.speculator_gpu_memory_utilization if mode != "baseline" else None,
-                "target_max_num_batched_tokens": args.target_max_num_batched_tokens,
+                "target_max_num_batched_tokens": target_max_num_batched_tokens,
                 "rep": rep, "seed": 0, "max_tokens": args.max_tokens,
                 "num_conversations": len(conversations),
                 "num_turns": len(predictions),
