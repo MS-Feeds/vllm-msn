@@ -83,6 +83,7 @@ Usage:
     python3 predict_scbench.py --list
     python3 predict_scbench.py --exp M000 --max-conversations 2   # smoke test
     python3 predict_scbench.py --exp M000,M-k80-g32,M-k20-gtoken
+    python3 predict_scbench.py --exp specprefill   # all 16 M-k*-g* rows, no baseline
 """
 
 from __future__ import annotations
@@ -767,7 +768,16 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--exp", help="Comma-separated experiment IDs (see --list)")
+    parser.add_argument(
+        "--exp",
+        help="Comma-separated experiment IDs (see --list), or one of the "
+             "group keywords 'specprefill' (all M-k*-g* rows, i.e. "
+             "everything except M000 baseline -- ORACLE-k* rows are NOT "
+             "included, since that mode isn't wired up yet) or 'all' "
+             "(every defined experiment, including the not-yet-implemented "
+             "ORACLE-k* rows, which will fail and be reported, not silently "
+             "skipped).",
+    )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
     parser.add_argument("--target-model", default=os.environ.get("LLAMA31_8B_MODEL_PATH"))
     parser.add_argument("--speculator-model", default=os.environ.get("LLAMA32_1B_MODEL_PATH"))
@@ -809,7 +819,22 @@ def main() -> None:
         parser.error("--target-model or $LLAMA31_8B_MODEL_PATH is required")
 
     ensure_csv_header()
-    exp_ids = [x.strip() for x in args.exp.split(",")]
+    # Two convenience group keywords, alongside the normal comma-separated
+    # explicit-id list -- "specprefill" is what you want for "everything
+    # except baseline" in practice: it's every implemented, non-baseline
+    # experiment (the 16 M-k*-g* rows). "all" includes the ORACLE-k* rows
+    # too, which are NOT wired up yet (predict_scbench.py's oracle branch
+    # raises NotImplementedError) -- included for completeness, not because
+    # it's expected to succeed; each failure is caught per-experiment (see
+    # the try/except below) and reported at the end, not fatal to the rest
+    # of the sweep.
+    exp_arg = args.exp.strip().lower()
+    if exp_arg == "specprefill":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "specprefill"]
+    elif exp_arg == "all":
+        exp_ids = list(EXPERIMENTS.keys())
+    else:
+        exp_ids = [x.strip() for x in args.exp.split(",")]
     failed_exp_ids = []
     for exp_id in exp_ids:
         if exp_id not in EXPERIMENTS:

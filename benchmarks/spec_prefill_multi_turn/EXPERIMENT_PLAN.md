@@ -152,6 +152,23 @@ measured fact rather than a guess.
   see `conversation_state.py`'s docstring for the reasoning and how to
   revisit it if DISCARD's accuracy degrades faster than expected).
 
+  **Not yet realized in code**: because DISCARD's kept-token sequence is a
+  genuine monotonic extension turn-to-turn (unlike KEEP's, which can
+  legitimately reselect a different subset each turn), its TARGET-side
+  prompt is, in principle, eligible for the same kind of cross-turn
+  prefix-cache reuse the speculator already gets (decision #2 above). The
+  current implementation does not realize this: `vllm_patch/pruner.py`'s
+  `prune_and_add_turn` sets `cache_salt=request_id`, unconditionally unique
+  PER TURN regardless of `keep_mode` -- correct and necessary for KEEP
+  (a stale partial cache match across turns could silently serve WRONG
+  content, since the kept subset can genuinely differ turn to turn), but
+  leaves DISCARD's own theoretical reuse benefit unrealized too, since the
+  same per-turn-unique salt applies to both modes today. Not a blocker for
+  the current KEEP-only MVP sweep, but a real, scoped fix needed (make
+  `cache_salt` mode-aware: `conversation_salt`-based for `discard`,
+  per-turn for `keep`) before DISCARD mode is actually implemented and run
+  -- flagged here rather than silently assumed to already work.
+
 **RoPE positions are absolute-conversation-relative, not turn-local**:
 `vllm_patch/pruning_registry.py`'s `PruneRecord.kept_positions` (consumed,
 unmodified, by `model_runner.py`/`worker.py`) must be each kept token's
