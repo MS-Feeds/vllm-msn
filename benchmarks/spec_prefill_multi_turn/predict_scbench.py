@@ -101,6 +101,34 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))  # for `vllm_patch` imports
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    # tqdm is a transitive dependency of vLLM itself (used for its own
+    # model-loading progress bars), so this should always resolve in this
+    # pipeline's real environment -- fallback only so a missing tqdm
+    # degrades to "no progress bar" instead of crashing a run that could
+    # otherwise take over an hour (a real baseline sweep against SCBench's
+    # up-to-~3M-character contexts). Must duck-type .set_postfix()/.write()
+    # too (not just be iterable), since run_baseline/run_specprefill call
+    # both on whatever this returns -- a bare `return iterable` here would
+    # crash the very degraded-mode fallback this exists to keep working.
+    class _NoOpProgress:
+        def __init__(self, iterable):
+            self._iterable = iterable
+
+        def __iter__(self):
+            return iter(self._iterable)
+
+        def set_postfix(self, **kwargs):
+            pass
+
+        def write(self, message):
+            print(message)
+
+    def tqdm(iterable, **kwargs):
+        return _NoOpProgress(iterable)
+
 OUT_DIR = Path(os.environ.get("BENCH_RESULTS_DIR", "results"))
 OUT_DIR.mkdir(exist_ok=True)
 CSV_PATH = OUT_DIR / "all_runs.csv"
@@ -310,14 +338,16 @@ def run_baseline(
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
               "num_skipped_too_large": 0}
 
-    for conv in conversations:
+    progress = tqdm(conversations, desc="M000 baseline", unit="conv")
+    for conv in progress:
+        progress.set_postfix(turns=len(predictions), skipped=stats["num_skipped_too_large"])
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
 
             prospective_len = state.total_len + len(query_ids) + wrapper_len
             if prospective_len > target_max_num_batched_tokens:
-                print(
+                progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
                     f"from turn {turn_idx} onward: full (unpruned) prompt "
                     f"length {prospective_len} exceeds "
@@ -418,14 +448,18 @@ def run_specprefill(
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
               "num_skipped_too_large": 0}
 
-    for conv in conversations:
+    keep_pct = spec_config.keep_kwargs.get("percentage")
+    desc = f"SpecPrefill keep={keep_pct}"
+    progress = tqdm(conversations, desc=desc, unit="conv")
+    for conv in progress:
+        progress.set_postfix(turns=len(predictions), skipped=stats["num_skipped_too_large"])
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
 
             prospective_speculator_len = state.total_len + len(query_ids)
             if prospective_speculator_len > speculator_max_num_batched_tokens:
-                print(
+                progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
                     f"from turn {turn_idx} onward: full (unpruned) "
                     f"candidate-pool length {prospective_speculator_len} "
@@ -441,7 +475,7 @@ def run_specprefill(
             prompt_ids = chat_before_ids + result.pruned_token_ids + chat_after_ids
 
             if len(prompt_ids) > target_max_num_batched_tokens:
-                print(
+                progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
                     f"from turn {turn_idx} onward: pruned prompt length "
                     f"{len(prompt_ids)} still exceeds "
