@@ -103,7 +103,34 @@ class SpecPrefillProposer:
         pipeline's speculator: `@support_torch_compile`-wrapped forward
         can't trace through the `functools.partial`-wrapped query-capture
         hook installed in `speculator_worker.py`.
+
+        **GPU placement.** `vllm.LLM()`/`EngineArgs` in this fork has no
+        `device=` constructor kwarg at all -- confirmed the hard way on real
+        hardware (`TypeError: EngineArgs.__init__() got an unexpected
+        keyword argument 'device'`), not assumed; an earlier version of this
+        method passed one, which was simply wrong. GPU placement in this
+        fork is controlled entirely via `CUDA_VISIBLE_DEVICES`, applied per
+        Worker process (confirmed against `vllm/platforms/cuda.py`'s own
+        `device_control_env_var = "CUDA_VISIBLE_DEVICES"`) -- the same
+        mechanism the single-turn pipeline's `predict_longbench_v2.py` uses
+        for its OWN speculator placement, just via `torch.cuda.set_device(...)`
+        beforehand there (valid for its `get_model()`-based standalone
+        loading, which follows torch's *current* device with no engine/
+        subprocess involved at all). That trick doesn't apply here: this
+        `LLM(...)` call spawns its own out-of-process `EngineCore` (see
+        `speculator_worker.py`'s module docstring), which only reads
+        `CUDA_VISIBLE_DEVICES` from the environment it's spawned INTO, not
+        from the parent driver process's `torch.cuda`-current-device state
+        at any later point. So: temporarily override `CUDA_VISIBLE_DEVICES`
+        in THIS process's environment for the duration of this one
+        (synchronous, blocks until the engine + model are fully loaded)
+        `LLM(...)` call, then restore it -- scoped narrowly so it doesn't
+        affect the TARGET model's own, separately-constructed `LLM()` in the
+        same driver process (which must see its own GPU correctly,
+        regardless of construction order relative to this one).
         """
+        import os
+
         from vllm import LLM
 
         self.device = device
@@ -115,10 +142,23 @@ class SpecPrefillProposer:
             enforce_eager=True,
             disable_log_stats=False,  # needed for RequestOutput.num_cached_tokens
             gpu_memory_utilization=gpu_memory_utilization,
-            device=str(device),
         )
         llm_kwargs.update(extra_llm_kwargs)
-        self.llm = LLM(**llm_kwargs)
+
+        device_index = device.index if device.type == "cuda" else None
+        if device_index is None:
+            self.llm = LLM(**llm_kwargs)
+        else:
+            prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
+            try:
+                self.llm = LLM(**llm_kwargs)
+            finally:
+                if prev_cvd is None:
+                    os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+                else:
+                    os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+
         self.llm_engine = self.llm.llm_engine
 
     def run_turn(

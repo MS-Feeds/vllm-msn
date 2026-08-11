@@ -100,15 +100,42 @@ def main() -> None:
     from vllm_patch.pruner import compute_pruned_turn, prune_and_add_turn
 
     print(f"[validate_runner_integration] Step A: constructing target engine ({args.target_model})")
-    llm = LLM(
-        model=args.target_model,
-        trust_remote_code=True,
-        enforce_eager=True,
-        disable_log_stats=False,
-        worker_cls="vllm_patch.worker.SpecPrefillWorker",
-        gpu_memory_utilization=args.target_gpu_memory_utilization,
-        device=args.target_device,
-    )
+    # `LLM()`/`EngineArgs` has no `device=` constructor kwarg in this fork
+    # (confirmed on real hardware: TypeError -- see proposer.py's
+    # SpecPrefillProposer.__init__ docstring for the full "why" and the
+    # CUDA_VISIBLE_DEVICES-scoping fix this mirrors). Same fix here, applied
+    # inline since this is the target's own one-off LLM() construction, not
+    # something SpecPrefillProposer wraps.
+    import os
+
+    target_device_obj = torch.device(args.target_device)
+    target_device_index = target_device_obj.index if target_device_obj.type == "cuda" else None
+    if target_device_index is None:
+        llm = LLM(
+            model=args.target_model,
+            trust_remote_code=True,
+            enforce_eager=True,
+            disable_log_stats=False,
+            worker_cls="vllm_patch.worker.SpecPrefillWorker",
+            gpu_memory_utilization=args.target_gpu_memory_utilization,
+        )
+    else:
+        prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(target_device_index)
+        try:
+            llm = LLM(
+                model=args.target_model,
+                trust_remote_code=True,
+                enforce_eager=True,
+                disable_log_stats=False,
+                worker_cls="vllm_patch.worker.SpecPrefillWorker",
+                gpu_memory_utilization=args.target_gpu_memory_utilization,
+            )
+        finally:
+            if prev_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
     tok = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
 
     smoke_prompt = tok.apply_chat_template(
