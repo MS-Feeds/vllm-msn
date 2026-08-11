@@ -55,8 +55,13 @@ DEFAULT_OUTPUT = Path(__file__).parent / "scbench_samples.jsonl"
 DEFAULT_CONFIGS = ["scbench_qa_eng", "scbench_kv", "scbench_summary"]
 
 _REQUIRED_FIELDS = ["id", "context", "multi_turns"]
-_MIN_TURNS = 2
-_MAX_TURNS = 4
+# NOT enforced as a hard filter (see build_scbench_samples) -- the HF
+# dataset card describes "2-4 turns per row" but this was confirmed wrong
+# for at least scbench_summary in practice (a real run: 70/70 rows had a
+# turn count outside this range, silently dropping the entire config).
+# Kept only as the threshold for a loud warning, not a skip.
+_EXPECTED_MIN_TURNS = 2
+_EXPECTED_MAX_TURNS = 4
 
 
 def _resolve_hf_token(explicit: str | None) -> str | None:
@@ -104,24 +109,30 @@ def build_scbench_samples(
     rows: list[dict],
     max_keep: int = -1,
 ) -> list[dict]:
-    """Formats each row into {"id", "config", "context", "turns"},
-    validating the 2-4-turns-per-row invariant SCBench's own documentation
-    states rather than assuming it silently holds."""
+    """Formats each row into {"id", "config", "context", "turns"}.
+
+    Does NOT hard-filter on turn count -- a real run against
+    `scbench_summary` showed 70/70 rows falling outside the HF dataset
+    card's stated "2-4 turns" range, which would have silently dropped the
+    whole config if enforced as a skip condition. Only a genuinely empty
+    `multi_turns` (0 turns -- nothing to build a conversation from at all)
+    is treated as a bad row; any other count is kept, with the observed
+    distribution printed per config so an unexpected schema is visible
+    (loud) rather than silently discarded (see `_EXPECTED_MIN_TURNS`/
+    `_EXPECTED_MAX_TURNS`)."""
     samples: list[dict] = []
     skipped_bad_row = 0
-    skipped_turn_count = 0
+    turn_counts: list[int] = []
 
     for row in rows:
         context = (row.get("context") or "").strip()
         multi_turns = row.get("multi_turns") or []
         row_id = row.get("id")
 
-        if not context or row_id is None:
+        if not context or row_id is None or not multi_turns:
             skipped_bad_row += 1
             continue
-        if not (_MIN_TURNS <= len(multi_turns) <= _MAX_TURNS):
-            skipped_turn_count += 1
-            continue
+        turn_counts.append(len(multi_turns))
 
         turns = []
         bad_turns = False
@@ -153,8 +164,25 @@ def build_scbench_samples(
 
     print(
         f"[prep_scbench] {config_name}: loaded={len(rows)} kept={len(samples)} "
-        f"skipped_bad_row={skipped_bad_row} skipped_turn_count={skipped_turn_count}"
+        f"skipped_bad_row={skipped_bad_row}"
     )
+    if turn_counts:
+        min_t, max_t = min(turn_counts), max(turn_counts)
+        print(
+            f"[prep_scbench] {config_name}: turn counts observed -- "
+            f"min={min_t} max={max_t}"
+        )
+        if min_t < _EXPECTED_MIN_TURNS or max_t > _EXPECTED_MAX_TURNS:
+            print(
+                f"[prep_scbench] {config_name}: WARNING -- turn count range "
+                f"[{min_t}, {max_t}] falls outside the HF dataset card's "
+                f"stated {_EXPECTED_MIN_TURNS}-{_EXPECTED_MAX_TURNS} turns/row "
+                f"(not enforced as a filter, all rows kept regardless -- see "
+                f"build_scbench_samples's docstring). Worth a manual look at "
+                f"a raw row before trusting downstream results for this "
+                f"config, since it means the schema differs from what this "
+                f"script assumed when it was written."
+            )
 
     if max_keep >= 0 and len(samples) > max_keep:
         samples = samples[:max_keep]
