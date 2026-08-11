@@ -63,15 +63,50 @@ reused verbatim, unmodified).
 
 ### Key architectural decisions
 
-**1. Golden-context mode.** Each turn's target generation is what gets
-graded, but the token sequence carried forward into FUTURE turns' history is
-SCBench's own reference answer, not the model's own output (matches SCBench's
-own official reference harness's default `disable_golden_context=False`
-behavior). This makes every turn's token sequence for every conversation
-knowable statically up front, enabling a tractable, batchable driver instead
-of a fully serialized "wait for generation, then build the next prompt" loop.
-A self-generated-history mode is a documented future extension
-(`predict_scbench.py`'s module docstring), not built in this pass.
+**1. Golden-context mode, plain-text turn rendering.** Each turn's target
+generation is what gets graded, but the token sequence carried forward into
+FUTURE turns' history is SCBench's own reference answer, not the model's own
+output (matches SCBench's own official reference harness's default
+`disable_golden_context=False` behavior). This makes every turn's token
+sequence for every conversation knowable statically up front, enabling a
+tractable, batchable driver instead of a fully serialized "wait for
+generation, then build the next prompt" loop.
+
+Turns are rendered as one flattened plain-text block (`Question 1: ...
+Answer 1: ... Question 2: ...`, all inside a single chat-template user/
+assistant exchange, no role tags between individual turns) rather than real
+alternating per-turn chat messages -- confirmed (not assumed) to match
+SCBench's own official reference harness's DEFAULT evaluation mode
+(`use_chat_template=False` in `microsoft/MInference/scbench/eval_utils.py`'s
+`create_multiturn_prompt`; their `follow_up_template` differs in exact
+wording from ours but is the same structural shape), so this should be
+comparable to published SCBench numbers, not an ad hoc simplification.
+Real-run evidence (`predict_scbench.py` M000, 2026-08-11): turns 1-4 of a
+5-turn `scbench_qa_eng` conversation produced direct, on-topic answers, but
+turn 5 showed the model apparently misreading the accumulated Q&A history as
+one compound question needing re-enumeration rather than a sequence of
+already-closed exchanges -- plausibly connected to the lack of `<|eot_id|>`
+turn-closing signals in this rendering (not yet confirmed systematic across
+more conversations/turn positions).
+
+**Two settings deferred to a later pass, not built in this one:**
+
+- **Chat-template rendering** (SCBench's OWN alternative,
+  `use_chat_template=True`: each turn as a real `{"role": "user"/
+  "assistant", ...}` message) -- the more benchmark-sanctioned response to
+  the turn-5 confusion above, if it proves systematic, rather than a
+  from-scratch design. Would require real per-turn token-boundary tracking
+  in `conversation_state.py` (chat-template role/`<|eot_id|>` wrapper tokens
+  between turns would need to be tracked and excluded from
+  scoring/pruning, not just the single constant wrapper this pass tracks) --
+  a real, scoped implementation task, not a flag flip.
+- **Self-generated history** (conversation history built from the model's
+  own prior-turn completions instead of SCBench's golden reference answers,
+  `disable_golden_context=True` in SCBench's own harness) -- would remove
+  the "every turn's tokens known up front" property this pass's tractable,
+  batchable driver design depends on (see above), forcing a fully
+  serialized per-conversation execution model instead. Also a real
+  redesign, not a flag flip.
 
 **2. Speculator persistence: a real, persistent `vllm.LLM()`, not a
 hand-extended scratch cache.** `vllm_patch/speculator_worker.py` runs the

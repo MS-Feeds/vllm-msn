@@ -41,10 +41,38 @@ in the ways EXPERIMENT_PLAN.md's architectural decisions require:
    user/assistant exchange (a single chat-template wrapper, applied once
    per turn's growing prompt), with turn structure expressed in plain text
    ("Question 1: ... Answer 1: ... Question 2: ...") inside that one
-   message -- see `render_turn_pieces` below. This is a documented
-   correctness-first simplification, not an oversight; switching to real
-   multi-turn chat-role rendering is a reasonable future improvement once
-   the token-boundary bookkeeping it needs is worth the added complexity.
+   message -- see `render_turn_query`/`render_golden_answer` below.
+
+   **Not an ad hoc shortcut** -- confirmed (not assumed) to match SCBench's
+   own official reference harness's DEFAULT evaluation mode
+   (`use_chat_template=False` in
+   `microsoft/MInference/scbench/eval_utils.py`'s `create_multiturn_prompt`;
+   their `follow_up_template` differs in exact wording but is the same
+   structural shape: one open exchange, no role tags between turns), so
+   results here should be comparable to published SCBench numbers using
+   this same mode.
+
+   **Real-run evidence this has a real cost, not just a theoretical one**
+   (M000, 2026-08-11): turns 1-4 of a 5-turn `scbench_qa_eng` conversation
+   produced direct, on-topic answers, but turn 5 showed the model
+   misreading the accumulated `Question N: ... Answer N: ...` history as
+   one compound question needing re-enumeration, rather than a sequence of
+   already-closed exchanges -- plausibly connected to the lack of
+   `<|eot_id|>` turn-closing signals in this rendering (not yet confirmed
+   systematic across more conversations/turn positions; worth checking
+   before trusting later-turn accuracy numbers from a full sweep). Two
+   settings deferred to a later pass if this proves systematic, both
+   real redesigns, not flag flips -- see EXPERIMENT_PLAN.md's "Key
+   architectural decisions" #1 for the full reasoning on each:
+     - **Chat-template rendering** -- SCBench's own `use_chat_template=True`
+       alternative (real per-turn role messages), which would need
+       `conversation_state.py` to track per-turn wrapper-token boundaries,
+       not just the single constant wrapper this pass tracks.
+     - **Self-generated history** -- SCBench's own `disable_golden_context=
+       True` alternative (build future turns' history from the model's own
+       completions instead of golden answers), which would remove the
+       "every turn's tokens known up front" property this driver's
+       tractable, batchable design (see decision #1 above) depends on.
 4. **`conversation_state.ConversationState` is used uniformly across
    baseline, SpecPrefill, and oracle runs** -- even the baseline (no
    pruning) path calls `begin_turn`/`complete_turn` to keep the ledger
