@@ -238,25 +238,68 @@ def drive_single_request_to_completion(llm_engine, request_id: str):
     return latest_output
 
 
-def run_baseline(llm, tok, conversations, max_tokens, keep_mode) -> tuple[list[dict], dict]:
+def run_baseline(
+    llm, tok, conversations, max_tokens, keep_mode, target_max_num_batched_tokens
+) -> tuple[list[dict], dict]:
     """M000: plain add_request per turn, no worker_cls/proposer/pruning --
     still uses ConversationState for ledger bookkeeping (module docstring
-    #4) but keeps every candidate token unconditionally."""
+    #4) but keeps every candidate token unconditionally.
+
+    **Pre-flight length check, skip-and-report (not crash).** Ported from
+    the single-turn pipeline's `predict_longbench_v2.py::submit_baseline_
+    requests` -- a real failure this fixes, not a defensive guess: a real
+    run against SCBench (contexts up to ~3M characters) hit vLLM's own
+    hard `ValueError` for a prompt exceeding `max_model_len`, crashing the
+    ENTIRE experiment on the first oversized conversation rather than
+    skipping just that one. Baseline is EXPECTED to skip more than
+    SpecPrefill experiments (it needs the full, unpruned conversation to
+    fit; pruning exists specifically to make oversized contexts fit) -- see
+    `grade_scbench.py`'s "missing" (excluded from every score denominator,
+    not counted as wrong) vs. matched distinction, mirroring the same
+    baseline-skips-more asymmetry the single-turn pipeline's own grading
+    already accounts for.
+
+    Checked BEFORE `state.begin_turn` mutates the ledger (using
+    `state.total_len` -- the ledger length as of right before this turn's
+    query, valid to check without begin_turn's side effects) so an
+    oversized turn can be skipped cleanly, with `state` simply abandoned
+    (no partial-turn cleanup needed) -- since context only grows turn over
+    turn in baseline mode (no pruning ever shrinks it), once one turn is
+    too large every later turn in the same conversation will be too;
+    skipping the rest of that conversation rather than checking turn by
+    turn avoids paying for tokenization + a doomed size check repeatedly.
+    """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
 
     chat_before, chat_after = chat_wrapper_pieces(tok)
     chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
     chat_after_ids = tok.encode(chat_after, add_special_tokens=False)
+    wrapper_len = len(chat_before_ids) + len(chat_after_ids)
 
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
-              "actual_keep_rates": [], "num_cached_tokens_speculator": []}
+              "actual_keep_rates": [], "num_cached_tokens_speculator": [],
+              "num_skipped_too_large": 0}
 
     for conv in conversations:
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
+
+            prospective_len = state.total_len + len(query_ids) + wrapper_len
+            if prospective_len > target_max_num_batched_tokens:
+                print(
+                    f"[predict_scbench] SKIP conversation id={conv['id']!r} "
+                    f"from turn {turn_idx} onward: full (unpruned) prompt "
+                    f"length {prospective_len} exceeds "
+                    f"--target-max-num-batched-tokens="
+                    f"{target_max_num_batched_tokens} -- baseline needs the "
+                    f"whole conversation to fit, no pruning to shrink it."
+                )
+                stats["num_skipped_too_large"] += 1
+                break
+
             candidate_pool, force_keep_query = state.begin_turn(query_ids)
             full_ids = [tid for tid, _ in candidate_pool] + [tid for tid, _ in force_keep_query]
             prompt_ids = chat_before_ids + full_ids + chat_after_ids
@@ -287,26 +330,101 @@ def run_baseline(llm, tok, conversations, max_tokens, keep_mode) -> tuple[list[d
 
 
 def run_specprefill(
-    llm, tok, proposer, spec_config, conversations, max_tokens, keep_mode
+    llm,
+    tok,
+    proposer,
+    spec_config,
+    conversations,
+    max_tokens,
+    keep_mode,
+    speculator_max_num_batched_tokens,
+    target_max_num_batched_tokens,
 ) -> tuple[list[dict], dict]:
-    """M-k*-g*: SpecPrefill pruning via the speculator, per turn."""
+    """M-k*-g*: SpecPrefill pruning via the speculator, per turn.
+
+    **Two-stage length check, skip-and-report (not crash)** -- same real
+    failure `run_baseline`'s docstring describes, mirrored here with the
+    single-turn pipeline's OWN two-stage check
+    (`predict_longbench_v2.py::submit_pruned_requests`, which separately
+    checks the full unpruned prompt against the speculator's budget before
+    scoring, then the pruned result against the target's budget before
+    generating):
+
+    1. **Before `compute_pruned_turn`** (which submits the FULL candidate
+       pool + query to the speculator for scoring -- see `proposer.py`'s
+       module docstring): check `state.total_len + len(query_ids)` (the
+       KEEP-mode candidate pool size -- see note below for DISCARD) against
+       `speculator_max_num_batched_tokens`. This is the check that actually
+       matters for SCBench's huge contexts: pruning only shrinks what the
+       TARGET sees, never what the SPECULATOR must process to decide what
+       to prune in the first place.
+    2. **After pruning**, a lightweight safety net: the pruned result
+       (usually much smaller than the speculator's own budget, since it's a
+       strict subset) is checked against `target_max_num_batched_tokens`
+       too, in case that budget happens to be configured smaller than the
+       speculator's.
+
+    Either failing skips the rest of THIS conversation (same reasoning as
+    `run_baseline`: context/candidate-pool size is non-decreasing turn over
+    turn under KEEP mode, so once one turn is too large, so is every later
+    one in the same conversation).
+
+    **DISCARD-mode note**: check 1 uses `state.total_len + len(query_ids)`,
+    which is exactly the KEEP-mode candidate pool size but an OVER-estimate
+    for DISCARD mode (whose actual candidate pool is a shrunk subset) --
+    conservative/safe (might skip a turn DISCARD could have actually
+    handled) rather than wrong in the unsafe direction. Not tightened here
+    since DISCARD isn't part of this MVP's default experiment matrix (see
+    EXPERIMENT_PLAN.md).
+    """
     from vllm import SamplingParams
     from vllm_patch.pruner import PrunedTurnResult, compute_pruned_turn, prune_and_add_turn
 
     chat_before, chat_after = chat_wrapper_pieces(tok)
     chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
     chat_after_ids = tok.encode(chat_after, add_special_tokens=False)
+    wrapper_len = len(chat_before_ids) + len(chat_after_ids)
 
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
-              "actual_keep_rates": [], "num_cached_tokens_speculator": []}
+              "actual_keep_rates": [], "num_cached_tokens_speculator": [],
+              "num_skipped_too_large": 0}
 
     for conv in conversations:
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
+
+            prospective_speculator_len = state.total_len + len(query_ids)
+            if prospective_speculator_len > speculator_max_num_batched_tokens:
+                print(
+                    f"[predict_scbench] SKIP conversation id={conv['id']!r} "
+                    f"from turn {turn_idx} onward: full (unpruned) "
+                    f"candidate-pool length {prospective_speculator_len} "
+                    f"exceeds --speculator-max-num-batched-tokens="
+                    f"{speculator_max_num_batched_tokens} -- the speculator "
+                    f"must process the whole thing to score it, before any "
+                    f"pruning happens."
+                )
+                stats["num_skipped_too_large"] += 1
+                break
+
             result = compute_pruned_turn(proposer, spec_config, state, query_ids)
             prompt_ids = chat_before_ids + result.pruned_token_ids + chat_after_ids
+
+            if len(prompt_ids) > target_max_num_batched_tokens:
+                print(
+                    f"[predict_scbench] SKIP conversation id={conv['id']!r} "
+                    f"from turn {turn_idx} onward: pruned prompt length "
+                    f"{len(prompt_ids)} still exceeds "
+                    f"--target-max-num-batched-tokens="
+                    f"{target_max_num_batched_tokens} (after keeping "
+                    f"{len(result.kept_positions)}/{result.orig_len} "
+                    f"tokens) -- would hit the same upstream failure this "
+                    f"check exists to avoid."
+                )
+                stats["num_skipped_too_large"] += 1
+                break
 
             request_id = f"{conv['id']}::turn{turn_idx}"
             sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
@@ -433,6 +551,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
 
     proposer = None
     spec_config = None
+    speculator_max_num_batched_tokens = None
     if mode == "specprefill":
         import torch
         from vllm_patch.proposer import SpecPrefillProposer
@@ -446,10 +565,54 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             pool_kernel_size=POOL_KERNEL_SIZE,
             keep_mode=keep_mode,
         )
+
+        # Same clamp-to-native-ceiling reasoning as the target above --
+        # independently derived (not assumed identical to the target's, even
+        # though both are Llama-3.x checkpoints here) since a different
+        # speculator model could have a different native context window.
+        # The speculator's OWN prompt is the FULL (never-pruned) candidate
+        # pool + query (see proposer.py's module docstring) -- this is what
+        # can genuinely exceed the budget for a huge SCBench context, well
+        # before pruning ever gets a chance to shrink anything, so this
+        # budget (not the target's) is the one that determines whether a
+        # turn's SCORING pass is even possible at all.
+        speculator_native_max_model_len = AutoConfig.from_pretrained(
+            args.speculator_model, trust_remote_code=True
+        ).max_position_embeddings
+        speculator_max_num_batched_tokens = args.speculator_max_num_batched_tokens
+        if (
+            speculator_native_max_model_len is not None
+            and speculator_max_num_batched_tokens > speculator_native_max_model_len
+        ):
+            print(
+                f"[predict_scbench] --speculator-max-num-batched-tokens "
+                f"({speculator_max_num_batched_tokens}) exceeds "
+                f"{args.speculator_model}'s native max_position_embeddings "
+                f"({speculator_native_max_model_len}) -- clamping down to it."
+            )
+            speculator_max_num_batched_tokens = int(speculator_native_max_model_len)
+
+        # + LOOK_AHEAD_CNT + 1: proposer.py's run_turn submits the full
+        # candidate_pool+query as this budget's own prompt, THEN generates
+        # 1 + look_ahead_cnt more tokens (bootstrap + lookahead decode) from
+        # it INSIDE the speculator's own engine -- that generation also
+        # needs room within max_model_len, or run_turn itself would hit the
+        # same "prompt + max_tokens exceeds max_model_len" error this whole
+        # fix is about, just one level deeper (inside proposer.py instead of
+        # here).
+        speculator_max_model_len = min(
+            speculator_max_num_batched_tokens + 1 + LOOK_AHEAD_CNT,
+            int(speculator_native_max_model_len)
+            if speculator_native_max_model_len is not None
+            else speculator_max_num_batched_tokens + 1 + LOOK_AHEAD_CNT,
+        )
+
         proposer = SpecPrefillProposer(
             speculator_model_path=args.speculator_model,
             device=speculator_device,
             gpu_memory_utilization=args.speculator_gpu_memory_utilization,
+            max_num_batched_tokens=speculator_max_num_batched_tokens,
+            max_model_len=speculator_max_model_len,
         )
     elif mode == "oracle":
         raise NotImplementedError(
@@ -471,11 +634,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             t0 = time.time()
             if mode == "baseline":
                 predictions, stats = run_baseline(
-                    llm, tok, conversations, args.max_tokens, keep_mode
+                    llm, tok, conversations, args.max_tokens, keep_mode,
+                    target_max_num_batched_tokens,
                 )
             else:
                 predictions, stats = run_specprefill(
-                    llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode
+                    llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
+                    speculator_max_num_batched_tokens, target_max_num_batched_tokens,
                 )
             elapsed = time.time() - t0
 
@@ -500,7 +665,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "rep": rep, "seed": 0, "max_tokens": args.max_tokens,
                 "num_conversations": len(conversations),
                 "num_turns": len(predictions),
-                "num_skipped_too_large": 0,
+                "num_skipped_too_large": stats["num_skipped_too_large"],
                 "elapsed_time": elapsed,
                 "turns_per_second": len(predictions) / elapsed if elapsed > 0 else None,
                 "actual_keep_rate_mean": statistics.mean(stats["actual_keep_rates"]) if stats["actual_keep_rates"] else None,
@@ -548,6 +713,15 @@ def main() -> None:
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument("--target-max-num-batched-tokens", type=int, default=131072)
+    parser.add_argument(
+        "--speculator-max-num-batched-tokens", type=int, default=131072,
+        help="Clamped down to the speculator checkpoint's own native "
+             "max_position_embeddings if larger -- see run_experiment's "
+             "specprefill branch. This is the budget that actually "
+             "determines whether a huge SCBench conversation's turn can be "
+             "SCORED at all, before any pruning shrinks what the target "
+             "sees.",
+    )
     parser.add_argument("--max-tokens", type=int, default=64,
                          help="Generation cap per turn.")
     parser.add_argument("--reps", type=int, default=1)
