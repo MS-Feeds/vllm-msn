@@ -305,9 +305,7 @@ def run_specprefill(
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
-            result = compute_pruned_turn(
-                proposer, spec_config, state, query_ids, eos_token_id=tok.eos_token_id
-            )
+            result = compute_pruned_turn(proposer, spec_config, state, query_ids)
             prompt_ids = chat_before_ids + result.pruned_token_ids + chat_after_ids
 
             request_id = f"{conv['id']}::turn{turn_idx}"

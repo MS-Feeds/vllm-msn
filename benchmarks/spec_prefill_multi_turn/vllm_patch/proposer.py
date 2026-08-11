@@ -168,16 +168,31 @@ class SpecPrefillProposer:
         turn_idx: int,
         full_sequence_token_ids: List[int],
         look_ahead_cnt: int,
-        eos_token_id: Optional[int] = None,
+        ignore_eos: bool = False,
     ) -> Tuple[List[torch.Tensor], int, int]:
         """Submit one turn's full (candidate_pool + query) sequence as a
         fresh request under `conversation_salt`'s stable cache lineage,
         drive it through its bootstrap prefill (a genuine prefix-cache-hit
         short-prefill step for KEEP mode's cache-hitting portion -- see this
         module's docstring on why DISCARD mode instead recomputes from
-        scratch each turn, which is expected, not a bug) plus
+        scratch each turn, which is expected, not a bug) plus up to
         `look_ahead_cnt` lookahead decode steps, capturing queries only for
         the decode portion.
+
+        `ignore_eos` is forwarded to vLLM's own `SamplingParams` (see
+        `SpecConfig.ignore_eos` -- threaded through by `pruner.py`'s
+        `compute_pruned_turn`, not read from spec_config here, to keep this
+        class spec_config-agnostic). **This is the ONLY thing that controls
+        early stopping** -- a previous version of this method accepted an
+        `eos_token_id` parameter that looked like it did something similar
+        but was never actually referenced in the body at all (confirmed on
+        real hardware: a synthetic-token smoke test that expected exactly
+        `look_ahead_cnt` steps got fewer, because the real model legitimately
+        hit its own real EOS token partway through decoding from
+        out-of-distribution input -- `ignore_eos` not `eos_token_id` was the
+        missing piece; SamplingParams's own default already respects the
+        model's real EOS regardless of any id this method might otherwise
+        be told about).
 
         Returns:
             (query_buffer, actual_look_ahead_cnt, num_cached_tokens) --
@@ -185,12 +200,14 @@ class SpecPrefillProposer:
             tensors on `self.device` (empty steps if actual_look_ahead_cnt
             is 0 -- caller must short-circuit, same rule as the single-turn
             pipeline: aggregating over zero lookahead steps produces silent
-            NaN, not an error). `num_cached_tokens` is vLLM's own
-            already-computed count of how many of this request's prompt
-            tokens were served from the prefix cache -- log this per turn
-            (see `pruner.py`) as the real, measured "only prefill new
-            tokens" signal EXPERIMENT_PLAN.md's KEEP-mode risk note calls
-            for, rather than assuming it.
+            NaN, not an error). actual_look_ahead_cnt may be less than
+            look_ahead_cnt on real EOS (expected, not an error, unless
+            ignore_eos=True was requested -- see above). `num_cached_tokens`
+            is vLLM's own already-computed count of how many of this
+            request's prompt tokens were served from the prefix cache --
+            log this per turn (see `pruner.py`) as the real, measured "only
+            prefill new tokens" signal EXPERIMENT_PLAN.md's KEEP-mode risk
+            note calls for, rather than assuming it.
         """
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
@@ -199,7 +216,9 @@ class SpecPrefillProposer:
         prompt = TokensPrompt(
             prompt_token_ids=full_sequence_token_ids, cache_salt=conversation_salt
         )
-        sampling_params = SamplingParams(max_tokens=1 + look_ahead_cnt, temperature=0.0)
+        sampling_params = SamplingParams(
+            max_tokens=1 + look_ahead_cnt, temperature=0.0, ignore_eos=ignore_eos
+        )
         real_request_id = self.llm_engine.add_request(request_id, prompt, sampling_params)
         assert real_request_id == request_id, (
             f"expected add_request() to use request_id={request_id!r} verbatim "

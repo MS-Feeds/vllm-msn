@@ -95,23 +95,37 @@ def main() -> None:
     turn1_tokens = list(range(10, 40))  # 30 "tokens"
 
     print("[validate_proposer] Step B: running turn 1 (bootstrap conversation)")
+    # ignore_eos=True: this smoke test feeds synthetic/out-of-distribution
+    # token ids (an ascending range, not real language) as the "prompt" --
+    # a real model can legitimately produce its own real EOS token partway
+    # through decoding from nonsense input (confirmed on real hardware:
+    # exactly this happened, actual_look_ahead_cnt=6 instead of 8, on a
+    # perfectly healthy capture mechanism). Forcing ignore_eos=True makes
+    # this check deterministic (always exactly look_ahead_cnt steps) so it
+    # actually isolates the capture-timing mechanism this step exists to
+    # validate, rather than being contaminated by incidental EOS timing on
+    # meaningless input. Real sweep runs (predict_scbench.py) leave
+    # ignore_eos at SpecConfig's own default (False) -- respecting real EOS
+    # there is correct, only this synthetic smoke test wants it disabled.
     query_buffer, actual_look_ahead_cnt, num_cached_tokens = proposer.run_turn(
         conversation_salt=conversation_salt,
         turn_idx=0,
         full_sequence_token_ids=turn1_tokens,
         look_ahead_cnt=args.look_ahead_cnt,
+        ignore_eos=True,
     )
     print(
         f"[validate_proposer] Step B: actual_look_ahead_cnt={actual_look_ahead_cnt} "
-        f"(expected {args.look_ahead_cnt}, less only on early EOS), "
+        f"(expected exactly {args.look_ahead_cnt} -- ignore_eos=True above rules "
+        f"out real-EOS timing as an explanation for anything less), "
         f"num_cached_tokens={num_cached_tokens} (expected 0 -- nothing cached yet)"
     )
     assert actual_look_ahead_cnt == args.look_ahead_cnt, (
-        f"expected {args.look_ahead_cnt} lookahead steps on a fresh conversation "
-        f"with no real EOS token configured, got {actual_look_ahead_cnt} -- either "
-        f"begin_capture fired too early/late (see proposer.py's run_turn docstring "
-        f"on the exact timing this depends on) or EOS fired unexpectedly on "
-        f"synthetic token ids."
+        f"expected exactly {args.look_ahead_cnt} lookahead steps (ignore_eos=True "
+        f"rules out real EOS as the explanation), got {actual_look_ahead_cnt} -- "
+        f"begin_capture likely fired too early/late (see proposer.py's run_turn "
+        f"docstring on the exact timing this depends on), or ignore_eos isn't "
+        f"actually reaching SamplingParams."
     )
     for i, q in enumerate(query_buffer):
         assert q.shape[1] == args.look_ahead_cnt, (
@@ -128,6 +142,7 @@ def main() -> None:
         turn_idx=1,
         full_sequence_token_ids=turn2_full_sequence,
         look_ahead_cnt=args.look_ahead_cnt,
+        ignore_eos=True,
     )
     print(
         f"[validate_proposer] Step C: turn 2 num_cached_tokens={num_cached_tokens_2} "

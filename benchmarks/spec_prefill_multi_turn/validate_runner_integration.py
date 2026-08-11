@@ -197,7 +197,7 @@ def main() -> None:
 
     for turn_idx, question in enumerate(["What animal is mentioned?", "What did it jump over?"]):
         query_ids = tok.encode(f"\n\nQuestion: {question}\nAnswer:", add_special_tokens=False)
-        result = compute_pruned_turn(proposer, spec_config, state, query_ids, eos_token_id=tok.eos_token_id)
+        result = compute_pruned_turn(proposer, spec_config, state, query_ids)
         print(
             f"[validate_runner_integration] Step B: turn {turn_idx} kept "
             f"{len(result.kept_positions)}/{result.orig_len} tokens "

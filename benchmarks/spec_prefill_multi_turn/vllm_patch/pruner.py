@@ -39,7 +39,7 @@ rather than duplicating the force-keep/chunk-selection logic.
 
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 
@@ -127,13 +127,19 @@ def compute_pruned_turn(
     spec_config: SpecConfig,
     conversation_state: ConversationState,
     query_token_ids: List[int],
-    eos_token_id: Optional[int] = None,
 ) -> PrunedTurnResult:
     """Runs one turn of the speculator-based pruning path: asks
     `conversation_state` for this turn's candidate pool (KEEP/DISCARD, see
     that module), submits it to the speculator via
     `SpecPrefillProposer.run_turn`, retrieves K for the same span, scores,
     and selects.
+
+    No `eos_token_id` parameter (a previous version had one -- it was
+    silently unused, since real early-stopping is controlled entirely by
+    `SamplingParams.ignore_eos`, not any id passed around out-of-band; see
+    `proposer.py::run_turn`'s docstring for the real-hardware finding this
+    fixes). Early stopping is instead controlled by `spec_config.ignore_eos`
+    directly, threaded straight into `proposer.run_turn`.
 
     Does NOT call `conversation_state.complete_turn` -- the caller
     (`predict_scbench.py`) must do that itself once it also knows this
@@ -155,7 +161,7 @@ def compute_pruned_turn(
         turn_idx=conversation_state.turn_idx,
         full_sequence_token_ids=full_token_ids,
         look_ahead_cnt=spec_config.look_ahead_cnt,
-        eos_token_id=eos_token_id,
+        ignore_eos=spec_config.ignore_eos,
     )
 
     if actual_look_ahead_cnt == 0:
