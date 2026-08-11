@@ -228,6 +228,7 @@ class SpecPrefillProposer:
 
         capturing = False
         num_cached_tokens = 0
+        final_output = None
         # Same "never break early / never abort" discipline as
         # predict_longbench_v2.py's drive_engine_to_completion -- an
         # unconditional step() without checking has_unfinished_requests()
@@ -242,6 +243,7 @@ class SpecPrefillProposer:
                     # does -- just ignore it, it'll be driven to completion
                     # by whatever submitted it.
                     continue
+                final_output = output
                 if output.num_cached_tokens:
                     num_cached_tokens = output.num_cached_tokens
                 if not capturing and len(output.outputs[0].token_ids) >= 1:
@@ -254,6 +256,32 @@ class SpecPrefillProposer:
                     # onward is a genuine one-new-token decode step.
                     self.llm_engine.collective_rpc("begin_capture", args=(request_id,))
                     capturing = True
+
+        # Diagnostic, not (yet) a hard assertion -- confirmed on real
+        # hardware that actual_look_ahead_cnt can come back short even with
+        # ignore_eos=True (still under investigation, see EXPERIMENT_PLAN.md/
+        # this method's own issue tracking). This print exists to pin down
+        # WHICH of the two candidate root causes it actually is: if
+        # total_generated is also short (< 1 + look_ahead_cnt), the request
+        # itself stopped early -- check finish_reason (a real EOS despite
+        # ignore_eos would mean ignore_eos isn't reaching SamplingParams as
+        # intended; "length" would mean something is capping max_tokens/
+        # max_model_len below what was requested). If total_generated is
+        # the full 1 + look_ahead_cnt but the CAPTURED step count is still
+        # short, the bug is in query capture itself (_capture_queries_by_
+        # request silently missing some steps), not in generation length.
+        if final_output is not None:
+            total_generated = len(final_output.outputs[0].token_ids)
+            if total_generated != 1 + look_ahead_cnt:
+                print(
+                    f"[proposer.run_turn] DIAGNOSTIC: request {request_id!r} "
+                    f"generated {total_generated} tokens total (expected "
+                    f"{1 + look_ahead_cnt} = 1 bootstrap + {look_ahead_cnt} "
+                    f"lookahead), finish_reason="
+                    f"{final_output.outputs[0].finish_reason!r}, "
+                    f"ignore_eos={ignore_eos} -- see this method's docstring "
+                    f"comment just above this print for how to interpret this."
+                )
 
         # collective_rpc returns one result per worker (TP ranks) -- this
         # pipeline is TP=1 only (see module docstring), so unwrap index 0.
