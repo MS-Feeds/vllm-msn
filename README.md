@@ -162,6 +162,23 @@ RUN uv pip install . --torch-backend=auto
 The completed `/opt/venv` is copied from the builder into the runtime stage;
 stock vLLM is not installed from PyPI.
 
+The runtime image also incorporates the compatible operational parts of the
+original AML development image:
+
+- OpenSSH server/client, `tmux`, Jupyter, and an IPython kernel.
+- NCCL/Gloo interface settings for `eth0`, plus `MASTER_ADDR=node-0` and
+  `MASTER_PORT=9500`.
+- `en_US.UTF-8`, the `US/Pacific` timezone, and the original service ports.
+- An entrypoint that starts `sshd` and then executes the container command.
+
+The original `ubuntu:18.04`, `python:3.10.15`, and
+`pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel` base layers are not stacked:
+only the final `FROM` in a sequence would be inherited. This image instead
+uses CUDA 13.0.3 with Python 3.12 and vLLM's resolved PyTorch dependencies,
+matching the validated local build. It intentionally does not install
+Transformers from GitHub or pin `protobuf==3.20`, because either can replace
+vLLM's tested dependency versions.
+
 The source defaults can be overridden when needed:
 
 ```bash

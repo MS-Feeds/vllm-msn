@@ -68,9 +68,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         curl \
+        git \
         libnuma-dev \
+        locales \
         numactl \
+        openssh-client \
+        openssh-server \
         software-properties-common \
+        tmux \
+        tzdata \
     && add-apt-repository -y ppa:deadsnakes/ppa \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -80,9 +86,11 @@ RUN apt-get update \
         cuda-cuobjdump-13-0 \
         libcublas-dev-13-0 \
         libcurand-dev-13-0 \
+    && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
 
 ENV PATH=/opt/venv/bin:${PATH} \
     CUDA_HOME=/usr/local/cuda \
@@ -92,22 +100,50 @@ ENV PATH=/opt/venv/bin:${PATH} \
     VLLM_MARLIN_FP8_DEQUANT_BF16=1 \
     VLLM_MHC_POST_FUSE_SQRSUM=0 \
     VLLM_MHC_AR_INT8=0 \
+    NCCL_DEBUG=INFO \
+    NCCL_SOCKET_IFNAME=eth0 \
+    NCCL_IB_PCI_RELAXED_ORDERING=1 \
+    GLOO_SOCKET_IFNAME=eth0 \
+    MASTER_ADDR=node-0 \
+    MASTER_PORT=9500 \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    TZ=US/Pacific \
+    TERM=xterm
 
 RUN mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" \
+        /var/run/sshd /root/.ssh \
+    && uv pip install --python /opt/venv/bin/python \
+        jupyter ipykernel \
+    && python -m ipykernel install --prefix=/opt/venv \
     && python -c "import vllm; print(vllm.__version__)"
 
+RUN <<'EOF'
+cat >/usr/local/bin/deepseek-v4-entrypoint <<'SCRIPT'
+#!/bin/bash
+set -e
+
+mkdir -p /var/run/sshd
+ssh-keygen -A
+/usr/sbin/sshd
+
+exec "$@"
+SCRIPT
+chmod 0755 /usr/local/bin/deepseek-v4-entrypoint
+EOF
+
 VOLUME ["/data"]
-EXPOSE 8000
+EXPOSE 22 5001 6066 8000 8080 8883 8889
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8000/health || exit 1
 
-ENTRYPOINT ["vllm", "serve"]
-CMD ["deepseek-ai/DeepSeek-V4-Flash-0731", \
+ENTRYPOINT ["/usr/local/bin/deepseek-v4-entrypoint"]
+CMD ["vllm", "serve", "deepseek-ai/DeepSeek-V4-Flash-0731", \
      "--host", "0.0.0.0", \
      "--port", "8000", \
      "--trust-remote-code", \
