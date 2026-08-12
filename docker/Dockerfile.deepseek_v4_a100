@@ -91,7 +91,6 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
-COPY --chmod=0755 docker/deepseek_v4_a100/run.sh /workspace/run.sh
 COPY --chmod=0755 docker/deepseek_v4_a100/run_wrapper.sh /workspace/run_wrapper.sh
 
 ENV PATH=/opt/venv/bin:/opt/aml-tools/bin:${PATH} \
@@ -169,26 +168,8 @@ RUN mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" \
         --display-name="Python (AML tools)" \
     && python -c "import vllm; print(vllm.__version__)"
 
-RUN <<'EOF'
-cat >/usr/local/bin/deepseek-v4-entrypoint <<'SCRIPT'
-#!/bin/bash
-set -e
-
-mkdir -p /var/run/sshd
-ssh-keygen -A
-/usr/sbin/sshd
-
-exec "$@"
-SCRIPT
-chmod 0755 /usr/local/bin/deepseek-v4-entrypoint
-EOF
-
 VOLUME ["/data"]
 EXPOSE 22 5001 6066 8000 8080 8883 8889
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
-    CMD curl --fail --silent http://127.0.0.1:8000/health || exit 1
-
 WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/deepseek-v4-entrypoint"]
-CMD ["/workspace/run_wrapper.sh"]
+CMD ["/bin/bash", "-c", "ssh-keygen -A && /usr/sbin/sshd && exec bash"]

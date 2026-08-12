@@ -171,6 +171,11 @@ original AML development image:
 - `en_US.UTF-8`, the `US/Pacific` timezone, and the original service ports.
 - An entrypoint that starts `sshd` and then executes the container command.
 
+The image starts `sshd` and opens Bash by default. It does not launch vLLM;
+the AML job or interactive user controls the serving command. The provided
+`/workspace/run_wrapper.sh` can dispatch to a job-supplied
+`/workspace/run.sh`.
+
 The original `ubuntu:18.04`, `python:3.10.15`, and
 `pytorch/pytorch:2.7.0-cuda12.6-cudnn9-devel` base layers are not stacked:
 only the final `FROM` in a sequence would be inherited. This image instead
