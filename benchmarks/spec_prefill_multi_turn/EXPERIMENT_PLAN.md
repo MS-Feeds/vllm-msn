@@ -432,7 +432,38 @@ comparing SPARSE against M-k*-g*'s own `seconds_per_conversation` (not
 M000's) is the fair way to isolate whether further sparse-specific
 overhead remains after this fix.
 
-**Still not yet smoke-tested end to end past either fix** -- re-run a 1-2
+**Third real finding, from stage-level timing logs added to `proposer.py`/
+`predict_scbench.py`**: `proposer.retrieve_keys` alone took 89s for one
+call (87,972 positions x 16 layers, 720M elements) -- confirming the
+`tensor_to_wire`/`tensor_from_wire` suspicion above as real, not
+theoretical, and quantifying it as the likely dominant cost (this call
+happens once per turn, growing with the KEEP-mode candidate pool). Root
+cause: `tensor_to_wire`'s `.tolist()`, msgpack's own list serialization,
+and `tensor_from_wire`'s `torch.tensor(list)` reconstruction are three
+separate non-vectorized, element-by-element Python passes over the full
+result -- unavoidable under the DEFAULT `collective_rpc` serialization
+mode, which (traced through `vllm/v1/serial_utils.py`) doesn't carry
+enough type info to reconstruct a `torch.Tensor` from a `UtilityResult`
+without `VLLM_ALLOW_INSECURE_SERIALIZATION=1`. Fixed by setting that flag
+in `proposer.py` (before either engine is constructed) and having
+`speculator_worker.py`'s `end_capture`/`retrieve_keys` return raw
+`torch.Tensor`s directly -- msgspec's own dedicated `_encode_tensor`/
+`_decode_tensor` codec then moves the underlying buffer directly, with no
+Python-list conversion at any point. **Judged safe for this pipeline**
+specifically because the flag's real risk (a `pickle.loads` fallback for
+otherwise-unserializable types, a genuine RCE vector if triggered by
+attacker-controlled data) requires a trust boundary this pipeline doesn't
+have: `collective_rpc` here only ever crosses between a locally-spawned
+`EngineCore` subprocess and its own parent driver process, never a
+network or multi-tenant boundary -- see `proposer.py`'s own docstring for
+the full reasoning. `tensor_to_wire`/`tensor_from_wire` are kept in
+`kv_cache_utils.py` (unused now, but still CPU-tested) as a documented
+fallback, since **this specific change has not been validated on real
+hardware** -- re-run `validate_proposer.py` (its Step C already exercises
+`retrieve_keys` directly) before trusting it.
+
+**Still not yet smoke-tested end to end past any of these fixes** -- re-run
+`validate_proposer.py` first, then a 1-2
 conversation `SPARSE-k*-g*` smoke test
 (`--exp SPARSE-k80-g32 --max-conversations 2`) before trusting a full
 sweep, same discipline applied to every other new mechanism in this

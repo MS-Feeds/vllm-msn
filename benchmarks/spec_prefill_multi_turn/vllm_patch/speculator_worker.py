@@ -123,7 +123,6 @@ from .kv_cache_utils import (
     gather_keys_for_slots,
     read_layer_keys,
     stack_decode_only_steps,
-    tensor_to_wire,
 )
 
 
@@ -430,22 +429,25 @@ class SpeculatorWorker(Worker):
     def begin_capture(self, request_id: str) -> None:
         self.model_runner.begin_capture(request_id)
 
-    def end_capture(self, request_id: str) -> List[dict]:
-        """Wire-encoded (see `kv_cache_utils.tensor_to_wire`'s docstring for
-        why) -- a raw `torch.Tensor` does NOT survive `collective_rpc`'s
-        process boundary intact in this fork (confirmed on real hardware:
-        comes back as a bare nested list, silently losing dtype/shape).
-        Caller (`proposer.py`) must decode with `tensor_from_wire`."""
-        return [tensor_to_wire(t) for t in self.model_runner.end_capture(request_id)]
+    def end_capture(self, request_id: str) -> List[torch.Tensor]:
+        """Returns raw `torch.Tensor`s directly -- safe to do because
+        `proposer.py` sets `VLLM_ALLOW_INSECURE_SERIALIZATION=1` (see that
+        module's docstring for the full reasoning and the exact
+        `vllm/v1/serial_utils.py` code path this depends on) before this
+        engine is ever constructed, which makes `collective_rpc`'s
+        `UtilityResult` wrapper carry proper type info for nested Tensors
+        -- msgspec's own dedicated `_encode_tensor` codec then moves the
+        buffer directly, no Python-list round trip needed. Caller
+        (`proposer.py`) still does `.to(self.device)` since the decoded
+        tensor lands on CPU."""
+        return list(self.model_runner.end_capture(request_id))
 
     def retrieve_keys(
         self, conversation_salt: str, positions: List[int]
-    ) -> List[dict]:
-        """Wire-encoded -- see `end_capture`'s docstring above."""
-        return [
-            tensor_to_wire(t)
-            for t in self.model_runner.retrieve_keys(conversation_salt, positions)
-        ]
+    ) -> List[torch.Tensor]:
+        """Returns raw `torch.Tensor`s directly -- see `end_capture`'s
+        docstring above."""
+        return list(self.model_runner.retrieve_keys(conversation_salt, positions))
 
     def discard_conversation(self, conversation_salt: str) -> None:
         self.model_runner.discard_conversation(conversation_salt)

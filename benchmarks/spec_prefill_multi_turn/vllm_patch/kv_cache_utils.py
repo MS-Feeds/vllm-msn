@@ -134,26 +134,48 @@ def tensor_to_wire(t: torch.Tensor) -> dict:
     """Plain-Python-native (dict of str/list) encoding for a tensor that
     needs to cross `collective_rpc`'s process boundary.
 
-    **Confirmed on real hardware**: a `torch.Tensor` returned directly as
-    (or nested inside) a `collective_rpc` RPC-method's return value does
-    NOT round-trip as a `Tensor` in this fork -- it comes back as a bare
-    nested Python list, silently losing dtype/shape metadata
-    (`AttributeError: 'list' object has no attribute 'to'` at the call
-    site). Root cause, traced through `vllm/v1/serial_utils.py`'s
-    `MsgpackEncoder.enc_hook`: utility/collective_rpc results are wrapped in
-    a `UtilityResult`, whose encoding only emits the type information needed
-    to reconstruct nested tensors on decode when
-    `envs.VLLM_ALLOW_INSECURE_SERIALIZATION` is set (`_encode_type_info_
-    recursive(result)`); without it (the default, and not something this
-    package should depend on toggling just to move Q/K tensors around) it
-    encodes as `(None, result)` -- no type info, so the decoder has no way
-    to know a deeply-nested value was ever a `Tensor` rather than a
-    plain list.
+    **No longer used by this pipeline's own `speculator_worker.py`/
+    `proposer.py`** (kept here, not deleted, as a documented, still-tested
+    fallback -- see below for why). Original problem this solved, confirmed
+    on real hardware: a `torch.Tensor` returned directly as (or nested
+    inside) a `collective_rpc` RPC-method's return value does NOT round-trip
+    as a `Tensor` in this fork by default -- it comes back as a bare nested
+    Python list, silently losing dtype/shape metadata (`AttributeError:
+    'list' object has no attribute 'to'` at the call site). Root cause,
+    traced through `vllm/v1/serial_utils.py`'s `MsgpackEncoder.enc_hook`:
+    utility/collective_rpc results are wrapped in a `UtilityResult`, whose
+    encoding only emits the type information needed to reconstruct nested
+    tensors on decode when `envs.VLLM_ALLOW_INSECURE_SERIALIZATION` is set
+    (`_encode_type_info_recursive(result)`); without it, it encodes as
+    `(None, result)` -- no type info, so the decoder has no way to know a
+    deeply-nested value was ever a `Tensor` rather than a plain list.
 
     Encoding explicitly here (dtype string + shape + a flat Python list of
-    values) sidesteps that flag entirely -- this is plain, unambiguous
-    msgpack-native data (str/int/float/list), no custom type hook needed on
-    either side of the RPC boundary. Reconstruct with `tensor_from_wire`.
+    values) sidesteps that flag entirely -- plain, unambiguous msgpack-
+    native data (str/int/float/list), no custom type hook needed on either
+    side of the RPC boundary. Reconstruct with `tensor_from_wire`.
+
+    **Why this got superseded**: real-hardware timing showed a single
+    `retrieve_keys` call taking 89s for a 720M-element result under this
+    encoding -- `.tolist()` (this function) plus msgpack list serialization
+    plus `torch.tensor(list)` on the decode side are three unavoidably
+    non-vectorized, element-by-element passes. `proposer.py` now sets
+    `VLLM_ALLOW_INSECURE_SERIALIZATION=1` instead (see that module's
+    docstring for why it's safe for this pipeline's own local-only IPC),
+    which lets `UtilityResult` carry real type info so msgspec's OWN
+    dedicated, zero-copy `_encode_tensor`/`_decode_tensor` codec handles
+    Tensors directly -- no Python-side list conversion at all.
+
+    **Why kept, not deleted, despite being unused now**: this specific
+    change (enabling insecure serialization) has not been validated on real
+    hardware as of when it was made -- unlike most of this pipeline's other
+    mechanisms, which were each confirmed working via a dedicated
+    validation script before being trusted (see `validate_proposer.py`,
+    `validate_resumable_session.py`, `validate_sparse_attention.py`). If
+    that validation surfaces a problem, this function (still covered by
+    `test_vllm_patch.py`'s round-trip tests) is the documented, working
+    fallback to revert `speculator_worker.py`'s `end_capture`/
+    `retrieve_keys` to.
     """
     t = t.detach().to("cpu")
     return {

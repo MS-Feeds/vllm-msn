@@ -77,7 +77,6 @@ from typing import List, Optional, Tuple
 import torch
 
 from .kv_cache_utils import gather_keys_for_slots  # noqa: F401  (re-exported for callers that want the raw utility)
-from .kv_cache_utils import tensor_from_wire
 
 # Same reasoning/placement as the single-turn pipeline's pruner.py: must be
 # set before any add_request() call reads it. Both the speculator's and the
@@ -87,6 +86,35 @@ from .kv_cache_utils import tensor_from_wire
 # `speculator_worker.py` parses; the target for the pre-add_request
 # PruneRecord-registration race documented in pruner.py).
 os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
+
+# Lets a raw torch.Tensor cross collective_rpc's process boundary (driver
+# <-> EngineCore) as an actual zero-copy tensor buffer, instead of the
+# `tensor_to_wire`/`tensor_from_wire` Python-list round trip this module
+# used to require -- see `end_capture`/`retrieve_keys` below for what this
+# replaces, and their docstrings for the exact vllm/v1/serial_utils.py code
+# path this depends on (traced, not assumed).
+#
+# **Why this is safe to set here, even though the flag's own name is
+# "insecure"**: `MsgpackEncoder.enc_hook` always encodes a raw `torch.Tensor`
+# via its OWN dedicated, lossless `_encode_tensor` path regardless of this
+# flag -- Tensors are never pickled. What the flag actually gates is (1)
+# `UtilityResult` (the wrapper `collective_rpc`'s return value travels in)
+# being allowed to carry TYPE INFO for its nested contents at all -- without
+# it, a `List[torch.Tensor]` result decodes back as a bare nested list with
+# no way to know it was ever a Tensor (confirmed on real hardware: this is
+# the literal `AttributeError: 'list' object has no attribute 'to'` the
+# previous wire-encoding workaround existed to avoid), and (2), for OTHER,
+# non-Tensor/ndarray/slice/MultiModalKwargs object types this pipeline never
+# actually sends across collective_rpc (every other RPC method here returns
+# None or plain ints/lists, which msgpack already handles natively), a
+# `pickle.loads` fallback that WOULD be a real remote-code-execution risk if
+# the serialized data ever crossed a trust boundary. It does not here: this
+# process spawns its own EngineCore subprocess locally (never over a
+# network, never accepting input from another user or host), so there is no
+# attacker position from which to inject a malicious payload into this
+# specific IPC channel -- the same reasoning that makes `enforce_eager=True`
+# and other same-host-only settings elsewhere in this pipeline uncontroversial.
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
 class SpecPrefillProposer:
@@ -313,13 +341,21 @@ class SpecPrefillProposer:
 
         # collective_rpc returns one result per worker (TP ranks) -- this
         # pipeline is TP=1 only (see module docstring), so unwrap index 0.
-        # Wire-decode -- see kv_cache_utils.tensor_from_wire's docstring:
-        # SpeculatorWorker.end_capture returns plain dicts, not raw Tensors
-        # (collective_rpc doesn't preserve Tensor type across the process
-        # boundary in this fork, confirmed on real hardware).
+        # SpeculatorWorker.end_capture now returns raw torch.Tensor objects
+        # directly -- this module's own VLLM_ALLOW_INSECURE_SERIALIZATION=1
+        # setting (see top of file) makes collective_rpc's UtilityResult
+        # wrapper carry proper type info for nested Tensors, so msgspec's
+        # own dedicated zero-copy tensor codec (`_encode_tensor`/
+        # `_decode_tensor` in vllm/v1/serial_utils.py) reconstructs them
+        # correctly -- no more `tensor_to_wire`/`tensor_from_wire` Python-
+        # list round trip needed (that workaround predates this fix; see
+        # kv_cache_utils.py for why it's kept, not deleted, as a documented
+        # fallback). Still need `.to(self.device)`: the decoded tensor
+        # lands on CPU (an IPC buffer reconstruction, not a CUDA-IPC share),
+        # same as the old path.
         t_before_end_capture = time.time()
-        query_buffer_wire = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
-        query_buffer = [tensor_from_wire(q).to(self.device) for q in query_buffer_wire]
+        query_buffer_cpu = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
+        query_buffer = [q.to(self.device) for q in query_buffer_cpu]
         actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
         print(
             f"[proposer.run_turn] {request_id!r}: query capture retrieved "
@@ -337,22 +373,30 @@ class SpecPrefillProposer:
         `conversation_salt`'s own speculator prompt (see module docstring's
         "Local positions vs. absolute conversation positions").
 
-        Timed and logged on completion -- this RPC round-trip wire-encodes
-        the WHOLE requested K span via `tensor_to_wire`'s `.tolist()` (see
-        that function's own docstring on why: `collective_rpc` doesn't
-        preserve `torch.Tensor` type across the process boundary in this
-        fork), across every layer -- for a large KEEP-mode candidate pool
-        (`local_positions` can be tens of thousands of entries for a big
-        SCBench context) this is real, unamortized CPU-bound work every
-        turn, and a leading suspect (alongside the now-fixed per-decode-
-        step block-index recomputation in `sparse_target_runner.py`) for
-        the multi-turn pipeline's speculator-vs-baseline slowdown -- log it
-        rather than guess."""
+        Timed and logged on completion -- for a large KEEP-mode candidate
+        pool (`local_positions` can be tens of thousands of entries for a
+        big SCBench context) this RPC moves a lot of data every turn, so
+        it's worth watching even after the fix below.
+
+        **Real measurement, not a guess**: a first real run showed this one
+        call taking 89s for 87,972 positions x 16 layers (720M elements) --
+        traced to the OLD `tensor_to_wire` implementation's `.tolist()`
+        (converts the whole tensor to a Python list, one boxed float at a
+        time), which then had to cross msgpack serialization AGAIN as a
+        plain list, then get rebuilt via `torch.tensor(list)` on this end --
+        three full non-vectorized passes over ~720M scalars. Fixed by this
+        module's `VLLM_ALLOW_INSECURE_SERIALIZATION=1` (see top of file):
+        `SpeculatorWorker.retrieve_keys` now returns raw `torch.Tensor`s,
+        and msgspec's own dedicated tensor codec moves the underlying
+        buffer directly (no Python-level element-by-element conversion at
+        all) -- expected to cut this dramatically, not yet confirmed on
+        real hardware past this change (re-run `validate_proposer.py`,
+        which already exercises this exact method in its Step C)."""
         t_start = time.time()
-        keys_wire = self.llm_engine.collective_rpc(
+        keys_cpu = self.llm_engine.collective_rpc(
             "retrieve_keys", args=(conversation_salt, local_positions)
         )[0]
-        keys = [tensor_from_wire(k).to(self.device) for k in keys_wire]
+        keys = [k.to(self.device) for k in keys_cpu]
         total_elements = sum(k.numel() for k in keys)
         print(
             f"[proposer.retrieve_keys] {conversation_salt!r}: retrieved K "
