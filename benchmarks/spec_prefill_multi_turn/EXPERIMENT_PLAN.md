@@ -573,6 +573,32 @@ validation order as the fourth change above; watch the SAME
 `[proposer.run_turn_and_score]` log line's duration for the actual
 improvement.
 
+**Sixth finding, on the TARGET side this time (not the speculator)**: real
+runs showed `SPARSE-k*-g*`'s own target-side generation taking ~0.5-1s
+longer per turn than `M000` baseline's, a gap `M-k*-g*` doesn't show to
+the same degree. Root-caused to `SparseTargetGPUModelRunner.
+_apply_sparse_attention_overrides`'s per-layer loop
+(`sparse_target_runner.py`) -- unlike the physically-pruned pipeline's
+RoPE-position patch (`model_runner.py`, O(1) per decode step: one dict
+lookup + one in-place tensor add), this one runs `_patch_layer_metadata`
+once per LAYER (32 for Llama-3.1-8B) on EVERY decode step, each call
+previously doing 2-3 separate small GPU tensor writes. Under
+`enforce_eager=True` (required elsewhere in this pipeline for the hook
+mechanisms, so no CUDA-graph batching to amortize per-op dispatch
+overhead), that's up to ~2,000 individual small GPU ops per turn
+(`max_tokens` x layers x ops/layer) purely for this bookkeeping, with
+nothing analogous on the baseline side at all. Fixed by building the
+zero-padded block-table row ONCE per decode step (not once per layer) and
+writing it as a single op per layer instead of two -- cuts the per-layer
+GPU-op count from 3 to 2 (build-once + one write per layer, vs. the old
+per-layer gather-write + zero-pad + seq_len-write). Purely mechanical --
+`compute_sparse_gather_view` (the correctness-critical, CPU-tested
+arithmetic) is completely untouched, only HOW the already-computed result
+gets written into each layer's metadata changed. **Unvalidated on real
+hardware** -- re-run `validate_sparse_attention.py` (its Steps A/B/C
+exercise this exact write path) before trusting it, then compare the
+target-generation timing log against the pre-fix ~0.5-1s gap.
+
 ---
 
 ## SpecPrefill settings

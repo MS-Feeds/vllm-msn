@@ -128,6 +128,7 @@ is where these should be checked first, before trusting any real sweep:
 
 from typing import TYPE_CHECKING, Dict, List, Optional
 
+import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -231,9 +232,35 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 continue
             gathered_block_table_row, gathered_seq_len = gathered
 
+            # Pad to the full block-table row width ONCE here, not inside
+            # the per-layer loop below -- real hardware timing showed
+            # `_patch_layer_metadata`'s per-layer cost (previously 2 writes:
+            # gathered-row + zero-pad) adding up across every layer (32 for
+            # Llama-3.1-8B) on EVERY decode step, under enforce_eager=True
+            # (no CUDA-graph batching to amortize the per-op dispatch cost)
+            # -- a real, measured 0.5-1s/turn overhead vs. baseline, not
+            # theoretical. block_table's column width is already assumed
+            # uniform across layers elsewhere (`_compute_gathered_view`
+            # reads it from "an arbitrary layer's metadata"), so building
+            # the padded row once here and writing it whole into each
+            # layer's own tensor is safe under the same assumption, and
+            # cuts the hot per-layer loop from 2 GPU ops to 1.
+            any_layer_metadata = next(iter(attn_metadata.values()))
+            block_table_width = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD).shape[1]
+            num_gathered = gathered_block_table_row.shape[0]
+            if block_table_width > num_gathered:
+                padded_block_table_row = torch.zeros(
+                    block_table_width,
+                    dtype=gathered_block_table_row.dtype,
+                    device=gathered_block_table_row.device,
+                )
+                padded_block_table_row[:num_gathered] = gathered_block_table_row
+            else:
+                padded_block_table_row = gathered_block_table_row
+
             for layer_name, layer_metadata in attn_metadata.items():
                 self._patch_layer_metadata(
-                    layer_metadata, req_idx, gathered_block_table_row, gathered_seq_len
+                    layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
                 )
 
     def _compute_gathered_view(
@@ -285,20 +312,21 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         return getattr(layer_metadata, field_name)
 
     def _patch_layer_metadata(
-        self, layer_metadata, req_idx: int, gathered_block_table_row, gathered_seq_len: int
+        self, layer_metadata, req_idx: int, padded_block_table_row, gathered_seq_len: int
     ) -> None:
+        """`padded_block_table_row` is already the FULL row width (gathered
+        blocks in the leading columns, zero-padded/NULL_BLOCK_ID after --
+        matching this fork's own cudagraph-padding convention for unused
+        block-table entries, see the real `_get_block_table`'s identical
+        `fill_(NULL_BLOCK_ID)` for out-of-range rows) -- built ONCE by the
+        caller (`_apply_sparse_attention_overrides`), not per layer, so
+        this is a single write instead of two (see that call site's own
+        comment for why this mattered on real hardware: 32 layers x 2 ops
+        x every decode step, under `enforce_eager=True`, added up)."""
         block_table = self._get_field(layer_metadata, _BLOCK_TABLE_FIELD)
         seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
 
-        num_gathered = gathered_block_table_row.shape[0]
-        # Write the gathered blocks into the row's leading columns, padding
-        # the rest with 0 (NULL_BLOCK_ID, matching this fork's own
-        # cudagraph-padding convention for unused block-table entries --
-        # see the real _get_block_table's identical fill_(NULL_BLOCK_ID)
-        # for out-of-range rows).
-        block_table[req_idx, :num_gathered] = gathered_block_table_row
-        if block_table.shape[1] > num_gathered:
-            block_table[req_idx, num_gathered:] = 0
+        block_table[req_idx, :] = padded_block_table_row
         seq_lens[req_idx] = gathered_seq_len
 
 
