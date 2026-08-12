@@ -139,6 +139,10 @@ def config_to_llm_kwargs(cfg: dict, scenario_cfg: dict) -> dict:
         kwargs["enable_prefix_caching"] = cfg["enable_prefix_caching"]
     if "enable_chunked_prefill" in cfg:
         kwargs["enable_chunked_prefill"] = cfg["enable_chunked_prefill"]
+    if "max_num_partial_prefills" in cfg:
+        kwargs["max_num_partial_prefills"] = cfg["max_num_partial_prefills"]
+    if "long_prefill_token_threshold" in cfg:
+        kwargs["long_prefill_token_threshold"] = cfg["long_prefill_token_threshold"]
     if "async_scheduling" in cfg:
         kwargs["async_scheduling"] = cfg["async_scheduling"]
     if cfg.get("attention_backend"):
