@@ -32,11 +32,13 @@ from vllm_patch.config import SpecConfig
 from vllm_patch.conversation_state import ConversationState
 from vllm_patch.kv_cache_utils import (
     _find_kv_split_dim,
+    compute_sparse_gather_view,
     gather_keys_for_slots,
     stack_decode_only_steps,
     tensor_from_wire,
     tensor_to_wire,
 )
+from vllm_patch import sparse_selection_registry
 from vllm_patch.prefill_split import split_prefill_decode_requests
 from vllm_patch import pruning_registry
 from vllm_patch.pruning_registry import PruneRecord
@@ -231,6 +233,138 @@ def test_gather_keys_for_slots():
     assert torch.equal(gathered[0], flat_keys[0])
     assert torch.equal(gathered[1], flat_keys[5])
     assert torch.equal(gathered[2], flat_keys[9])
+
+
+def test_compute_sparse_gather_view_basic_selection():
+    """block_size=4, 6 blocks resident (24 tokens computed, decode step at
+    the very start so num_prompt == num_computed == 24 -- no in-progress
+    decode tail to force-keep yet). Selecting positions in blocks 0 and 3
+    should gather exactly those two blocks, in ascending order."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101, 102, 103, 104, 105])  # 6 blocks
+    result = compute_sparse_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        selected_positions=[1, 14],  # block 0 (0-3) and block 3 (12-15)
+        num_prompt=24,
+        num_computed=24,
+    )
+    assert result is not None
+    gathered_row, gathered_seq_len = result
+    assert torch.equal(gathered_row, torch.tensor([100, 103]))  # blocks 0 and 3
+    assert gathered_seq_len == 2 * block_size  # both fully-occupied historical blocks
+
+
+def test_compute_sparse_gather_view_force_keeps_in_progress_decode_tail():
+    """Even with an empty selection, tokens generated so far THIS turn
+    (num_prompt..num_computed) must always be force-included -- the model
+    needs coherent access to what it just generated within the same turn,
+    regardless of what the speculator chose."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101, 102, 103, 104])  # 5 blocks
+    # num_prompt=16 (4 blocks fully resident before this turn's decode
+    # started), num_computed=18 (2 tokens generated so far this turn, both
+    # landing in block index 4 -- positions 16, 17).
+    result = compute_sparse_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        selected_positions=[],  # nothing selected by the speculator at all
+        num_prompt=16,
+        num_computed=18,
+    )
+    assert result is not None
+    gathered_row, gathered_seq_len = result
+    assert torch.equal(gathered_row, torch.tensor([104]))  # block 4, force-kept
+    assert gathered_seq_len == 2  # only 2 of that block's 4 slots are occupied
+
+
+def test_compute_sparse_gather_view_combines_selection_and_force_keep():
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101, 102, 103, 104])
+    result = compute_sparse_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        selected_positions=[0],  # block 0
+        num_prompt=16,
+        num_computed=17,  # 1 token generated so far this turn -> block 4
+    )
+    assert result is not None
+    gathered_row, gathered_seq_len = result
+    assert torch.equal(gathered_row, torch.tensor([100, 104]))  # block 0 + force-kept block 4
+    assert gathered_seq_len == block_size + 1  # block 0 full + block 4's 1 occupied slot
+
+
+def test_compute_sparse_gather_view_degenerate_full_selection_returns_none():
+    """Selecting every currently-resident block is a no-op -- caller should
+    leave the stock (already-correct) metadata untouched rather than
+    "gather" a subset that's just the whole thing again."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101])  # 2 blocks, 8 tokens
+    result = compute_sparse_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        selected_positions=[0, 4],  # blocks 0 and 1 -- everything
+        num_prompt=8,
+        num_computed=8,
+    )
+    assert result is None
+
+
+def test_compute_sparse_gather_view_out_of_range_raises():
+    """A selection referencing a block beyond what's actually allocated
+    must fail loudly -- silently reading whatever physical block sits at
+    that index could be a completely different request's data."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101])  # only 2 blocks allocated
+    try:
+        compute_sparse_gather_view(
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            selected_positions=[100],  # block 25 -- way out of range
+            num_prompt=8,
+            num_computed=8,
+        )
+        raise AssertionError("expected ValueError for out-of-range block selection")
+    except ValueError:
+        pass
+
+
+def test_compute_sparse_gather_view_preserves_ascending_order():
+    """Selected positions arriving out of order must still gather blocks in
+    ascending original order, not selection order -- the gathered row's
+    order determines the virtual sequence's own (causally-irrelevant for
+    single-token decode, but still deterministic) position mapping."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101, 102, 103])
+    result = compute_sparse_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        selected_positions=[12, 0, 4],  # blocks 3, 0, 1 -- deliberately unordered
+        num_prompt=16,
+        num_computed=16,
+    )
+    assert result is not None
+    gathered_row, _ = result
+    assert torch.equal(gathered_row, torch.tensor([100, 101, 103]))  # blocks 0, 1, 3
+
+
+def test_sparse_selection_registry_lifecycle():
+    sparse_selection_registry.clear()
+    try:
+        assert sparse_selection_registry.get("req-1") is None
+
+        sparse_selection_registry.register("req-1", [0, 4, 8])
+        assert sparse_selection_registry.get("req-1") == [0, 4, 8]
+
+        # re-registering overwrites, doesn't accumulate (same convention as
+        # pruning_registry.py)
+        sparse_selection_registry.register("req-1", [12])
+        assert sparse_selection_registry.get("req-1") == [12]
+
+        sparse_selection_registry.discard("req-1")
+        assert sparse_selection_registry.get("req-1") is None
+    finally:
+        sparse_selection_registry.clear()
 
 
 def test_prune_record_validation():

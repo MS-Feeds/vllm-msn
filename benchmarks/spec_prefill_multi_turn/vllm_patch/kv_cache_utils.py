@@ -43,7 +43,7 @@ forward-context-scoped lookup at all -- this module has no vLLM dependency
 whatsoever, not even a lazy one.
 """
 
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -206,6 +206,112 @@ def stack_decode_only_steps(
     if decode_steps:
         return torch.stack(decode_steps, dim=1)
     return torch.empty(1, 0, hidden_dim_fallback)
+
+
+def compute_sparse_gather_view(
+    full_block_table_row: torch.Tensor,
+    block_size: int,
+    selected_positions: List[int],
+    num_prompt: int,
+    num_computed: int,
+) -> Optional[Tuple[torch.Tensor, int]]:
+    """Pure-tensor core of `sparse_target_runner.py`'s
+    `SparseTargetGPUModelRunner._compute_gathered_view` -- lives here (not
+    in `sparse_target_runner.py`, which imports vLLM's `GPUModelRunner` at
+    module level and so can't be imported without vLLM's full runtime
+    installed) specifically so it's unit-testable without a live
+    `GPUModelRunner` or a GPU at all -- see that method's own docstring for
+    the full reasoning behind block-level (not token-level) gathering and
+    the force-keep rule for this turn's own in-progress decode tokens, and
+    `test_vllm_patch.py` for the CPU-only tests this enables.
+
+    Args:
+        full_block_table_row: this request's own 1D tensor of physical
+            block ids, as already built by the stock attention-metadata
+            builder (read, not recomputed, from an already-built
+            `AttentionMetadata` -- see caller).
+        block_size: engine's KV-cache block size (tokens per block).
+        selected_positions: absolute conversation-ledger positions the
+            speculator chose for this turn (already includes this turn's
+            own query span -- the driver's responsibility, not this
+            function's -- see `sparse_selection_registry.py`'s module
+            docstring).
+        num_prompt: this request's cumulative prompt length so far
+            (`self.input_batch.num_prompt_tokens_cpu_tensor[req_idx]`),
+            INCLUDING this turn's own query, per `_update_request_as_
+            session`'s real behavior (confirmed: it extends
+            `session.prompt_token_ids` with the new turn's tokens before
+            decode begins).
+        num_computed: this request's tokens actually computed so far
+            (`self.input_batch.num_computed_tokens_cpu_tensor[req_idx]`) --
+            for a decode step this is `>= num_prompt`, and
+            `num_computed - num_prompt` is exactly how many tokens THIS
+            turn has generated so far, always force-included regardless of
+            `selected_positions` (see module docstring's "Force-keep"
+            reasoning in `sparse_target_runner.py`).
+
+    Returns:
+        `(gathered_block_table_row, gathered_seq_len)` -- the block ids to
+        actually present to the attention kernel this step (a strict subset
+        of `full_block_table_row`'s real, occupied entries, in ascending
+        original order) and the corresponding shrunk sequence length
+        (accounting for the last included block possibly being only
+        partially filled -- see this function's own "last block occupancy"
+        handling below). `None` if the selection is degenerate (covers
+        every currently-resident block already) -- caller should leave the
+        stock metadata untouched in that case rather than gather a no-op
+        subset.
+
+    Raises:
+        ValueError: if `selected_positions` (plus the always-force-included
+            in-progress-decode tail) reference a block index beyond what's
+            actually allocated for this request yet -- a stale or
+            out-of-range selection must fail loudly here, not silently read
+            whatever physical block happens to sit at that index (which
+            could belong to a completely different request or conversation
+            by then).
+    """
+    selected_block_indices = {p // block_size for p in selected_positions}
+    for pos in range(num_prompt, num_computed):
+        selected_block_indices.add(pos // block_size)
+
+    if not selected_block_indices:
+        return None
+
+    sorted_blocks = sorted(selected_block_indices)
+
+    num_full_blocks_present = -(-num_computed // block_size)  # ceil div
+    if max(sorted_blocks) >= num_full_blocks_present:
+        raise ValueError(
+            f"selected block index {max(sorted_blocks)} exceeds the number "
+            f"of blocks actually allocated so far ({num_full_blocks_present}, "
+            f"for num_computed={num_computed} tokens at block_size="
+            f"{block_size}) -- the speculator's selection must be scoped to "
+            f"positions already resident in this request's OWN cache; a "
+            f"stale/out-of-range selection would otherwise silently read "
+            f"another request's or another conversation's data at that "
+            f"physical block id."
+        )
+    if len(sorted_blocks) == num_full_blocks_present:
+        # Degenerate: selection covers the entire resident cache already --
+        # gathering would be a no-op.
+        return None
+
+    block_index_tensor = torch.tensor(
+        sorted_blocks, dtype=torch.int64, device=full_block_table_row.device
+    )
+    gathered_block_table_row = full_block_table_row[block_index_tensor].clone()
+
+    last_real_block_index = (num_computed - 1) // block_size
+    last_real_block_occupancy = num_computed - last_real_block_index * block_size
+    gathered_seq_len = 0
+    for block_idx in sorted_blocks:
+        if block_idx == last_real_block_index:
+            gathered_seq_len += last_real_block_occupancy
+        else:
+            gathered_seq_len += block_size
+
+    return gathered_block_table_row, gathered_seq_len
 
 
 def retrieve_keys_per_sample(
