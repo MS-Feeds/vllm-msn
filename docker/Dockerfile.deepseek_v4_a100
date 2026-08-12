@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE=deepseek-v4-a100-vllm:base
+FROM ${BASE_IMAGE}
+
+ARG CUDA_VERSION=13.0.3
+
+LABEL org.opencontainers.image.title="DeepSeek-V4-Flash-0731 on vLLM for A100" \
+      org.opencontainers.image.description="Experimental SM80 vLLM backend for DeepSeek-V4-Flash-0731" \
+      com.deepseek-v4-a100.cuda.version="${CUDA_VERSION}"
+
+ENV CUDA_HOME=/usr/local/cuda \
+    HF_HOME=/data/huggingface \
+    VLLM_CACHE_ROOT=/data/vllm \
+    TRITON_CACHE_DIR=/data/triton \
+    VLLM_MARLIN_FP8_DEQUANT_BF16=1 \
+    VLLM_MHC_POST_FUSE_SQRSUM=0 \
+    VLLM_MHC_AR_INT8=0 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
+    PYTHONUNBUFFERED=1
+
+RUN mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}"
+
+VOLUME ["/data"]
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8000/health || exit 1
+
+ENTRYPOINT ["vllm", "serve"]
+CMD ["deepseek-ai/DeepSeek-V4-Flash-0731", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--trust-remote-code", \
+     "--tensor-parallel-size", "8", \
+     "--enable-expert-parallel", \
+     "--moe-backend", "marlin", \
+     "--kv-cache-dtype", "fp8", \
+     "--block-size", "256", \
+     "--max-model-len", "8192", \
+     "--gpu-memory-utilization", "0.90", \
+     "--tokenizer-mode", "deepseek_v4", \
+     "--enable-auto-tool-choice", \
+     "--tool-call-parser", "deepseek_v4", \
+     "--reasoning-parser", "deepseek_v4", \
+     "--attention-config", "{\"use_fp4_indexer_cache\":true}", \
+     "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"greedy\"}"]

@@ -77,6 +77,93 @@ Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
 - [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
 - [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
 
+## DeepSeek-V4-Flash-0731 Deployment
+
+This branch targets
+[`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731)
+and is based on the official vLLM `v0.27.1` release.
+
+The checkpoint uses `DeepseekV4ForCausalLM`, with FP4 MoE experts, FP8
+linear and attention weights, 256 routed experts, six active experts per
+token, and a maximum context length of 1,048,576 tokens. It occupies
+approximately 167 GB on disk. The 0731 release also includes a DSpark
+speculative decoder, which can be enabled with:
+
+```bash
+--speculative-config \
+  '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}'
+```
+
+The current deployment host has eight NVIDIA A100-SXM4 80 GB GPUs
+(compute capability 8.0), CUDA 13.0.3, and driver 580.167.08. A launch with
+tensor parallelism and expert parallelism across all eight GPUs confirmed that
+stock vLLM `v0.27.1` is not compatible with this hardware:
+
+- DeepSeek-V4 uses sparse FlashMLA attention, which vLLM restricts to Hopper
+  and Blackwell data-center GPUs.
+- Its FP8 attention output projection uses DeepGEMM, which vLLM supports only
+  on Hopper and Blackwell.
+- MXFP4 MoE weights can fall back to Marlin on Ampere, but that does not
+  provide an Ampere fallback for the DeepSeek-V4 attention path.
+
+The checkpoint and DSpark weights loaded successfully in about 96 seconds and
+used approximately 21.43 GiB per GPU. The initialization profile then failed
+in the first mHC operation:
+
+```text
+RuntimeError: Assertion error
+(/workspace/.deps/deepgemm-src/csrc/apis/hyperconnection.hpp:56):
+Unsupported architecture
+```
+
+The model therefore fits in GPU memory, but cannot serve on A100 with the stock
+NVIDIA DeepSeek-V4 implementation. Hopper or Blackwell GPUs are required unless
+Ampere fallbacks are added for mHC, sparse attention, and the FP8 output
+projection.
+
+This branch includes an experimental SM80 backend that adds those Ampere
+fallbacks. Build it from source; precompiled vLLM wheels do not contain the
+changed CUDA and C++ kernels. The patched source and its core, MoE, and FlashMLA
+extensions have been built successfully with CUDA 13.0.3. End-to-end model
+serving validation is still pending.
+
+### Container deployment
+
+Build the patched source image for A100, then add the deployment defaults:
+
+```bash
+DOCKER_BUILDKIT=1 docker build . \
+  --file docker/Dockerfile \
+  --target vllm-openai \
+  --tag deepseek-v4-a100-vllm:base \
+  --build-arg CUDA_VERSION=13.0.3 \
+  --build-arg torch_cuda_arch_list=8.0 \
+  --build-arg max_jobs=32 \
+  --build-arg nvcc_threads=2
+
+docker build . \
+  --file docker/Dockerfile.deepseek_v4_a100 \
+  --tag deepseek-v4-flash-0731:a100 \
+  --build-arg CUDA_VERSION=13.0.3
+```
+
+Run the API server with all eight GPUs and a persistent model/kernel cache:
+
+```bash
+docker run --rm \
+  --gpus all \
+  --ipc=host \
+  --shm-size=32g \
+  --publish 8000:8000 \
+  --volume /scratch/deepseek-v4-cache:/data \
+  deepseek-v4-flash-0731:a100
+```
+
+The image starts with an 8K context for initial validation. Override any
+arguments after the image name to replace the default command. Set `HF_TOKEN`
+at runtime if authenticated Hugging Face downloads are required; never bake it
+into the image.
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.
