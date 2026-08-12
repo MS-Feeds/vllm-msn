@@ -515,6 +515,38 @@ figure, and checking predictions/keep-rates look sane (not empty, not
 100% kept when a keep rate < 100% was requested) before trusting a full
 sweep.
 
+**Fifth finding, from the fourth change's own first real measurement**:
+`[proposer.run_turn_and_score]` logged 34.26s for in-process K retrieval +
+scoring (kept=70,317 of an 87,972-position candidate pool,
+actual_look_ahead_cnt=8 -- full lookahead completed, so this isn't an EOS-
+short-circuit case). A real improvement over the old design (which spent
+89s on `retrieve_keys` ALONE, before any scoring even started), but still
+large for what should be a GPU-bound matmul/softmax/topk pipeline over a
+context this size. Root cause: `SpeculatorGPUModelRunner.end_capture`/
+`retrieve_keys` both moved their results to CPU (`.to("cpu")`) as their
+OWN last step, a leftover from when they were ONLY ever called by
+`SpeculatorWorker`'s RPC-exposed wrapper methods (which genuinely need
+CPU tensors to cross `collective_rpc`'s process boundary). Once
+`end_capture_and_score` started calling them IN-PROCESS too, that CPU
+move happened before scoring had a chance to use the GPU -- forcing
+`compute_attention_score`'s matmul and `aggregate_attention_score`'s
+softmax/pooling (over an 88k-token context, 16 layers) onto CPU instead
+of GPU, plausibly the majority of the 34s.
+
+Fixed by moving the `.to("cpu")` responsibility DOWN to where it actually
+belongs: `SpeculatorGPUModelRunner.end_capture`/`retrieve_keys` now stay
+on-device unconditionally; `SpeculatorWorker.end_capture`/`retrieve_keys`
+(the RPC-exposed wrappers `validate_proposer.py` and `proposer.py`'s
+`run_turn`/`retrieve_keys` still call directly) do the `.to("cpu")`
+themselves, right at the actual process boundary. `end_capture_and_score`
+needed no changes at all -- it already just calls `self.end_capture`/
+`self.retrieve_keys` (the model-runner-level, now on-device versions) and
+lets whatever device Q/K land on flow through to `score_and_select_
+indices` naturally. **Also unvalidated on real hardware** -- same
+validation order as the fourth change above; watch the SAME
+`[proposer.run_turn_and_score]` log line's duration for the actual
+improvement.
+
 ---
 
 ## SpecPrefill settings

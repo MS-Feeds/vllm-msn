@@ -282,16 +282,25 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         decode step, there is no multi-token entry to filter out at all,
         which this same rule handles correctly with no special-casing).
 
-        Moved to CPU before returning -- collective_rpc results cross a
-        process boundary; a CUDA tensor's storage isn't valid to
-        reconstruct in the driver process's own (different) CUDA context,
-        and the tensors here are small (bounded by look_ahead_cnt *
-        num_layers * hidden_size) so the CPU copy is cheap relative to the
-        forward passes that produced them."""
+        **Stays on-device here** (a change from this method's original
+        design, which moved to CPU itself) -- `end_capture` is called from
+        TWO contexts now: `SpeculatorWorker.end_capture` below (an RPC-
+        exposed method, whose result DOES cross `collective_rpc`'s process
+        boundary and so DOES need a CPU tensor -- that method does the
+        `.to("cpu")` itself, right at the boundary) and
+        `end_capture_and_score` below (an IN-PROCESS caller that
+        immediately feeds this straight into GPU-accelerated scoring math
+        -- forcing CPU here would mean an unnecessary GPU->CPU copy AND run
+        `compute_attention_score`'s matmuls on CPU instead of GPU, a real,
+        measured cost: a first real run of `end_capture_and_score` took 34s
+        for one turn with Q/K both on CPU, most of that plausibly this
+        exact inefficiency). Keeping this method itself device-agnostic and
+        pushing the CPU decision to whichever caller actually needs it is
+        the correct place for that decision to live."""
         self._capturing_request_ids.discard(request_id)
         per_layer_steps = self._query_buffer.pop(request_id, None)
         if per_layer_steps is None:
-            return [torch.empty(1, 0, 0) for _ in self._hooked_layers]
+            return [torch.empty(1, 0, 0, device=self.device) for _ in self._hooked_layers]
 
         result = []
         for layer_idx, steps in enumerate(per_layer_steps):
@@ -299,7 +308,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
                 self._hooked_layers[layer_idx].num_heads
                 * self._hooked_layers[layer_idx].head_dim
             )
-            result.append(stack_decode_only_steps(steps, hidden_dim_fallback).to("cpu"))
+            result.append(stack_decode_only_steps(steps, hidden_dim_fallback))
         return result
 
     def _capture_queries_by_request(self, layer_idx: int, q: torch.Tensor) -> None:
@@ -372,14 +381,21 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
     def retrieve_keys(
         self, conversation_salt: str, positions: List[int]
     ) -> List[torch.Tensor]:
-        """Per-layer [len(positions), num_kv_heads, head_size] K tensors
-        (CPU, see `end_capture`'s docstring for why) for the given absolute
-        LOCAL positions within this conversation's own speculator prompt
-        (i.e. indices into what `proposer.py` submitted as this
-        conversation's growing prompt -- NOT the multi-turn ledger's
-        absolute positions used for the TARGET's RoPE restoration, a
-        separate numbering -- see `proposer.py`'s docstring for how the two
-        relate)."""
+        """Per-layer [len(positions), num_kv_heads, head_size] K tensors,
+        ON-DEVICE (see `end_capture`'s docstring for why this method no
+        longer moves to CPU itself -- same reasoning applies here: this
+        method is called from both `SpeculatorWorker.retrieve_keys` (RPC-
+        exposed, needs CPU, does the `.to("cpu")` itself at that boundary)
+        and `end_capture_and_score` (in-process, wants to keep K on-device
+        for GPU-accelerated scoring -- moving ~720M elements to CPU only to
+        immediately run CPU-bound matmuls over them was the single largest
+        remaining cost after the collective_rpc transfer itself was fixed)
+        -- for the given absolute LOCAL positions within this
+        conversation's own speculator prompt (i.e. indices into what
+        `proposer.py` submitted as this conversation's growing prompt --
+        NOT the multi-turn ledger's absolute positions used for the
+        TARGET's RoPE restoration, a separate numbering -- see
+        `proposer.py`'s docstring for how the two relate)."""
         slots = self.get_slots_for_positions(conversation_salt, positions)
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.device)
         block_size = self.vllm_config.cache_config.block_size
@@ -388,7 +404,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             num_kv_heads = self_attn.num_kv_heads
             head_size = self_attn.head_dim
             flat_keys = read_layer_keys(self_attn.attn, block_size, num_kv_heads, head_size)
-            keys.append(gather_keys_for_slots(flat_keys, slot_tensor).to("cpu"))
+            keys.append(gather_keys_for_slots(flat_keys, slot_tensor))
         return keys
 
     def end_capture_and_score(
@@ -429,7 +445,19 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         docstring on local-position numbering), covering the WHOLE
         sequence, not pre-filtered to just the candidate-history portion
         -- `pruner.py` still owns that filter, unchanged, since it's cheap
-        once the result is this small."""
+        once the result is this small.
+
+        **On-device, not CPU**: `self.end_capture`/`self.retrieve_keys`
+        called here are the `SpeculatorGPUModelRunner`-level methods (not
+        `SpeculatorWorker`'s RPC-exposed wrappers of the same name, which
+        DO move to CPU for the collective_rpc boundary those cross) -- see
+        both methods' own docstrings. Q and K therefore stay on `self.
+        device` all the way through `score_and_select_indices`'s matmul/
+        softmax/topk pipeline, letting it run GPU-accelerated instead of
+        CPU-bound -- a first real run before this distinction existed took
+        34s total with everything forced onto CPU, most of that plausibly
+        this exact inefficiency (a large matmul + softmax over an
+        88k-token context on CPU instead of GPU)."""
         from .config import SpecConfig
         from .scoring import score_and_select_indices
 
@@ -497,21 +525,33 @@ class SpeculatorWorker(Worker):
         engine is ever constructed, which makes `collective_rpc`'s
         `UtilityResult` wrapper carry proper type info for nested Tensors
         -- msgspec's own dedicated `_encode_tensor` codec then moves the
-        buffer directly, no Python-list round trip needed. Caller
-        (`proposer.py`) still does `.to(self.device)` since the decoded
-        tensor lands on CPU."""
-        return list(self.model_runner.end_capture(request_id))
+        buffer directly, no Python-list round trip needed.
+
+        The `.to("cpu")` here (not inside `SpeculatorGPUModelRunner.
+        end_capture`, which now stays on-device -- see that method's
+        docstring) is deliberately done at THIS boundary: this is an
+        RPC-exposed method whose result crosses `collective_rpc`'s process
+        boundary, where a CUDA tensor's storage isn't valid to reconstruct
+        in the driver process's own (different) CUDA context. Caller
+        (`proposer.py::run_turn`) then does `.to(self.device)` to bring it
+        back onto the SPECULATOR's device from the DRIVER process's own
+        perspective (a separate, necessary hop -- collective_rpc's decode
+        happens in the driver process, which has no CUDA context of the
+        worker's device unless it moves the data itself)."""
+        return [t.to("cpu") for t in self.model_runner.end_capture(request_id)]
 
     def retrieve_keys(
         self, conversation_salt: str, positions: List[int]
     ) -> List[torch.Tensor]:
         """Returns raw `torch.Tensor`s directly -- see `end_capture`'s
-        docstring above. Kept as a standalone RPC method (not removed now
-        that `end_capture_and_score` below does K retrieval internally)
-        because `validate_proposer.py`'s Step C calls it directly to
-        validate K read-back in isolation, and `proposer.py` still exposes
-        it as a public method for the same reason."""
-        return list(self.model_runner.retrieve_keys(conversation_salt, positions))
+        docstring above for why the `.to("cpu")` lives here now, not in
+        `SpeculatorGPUModelRunner.retrieve_keys`. Kept as a standalone RPC
+        method (not removed now that `end_capture_and_score` below does K
+        retrieval internally, on-device) because `validate_proposer.py`'s
+        Step C calls it directly to validate K read-back in isolation, and
+        `proposer.py` still exposes it as a public method for the same
+        reason."""
+        return [t.to("cpu") for t in self.model_runner.retrieve_keys(conversation_salt, positions)]
 
     def end_capture_and_score(
         self,
