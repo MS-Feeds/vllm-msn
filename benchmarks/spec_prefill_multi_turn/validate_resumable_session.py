@@ -195,7 +195,9 @@ def main() -> None:
     )
     print(f"[validate_resumable_session] Step A: add_request confirmed request_id={real_id!r}")
 
+    t0 = time.time()
     output1 = drive_one_turn_of_session(llm_engine, request_id)
+    turn1_elapsed = time.time() - t0
     if output1 is None:
         print("[validate_resumable_session] Step A: FAIL -- no output ever observed for "
               "this request_id. Either the request was never scheduled, or "
@@ -203,11 +205,19 @@ def main() -> None:
               "see this script's module docstring for what to check.")
         sys.exit(1)
 
+    turn1_ttft = (
+        output1.metrics.first_token_latency * 1000
+        if output1.metrics is not None and output1.metrics.first_token_latency
+        else None
+    )
     print(
         f"[validate_resumable_session] Step A: turn 1 finish_reason="
         f"{output1.outputs[0].finish_reason!r}, generated={output1.outputs[0].text!r}, "
-        f"num_cached_tokens={output1.num_cached_tokens} (expected 0 or small -- "
-        f"nothing real to hit yet on a fresh conversation)"
+        f"elapsed={turn1_elapsed:.2f}s, ttft={turn1_ttft}ms "
+        f"(prefilled {len(turn1_ids)} tokens from scratch -- this is the SLOW "
+        f"reference point Step B's turn 2 timing gets compared against). "
+        f"num_cached_tokens={output1.num_cached_tokens} (expected 0 -- nothing to "
+        f"hit yet on a fresh conversation, not itself meaningful beyond that)."
     )
 
     # Turn 2: ONLY the new delta tokens -- confirmed from
@@ -232,32 +242,76 @@ def main() -> None:
         f"unrelated requests, not a continued session."
     )
 
+    t0 = time.time()
     output2 = drive_one_turn_of_session(llm_engine, request_id)
+    turn2_elapsed = time.time() - t0
     if output2 is None:
         print("[validate_resumable_session] Step B: FAIL -- no output observed for turn 2.")
         sys.exit(1)
 
+    turn2_ttft = (
+        output2.metrics.first_token_latency * 1000
+        if output2.metrics is not None and output2.metrics.first_token_latency
+        else None
+    )
     print(
         f"[validate_resumable_session] Step B: turn 2 finish_reason="
         f"{output2.outputs[0].finish_reason!r}, generated={output2.outputs[0].text!r}, "
-        f"num_cached_tokens={output2.num_cached_tokens} "
-        f"(THE key assertion below -- expected close to {len(turn1_ids)}, "
-        f"the whole of turn 1's prompt, since nothing should have evicted it "
-        f"between these two back-to-back turns on an otherwise-idle engine)"
+        f"elapsed={turn2_elapsed:.2f}s, ttft={turn2_ttft}ms. "
+        f"num_cached_tokens={output2.num_cached_tokens} -- **expected to ALSO read 0 "
+        f"here, and this is NOT a failure signal**: traced against real source "
+        f"(scheduler.py's Scheduler.schedule(), the block starting "
+        f"`if request.num_computed_tokens == 0:`) that the prefix-cache-lookup/"
+        f"stats-recording path this metric comes from is gated to a request's "
+        f"VERY FIRST scheduling only; _update_request_as_session never resets "
+        f"num_computed_tokens, so a resumed session's later turns take the ELSE "
+        f"branch (reuse num_computed_tokens directly, no lookup, no stats update) "
+        f"every time -- num_cached_tokens is architecturally not meaningful for "
+        f"this code path, not evidence against persistence."
     )
 
-    if output2.num_cached_tokens < len(turn1_ids) // 2:
-        print(
-            "[validate_resumable_session] Step B: WARNING -- num_cached_tokens on turn 2 "
-            "is far below turn 1's prompt length. Either the KV cache did NOT genuinely "
-            "persist across the turn boundary (the core premise of the whole new "
-            "architecture), or num_cached_tokens doesn't mean what this script assumes "
-            "for a resumable request specifically -- do not proceed with building the "
-            "sparse-attention runner on top of this until this is understood."
-        )
+    # THE actual verification signal for this code path: prefill cost is
+    # proportional to how many NEW tokens actually needed a forward pass.
+    # Turn 1 prefilled len(turn1_ids) tokens from scratch; if turn 2 only
+    # ever needed to prefill its own len(turn2_ids) new tokens (because
+    # turn 1's KV is still resident, not recomputed), its TTFT should be
+    # dramatically lower than turn 1's -- not just "a bit faster", since
+    # turn1_ids is ~46x longer than turn2_ids in this script's own prompt.
+    # Turn 2's own generated text already showed the model correctly used
+    # turn 1's context regardless of caching, so the MODEL clearly had
+    # access to it either way -- what this check isolates is whether that
+    # access was served from cache (cheap) or genuinely recomputed
+    # (expensive).
+    if turn1_ttft is not None and turn2_ttft is not None:
+        if turn2_ttft > turn1_ttft * 0.5:
+            print(
+                f"[validate_resumable_session] Step B: WARNING -- turn 2's TTFT "
+                f"({turn2_ttft:.0f}ms) is not dramatically lower than turn 1's "
+                f"({turn1_ttft:.0f}ms), despite turn 2 only submitting "
+                f"{len(turn2_ids)} new tokens against turn 1's {len(turn1_ids)}. "
+                f"This suggests turn 2 may have re-prefilled turn 1's content from "
+                f"scratch rather than reusing already-computed KV -- do not proceed "
+                f"with building the sparse-attention runner on top of this until "
+                f"this is understood (the model producing a correct answer either "
+                f"way doesn't distinguish 'served from cache' from 'recomputed', "
+                f"only the timing does)."
+            )
+        else:
+            print(
+                f"[validate_resumable_session] Step B: PASS -- turn 2's TTFT "
+                f"({turn2_ttft:.0f}ms) is dramatically lower than turn 1's "
+                f"({turn1_ttft:.0f}ms), consistent with turn 1's KV genuinely "
+                f"persisting and being reused rather than recomputed."
+            )
     else:
-        print("[validate_resumable_session] Step B: PASS -- turn 2 shows a real cache hit "
-              "for turn 1's content, consistent with genuine cross-turn KV persistence.")
+        print(
+            "[validate_resumable_session] Step B: WARNING -- first_token_latency "
+            "was not available on one or both outputs (metrics=None?) -- cannot "
+            "make the timing-based determination above. Check that "
+            "disable_log_stats=False actually took effect, or fall back to "
+            "comparing elapsed= (cruder -- includes decode time, not just "
+            "prefill) printed above."
+        )
 
     # Step C: clean termination -- abort_request is a real, already-used
     # API elsewhere in vLLM's own client code (not invented for this
