@@ -91,7 +91,8 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
-COPY --chmod=0755 docker/deepseek_v4_a100/run.sh /usr/local/bin/run.sh
+COPY --chmod=0755 docker/deepseek_v4_a100/run.sh /workspace/run.sh
+COPY --chmod=0755 docker/deepseek_v4_a100/run_wrapper.sh /workspace/run_wrapper.sh
 
 ENV PATH=/opt/venv/bin:/opt/aml-tools/bin:${PATH} \
     CUDA_HOME=/usr/local/cuda \
@@ -188,5 +189,6 @@ EXPOSE 22 5001 6066 8000 8080 8883 8889
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8000/health || exit 1
 
+WORKDIR /workspace
 ENTRYPOINT ["/usr/local/bin/deepseek-v4-entrypoint"]
-CMD ["/usr/local/bin/run.sh"]
+CMD ["/workspace/run_wrapper.sh"]
