@@ -786,6 +786,24 @@ def run_sparse_attention(
         position_map = LedgerToTargetPositionMap(initial_offset=len(chat_before_ids))
         target_request_id = f"{conv['id']}::sparse-session"
         session_started = False
+        # RequestOutput.outputs[0].token_ids/.text are CUMULATIVE for the
+        # WHOLE request's lifetime under this engine's default (non-DELTA)
+        # output_kind -- confirmed by reading output_processor.py's
+        # RequestState/_new_completion_output (token_ids = self.detokenizer.
+        # output_token_ids when not delta) and detokenizer.py's
+        # IncrementalDetokenizer (self.output_text += ...) -- NEITHER is
+        # reset by apply_streaming_update/`_update_request_as_session` on a
+        # session resumption, so turn 2's `output` already contains turn 1's
+        # tokens/text prepended, turn 3's contains turns 1+2's, etc. Track
+        # how many output tokens existed before THIS turn so each turn's
+        # genuinely NEW tokens can be sliced out -- real hardware evidence
+        # this matters (not a theoretical concern): feeding the raw
+        # cumulative slice into state.complete_turn re-appended every prior
+        # turn's output to the ledger each turn, a compounding drift that
+        # crashed sparse_target_runner.py's block-index bounds check a few
+        # turns into a real SCBench conversation (kept_positions translated
+        # to a target position far beyond anything actually computed).
+        prev_cumulative_output_len = 0
 
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
@@ -856,8 +874,25 @@ def run_sparse_attention(
             actual_output_ids: list[int] = []
             if output is not None:
                 completion = output.outputs[0]
-                actual_output_ids = list(completion.token_ids)
-                stats["out_lens"].append(len(completion.token_ids))
+                # Slice out just THIS turn's new tokens from the cumulative
+                # list -- see prev_cumulative_output_len's own comment above
+                # for why the raw list can't be used directly.
+                cumulative_output_ids = list(completion.token_ids)
+                new_output_ids = cumulative_output_ids[prev_cumulative_output_len:]
+                prev_cumulative_output_len = len(cumulative_output_ids)
+
+                # Drop the last generated token before feeding the ledger --
+                # `_update_request_as_session` (vllm/v1/core/sched/
+                # scheduler.py) does the same when a session resumes
+                # ("Discards the last sampled output token from the prior
+                # input chunk"): that token was only ever SAMPLED, never fed
+                # back into the model, so its own KV was never computed and
+                # it is not physically part of the target's retained
+                # context going forward. The ledger must mirror that or
+                # LedgerToTargetPositionMap drifts by one token per turn.
+                actual_output_ids = new_output_ids[:-1]
+
+                stats["out_lens"].append(len(new_output_ids))
                 stats["finish"][completion.finish_reason if completion.finish_reason in
                                  stats["finish"] else "other"] += 1
                 if output.metrics is not None and output.metrics.first_token_latency:
@@ -865,9 +900,13 @@ def run_sparse_attention(
                 if result.orig_len > 0:
                     stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
+                # completion.text is ALSO cumulative for the same reason --
+                # re-decode just this turn's own new tokens rather than use
+                # it directly.
+                pred_text = tok.decode(new_output_ids, skip_special_tokens=True)
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
-                    "config": conv["config"], "pred": completion.text,
+                    "config": conv["config"], "pred": pred_text,
                 })
 
             state.complete_turn(result.kept_history_pairs, actual_output_ids)

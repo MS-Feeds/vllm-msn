@@ -379,11 +379,39 @@ the target always receives the FULL, unpruned content).
 Both validation scripts (`validate_resumable_session.py`,
 `validate_sparse_attention.py`) pass on real hardware; the driving loop
 (`run_sparse_attention`, `run_experiment`'s `mode == "sparse"` dispatch) is
-wired up and CPU-tested (`test_vllm_patch.py`), but has **not yet been
-smoke-tested on real GPU hardware end to end** -- run a 1-2 conversation
-`SPARSE-k*-g*` smoke test (`--exp SPARSE-k80-g32 --max-conversations 2`)
-before trusting a full sweep, same discipline applied to every other new
-mechanism in this pipeline.
+wired up and CPU-tested (`test_vllm_patch.py`).
+
+**A real first-smoke-test finding, since fixed**: `RequestOutput.
+outputs[0].token_ids`/`.text` are CUMULATIVE for a request's WHOLE
+lifetime under this engine's default (non-`DELTA`) `output_kind` --
+confirmed by reading `output_processor.py` (`RequestState.
+_new_completion_output`: `token_ids = self.detokenizer.output_token_ids`
+when not delta) and `detokenizer.py` (`self.output_text += ...`) -- and
+NEITHER is reset by `apply_streaming_update`/`_update_request_as_session`
+on a session resumption. `run_sparse_attention`'s first version fed this
+raw cumulative output straight into `state.complete_turn`, re-appending
+every prior turn's output to the ledger each turn -- a compounding drift
+that crashed `sparse_target_runner.py`'s block-index bounds check a few
+turns into a real SCBench conversation (a registered position translated
+to a target position far beyond anything actually computed) and would
+independently have corrupted every recorded prediction from turn 2 onward
+(each `pred` field would have contained all previous turns' text
+prepended). Fixed by tracking each turn's cumulative-output-length-so-far
+and slicing out just the new tokens/text per turn. A second, smaller
+related fix: `_update_request_as_session` itself discards the final
+sampled token of each turn when a session resumes ("its own KV was never
+computed, since it was never fed back into the model before the request
+stopped") -- `state.complete_turn`'s ledger-feeding slice now drops that
+same last token too (predictions/grading still use the FULL per-turn
+slice, only the ledger is truncated), or `LedgerToTargetPositionMap` would
+drift by one token per turn against what the target's session actually
+retains.
+
+**Still not yet smoke-tested end to end past this fix** -- re-run a 1-2
+conversation `SPARSE-k*-g*` smoke test
+(`--exp SPARSE-k80-g32 --max-conversations 2`) before trusting a full
+sweep, same discipline applied to every other new mechanism in this
+pipeline.
 
 ---
 
