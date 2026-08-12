@@ -124,8 +124,10 @@ projection.
 This branch includes an experimental SM80 backend that adds those Ampere
 fallbacks. Build it from source; precompiled vLLM wheels do not contain the
 changed CUDA and C++ kernels. The patched source and its core, MoE, and FlashMLA
-extensions have been built successfully with CUDA 13.0.3. End-to-end model
-serving validation is still pending.
+extensions have been built successfully with CUDA 13.0.3. An eight-GPU launch
+also completed NCCL initialization, selected Marlin for FP4 MoE, and selected
+the Triton sparse-indexer fallback on A100. Full serving validation is pending
+completion of the approximately 167 GB checkpoint download.
 
 ### Container deployment
 
@@ -146,6 +148,19 @@ The builder stage compiles this checkout for SM80 and installs it into an
 isolated Python environment. The final stage copies that environment into a
 fresh CUDA runtime image. It retains only the CUDA development components
 needed by vLLM, Triton, and DeepGEMM for runtime JIT compilation.
+
+The self-contained source and installation steps are:
+
+```dockerfile
+RUN git clone --depth 1 --branch "${VLLM_REF}" \
+    "${VLLM_REPOSITORY}" /workspace
+
+WORKDIR /workspace
+RUN uv pip install . --torch-backend=auto
+```
+
+The completed `/opt/venv` is copied from the builder into the runtime stage;
+stock vLLM is not installed from PyPI.
 
 The source defaults can be overridden when needed:
 
@@ -168,14 +183,14 @@ builds vLLM from GitHub. From the repository root, submit the image build with:
 ```bash
 az ml environment create \
   --file azureml/environment.deepseek_v4_a100.yml \
-  --resource-group <resource-group> \
-  --workspace-name <workspace-name>
+  --resource-group AMLStudio \
+  --workspace-name NewsFeedL2_AML
 ```
 
-On this host, the complete environment file path is:
+After registration, reference this environment as:
 
 ```text
-/scratch/azureml/cr/j/13657718eaad4163badb1385dd61cb55/exe/wd/vllm-msn/azureml/environment.deepseek_v4_a100.yml
+azureml://locations/eastus/workspaces/f9309c3a-cdd8-4284-8c88-032e1ec736d2/environments/deepseek-v4-flash-0731-a100/versions/0.27.2-cuda13-sm80-selfcontained
 ```
 
 Run the API server with all eight GPUs and a persistent model/kernel cache:
