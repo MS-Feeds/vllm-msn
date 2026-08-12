@@ -22,12 +22,27 @@ in the ways EXPERIMENT_PLAN.md's architectural decisions require:
    time" MVP scope) -- flagged as a real, deliberate simplification, not an
    oversight; interleaving conversations for throughput is a natural
    follow-up once correctness is confirmed on real hardware.
-2. **Golden-context mode only** (EXPERIMENT_PLAN.md's decision #1): each
-   turn's target generation is what gets GRADED, but the token sequence fed
-   forward into FUTURE turns' history/ledger is the dataset's own reference
-   answer, not the model's own output. This is what makes the whole
-   per-turn token sequence for a conversation knowable statically up front
-   -- see that decision's docstring for why this matters for tractability.
+2. **Golden-context mode for `M-k*-g*`/oracle, NOT for `M000` baseline**
+   (EXPERIMENT_PLAN.md's decision #1, since narrowed): for `run_specprefill`,
+   each turn's target generation is what gets GRADED, but the token
+   sequence fed forward into FUTURE turns' history/ledger is the dataset's
+   own reference answer, not the model's own output -- this is what makes
+   the whole per-turn token sequence for a conversation knowable statically
+   up front for THAT path, see that decision's docstring for why this
+   matters for tractability. `run_baseline` was changed to use
+   self-generated history instead (its own actual completions, INCLUDING
+   whatever special/EOS tokens the model generated -- see that function's
+   own docstring), for the same reason `run_sparse_attention` already had
+   to: it's what a real conversation actually looks like, and it removes a
+   real confound when comparing `M000` against `SPARSE-k*-g*` (both now
+   self-generated, so context-length growth rate no longer differs between
+   them for reasons unrelated to either architecture -- previously `M000`'s
+   golden answers were typically much shorter than `SPARSE`'s own
+   `max_tokens`-bounded completions, making `SPARSE`'s conversations grow
+   faster turn over turn independent of its sparse-attention design).
+   `M-k*-g*`/oracle still need golden-context's "every turn's tokens known
+   up front" property (DISCARD mode's candidate-pool bookkeeping and the
+   pre-flight speculator-budget check both depend on it), so they keep it.
 3. **Turn/answer text is tokenized as separate pieces and concatenated**,
    never produced by a single `apply_chat_template` call over an
    accumulating multi-role messages list. A "real" multi-turn chat
@@ -547,9 +562,33 @@ def run_baseline(
                 f"({len(prompt_ids)} prompt tokens)"
             )
 
+            actual_output_ids: list[int] = []
             if output is not None:
                 completion = output.outputs[0]
-                stats["out_lens"].append(len(completion.token_ids))
+                # Real model generation, NOT golden_answer_ids -- unlike
+                # run_specprefill/the oracle path (still golden-context, see
+                # module docstring #2), baseline feeds its own actual
+                # output forward into future turns' ledger/context, same
+                # self-generated-history principle run_sparse_attention
+                # already uses (see that function's own docstring) and for
+                # the same reason: it's what a REAL multi-turn conversation
+                # actually looks like, not a golden-context simplification.
+                # `completion.token_ids` is used AS-IS, not re-tokenized
+                # from `.text` -- includes the model's own EOS/special
+                # tokens verbatim when generation stopped on one (vLLM's
+                # token_ids always reflects the raw sampled sequence;
+                # `skip_special_tokens` only affects `.text` decoding, never
+                # `.token_ids`), since a real conversation's own history
+                # would include whatever the model actually produced,
+                # special tokens included, not a cleaned-up version of it.
+                # This is a ONE-SHOT (non-resumable) request per turn here
+                # (unlike run_sparse_attention's persistent session), so
+                # `completion.token_ids` is this turn's own output only --
+                # no cumulative-output slicing needed (see that function's
+                # own docstring for why THAT pipeline needs it and this one
+                # doesn't).
+                actual_output_ids = list(completion.token_ids)
+                stats["out_lens"].append(len(actual_output_ids))
                 stats["finish"][completion.finish_reason if completion.finish_reason in
                                  stats["finish"] else "other"] += 1
                 if output.metrics is not None and output.metrics.first_token_latency:
@@ -561,8 +600,7 @@ def run_baseline(
                     "config": conv["config"], "pred": completion.text,
                 })
 
-            golden_answer_ids = render_golden_answer(tok, turn)
-            state.complete_turn(candidate_pool, golden_answer_ids)
+            state.complete_turn(candidate_pool, actual_output_ids)
 
         if len(predictions) > turns_before:
             conversations_processed += 1

@@ -108,6 +108,32 @@ more conversations/turn positions).
   serialized per-conversation execution model instead. Also a real
   redesign, not a flag flip.
 
+  **Since partially realized**: `M000` (`run_baseline`) now uses
+  self-generated history -- its own actual per-turn completions
+  (`completion.token_ids`, used verbatim, INCLUDING whatever special/EOS
+  token the model generated -- `skip_special_tokens` only ever affects
+  `.text` decoding, never `.token_ids`) instead of golden answers. Safe to
+  do without the "fully serialized" cost the bullet above warns about,
+  because `run_baseline` was ALREADY fully serialized per-conversation (one
+  one-shot `add_request` per turn, no cross-turn batching attempted, see
+  decision #1's docstring in `predict_scbench.py`) -- there was no
+  "tokens known up front" property to lose in the first place, unlike
+  `M-k*-g*`/oracle (`run_specprefill`), which genuinely still need it
+  (DISCARD mode's candidate-pool bookkeeping and the pre-flight
+  speculator-budget check both depend on knowing turn content ahead of
+  driving it), so those keep golden-context unchanged. Motivation: this
+  matches `SPARSE-k*-g*` (`run_sparse_attention`, which was FORCED into
+  self-generated history by its own resumable-session mechanism -- see
+  that pipeline's own section below) on this axis, removing a real
+  confound when comparing the two -- previously `M000`'s golden answers
+  (typically short reference text) were much shorter than `SPARSE`'s own
+  `max_tokens`-bounded completions, making `SPARSE`'s conversations grow
+  faster turn over turn for a reason unrelated to either architecture.
+  `M-k*-g*` was NOT changed, so it still has this asymmetry against
+  `SPARSE` -- worth keeping in mind if comparing `M-k*-g*` vs. `SPARSE-k*-
+  g*` context-length-sensitive metrics (candidate-pool size, scoring time)
+  turn over turn.
+
 **2. Speculator persistence: a real, persistent `vllm.LLM()`, not a
 hand-extended scratch cache.** `vllm_patch/speculator_worker.py` runs the
 speculator as a genuine `vllm.LLM(enable_prefix_caching=True)`, wired via the
