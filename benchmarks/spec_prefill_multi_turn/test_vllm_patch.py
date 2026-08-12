@@ -38,6 +38,7 @@ from vllm_patch.config import SpecConfig
 from vllm_patch.conversation_state import ConversationState
 from vllm_patch.kv_cache_utils import (
     _find_kv_split_dim,
+    block_indices_from_positions,
     compute_sparse_gather_view,
     gather_keys_for_slots,
     stack_decode_only_steps,
@@ -252,7 +253,7 @@ def test_compute_sparse_gather_view_basic_selection():
     result = compute_sparse_gather_view(
         full_block_table_row=full_block_table_row,
         block_size=block_size,
-        selected_positions=[1, 14],  # block 0 (0-3) and block 3 (12-15)
+        base_block_indices=block_indices_from_positions([1, 14], block_size),  # blocks 0, 3
         num_prompt=24,
         num_computed=24,
     )
@@ -275,7 +276,7 @@ def test_compute_sparse_gather_view_force_keeps_in_progress_decode_tail():
     result = compute_sparse_gather_view(
         full_block_table_row=full_block_table_row,
         block_size=block_size,
-        selected_positions=[],  # nothing selected by the speculator at all
+        base_block_indices=set(),  # nothing selected by the speculator at all
         num_prompt=16,
         num_computed=18,
     )
@@ -291,7 +292,7 @@ def test_compute_sparse_gather_view_combines_selection_and_force_keep():
     result = compute_sparse_gather_view(
         full_block_table_row=full_block_table_row,
         block_size=block_size,
-        selected_positions=[0],  # block 0
+        base_block_indices=block_indices_from_positions([0], block_size),  # block 0
         num_prompt=16,
         num_computed=17,  # 1 token generated so far this turn -> block 4
     )
@@ -310,7 +311,7 @@ def test_compute_sparse_gather_view_degenerate_full_selection_returns_none():
     result = compute_sparse_gather_view(
         full_block_table_row=full_block_table_row,
         block_size=block_size,
-        selected_positions=[0, 4],  # blocks 0 and 1 -- everything
+        base_block_indices=block_indices_from_positions([0, 4], block_size),  # blocks 0, 1
         num_prompt=8,
         num_computed=8,
     )
@@ -327,7 +328,7 @@ def test_compute_sparse_gather_view_out_of_range_raises():
         compute_sparse_gather_view(
             full_block_table_row=full_block_table_row,
             block_size=block_size,
-            selected_positions=[100],  # block 25 -- way out of range
+            base_block_indices=block_indices_from_positions([100], block_size),  # block 25
             num_prompt=8,
             num_computed=8,
         )
@@ -346,13 +347,43 @@ def test_compute_sparse_gather_view_preserves_ascending_order():
     result = compute_sparse_gather_view(
         full_block_table_row=full_block_table_row,
         block_size=block_size,
-        selected_positions=[12, 0, 4],  # blocks 3, 0, 1 -- deliberately unordered
+        # blocks 3, 0, 1 -- deliberately unordered input positions
+        base_block_indices=block_indices_from_positions([12, 0, 4], block_size),
         num_prompt=16,
         num_computed=16,
     )
     assert result is not None
     gathered_row, _ = result
     assert torch.equal(gathered_row, torch.tensor([100, 101, 103]))  # blocks 0, 1, 3
+
+
+def test_block_indices_from_positions_dedupes_by_block():
+    assert block_indices_from_positions([1, 2, 3, 14, 15], block_size=4) == {0, 3}
+
+
+def test_block_indices_from_positions_empty():
+    assert block_indices_from_positions([], block_size=4) == set()
+
+
+def test_compute_sparse_gather_view_does_not_mutate_caller_base_set():
+    """`sparse_target_runner.py` caches `base_block_indices` per turn and
+    reuses the SAME set object across every decode step of that turn (see
+    that module's `_get_base_block_indices`) -- `compute_sparse_gather_view`
+    must copy it internally, never mutate it in place, or the second decode
+    step of a turn would see stale force-keep entries leaked in from the
+    first."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101, 102, 103, 104])
+    base_block_indices = block_indices_from_positions([0], block_size)  # {0}
+    original = set(base_block_indices)
+    compute_sparse_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        base_block_indices=base_block_indices,
+        num_prompt=16,
+        num_computed=17,  # force-keep tail would add block 4 if it mutated the input
+    )
+    assert base_block_indices == original
 
 
 def test_sparse_selection_registry_lifecycle():

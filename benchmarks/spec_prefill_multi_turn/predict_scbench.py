@@ -440,6 +440,28 @@ class LedgerToTargetPositionMap:
         return ledger_position + offset
 
 
+def _progress_postfix(
+    predictions: list, stats: dict, t_loop_start: float, conversations_processed: int
+) -> dict:
+    """Shared `tqdm.set_postfix` payload for `run_baseline`/`run_specprefill`/
+    `run_sparse_attention`'s per-conversation progress bars. `s/conv`
+    deliberately does NOT use tqdm's own built-in rate (`n / elapsed`,
+    where `n` advances once per LOADED conversation, including ones that
+    get skipped and complete almost instantly -- exactly the same "total
+    vs. processed" distortion the CSV's `seconds_per_conversation` field
+    exists to avoid, see `run_experiment`'s own comment on that field) --
+    computed here from `conversations_processed` (conversations that
+    contributed >=1 turn to `predictions`) instead, so it reads as real
+    per-conversation cost even while a run is skipping a lot of oversized
+    conversations (baseline especially, see `run_baseline`'s docstring).
+    `None` (omitted) until the first conversation actually completes, to
+    avoid a misleadingly tiny number from a single fast conversation."""
+    postfix = {"turns": len(predictions), "skipped": stats["num_skipped_too_large"]}
+    if conversations_processed > 0:
+        postfix["s/conv"] = f"{(time.time() - t_loop_start) / conversations_processed:.1f}"
+    return postfix
+
+
 def run_baseline(
     llm, tok, conversations, max_tokens, keep_mode, target_max_num_batched_tokens
 ) -> tuple[list[dict], dict]:
@@ -484,9 +506,12 @@ def run_baseline(
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
               "num_skipped_too_large": 0}
 
+    t_loop_start = time.time()
+    conversations_processed = 0
     progress = tqdm(conversations, desc="M000 baseline", unit="conv")
     for conv in progress:
-        progress.set_postfix(turns=len(predictions), skipped=stats["num_skipped_too_large"])
+        progress.set_postfix(_progress_postfix(predictions, stats, t_loop_start, conversations_processed))
+        turns_before = len(predictions)
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
@@ -529,6 +554,9 @@ def run_baseline(
 
             golden_answer_ids = render_golden_answer(tok, turn)
             state.complete_turn(candidate_pool, golden_answer_ids)
+
+        if len(predictions) > turns_before:
+            conversations_processed += 1
 
     return predictions, stats
 
@@ -596,9 +624,12 @@ def run_specprefill(
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
     desc = f"SpecPrefill keep={keep_pct}"
+    t_loop_start = time.time()
+    conversations_processed = 0
     progress = tqdm(conversations, desc=desc, unit="conv")
     for conv in progress:
-        progress.set_postfix(turns=len(predictions), skipped=stats["num_skipped_too_large"])
+        progress.set_postfix(_progress_postfix(predictions, stats, t_loop_start, conversations_processed))
+        turns_before = len(predictions)
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
             query_ids = render_turn_query(tok, turn_idx, turn)
@@ -689,6 +720,8 @@ def run_specprefill(
             state.complete_turn(result.kept_history_pairs, golden_answer_ids)
 
         proposer.discard_conversation(conv["id"])
+        if len(predictions) > turns_before:
+            conversations_processed += 1
 
     return predictions, stats
 
@@ -777,9 +810,12 @@ def run_sparse_attention(
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
     desc = f"Sparse attention keep={keep_pct}"
+    t_loop_start = time.time()
+    conversations_processed = 0
     progress = tqdm(conversations, desc=desc, unit="conv")
     for conv in progress:
-        progress.set_postfix(turns=len(predictions), skipped=stats["num_skipped_too_large"])
+        progress.set_postfix(_progress_postfix(predictions, stats, t_loop_start, conversations_processed))
+        turns_before = len(predictions)
 
         context_ids = tok.encode(conv["context"], add_special_tokens=False)
         state = ConversationState(conv["id"], context_ids, keep_mode)
@@ -914,6 +950,8 @@ def run_sparse_attention(
         proposer.discard_conversation(conv["id"])
         if session_started:
             llm.llm_engine.abort_request([target_request_id])
+        if len(predictions) > turns_before:
+            conversations_processed += 1
 
     return predictions, stats
 

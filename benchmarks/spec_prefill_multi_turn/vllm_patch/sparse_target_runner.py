@@ -73,6 +73,26 @@ the same turn, mirroring the physically-pruned pipeline's own
 force-keep-the-query-span rule, generalized here to "force-keep this
 turn's own tokens so far."
 
+## Per-turn caching of the block-index computation (real perf fix, not
+## speculative)
+
+A first real smoke test against SCBench (large contexts, KEEP mode, so
+`selected_positions` can be tens of thousands of absolute ledger positions)
+measured a catastrophic per-conversation slowdown vs. the physically-pruned
+sibling pipeline. Traced to `compute_sparse_gather_view` originally
+recomputing `{p // block_size for p in selected_positions}` -- an
+O(len(selected_positions)) Python set comprehension -- on every single call
+to `_apply_sparse_attention_overrides`, which runs once per DECODE STEP
+(`_build_attention_metadata` is called every step, not once per turn), i.e.
+up to `max_tokens` times (e.g. 64) per turn, even though the registered
+selection is constant for the whole turn. `_get_base_block_indices` above
+now computes and caches this set ONCE per turn (invalidated by `id()` of
+the registry's `selected_positions` object changing, which happens exactly
+once per `register_sparse_selection` call -- see that method's docstring),
+so each decode step only pays for the small, per-step-bounded force-keep
+tail (`kv_cache_utils.compute_sparse_gather_view`'s own
+`range(num_prompt, num_computed)` loop), not the whole selection again.
+
 ## Known risk areas -- NOT independently confirmed on real hardware yet
 (unlike the resumable-session foundation this builds on, which IS confirmed
 -- see `validate_resumable_session.py`). `validate_sparse_attention.py`
@@ -125,6 +145,42 @@ _SEQ_LENS_FIELD = "seq_lens"
 
 
 class SparseTargetGPUModelRunner(GPUModelRunner):
+    def _base_block_indices_cache(self) -> Dict[str, tuple]:
+        # Lazily-initialized rather than added to __init__ -- same
+        # *args/**kwargs-passthrough philosophy as this class's own
+        # _build_attention_metadata override: GPUModelRunner's real
+        # constructor signature is large and version-sensitive, so this
+        # avoids needing to know or forward it just to add one cache dict.
+        # Keyed by req_id -> (id(selected_positions) at cache time, the
+        # resulting block-index set) -- id() is a safe cache key here
+        # specifically because sparse_selection_registry.py's `register()`
+        # always stores a NEW list object (`list(selected_positions)`) and
+        # keeps it alive for the request's whole turn, so id() can't be
+        # silently reused for a DIFFERENT selection while this cache entry
+        # is still valid.
+        if not hasattr(self, "_sparse_base_block_indices_cache"):
+            self._sparse_base_block_indices_cache: Dict[str, tuple] = {}
+        return self._sparse_base_block_indices_cache
+
+    def _get_base_block_indices(self, req_id: str, selected_positions: List[int], block_size: int):
+        # Caches `block_indices_from_positions` per request, invalidated
+        # whenever the registry hands back a different `selected_positions`
+        # object (a new turn's registration) -- see module docstring:
+        # without this, this O(len(selected_positions)) computation (which
+        # can be tens of thousands of entries for a large SCBench context)
+        # was being redone on EVERY decode step of a turn (up to
+        # `max_tokens` times), a real, measured per-conversation slowdown.
+        from .kv_cache_utils import block_indices_from_positions
+
+        cache = self._base_block_indices_cache()
+        cache_key = id(selected_positions)
+        cached = cache.get(req_id)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        base_block_indices = block_indices_from_positions(selected_positions, block_size)
+        cache[req_id] = (cache_key, base_block_indices)
+        return base_block_indices
+
     def _build_attention_metadata(self, *args, **kwargs):
         # *args/**kwargs passthrough -- see module docstring: this method's
         # real signature (num_tokens, num_reqs, max_query_len, ... many more
@@ -162,10 +218,11 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 # (num_computed >= num_prompt) get gathered.
                 continue
 
+            base_block_indices = self._get_base_block_indices(req_id, selected_positions, block_size)
             gathered = self._compute_gathered_view(
                 req_idx=req_idx,
                 block_size=block_size,
-                selected_positions=selected_positions,
+                base_block_indices=base_block_indices,
                 num_prompt=num_prompt,
                 num_computed=num_computed,
                 attn_metadata=attn_metadata,
@@ -183,7 +240,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         self,
         req_idx: int,
         block_size: int,
-        selected_positions: List[int],
+        base_block_indices,
         num_prompt: int,
         num_computed: int,
         attn_metadata: Dict[str, object],
@@ -197,7 +254,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         block-selection/seq_len arithmetic to
         `kv_cache_utils.compute_sparse_gather_view` -- factored out
         specifically so that logic is unit-testable without a live
-        `GPUModelRunner` or GPU (see that function's own docstring)."""
+        `GPUModelRunner` or GPU (see that function's own docstring).
+        `base_block_indices` is the CACHED per-turn block-index set from
+        `_get_base_block_indices` above, not the raw selection list -- see
+        that method's docstring for why."""
         from .kv_cache_utils import compute_sparse_gather_view
 
         any_layer_metadata = next(iter(attn_metadata.values()))
@@ -206,7 +266,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         return compute_sparse_gather_view(
             full_block_table_row=full_block_table_row,
             block_size=block_size,
-            selected_positions=selected_positions,
+            base_block_indices=base_block_indices,
             num_prompt=num_prompt,
             num_computed=num_computed,
         )

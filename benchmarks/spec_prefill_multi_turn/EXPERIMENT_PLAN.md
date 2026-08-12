@@ -407,7 +407,32 @@ slice, only the ledger is truncated), or `LedgerToTargetPositionMap` would
 drift by one token per turn against what the target's session actually
 retains.
 
-**Still not yet smoke-tested end to end past this fix** -- re-run a 1-2
+**Second real finding, from the fixed pipeline's first successful smoke
+test (4 processed conversations)**: SPARSE ran at 695s/conversation vs.
+M000 baseline's 28s/conversation -- a 25x gap far larger than "pays for an
+extra speculator forward pass" alone should explain. Root-caused to
+`compute_sparse_gather_view` (`kv_cache_utils.py`) recomputing
+`{p // block_size for p in selected_positions}` -- an
+O(len(selected_positions)) Python set comprehension, and
+`selected_positions` can be tens of thousands of absolute ledger positions
+for a large SCBench context under KEEP mode -- on EVERY decode step
+(`_apply_sparse_attention_overrides` runs once per `_build_attention_
+metadata` call, i.e. once per decode step, not once per turn), even though
+the registered selection is constant for a whole turn's ~`max_tokens`
+(e.g. 64) decode steps. Fixed by caching the block-index set once per turn
+(`sparse_target_runner.py`'s new `_get_base_block_indices`, invalidated by
+`id()` of the registry's `selected_positions` object changing) -- see that
+module's own "Per-turn caching" docstring section. **Note this doesn't
+necessarily close the whole 25x gap**: M000 pays zero speculator cost at
+all (no proposer, no K read-back, no scoring), while SPARSE and M-k*-g*
+both pay for a full speculator forward pass plus `proposer.py`'s
+cross-process K-tensor transfer (`tensor_to_wire`'s `.tolist()`, expensive
+for a large candidate pool, shared unchanged by both pipelines) -- so
+comparing SPARSE against M-k*-g*'s own `seconds_per_conversation` (not
+M000's) is the fair way to isolate whether further sparse-specific
+overhead remains after this fix.
+
+**Still not yet smoke-tested end to end past either fix** -- re-run a 1-2
 conversation `SPARSE-k*-g*` smoke test
 (`--exp SPARSE-k80-g32 --max-conversations 2`) before trusting a full
 sweep, same discipline applied to every other new mechanism in this

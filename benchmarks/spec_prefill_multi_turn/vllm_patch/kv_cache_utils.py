@@ -43,7 +43,7 @@ forward-context-scoped lookup at all -- this module has no vLLM dependency
 whatsoever, not even a lazy one.
 """
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 import torch
 
@@ -208,10 +208,25 @@ def stack_decode_only_steps(
     return torch.empty(1, 0, hidden_dim_fallback)
 
 
+def block_indices_from_positions(positions: List[int], block_size: int) -> Set[int]:
+    """`{p // block_size for p in positions}` -- factored out to its own
+    function specifically so `sparse_target_runner.py` can CACHE the result
+    per turn (see that module's docstring on why this matters: `positions`
+    here is the speculator's registered selection, which can be tens of
+    thousands of absolute conversation-ledger positions for a large SCBench
+    context, but is only registered ONCE per turn while
+    `compute_sparse_gather_view` runs on every DECODE step of that turn --
+    up to `max_tokens` times, e.g. 64 -- so recomputing this set from raw
+    positions on every single step, as an earlier version of
+    `compute_sparse_gather_view` did inline, was a real, measured
+    per-conversation slowdown, not a theoretical one)."""
+    return {p // block_size for p in positions}
+
+
 def compute_sparse_gather_view(
     full_block_table_row: torch.Tensor,
     block_size: int,
-    selected_positions: List[int],
+    base_block_indices: Set[int],
     num_prompt: int,
     num_computed: int,
 ) -> Optional[Tuple[torch.Tensor, int]]:
@@ -231,11 +246,15 @@ def compute_sparse_gather_view(
             builder (read, not recomputed, from an already-built
             `AttentionMetadata` -- see caller).
         block_size: engine's KV-cache block size (tokens per block).
-        selected_positions: absolute conversation-ledger positions the
-            speculator chose for this turn (already includes this turn's
-            own query span -- the driver's responsibility, not this
-            function's -- see `sparse_selection_registry.py`'s module
-            docstring).
+        base_block_indices: block indices the speculator's selection maps
+            to for this turn -- i.e. `block_indices_from_positions(
+            selected_positions, block_size)`, but computed and CACHED once
+            per turn by the caller (see that function's own docstring),
+            not recomputed inline here on every decode step. This function
+            only adds the (small, per-step-bounded) in-progress-decode
+            force-keep tail on top of it -- never mutates the set passed
+            in (copies internally), so the same cached set is safe to pass
+            again on the next decode step.
         num_prompt: this request's cumulative prompt length so far
             (`self.input_batch.num_prompt_tokens_cpu_tensor[req_idx]`),
             INCLUDING this turn's own query, per `_update_request_as_
@@ -247,7 +266,7 @@ def compute_sparse_gather_view(
             for a decode step this is `>= num_prompt`, and
             `num_computed - num_prompt` is exactly how many tokens THIS
             turn has generated so far, always force-included regardless of
-            `selected_positions` (see module docstring's "Force-keep"
+            `base_block_indices` (see module docstring's "Force-keep"
             reasoning in `sparse_target_runner.py`).
 
     Returns:
@@ -271,7 +290,7 @@ def compute_sparse_gather_view(
             could belong to a completely different request or conversation
             by then).
     """
-    selected_block_indices = {p // block_size for p in selected_positions}
+    selected_block_indices = set(base_block_indices)  # copy -- never mutate caller's cache
     for pos in range(num_prompt, num_computed):
         selected_block_indices.add(pos // block_size)
 
