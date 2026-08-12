@@ -91,9 +91,11 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /root/.local/bin/uv /usr/local/bin/uv
+COPY --chmod=0755 docker/deepseek_v4_a100/run.sh /usr/local/bin/run.sh
 
-ENV PATH=/opt/venv/bin:${PATH} \
+ENV PATH=/opt/venv/bin:/opt/aml-tools/bin:${PATH} \
     CUDA_HOME=/usr/local/cuda \
+    AML_PYTHON=/opt/aml-tools/bin/python \
     HF_HOME=/data/huggingface \
     VLLM_CACHE_ROOT=/data/vllm \
     TRITON_CACHE_DIR=/data/triton \
@@ -115,11 +117,55 @@ ENV PATH=/opt/venv/bin:${PATH} \
     TZ=US/Pacific \
     TERM=xterm
 
+RUN uv venv --python python${PYTHON_VERSION} /opt/aml-tools \
+    && uv pip install --python /opt/aml-tools/bin/python --upgrade pip \
+    && uv pip install --python /opt/aml-tools/bin/python \
+        --torch-backend=auto \
+        "git+https://github.com/huggingface/transformers" \
+        accelerate \
+        datasets \
+        peft \
+        trl \
+        tokenizers \
+        gradio \
+        pandas \
+        scipy \
+        einops \
+        sentencepiece \
+        tiktoken \
+        "protobuf==3.20" \
+        uvicorn \
+        pydantic \
+        fastapi \
+        sse-starlette \
+        matplotlib \
+        fire \
+        packaging \
+        pyyaml \
+        numpy \
+        av \
+        tyro \
+        colorlog \
+        torchvision \
+        nltk \
+        rouge-chinese \
+        python-dotenv \
+        bitsandbytes \
+        evaluate \
+        jiwer \
+        deepspeed \
+        scikit-learn \
+        tornado \
+        watchdog \
+        jupyter \
+        ipykernel
+
 RUN mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" \
         /var/run/sshd /root/.ssh \
-    && uv pip install --python /opt/venv/bin/python \
-        jupyter ipykernel \
-    && python -m ipykernel install --prefix=/opt/venv \
+    && /opt/aml-tools/bin/python -m ipykernel install \
+        --prefix=/opt/aml-tools \
+        --name=aml-tools \
+        --display-name="Python (AML tools)" \
     && python -c "import vllm; print(vllm.__version__)"
 
 RUN <<'EOF'
@@ -143,19 +189,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 \
     CMD curl --fail --silent http://127.0.0.1:8000/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/deepseek-v4-entrypoint"]
-CMD ["vllm", "serve", "deepseek-ai/DeepSeek-V4-Flash-0731", \
-     "--host", "0.0.0.0", \
-     "--port", "8000", \
-     "--trust-remote-code", \
-     "--tensor-parallel-size", "8", \
-     "--enable-expert-parallel", \
-     "--moe-backend", "marlin", \
-     "--kv-cache-dtype", "fp8", \
-     "--block-size", "256", \
-     "--max-model-len", "8192", \
-     "--gpu-memory-utilization", "0.90", \
-     "--tokenizer-mode", "deepseek_v4", \
-     "--enable-auto-tool-choice", \
-     "--tool-call-parser", "deepseek_v4", \
-     "--reasoning-parser", "deepseek_v4", \
-     "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"greedy\"}"]
+CMD ["/usr/local/bin/run.sh"]
