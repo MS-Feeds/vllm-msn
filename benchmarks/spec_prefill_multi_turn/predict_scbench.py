@@ -142,8 +142,8 @@ CSV_FIELDS = [
     "target_gpu_memory_utilization", "speculator_gpu_memory_utilization",
     "target_max_num_batched_tokens",
     "rep", "seed", "max_tokens",
-    "num_conversations", "num_turns", "num_skipped_too_large",
-    "elapsed_time", "turns_per_second",
+    "num_conversations_loaded", "num_conversations", "num_turns", "num_skipped_too_large",
+    "elapsed_time", "turns_per_second", "seconds_per_conversation",
     "actual_keep_rate_mean",
     "ttft_mean_ms", "ttft_p50_ms", "ttft_p90_ms",
     "num_cached_tokens_speculator_mean",
@@ -1096,6 +1096,19 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
                 )
             elapsed = time.time() - t0
+            # "Processed" == actually contributed >=1 turn to `predictions`
+            # (not skipped from turn 0 onward by one of run_*'s pre-flight
+            # length checks) -- rate/average metrics below (turns_per_second
+            # already did this implicitly, since a prediction is only ever
+            # appended for a turn that wasn't skipped) use ONLY this count,
+            # not `len(conversations)` (the raw number loaded from the
+            # samples file, kept separately as num_conversations_loaded for
+            # context/skip-rate visibility) -- a conversation skipped
+            # immediately (e.g. baseline against an oversized SCBench
+            # context) costs near-zero wall time, so counting it in a
+            # per-conversation denominator would understate real per-
+            # conversation cost.
+            num_conversations_processed = len({p["conversation_id"] for p in predictions})
 
             if rep == args.reps:
                 pred_path = OUT_DIR / f"{exp_id}_predictions.jsonl"
@@ -1116,11 +1129,16 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "speculator_gpu_memory_utilization": args.speculator_gpu_memory_utilization if mode != "baseline" else None,
                 "target_max_num_batched_tokens": target_max_num_batched_tokens,
                 "rep": rep, "seed": 0, "max_tokens": args.max_tokens,
-                "num_conversations": len(conversations),
+                "num_conversations_loaded": len(conversations),
+                "num_conversations": num_conversations_processed,
                 "num_turns": len(predictions),
                 "num_skipped_too_large": stats["num_skipped_too_large"],
                 "elapsed_time": elapsed,
                 "turns_per_second": len(predictions) / elapsed if elapsed > 0 else None,
+                "seconds_per_conversation": (
+                    elapsed / num_conversations_processed
+                    if num_conversations_processed > 0 else None
+                ),
                 "actual_keep_rate_mean": statistics.mean(stats["actual_keep_rates"]) if stats["actual_keep_rates"] else None,
                 "ttft_mean_ms": statistics.mean(stats["ttfts"]) if stats["ttfts"] else None,
                 "ttft_p50_ms": percentile(ttfts_sorted, 0.5),
@@ -1136,10 +1154,14 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "finish_other": stats["finish"]["other"],
             }
             append_csv_row(row)
+            spc = row["seconds_per_conversation"]
+            spc_str = f"{spc:.1f}s/conversation" if spc is not None else "n/a s/conversation"
             print(
                 f"[predict_scbench] rep {rep}/{args.reps}: {row['num_turns']} turns "
-                f"across {row['num_conversations']} conversations in {elapsed:.1f}s "
-                f"({row['turns_per_second']:.2f} turns/s), "
+                f"across {row['num_conversations']} processed conversations "
+                f"({row['num_conversations_loaded']} loaded, "
+                f"{row['num_skipped_too_large']} skipped) in {elapsed:.1f}s "
+                f"({row['turns_per_second']:.2f} turns/s, {spc_str}), "
                 f"ttft_mean={row['ttft_mean_ms']}, "
                 f"actual_keep_rate_mean={row['actual_keep_rate_mean']}, "
                 f"num_cached_tokens_speculator_mean={row['num_cached_tokens_speculator_mean']}"
