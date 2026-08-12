@@ -71,6 +71,7 @@ instead of a parallelism one).
 """
 
 import os
+import time
 from typing import List, Optional, Tuple
 
 import torch
@@ -217,6 +218,7 @@ class SpecPrefillProposer:
         from vllm.inputs import TokensPrompt
 
         request_id = f"{conversation_salt}::turn{turn_idx}"
+        t_start = time.time()
 
         # Register capture BEFORE add_request -- NOT reactively, in response
         # to observed output progress, as an earlier version of this method
@@ -247,6 +249,7 @@ class SpecPrefillProposer:
 
         num_cached_tokens = 0
         final_output = None
+        t_prefill_done = None
         # Same "never break early / never abort" discipline as
         # predict_longbench_v2.py's drive_engine_to_completion -- an
         # unconditional step() without checking has_unfinished_requests()
@@ -261,9 +264,31 @@ class SpecPrefillProposer:
                     # does -- just ignore it, it'll be driven to completion
                     # by whatever submitted it.
                     continue
+                if final_output is None:
+                    # The FIRST output seen for a fresh (non-resumable,
+                    # non-streamed) request is exactly the point the
+                    # bootstrap prefill finished and the first token was
+                    # sampled -- there is no earlier signal available from
+                    # outside the engine.
+                    t_prefill_done = time.time()
+                    print(
+                        f"[proposer.run_turn] {request_id!r}: bootstrap "
+                        f"prefill done in {t_prefill_done - t_start:.2f}s "
+                        f"({len(full_sequence_token_ids)} tokens, "
+                        f"num_cached_tokens={output.num_cached_tokens})"
+                    )
                 final_output = output
                 if output.num_cached_tokens:
                     num_cached_tokens = output.num_cached_tokens
+
+        t_decode_done = time.time()
+        if t_prefill_done is not None and final_output is not None:
+            print(
+                f"[proposer.run_turn] {request_id!r}: lookahead speculation "
+                f"done in {t_decode_done - t_prefill_done:.2f}s "
+                f"({len(final_output.outputs[0].token_ids) - 1} lookahead "
+                f"steps, total turn so far {t_decode_done - t_start:.2f}s)"
+            )
 
         # Diagnostic, not a hard assertion -- still worth surfacing if
         # generation itself stopped short of the requested length (distinct
@@ -292,9 +317,16 @@ class SpecPrefillProposer:
         # SpeculatorWorker.end_capture returns plain dicts, not raw Tensors
         # (collective_rpc doesn't preserve Tensor type across the process
         # boundary in this fork, confirmed on real hardware).
+        t_before_end_capture = time.time()
         query_buffer_wire = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
         query_buffer = [tensor_from_wire(q).to(self.device) for q in query_buffer_wire]
         actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
+        print(
+            f"[proposer.run_turn] {request_id!r}: query capture retrieved "
+            f"in {time.time() - t_before_end_capture:.2f}s "
+            f"(actual_look_ahead_cnt={actual_look_ahead_cnt}, total turn "
+            f"{time.time() - t_start:.2f}s)"
+        )
         return query_buffer, actual_look_ahead_cnt, num_cached_tokens
 
     def retrieve_keys(
@@ -303,11 +335,32 @@ class SpecPrefillProposer:
         """Per-layer [len(local_positions), num_kv_heads, head_size] K
         tensors on `self.device`, for LOCAL positions within
         `conversation_salt`'s own speculator prompt (see module docstring's
-        "Local positions vs. absolute conversation positions")."""
+        "Local positions vs. absolute conversation positions").
+
+        Timed and logged on completion -- this RPC round-trip wire-encodes
+        the WHOLE requested K span via `tensor_to_wire`'s `.tolist()` (see
+        that function's own docstring on why: `collective_rpc` doesn't
+        preserve `torch.Tensor` type across the process boundary in this
+        fork), across every layer -- for a large KEEP-mode candidate pool
+        (`local_positions` can be tens of thousands of entries for a big
+        SCBench context) this is real, unamortized CPU-bound work every
+        turn, and a leading suspect (alongside the now-fixed per-decode-
+        step block-index recomputation in `sparse_target_runner.py`) for
+        the multi-turn pipeline's speculator-vs-baseline slowdown -- log it
+        rather than guess."""
+        t_start = time.time()
         keys_wire = self.llm_engine.collective_rpc(
             "retrieve_keys", args=(conversation_salt, local_positions)
         )[0]
-        return [tensor_from_wire(k).to(self.device) for k in keys_wire]
+        keys = [tensor_from_wire(k).to(self.device) for k in keys_wire]
+        total_elements = sum(k.numel() for k in keys)
+        print(
+            f"[proposer.retrieve_keys] {conversation_salt!r}: retrieved K "
+            f"for {len(local_positions)} positions across {len(keys)} "
+            f"layers ({total_elements} total elements) in "
+            f"{time.time() - t_start:.2f}s"
+        )
+        return keys
 
     def discard_conversation(self, conversation_salt: str) -> None:
         """Call once a whole conversation (not just one turn) is finished,

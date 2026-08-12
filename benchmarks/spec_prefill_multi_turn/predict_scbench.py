@@ -536,8 +536,14 @@ def run_baseline(
             request_id = f"{conv['id']}::turn{turn_idx}"
             sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
+            t_gen_start = time.time()
             llm.llm_engine.add_request(request_id, prompt, sampling_params)
             output = drive_single_request_to_completion(llm.llm_engine, request_id)
+            progress.write(
+                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
+                f"generation done in {time.time() - t_gen_start:.2f}s "
+                f"({len(prompt_ids)} prompt tokens)"
+            )
 
             if output is not None:
                 completion = output.outputs[0]
@@ -648,7 +654,13 @@ def run_specprefill(
                 stats["num_skipped_too_large"] += 1
                 break
 
+            t_scoring_start = time.time()
             result = compute_pruned_turn(proposer, spec_config, state, query_ids)
+            progress.write(
+                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: speculator "
+                f"scoring done in {time.time() - t_scoring_start:.2f}s "
+                f"(kept {len(result.kept_positions)}/{result.orig_len})"
+            )
             prompt_ids = chat_before_ids + result.pruned_token_ids + chat_after_ids
 
             if len(prompt_ids) > target_max_num_batched_tokens:
@@ -698,8 +710,13 @@ def run_specprefill(
                 actual_look_ahead_cnt=result.actual_look_ahead_cnt,
                 num_cached_tokens=result.num_cached_tokens,
             )
+            t_gen_start = time.time()
             prune_and_add_turn(llm.llm_engine, request_id, full_result, sampling_params)
             output = drive_single_request_to_completion(llm.llm_engine, request_id)
+            progress.write(
+                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
+                f"generation done in {time.time() - t_gen_start:.2f}s"
+            )
 
             if output is not None:
                 completion = output.outputs[0]
@@ -871,7 +888,13 @@ def run_sparse_attention(
                 stats["num_skipped_too_large"] += 1
                 break
 
+            t_scoring_start = time.time()
             result = compute_pruned_turn(proposer, spec_config, state, query_ids)
+            progress.write(
+                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: speculator "
+                f"scoring done in {time.time() - t_scoring_start:.2f}s "
+                f"(kept {len(result.kept_positions)}/{result.orig_len})"
+            )
             query_start_ledger_pos = result.orig_len - len(query_ids)
 
             if turn_idx > 0:
@@ -895,6 +918,7 @@ def run_sparse_attention(
             prompt = build_sparse_session_request(
                 target_request_id, delta_ids, sampling_params, resumable=True,
             )
+            t_gen_start = time.time()
             real_id = llm.llm_engine.add_request(target_request_id, prompt, sampling_params)
             assert real_id == target_request_id, (
                 f"expected request_id={target_request_id!r} verbatim, got "
@@ -903,6 +927,11 @@ def run_sparse_attention(
             )
             session_started = True
             output = drive_one_turn_of_session(llm.llm_engine, target_request_id)
+            progress.write(
+                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
+                f"generation done in {time.time() - t_gen_start:.2f}s "
+                f"({len(delta_ids)} new delta tokens submitted)"
+            )
             llm.llm_engine.collective_rpc(
                 "discard_sparse_selection", args=(target_request_id,),
             )
