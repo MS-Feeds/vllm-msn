@@ -1,15 +1,86 @@
 # syntax=docker/dockerfile:1
 
-ARG BASE_IMAGE=deepseek-v4-a100-vllm:base
-FROM ${BASE_IMAGE}
-
 ARG CUDA_VERSION=13.0.3
+ARG PYTHON_VERSION=3.12
+ARG UBUNTU_VERSION=22.04
+ARG VLLM_VERSION=0.27.2.dev1
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG VLLM_VERSION
+ARG MAX_JOBS=32
+ARG NVCC_THREADS=2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST=8.0 \
+    MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS} \
+    UV_HTTP_TIMEOUT=500 \
+    UV_INDEX_STRATEGY=unsafe-best-match \
+    UV_LINK_MODE=copy \
+    VLLM_TARGET_DEVICE=cuda \
+    VLLM_VERSION_OVERRIDE=${VLLM_VERSION}
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+        git \
+        libnuma-dev \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && /root/.local/bin/uv venv --python python${PYTHON_VERSION} /opt/venv
+
+ENV PATH=/opt/venv/bin:/root/.local/bin:${PATH}
+
+WORKDIR /workspace
+COPY . .
+
+RUN uv pip install . --torch-backend=auto
+
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION} AS runtime
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
 
 LABEL org.opencontainers.image.title="DeepSeek-V4-Flash-0731 on vLLM for A100" \
       org.opencontainers.image.description="Experimental SM80 vLLM backend for DeepSeek-V4-Flash-0731" \
       com.deepseek-v4-a100.cuda.version="${CUDA_VERSION}"
 
-ENV CUDA_HOME=/usr/local/cuda \
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        libnuma-dev \
+        numactl \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        cuda-nvcc-13-0 \
+        cuda-nvrtc-13-0 \
+        cuda-cuobjdump-13-0 \
+        libcublas-dev-13-0 \
+        libcurand-dev-13-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+
+ENV PATH=/opt/venv/bin:${PATH} \
+    CUDA_HOME=/usr/local/cuda \
     HF_HOME=/data/huggingface \
     VLLM_CACHE_ROOT=/data/vllm \
     TRITON_CACHE_DIR=/data/triton \
@@ -21,7 +92,8 @@ ENV CUDA_HOME=/usr/local/cuda \
     NVIDIA_REQUIRE_CUDA="cuda>=13.0" \
     PYTHONUNBUFFERED=1
 
-RUN mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}"
+RUN mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TRITON_CACHE_DIR}" \
+    && python -c "import vllm; print(vllm.__version__)"
 
 VOLUME ["/data"]
 EXPOSE 8000
@@ -45,5 +117,4 @@ CMD ["deepseek-ai/DeepSeek-V4-Flash-0731", \
      "--enable-auto-tool-choice", \
      "--tool-call-parser", "deepseek_v4", \
      "--reasoning-parser", "deepseek_v4", \
-     "--attention-config", "{\"use_fp4_indexer_cache\":true}", \
      "--speculative-config", "{\"method\":\"dspark\",\"num_speculative_tokens\":7,\"draft_sample_method\":\"greedy\"}"]

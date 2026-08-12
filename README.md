@@ -129,22 +129,45 @@ serving validation is still pending.
 
 ### Container deployment
 
-Build the patched source image for A100, then add the deployment defaults:
+Build the standalone image from the patched source:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build . \
-  --file docker/Dockerfile \
-  --target vllm-openai \
-  --tag deepseek-v4-a100-vllm:base \
-  --build-arg CUDA_VERSION=13.0.3 \
-  --build-arg torch_cuda_arch_list=8.0 \
-  --build-arg max_jobs=32 \
-  --build-arg nvcc_threads=2
-
-docker build . \
   --file docker/Dockerfile.deepseek_v4_a100 \
   --tag deepseek-v4-flash-0731:a100 \
-  --build-arg CUDA_VERSION=13.0.3
+  --build-arg CUDA_VERSION=13.0.3 \
+  --build-arg MAX_JOBS=32 \
+  --build-arg NVCC_THREADS=2
+```
+
+The builder stage compiles this checkout for SM80 and installs it into an
+isolated Python environment. The final stage copies that environment into a
+fresh CUDA runtime image. It retains only the CUDA development components
+needed by vLLM, Triton, and DeepGEMM for runtime JIT compilation.
+
+### Azure Machine Learning image build
+
+The AML environment definition is:
+
+```text
+azureml/environment.deepseek_v4_a100.yml
+```
+
+Its build context is the repository root (`..` relative to the YAML), and its
+Dockerfile path is `docker/Dockerfile.deepseek_v4_a100` relative to that build
+context. From the repository root, submit the image build with:
+
+```bash
+az ml environment create \
+  --file azureml/environment.deepseek_v4_a100.yml \
+  --resource-group <resource-group> \
+  --workspace-name <workspace-name>
+```
+
+On this host, the complete environment file path is:
+
+```text
+/scratch/azureml/cr/j/13657718eaad4163badb1385dd61cb55/exe/wd/vllm-msn/azureml/environment.deepseek_v4_a100.yml
 ```
 
 Run the API server with all eight GPUs and a persistent model/kernel cache:

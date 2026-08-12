@@ -1,0 +1,17 @@
+.git/
+.venv/
+.deps/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.triton/
+build/
+dist/
+cmake-build-*/
+rust/target/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.log
