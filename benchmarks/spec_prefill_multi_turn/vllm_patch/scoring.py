@@ -189,3 +189,34 @@ def chunk_select_from_smoothed_attention(
         kept_indices.append(torch.sort(indices)[0])
 
     return kept_indices
+
+
+def score_and_select_indices(
+    query_buffer: List[torch.Tensor],
+    key_buffer_per_layer: List[torch.Tensor],
+    actual_look_ahead_cnt: int,
+    spec_config: SpecConfig,
+) -> List[int]:
+    """One-sample convenience wrapper chaining lines 12/14/16 above
+    (`compute_attention_score` -> `aggregate_attention_score` ->
+    `chunk_select_from_smoothed_attention`) for the single-conversation-
+    at-a-time case this pipeline always calls with -- factored out so
+    every caller that has a `(query_buffer, key_buffer_per_layer)` pair in
+    hand and just wants "which local indices to keep" doesn't duplicate
+    the 3-call sequence. Two real callers, in two different PROCESSES:
+    `pruner.py`'s `_score_and_select` (oracle path, driver-side, scores
+    the TARGET's own Q/K) and `speculator_worker.py`'s
+    `SpeculatorGPUModelRunner.end_capture_and_score` (speculator path,
+    runs IN-PROCESS inside the speculator's own worker so only the
+    resulting small index list -- not the Q/K tensors themselves -- ever
+    needs to cross `collective_rpc`'s process boundary; see that method's
+    own docstring for the real, measured cost this avoids).
+
+    Caller must not call this with `actual_look_ahead_cnt == 0` (aggregating
+    over zero lookahead steps produces silent NaN, not an error -- both
+    real callers already guard this themselves before calling in)."""
+    key_buffer = [[k] for k in key_buffer_per_layer]  # one sample
+    attn_scores = compute_attention_score(query_buffer, key_buffer, [actual_look_ahead_cnt])
+    token_importance = aggregate_attention_score(attn_scores, spec_config)
+    kept_local_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
+    return kept_local_indices.tolist()

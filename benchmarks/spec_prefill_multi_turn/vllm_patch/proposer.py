@@ -242,6 +242,106 @@ class SpecPrefillProposer:
             prefill new tokens" signal EXPERIMENT_PLAN.md's KEEP-mode risk
             note calls for, rather than assuming it.
         """
+        request_id, num_cached_tokens, t_start = self._submit_and_drive_turn(
+            conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
+        )
+
+        # collective_rpc returns one result per worker (TP ranks) -- this
+        # pipeline is TP=1 only (see module docstring), so unwrap index 0.
+        # SpeculatorWorker.end_capture now returns raw torch.Tensor objects
+        # directly -- this module's own VLLM_ALLOW_INSECURE_SERIALIZATION=1
+        # setting (see top of file) makes collective_rpc's UtilityResult
+        # wrapper carry proper type info for nested Tensors, so msgspec's
+        # own dedicated zero-copy tensor codec (`_encode_tensor`/
+        # `_decode_tensor` in vllm/v1/serial_utils.py) reconstructs them
+        # correctly -- no more `tensor_to_wire`/`tensor_from_wire` Python-
+        # list round trip needed (that workaround predates this fix; see
+        # kv_cache_utils.py for why it's kept, not deleted, as a documented
+        # fallback). Still need `.to(self.device)`: the decoded tensor
+        # lands on CPU (an IPC buffer reconstruction, not a CUDA-IPC share),
+        # same as the old path.
+        t_before_end_capture = time.time()
+        query_buffer_cpu = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
+        query_buffer = [q.to(self.device) for q in query_buffer_cpu]
+        actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
+        print(
+            f"[proposer.run_turn] {request_id!r}: query capture retrieved "
+            f"in {time.time() - t_before_end_capture:.2f}s "
+            f"(actual_look_ahead_cnt={actual_look_ahead_cnt}, total turn "
+            f"{time.time() - t_start:.2f}s)"
+        )
+        return query_buffer, actual_look_ahead_cnt, num_cached_tokens
+
+    def run_turn_and_score(
+        self,
+        conversation_salt: str,
+        turn_idx: int,
+        full_sequence_token_ids: List[int],
+        look_ahead_cnt: int,
+        pool_kernel_size: Optional[int],
+        keep_kwargs: dict,
+        ignore_eos: bool = False,
+    ) -> Tuple[Optional[List[int]], int, int]:
+        """Same driving/submission as `run_turn` (via the shared
+        `_submit_and_drive_turn` helper), but retrieves K and runs the
+        scoring/selection pipeline IN-PROCESS inside the speculator's own
+        worker (`speculator_worker.py`'s `end_capture_and_score`), instead
+        of shipping Q back here and separately asking for K -- see that
+        method's docstring for the real, measured cost this avoids (a
+        single `retrieve_keys` call moving 720M K elements took 89s on a
+        real SCBench turn). This is what `pruner.py::compute_pruned_turn`
+        calls; `run_turn` itself is unchanged and still used directly by
+        `validate_proposer.py`, which wants the raw Q buffer to validate
+        the capture mechanism in isolation from scoring.
+
+        Returns `(kept_local_indices, actual_look_ahead_cnt,
+        num_cached_tokens)` -- `kept_local_indices` is `None` if
+        `actual_look_ahead_cnt == 0` (see `speculator_worker.py`'s
+        docstring for when/why), otherwise a `List[int]` of LOCAL indices
+        into the full submitted sequence (candidate history + this turn's
+        query) -- `pruner.py` still owns filtering that down to just the
+        candidate-history portion and converting to absolute positions.
+        """
+        request_id, num_cached_tokens, t_start = self._submit_and_drive_turn(
+            conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
+        )
+
+        t_before_score = time.time()
+        kept_local_indices, actual_look_ahead_cnt = self.llm_engine.collective_rpc(
+            "end_capture_and_score",
+            args=(
+                request_id,
+                conversation_salt,
+                len(full_sequence_token_ids),
+                pool_kernel_size,
+                keep_kwargs,
+            ),
+        )[0]
+        num_kept = len(kept_local_indices) if kept_local_indices is not None else None
+        print(
+            f"[proposer.run_turn_and_score] {request_id!r}: in-process K "
+            f"retrieval + scoring done in {time.time() - t_before_score:.2f}s "
+            f"(actual_look_ahead_cnt={actual_look_ahead_cnt}, kept={num_kept}, "
+            f"total turn {time.time() - t_start:.2f}s)"
+        )
+        return kept_local_indices, actual_look_ahead_cnt, num_cached_tokens
+
+    def _submit_and_drive_turn(
+        self,
+        conversation_salt: str,
+        turn_idx: int,
+        full_sequence_token_ids: List[int],
+        look_ahead_cnt: int,
+        ignore_eos: bool,
+    ) -> Tuple[str, int, float]:
+        """Shared submission/driving core for `run_turn` and `run_turn_and_
+        score` -- begin_capture, add_request, drive to completion, and the
+        bootstrap-prefill/lookahead-speculation timing logs and DIAGNOSTIC
+        check, all identical regardless of how the caller retrieves the
+        result afterward. Returns (request_id, num_cached_tokens, t_start)
+        -- `t_start` handed back so callers' own post-driving timing logs
+        report a "total turn" figure that includes submission/driving, not
+        just their own retrieval step."""
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
 
@@ -339,31 +439,7 @@ class SpecPrefillProposer:
                     f"requested."
                 )
 
-        # collective_rpc returns one result per worker (TP ranks) -- this
-        # pipeline is TP=1 only (see module docstring), so unwrap index 0.
-        # SpeculatorWorker.end_capture now returns raw torch.Tensor objects
-        # directly -- this module's own VLLM_ALLOW_INSECURE_SERIALIZATION=1
-        # setting (see top of file) makes collective_rpc's UtilityResult
-        # wrapper carry proper type info for nested Tensors, so msgspec's
-        # own dedicated zero-copy tensor codec (`_encode_tensor`/
-        # `_decode_tensor` in vllm/v1/serial_utils.py) reconstructs them
-        # correctly -- no more `tensor_to_wire`/`tensor_from_wire` Python-
-        # list round trip needed (that workaround predates this fix; see
-        # kv_cache_utils.py for why it's kept, not deleted, as a documented
-        # fallback). Still need `.to(self.device)`: the decoded tensor
-        # lands on CPU (an IPC buffer reconstruction, not a CUDA-IPC share),
-        # same as the old path.
-        t_before_end_capture = time.time()
-        query_buffer_cpu = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
-        query_buffer = [q.to(self.device) for q in query_buffer_cpu]
-        actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
-        print(
-            f"[proposer.run_turn] {request_id!r}: query capture retrieved "
-            f"in {time.time() - t_before_end_capture:.2f}s "
-            f"(actual_look_ahead_cnt={actual_look_ahead_cnt}, total turn "
-            f"{time.time() - t_start:.2f}s)"
-        )
-        return query_buffer, actual_look_ahead_cnt, num_cached_tokens
+        return request_id, num_cached_tokens, t_start
 
     def retrieve_keys(
         self, conversation_salt: str, local_positions: List[int]

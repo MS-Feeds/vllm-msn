@@ -462,12 +462,58 @@ fallback, since **this specific change has not been validated on real
 hardware** -- re-run `validate_proposer.py` (its Step C already exercises
 `retrieve_keys` directly) before trusting it.
 
-**Still not yet smoke-tested end to end past any of these fixes** -- re-run
-`validate_proposer.py` first, then a 1-2
-conversation `SPARSE-k*-g*` smoke test
-(`--exp SPARSE-k80-g32 --max-conversations 2`) before trusting a full
-sweep, same discipline applied to every other new mechanism in this
-pipeline.
+**Fourth change, superseding the third's zero-copy fix with a better one**:
+rather than moving the K tensor across `collective_rpc`'s process boundary
+more efficiently, avoid moving it at all. Q and K both already live inside
+the speculator's own worker process (Q captured during that turn's forward
+passes, K resident in its own KV cache) -- only the FINAL SELECTION
+DECISION (a list of at most a few tens of thousands of small ints, not
+720M floats) ever needs to leave it. Implemented as:
+- `scoring.py`: new `score_and_select_indices(query_buffer, key_buffer_
+  per_layer, actual_look_ahead_cnt, spec_config) -> List[int]`, the shared
+  3-call scoring pipeline (`compute_attention_score` ->
+  `aggregate_attention_score` -> `chunk_select_from_smoothed_attention`)
+  factored out so both the oracle path (still driver-side) and the new
+  in-process speculator path can call it without duplicating logic.
+- `speculator_worker.py`: new `SpeculatorGPUModelRunner.end_capture_and_
+  score` / `SpeculatorWorker.end_capture_and_score` -- combines
+  `end_capture` + `retrieve_keys` + scoring into ONE in-process call,
+  returning just `(kept_local_indices_or_None, actual_look_ahead_cnt)`.
+  The old standalone `end_capture`/`retrieve_keys` RPC methods are
+  UNCHANGED and still used directly by `validate_proposer.py` (which wants
+  the raw Q buffer / K tensors to validate capture and read-back in
+  isolation from scoring) -- nothing about that validation script needed
+  to change.
+- `proposer.py`: driving logic (submit, drive to completion, timing logs,
+  the DIAGNOSTIC check) factored into a shared `_submit_and_drive_turn`
+  helper. `run_turn` (unchanged signature/behavior, still returns the raw
+  Q buffer) now calls it, as does a NEW `run_turn_and_score` method (takes
+  `pool_kernel_size`/`keep_kwargs` instead of returning Q, calls the new
+  combined RPC) -- `pruner.py::compute_pruned_turn` now calls
+  `run_turn_and_score` instead of `run_turn`+`retrieve_keys`+local scoring.
+- `pruner.py`: `_score_and_select`'s position-conversion logic (turning
+  local indices into `PrunedTurnResult`'s four fields) split out into
+  `_positions_from_kept_indices`, shared by `_score_and_select` (oracle
+  path, still scores driver-side against the target's own Q/K) and
+  `compute_pruned_turn` (speculator path, now receives indices already
+  computed in-process).
+
+All CPU-testable pieces covered (`score_and_select_indices`,
+`_positions_from_kept_indices` -- confirmed `pruner.py` itself imports
+cleanly without a live vLLM engine, so these are now exercised in
+`test_vllm_patch.py` alongside the rest). **This is the largest,
+least-validated change made in this troubleshooting pass** -- it touches
+the core scoring data flow shared by BOTH `M-k*-g*` and `SPARSE-k*-g*`.
+Validate in order: `validate_proposer.py` first (confirms `run_turn`'s
+unchanged behavior still works, and `retrieve_keys` still works standalone
+-- neither exercises the NEW `run_turn_and_score`/`end_capture_and_score`
+path, so this alone is NOT sufficient), then a small `M-k80-g32` or
+`SPARSE-k80-g32` smoke test (either exercises `compute_pruned_turn`'s new
+call path), checking the new `[proposer.run_turn_and_score]` log line's
+"in-process K retrieval + scoring done" duration against the old ~89s
+figure, and checking predictions/keep-rates look sane (not empty, not
+100% kept when a keep rate < 100% was requested) before trusting a full
+sweep.
 
 ---
 

@@ -53,7 +53,9 @@ from vllm_patch.scoring import (
     aggregate_attention_score,
     chunk_select_from_smoothed_attention,
     compute_attention_score,
+    score_and_select_indices,
 )
+from vllm_patch.pruner import _positions_from_kept_indices
 from predict_scbench import LedgerToTargetPositionMap
 
 
@@ -125,6 +127,83 @@ def test_aggregate_and_select_pipeline():
     )
     kept_all = chunk_select_from_smoothed_attention(token_importance, cfg_keep_all)
     assert kept_all[0].numel() == 16
+
+
+def test_score_and_select_indices_returns_sorted_local_indices():
+    """`score_and_select_indices` is the single-sample convenience wrapper
+    `speculator_worker.py::end_capture_and_score` calls IN-PROCESS (see
+    that method's docstring) instead of shipping Q/K back to the driver --
+    exercises the exact input shape that in-process call site uses: one
+    `torch.Tensor` per layer (no per-sample list nesting, unlike
+    `_synthetic_qk`'s shape for `compute_attention_score` directly)."""
+    num_layers, num_heads, num_kv_heads, head_dim, look_ahead, ctx_len = 2, 4, 4, 8, 3, 16
+    query_buffer = [torch.randn(1, look_ahead, num_heads * head_dim) for _ in range(num_layers)]
+    key_buffer_per_layer = [torch.randn(ctx_len, num_kv_heads, head_dim) for _ in range(num_layers)]
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.5}, look_ahead_cnt=look_ahead)
+
+    kept = score_and_select_indices(query_buffer, key_buffer_per_layer, look_ahead, cfg)
+
+    assert isinstance(kept, list)
+    assert all(isinstance(i, int) for i in kept)
+    assert kept == sorted(kept)
+    assert len(kept) == 8  # ceil(16 * 0.5)
+    assert all(0 <= i < ctx_len for i in kept)
+
+
+def test_score_and_select_indices_keep_all():
+    num_layers, num_heads, num_kv_heads, head_dim, look_ahead, ctx_len = 1, 2, 2, 4, 2, 6
+    query_buffer = [torch.randn(1, look_ahead, num_heads * head_dim) for _ in range(num_layers)]
+    key_buffer_per_layer = [torch.randn(ctx_len, num_kv_heads, head_dim) for _ in range(num_layers)]
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 1.0}, look_ahead_cnt=look_ahead)
+
+    kept = score_and_select_indices(query_buffer, key_buffer_per_layer, look_ahead, cfg)
+    assert kept == list(range(ctx_len))
+
+
+def test_positions_from_kept_indices_none_keeps_everything():
+    """`kept_local_indices=None` is the "0 lookahead steps, no scoring
+    signal" fallback -- both real callers (`compute_pruned_turn`'s
+    speculator path, `_score_and_select`'s oracle path) pass this only
+    when `actual_look_ahead_cnt == 0`."""
+    candidate_pool = [(10, 0), (11, 1), (12, 2)]
+    force_keep_query = [(20, 3), (21, 4)]
+    pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(
+        candidate_pool, force_keep_query, None
+    )
+    assert pruned_token_ids == [10, 11, 12, 20, 21]
+    assert kept_positions == [0, 1, 2, 3, 4]
+    assert orig_len == 5
+    assert kept_history_pairs == candidate_pool
+
+
+def test_positions_from_kept_indices_selects_subset_and_force_keeps_query():
+    candidate_pool = [(10, 0), (11, 1), (12, 2), (13, 3)]
+    force_keep_query = [(20, 4), (21, 5)]
+    # Scorer selected local indices 0, 2 (within candidate_len=4) plus 4, 5
+    # (the force-kept query span's own local indices, since
+    # score_and_select_indices scores the WHOLE submitted sequence) -- the
+    # query-span indices must be filtered out here (force_keep_query is
+    # appended unconditionally below), not double-counted.
+    kept_local_indices = [0, 2, 4, 5]
+
+    pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(
+        candidate_pool, force_keep_query, kept_local_indices
+    )
+    assert kept_history_pairs == [(10, 0), (12, 2)]
+    assert pruned_token_ids == [10, 12, 20, 21]
+    assert kept_positions == [0, 2, 4, 5]
+    assert orig_len == 6
+
+
+def test_positions_from_kept_indices_empty_force_keep_query():
+    candidate_pool = [(10, 0), (11, 1)]
+    pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(
+        candidate_pool, [], [1]
+    )
+    assert kept_history_pairs == [(11, 1)]
+    assert pruned_token_ids == [11]
+    assert kept_positions == [1]
+    assert orig_len == 2
 
 
 def test_kv_split_dim_triton_layout():

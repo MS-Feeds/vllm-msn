@@ -39,18 +39,14 @@ rather than duplicating the force-keep/chunk-selection logic.
 
 import logging
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
 from .config import SpecConfig
 from .conversation_state import ConversationState
 from .proposer import SpecPrefillProposer
-from .scoring import (
-    aggregate_attention_score,
-    chunk_select_from_smoothed_attention,
-    compute_attention_score,
-)
+from .scoring import score_and_select_indices
 
 logger = logging.getLogger(__name__)
 
@@ -65,21 +61,28 @@ class PrunedTurnResult:
     num_cached_tokens: int  # 0 for the oracle path (no speculator cache involved)
 
 
-def _score_and_select(
+def _positions_from_kept_indices(
     candidate_pool: List[Tuple[int, int]],
     force_keep_query: List[Tuple[int, int]],
-    query_buffer: List[torch.Tensor],
-    key_buffer_per_layer: List[torch.Tensor],
-    actual_look_ahead_cnt: int,
-    spec_config: SpecConfig,
+    kept_local_indices: Optional[List[int]],
 ) -> Tuple[List[int], List[int], int, List[Tuple[int, int]]]:
-    """Shared scoring/selection core for both the speculator and oracle
-    paths. `key_buffer_per_layer[layer_idx]` is a single [full_len,
-    num_kv_heads, head_size] tensor (one sample) -- wrapped into the
-    1-element-per-sample list shape `compute_attention_score` expects.
+    """Converts a scorer's chosen LOCAL indices (0..len(candidate_pool)+
+    len(force_keep_query)-1) into the four `PrunedTurnResult` fields --
+    shared by both the speculator path (`compute_pruned_turn`, indices
+    already computed IN-PROCESS by `speculator_worker.py`'s
+    `end_capture_and_score`, see that method's docstring for why) and the
+    oracle path (`_score_and_select` below, indices computed here
+    driver-side from the target's own Q/K).
+
+    `kept_local_indices=None` means "no scoring signal at all" (real
+    callers only pass None when `actual_look_ahead_cnt == 0` -- EOS on the
+    very first candidate token, or `look_ahead_cnt=0`) -- keeps the full,
+    unpruned candidate pool + query rather than scoring with nothing to
+    score on, logging a warning since this is a real, if rare, degraded
+    case worth knowing about.
 
     Returns (pruned_token_ids, kept_positions, orig_len, kept_history_pairs)
-    -- see `PrunedTurnResult`'s fields (orig_len computed here from
+    -- see `PrunedTurnResult`'s fields (`orig_len` computed here from
     `force_keep_query`'s own positions, not passed in, since both callers
     already have it via that list).
     """
@@ -90,7 +93,7 @@ def _score_and_select(
     # proposer.py's docstring on local-position numbering).
     orig_len = force_keep_query[-1][1] + 1 if force_keep_query else candidate_pool[-1][1] + 1
 
-    if actual_look_ahead_cnt == 0:
+    if kept_local_indices is None:
         logger.warning(
             "SpecPrefill: 0 lookahead steps completed for this turn (EOS on "
             "the very first candidate token, or look_ahead_cnt=0) -- keeping "
@@ -101,16 +104,11 @@ def _score_and_select(
         kept_positions = [pos for _, pos in full_sequence]
         return pruned_token_ids, kept_positions, orig_len, list(candidate_pool)
 
-    key_buffer = [[k] for k in key_buffer_per_layer]  # one sample
-    attn_scores = compute_attention_score(query_buffer, key_buffer, [actual_look_ahead_cnt])
-    token_importance = aggregate_attention_score(attn_scores, spec_config)
-    kept_local_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
-
     # Force-keep: only honor the scorer's decision within [0, candidate_len)
     # -- see module docstring's "Force-keep" section. Indices >= candidate_len
     # (the query region) are discarded here, not because they're unimportant,
     # but because force_keep_query is unconditionally appended below anyway.
-    kept_history_local = [i for i in kept_local_indices.tolist() if i < candidate_len]
+    kept_history_local = [i for i in kept_local_indices if i < candidate_len]
     kept_history_pairs = [candidate_pool[i] for i in kept_history_local]
 
     pruned_token_ids = [tid for tid, _ in kept_history_pairs] + [
@@ -122,6 +120,35 @@ def _score_and_select(
     return pruned_token_ids, kept_positions, orig_len, kept_history_pairs
 
 
+def _score_and_select(
+    candidate_pool: List[Tuple[int, int]],
+    force_keep_query: List[Tuple[int, int]],
+    query_buffer: List[torch.Tensor],
+    key_buffer_per_layer: List[torch.Tensor],
+    actual_look_ahead_cnt: int,
+    spec_config: SpecConfig,
+) -> Tuple[List[int], List[int], int, List[Tuple[int, int]]]:
+    """Oracle-path scoring core: computes indices driver-side (the oracle
+    path has no in-process speculator worker to run scoring inside -- its
+    Q/K come from a teacher-forced forward pass on the TARGET's own
+    attention layers, hooked by `predict_scbench.py`, not from
+    `proposer.py` at all), then delegates the shared index -> position
+    conversion to `_positions_from_kept_indices`.
+
+    `key_buffer_per_layer[layer_idx]` is a single [full_len, num_kv_heads,
+    head_size] tensor (one sample) -- see `score_and_select_indices`'s own
+    docstring for the wrapping this passes through.
+    """
+    kept_local_indices = (
+        None
+        if actual_look_ahead_cnt == 0
+        else score_and_select_indices(
+            query_buffer, key_buffer_per_layer, actual_look_ahead_cnt, spec_config
+        )
+    )
+    return _positions_from_kept_indices(candidate_pool, force_keep_query, kept_local_indices)
+
+
 def compute_pruned_turn(
     proposer: SpecPrefillProposer,
     spec_config: SpecConfig,
@@ -131,15 +158,21 @@ def compute_pruned_turn(
     """Runs one turn of the speculator-based pruning path: asks
     `conversation_state` for this turn's candidate pool (KEEP/DISCARD, see
     that module), submits it to the speculator via
-    `SpecPrefillProposer.run_turn`, retrieves K for the same span, scores,
-    and selects.
+    `SpecPrefillProposer.run_turn_and_score`, which does K retrieval AND
+    scoring IN-PROCESS inside the speculator's own worker (see that
+    method's docstring, and `speculator_worker.py::end_capture_and_score`'s,
+    for why: a first real run measured the OLD design -- ship Q back here,
+    separately ask for K, score locally -- moving up to 720M K elements
+    across `collective_rpc`'s process boundary for a single turn, taking
+    89s on its own. Only the tiny resulting index list crosses the
+    boundary now).
 
     No `eos_token_id` parameter (a previous version had one -- it was
     silently unused, since real early-stopping is controlled entirely by
     `SamplingParams.ignore_eos`, not any id passed around out-of-band; see
     `proposer.py::run_turn`'s docstring for the real-hardware finding this
     fixes). Early stopping is instead controlled by `spec_config.ignore_eos`
-    directly, threaded straight into `proposer.run_turn`.
+    directly, threaded straight into `proposer.run_turn_and_score`.
 
     Does NOT call `conversation_state.complete_turn` -- the caller
     (`predict_scbench.py`) must do that itself once it also knows this
@@ -156,31 +189,19 @@ def compute_pruned_turn(
     full_sequence = candidate_pool + force_keep_query
     full_token_ids = [tid for tid, _ in full_sequence]
 
-    query_buffer, actual_look_ahead_cnt, num_cached_tokens = proposer.run_turn(
+    kept_local_indices, actual_look_ahead_cnt, num_cached_tokens = proposer.run_turn_and_score(
         conversation_salt=conversation_state.conversation_id,
         turn_idx=conversation_state.turn_idx,
         full_sequence_token_ids=full_token_ids,
         look_ahead_cnt=spec_config.look_ahead_cnt,
+        pool_kernel_size=spec_config.pool_kernel_size,
+        keep_kwargs=spec_config.keep_kwargs,
         ignore_eos=spec_config.ignore_eos,
     )
 
-    if actual_look_ahead_cnt == 0:
-        pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _score_and_select(
-            candidate_pool, force_keep_query, [], [], 0, spec_config
-        )
-    else:
-        local_positions = list(range(len(full_sequence)))
-        key_buffer_per_layer = proposer.retrieve_keys(
-            conversation_state.conversation_id, local_positions
-        )
-        pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _score_and_select(
-            candidate_pool,
-            force_keep_query,
-            query_buffer,
-            key_buffer_per_layer,
-            actual_look_ahead_cnt,
-            spec_config,
-        )
+    pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(
+        candidate_pool, force_keep_query, kept_local_indices
+    )
 
     return PrunedTurnResult(
         pruned_token_ids=pruned_token_ids,

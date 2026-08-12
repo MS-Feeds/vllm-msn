@@ -391,6 +391,66 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             keys.append(gather_keys_for_slots(flat_keys, slot_tensor).to("cpu"))
         return keys
 
+    def end_capture_and_score(
+        self,
+        request_id: str,
+        conversation_salt: str,
+        full_sequence_len: int,
+        pool_kernel_size: Optional[int],
+        keep_kwargs: dict,
+    ):
+        """Combines `end_capture` + `retrieve_keys` + the scoring/selection
+        pipeline (`scoring.score_and_select_indices`) into ONE in-process
+        call, so only the tiny resulting index list -- not Q or K -- ever
+        needs to cross `collective_rpc`'s process boundary.
+
+        **Why this exists, concretely measured, not theoretical**: Q and K
+        both already live in THIS process (Q captured during this turn's
+        own forward passes, K resident in this engine's own KV cache) --
+        there was never an architectural need to ship either across the
+        process boundary, only the FINAL SELECTION DECISION does. The OLD
+        design (ship Q back via `end_capture`, separately ask for K via
+        `retrieve_keys`, score driver-side) measured a single `retrieve_
+        keys` call taking 89s for 87,972 positions x 16 layers (720M
+        elements) on a real SCBench turn -- this method exists specifically
+        to make that number irrelevant by never moving that data at all.
+
+        Returns `(kept_local_indices, actual_look_ahead_cnt)` --
+        `kept_local_indices` is `None` if `actual_look_ahead_cnt == 0` (no
+        lookahead steps completed: real EOS on the very first candidate
+        token, or `look_ahead_cnt=0`), meaning the caller should keep
+        everything rather than score with no signal (same fallback
+        `pruner.py`'s `_positions_from_kept_indices` already implements for
+        the oracle path -- this method's caller, `proposer.py::run_turn`,
+        passes this straight through rather than duplicating that logic).
+        Otherwise a plain `List[int]` of LOCAL indices into the full
+        `full_sequence_len`-token sequence (candidate history + this
+        turn's own query, in that order -- see `proposer.py`'s module
+        docstring on local-position numbering), covering the WHOLE
+        sequence, not pre-filtered to just the candidate-history portion
+        -- `pruner.py` still owns that filter, unchanged, since it's cheap
+        once the result is this small."""
+        from .config import SpecConfig
+        from .scoring import score_and_select_indices
+
+        query_buffer = self.end_capture(request_id)
+        actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
+        if actual_look_ahead_cnt == 0:
+            return None, 0
+
+        key_buffer_per_layer = self.retrieve_keys(
+            conversation_salt, list(range(full_sequence_len))
+        )
+        spec_config = SpecConfig(
+            keep_strategy="percentage",
+            keep_kwargs=keep_kwargs,
+            pool_kernel_size=pool_kernel_size,
+        )
+        kept_local_indices = score_and_select_indices(
+            query_buffer, key_buffer_per_layer, actual_look_ahead_cnt, spec_config
+        )
+        return kept_local_indices, actual_look_ahead_cnt
+
     def discard_conversation(self, conversation_salt: str) -> None:
         """Drop this conversation's accumulated slot history -- call once
         the whole conversation (not just one turn) is done, to avoid
@@ -446,8 +506,28 @@ class SpeculatorWorker(Worker):
         self, conversation_salt: str, positions: List[int]
     ) -> List[torch.Tensor]:
         """Returns raw `torch.Tensor`s directly -- see `end_capture`'s
-        docstring above."""
+        docstring above. Kept as a standalone RPC method (not removed now
+        that `end_capture_and_score` below does K retrieval internally)
+        because `validate_proposer.py`'s Step C calls it directly to
+        validate K read-back in isolation, and `proposer.py` still exposes
+        it as a public method for the same reason."""
         return list(self.model_runner.retrieve_keys(conversation_salt, positions))
+
+    def end_capture_and_score(
+        self,
+        request_id: str,
+        conversation_salt: str,
+        full_sequence_len: int,
+        pool_kernel_size: Optional[int],
+        keep_kwargs: dict,
+    ):
+        """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
+        end_capture_and_score`'s docstring for the full reasoning (in-
+        process K retrieval + scoring, only the small resulting index list
+        crosses `collective_rpc`)."""
+        return self.model_runner.end_capture_and_score(
+            request_id, conversation_salt, full_sequence_len, pool_kernel_size, keep_kwargs
+        )
 
     def discard_conversation(self, conversation_salt: str) -> None:
         self.model_runner.discard_conversation(conversation_salt)
