@@ -1,7 +1,7 @@
 $schema: https://azuremlschemas.azureedge.net/latest/environment.schema.json
 name: deepseek-v4-flash-0731-a100
-version: 0.27.2-cuda13-sm80
-description: Patched vLLM source build for DeepSeek-V4-Flash-0731 on eight A100 GPUs.
+version: 0.27.2-cuda13-sm80-selfcontained
+description: Self-contained patched vLLM build for DeepSeek-V4-Flash-0731 on eight A100 GPUs.
 build:
   path: ..
   dockerfile_path: docker/Dockerfile.deepseek_v4_a100

@@ -129,7 +129,9 @@ serving validation is still pending.
 
 ### Container deployment
 
-Build the standalone image from the patched source:
+Build the standalone image. The Dockerfile clones the public
+`overwindows/vllm-msn` feature branch itself, so the build does not depend on
+the local source tree:
 
 ```bash
 DOCKER_BUILDKIT=1 docker build . \
@@ -145,6 +147,13 @@ isolated Python environment. The final stage copies that environment into a
 fresh CUDA runtime image. It retains only the CUDA development components
 needed by vLLM, Triton, and DeepGEMM for runtime JIT compilation.
 
+The source defaults can be overridden when needed:
+
+```bash
+--build-arg VLLM_REPOSITORY=https://github.com/overwindows/vllm-msn.git \
+--build-arg VLLM_REF=feat/deepseek-v4-flash-0731
+```
+
 ### Azure Machine Learning image build
 
 The AML environment definition is:
@@ -153,9 +162,8 @@ The AML environment definition is:
 azureml/environment.deepseek_v4_a100.yml
 ```
 
-Its build context is the repository root (`..` relative to the YAML), and its
-Dockerfile path is `docker/Dockerfile.deepseek_v4_a100` relative to that build
-context. From the repository root, submit the image build with:
+Its build context only supplies the Dockerfile; the Dockerfile clones and
+builds vLLM from GitHub. From the repository root, submit the image build with:
 
 ```bash
 az ml environment create \

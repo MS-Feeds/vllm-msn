@@ -4,12 +4,16 @@ ARG CUDA_VERSION=13.0.3
 ARG PYTHON_VERSION=3.12
 ARG UBUNTU_VERSION=22.04
 ARG VLLM_VERSION=0.27.2.dev1
+ARG VLLM_REPOSITORY=https://github.com/overwindows/vllm-msn.git
+ARG VLLM_REF=feat/deepseek-v4-flash-0731
 
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu${UBUNTU_VERSION} AS builder
 
 ARG CUDA_VERSION
 ARG PYTHON_VERSION
 ARG VLLM_VERSION
+ARG VLLM_REPOSITORY
+ARG VLLM_REF
 ARG MAX_JOBS=32
 ARG NVCC_THREADS=2
 
@@ -44,9 +48,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 
 ENV PATH=/opt/venv/bin:/root/.local/bin:${PATH}
 
-WORKDIR /workspace
-COPY . .
+RUN git clone --depth 1 --branch "${VLLM_REF}" \
+    "${VLLM_REPOSITORY}" /workspace
 
+WORKDIR /workspace
 RUN uv pip install . --torch-backend=auto
 
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu${UBUNTU_VERSION} AS runtime
