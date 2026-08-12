@@ -144,6 +144,7 @@ CSV_FIELDS = [
     "rep", "seed", "max_tokens",
     "num_conversations_loaded", "num_conversations", "num_turns", "num_skipped_too_large",
     "elapsed_time", "turns_per_second", "seconds_per_conversation",
+    "seconds_per_turn_mean", "seconds_per_turn_excl_turn0_mean",
     "actual_keep_rate_mean",
     "ttft_mean_ms", "ttft_p50_ms", "ttft_p90_ms",
     "num_cached_tokens_speculator_mean",
@@ -504,7 +505,7 @@ def run_baseline(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0}
+              "num_skipped_too_large": 0, "turn_elapsed": []}
 
     t_loop_start = time.time()
     conversations_processed = 0
@@ -514,6 +515,7 @@ def run_baseline(
         turns_before = len(predictions)
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
+            t_turn_start = time.time()
             query_ids = render_turn_query(tok, turn_idx, turn)
 
             prospective_len = state.total_len + len(query_ids) + wrapper_len
@@ -553,6 +555,7 @@ def run_baseline(
                 if output.metrics is not None and output.metrics.first_token_latency:
                     stats["ttfts"].append(output.metrics.first_token_latency * 1000)
                 stats["actual_keep_rates"].append(1.0)
+                stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": completion.text,
@@ -626,7 +629,7 @@ def run_specprefill(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0}
+              "num_skipped_too_large": 0, "turn_elapsed": []}
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
     desc = f"SpecPrefill keep={keep_pct}"
@@ -638,6 +641,7 @@ def run_specprefill(
         turns_before = len(predictions)
         state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
         for turn_idx, turn in enumerate(conv["turns"]):
+            t_turn_start = time.time()
             query_ids = render_turn_query(tok, turn_idx, turn)
 
             prospective_speculator_len = state.total_len + len(query_ids)
@@ -728,6 +732,7 @@ def run_specprefill(
                 if result.orig_len > 0:
                     stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
+                stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": completion.text,
@@ -823,7 +828,7 @@ def run_sparse_attention(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0}
+              "num_skipped_too_large": 0, "turn_elapsed": []}
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
     desc = f"Sparse attention keep={keep_pct}"
@@ -859,6 +864,7 @@ def run_sparse_attention(
         prev_cumulative_output_len = 0
 
         for turn_idx, turn in enumerate(conv["turns"]):
+            t_turn_start = time.time()
             query_ids = render_turn_query(tok, turn_idx, turn)
 
             prospective_speculator_len = state.total_len + len(query_ids)
@@ -965,6 +971,7 @@ def run_sparse_attention(
                 if result.orig_len > 0:
                     stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
+                stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
                 # completion.text is ALSO cumulative for the same reason --
                 # re-decode just this turn's own new tokens rather than use
                 # it directly.
@@ -1185,6 +1192,17 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 print(f"[predict_scbench] wrote {len(predictions)} predictions -> {pred_path}")
 
             ttfts_sorted = sorted(stats["ttfts"])
+            # turn_idx == 0 pays each conversation's own "cold start" cost
+            # (the full context's first prefill -- into the target directly
+            # for baseline/specprefill, or into both the target session AND
+            # the speculator's own growing cache for sparse) -- a
+            # fundamentally different, much larger cost than any later
+            # turn's incremental one. Averaging it in with every other turn
+            # would make "time per turn" mostly reflect how big turn 0 was,
+            # not the STEADY-STATE per-turn cost this metric exists to
+            # show -- exclude it, per turn_idx, for every conversation (not
+            # just the first one processed).
+            turn_times_excl_first = [t for idx, t in stats["turn_elapsed"] if idx > 0]
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "exp_id": exp_id, "label": label, "mode": mode, "keep_mode": keep_mode,
@@ -1206,6 +1224,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     elapsed / num_conversations_processed
                     if num_conversations_processed > 0 else None
                 ),
+                "seconds_per_turn_mean": (
+                    statistics.mean(t for _, t in stats["turn_elapsed"])
+                    if stats["turn_elapsed"] else None
+                ),
+                "seconds_per_turn_excl_turn0_mean": (
+                    statistics.mean(turn_times_excl_first) if turn_times_excl_first else None
+                ),
                 "actual_keep_rate_mean": statistics.mean(stats["actual_keep_rates"]) if stats["actual_keep_rates"] else None,
                 "ttft_mean_ms": statistics.mean(stats["ttfts"]) if stats["ttfts"] else None,
                 "ttft_p50_ms": percentile(ttfts_sorted, 0.5),
@@ -1223,12 +1248,19 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             append_csv_row(row)
             spc = row["seconds_per_conversation"]
             spc_str = f"{spc:.1f}s/conversation" if spc is not None else "n/a s/conversation"
+            spt = row["seconds_per_turn_mean"]
+            spt_excl = row["seconds_per_turn_excl_turn0_mean"]
+            spt_str = f"{spt:.2f}s/turn (all)" if spt is not None else "n/a s/turn"
+            spt_excl_str = (
+                f"{spt_excl:.2f}s/turn (excl. turn0)" if spt_excl is not None else "n/a s/turn (excl. turn0)"
+            )
             print(
                 f"[predict_scbench] rep {rep}/{args.reps}: {row['num_turns']} turns "
                 f"across {row['num_conversations']} processed conversations "
                 f"({row['num_conversations_loaded']} loaded, "
                 f"{row['num_skipped_too_large']} skipped) in {elapsed:.1f}s "
-                f"({row['turns_per_second']:.2f} turns/s, {spc_str}), "
+                f"({row['turns_per_second']:.2f} turns/s, {spc_str}, {spt_str}, "
+                f"{spt_excl_str}), "
                 f"ttft_mean={row['ttft_mean_ms']}, "
                 f"actual_keep_rate_mean={row['actual_keep_rate_mean']}, "
                 f"num_cached_tokens_speculator_mean={row['num_cached_tokens_speculator_mean']}"

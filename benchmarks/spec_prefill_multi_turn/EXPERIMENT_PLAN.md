@@ -594,6 +594,19 @@ rate. Broken down by `(config, turn_idx)` in grading -- the `turn_idx` axis
 is the multi-turn-specific signal (does accuracy degrade as the conversation
 lengthens?) that a single-turn benchmark never needed.
 
+`all_runs.csv` also records per-turn wall-clock time: `seconds_per_turn_mean`
+(every completed turn) and `seconds_per_turn_excl_turn0_mean` (excludes
+`turn_idx == 0` for every conversation, not just the first one processed).
+Turn 0 pays each conversation's own cold-start cost -- the full context's
+first prefill, into the target directly for baseline/specprefill, or into
+both the target session AND the speculator's own growing cache for sparse
+-- a fundamentally different, much larger cost than any later turn's
+incremental one; averaging it in with steady-state turns would make "time
+per turn" mostly reflect how big turn 0's context was, not the recurring
+per-turn cost the metric is meant to isolate. Both are computed from a new
+per-turn timer (`t_turn_start`) in each `run_*` function, recorded only for
+turns that actually completed (not skipped).
+
 `DISCARD` mode and the `ORACLE` rows' full granularity cross are natural
 next steps once `M000`/`M-k*-g*` are validated and run — not part of this
 pass's default sweep.
