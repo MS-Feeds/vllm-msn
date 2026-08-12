@@ -248,6 +248,142 @@ Llama-3.2-1B speculator, the exact pair this protocol calls for):
    (no cross-conversation batching) for a much simpler, easier-to-validate
    sequential driving loop. A natural follow-up once correctness is
    confirmed on real hardware.
+6. **A second, architecturally distinct pipeline** (persistent target-side
+   KV cache + speculator-guided sparse attention, `SPARSE-k*-g*`) is built
+   and wired up alongside the physical-pruning pipeline above -- see its
+   own "Persistent KV cache + sparse attention (SPARSE-k*-g*)" section
+   below for the full design, validation status, and how it differs.
+
+---
+
+## Persistent KV cache + sparse attention (SPARSE-k*-g*)
+
+**A second, architecturally distinct pipeline, run alongside M-k*-g* as a
+comparison baseline, not a replacement for it.** Everything above this
+section ("Algorithm reference" through "Implementation status") describes
+**physical pruning**: each turn, the target receives a genuinely SHORTER
+prompt (`pruned_token_ids`), faithful to the original SpecPrefill paper's
+own mechanism. That compresses the target's KV cache SIZE.
+
+This section's architecture instead compresses ATTENTION COMPUTE: **the
+target retains the full conversation's KV cache persistently across every
+turn — nothing is ever discarded — and the speculator's job is to tell the
+target which subset of that already-resident cache to actually attend to
+when decoding each turn's response.** Confirmed as the user's real intent
+partway through the M-k*-g* build (the physical-pruning pipeline was built
+first, matching the paper literally, before this distinction surfaced); the
+full research trail (vLLM V1 scheduler/attention internals, DeepSeek sparse
+MLA precedent ruled out as non-portable to GQA, block-table gathering
+adopted instead) lives in the approved plan this section summarizes.
+
+### Mechanism
+
+1. **Target-side persistence**: this fork's native "resumable session"
+   request lifecycle (`Request.resumable`, `RequestStatus.
+   WAITING_FOR_STREAMING_REQ`, `Scheduler._update_request_as_session`) --
+   one target request per CONVERSATION (not per turn), with each turn
+   delivered as a session update against the same `request_id`. KV blocks
+   stay `ref_cnt`-pinned for the whole conversation, never torn down
+   between turns. Verified on real hardware via TTFT comparison
+   (`validate_resumable_session.py` -- turn 2's TTFT was dramatically lower
+   than turn 1's, confirming genuine reuse, not recomputation;
+   `num_cached_tokens` was checked and found NOT meaningful for session
+   continuations, a scheduler-internal gating detail, not a bug).
+2. **Decode-only sparse attention via block-table gathering**: the target
+   runner (`vllm_patch/sparse_target_runner.py`) overrides
+   `_build_attention_metadata()` to substitute a gathered
+   `(block_table, seq_lens)` view -- reusing the STOCK, unmodified
+   attention kernel underneath, the same technique
+   `make_local_attention_virtual_batches()` already uses for chunked-local
+   attention. Correct for single-token decode steps only (RoPE is baked
+   into K at write time, so gathered vectors carry correct rotation
+   regardless of where they land in the shrunk view); each turn's own new
+   query tokens always prefill with full, unrestricted attention over the
+   whole resident cache. Verified on real hardware via a needle-in-a-
+   haystack behavioral test (`validate_sparse_attention.py`, all 3 steps
+   passed: full-attention baseline finds the needle, excluding its block
+   loses it, re-including a different partial selection recovers it).
+3. **Block-level granularity only** (`16`/`32`/`64`) -- `token`-level
+   sparse selection would need a genuine custom kernel (DeepSeek's sparse
+   MLA path is architecturally similar but MQA/MLA-specific, not portable
+   to Llama's GQA); out of scope for this pass, `SPARSE-k*-gtoken` rows do
+   not exist.
+4. **No RoPE position-override machinery needed** (unlike the
+   physical-pruning pipeline) -- gathered K already carries correct
+   rotation, and the query's own position is just its true, ever-
+   incrementing position in a continuously-open session.
+   `pruning_registry.py`/`model_runner.py`/`worker.py` are untouched by
+   this pipeline; it uses a separate, simpler registry
+   (`vllm_patch/sparse_selection_registry.py`) instead.
+
+### Self-generated history (a real decision, not an oversight)
+
+The physical-pruning pipeline above runs in **golden-context mode**: future
+turns' history is the dataset's reference answer, not the model's own
+output, which is what makes every turn's tokens knowable statically up
+front (see "Structurally different..." point 2 in `predict_scbench.py`'s
+own module docstring). This pipeline cannot do that: the resumable-session
+mechanism's own scheduler logic auto-appends the target's ACTUAL generated
+output tokens to its KV cache as part of normal decoding -- there is no
+hook to substitute a different, golden continuation into an already-
+persistent cache without contradicting the "persistent, never discarded"
+premise this whole architecture exists to test. Fighting that native
+behavior (e.g. forcibly overwriting cache contents to match golden text)
+would be substantially more complex than embracing it, so
+`predict_scbench.py::run_sparse_attention` feeds the target's own actual
+generated output into `conversation_state.py`'s ledger
+(`state.complete_turn(result.kept_history_pairs, actual_output_ids)`, not
+the golden answer) -- both for the speculator's own candidate-pool
+construction (via the ledger) and to keep `LedgerToTargetPositionMap`'s
+position translation in lockstep with what the target session actually
+contains. Golden answers are still used for grading (`grade_scbench.py`
+reads the dataset directly, independent of what was fed forward during
+generation); the metric comparison against M-k*-g*'s golden-context numbers
+should account for this difference (self-generated history is a harder,
+more realistic setting -- a lower score here isn't necessarily attention-
+restriction-induced degradation).
+
+A `LedgerToTargetPositionMap` (per conversation) translates
+`conversation_state.py`'s pure-content absolute positions into the target
+session's real, wrapper-token-inclusive stream positions before every
+`register_sparse_selection` call -- needed because this pipeline (unlike
+M-k*-g*'s single flattened text block) uses genuine per-turn chat-template
+boundaries (`chat_turn_boundary_pieces`), which insert real wrapper tokens
+between turns that the content-only ledger doesn't know about.
+
+### KEEP mode only, and for a different reason than M-k*-g*'s
+
+Nothing is ever physically discarded from the target's cache under this
+architecture, so "re-selecting" a token dropped from attention at turn 2
+costs nothing extra at turn 5 (it was never evicted) -- DISCARD mode's
+whole reason for existing (reconstructing genuinely-lost data) doesn't
+apply here. `SPARSE-k*-g*` rows always use `keep_mode="keep"`.
+
+### Files
+
+New: `vllm_patch/sparse_target_runner.py` (`SparseTargetGPUModelRunner`/
+`SparseTargetWorker`), `vllm_patch/sparse_selection_registry.py`,
+`vllm_patch/kv_cache_utils.py::compute_sparse_gather_view` (pure-function,
+CPU-unit-tested), `predict_scbench.py::run_sparse_attention`/
+`LedgerToTargetPositionMap`/`chat_turn_boundary_pieces`/
+`build_sparse_session_request`/`drive_one_turn_of_session`,
+`validate_resumable_session.py`, `validate_sparse_attention.py`. Reused
+unchanged: `proposer.py`/`speculator_worker.py` (the speculator's own job
+doesn't change at all under this design), `conversation_state.py`,
+`pruner.py::compute_pruned_turn` (its `kept_positions` field is exactly the
+sparse selection needed; `pruned_token_ids` goes unused by this path, since
+the target always receives the FULL, unpruned content).
+
+### Status
+
+Both validation scripts (`validate_resumable_session.py`,
+`validate_sparse_attention.py`) pass on real hardware; the driving loop
+(`run_sparse_attention`, `run_experiment`'s `mode == "sparse"` dispatch) is
+wired up and CPU-tested (`test_vllm_patch.py`), but has **not yet been
+smoke-tested on real GPU hardware end to end** -- run a 1-2 conversation
+`SPARSE-k*-g*` smoke test (`--exp SPARSE-k80-g32 --max-conversations 2`)
+before trusting a full sweep, same discipline applied to every other new
+mechanism in this pipeline.
 
 ---
 
@@ -281,9 +417,13 @@ implemented this pass.
 | M-k40-g{token,16,32,64} | Keep 40% | 40% | token/16/32/64 | keep |
 | M-k20-g{token,16,32,64} | Keep 20% | 20% | token/16/32/64 | keep |
 | ORACLE-k{80,60,40,20} | Oracle upper bound | 80/60/40/20% | 32 (representative) | keep |
+| SPARSE-k{80,60,40,20}-g{16,32,64} | Persistent cache + sparse attention (see that section above) | 80/60/40/20% | 16/32/64 (no `token` -- block-gather is block-granular only) | keep (only) |
 
 `predict_scbench.py --list` prints this matrix (generated programmatically,
-not hand-enumerated -- see that script's `_build_experiments`).
+not hand-enumerated -- see that script's `_build_experiments`). Use
+`--exp specprefill` for all M-k*-g* rows, `--exp sparse` for all
+SPARSE-k*-g* rows, or `--exp all` for everything (including the
+not-yet-implemented ORACLE-k* rows).
 
 Metrics captured per turn: per-config metric (`grade_scbench.py` --
 `in_match` for `scbench_kv`, `qa_f1_score` for `scbench_qa_eng`, ROUGE-L for
@@ -365,8 +505,10 @@ memory-footprint variable that estimate didn't have to account for.
 | `test_vllm_patch.py` | Unit tests -- engine-agnostic pieces + `conversation_state.py` (no GPU needed) |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
+| `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) -- see "Persistent KV cache + sparse attention" section |
+| `validate_sparse_attention.py` | GPU-node validation: decode-step block-gather sparse attention (needle-in-haystack) -- see "Persistent KV cache + sparse attention" section |
 | `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
-| `predict_scbench.py` | Runs the M000/M-k*-g*/ORACLE-k* matrix, writes a per-turn predictions JSONL per experiment |
+| `predict_scbench.py` | Runs the M000/M-k*-g*/ORACLE-k*/SPARSE-k*-g* matrix, writes a per-turn predictions JSONL per experiment |
 | `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
 | `datasets/` | SCBench prep output (gitignored) |
 | `results/` | Output directory (gitignored) |

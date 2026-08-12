@@ -201,6 +201,26 @@ def _build_experiments() -> dict:
             "mode": "oracle", "keep_mode": "keep",
             "keep_percentage": rate, "granularity": ORACLE_GRANULARITY,
         }
+    # Persistent-KV-cache + speculator-guided sparse attention -- the
+    # OTHER architecture (see EXPERIMENT_PLAN.md's separate section for it),
+    # run alongside M-k*-g*/ORACLE-k* rather than replacing them, per the
+    # user's own decision to keep the physically-pruned sweep as a
+    # comparison baseline. Same keep-rate x granularity grid as M-k*-g*, but
+    # "token" granularity is NOT offered here -- the block-table-gather
+    # mechanism this architecture depends on is block-granular by
+    # construction (see sparse_target_runner.py's module docstring), no
+    # token-level path exists.
+    for rate in KEEP_RATES:
+        for gran_name in GRANULARITIES:
+            if gran_name == "token":
+                continue
+            exp_id = f"SPARSE-k{int(rate * 100)}-g{gran_name}"
+            experiments[exp_id] = {
+                "label": f"Sparse attention (persistent cache) keep={int(rate * 100)}% "
+                         f"granularity={gran_name}",
+                "mode": "sparse", "keep_mode": "keep",
+                "keep_percentage": rate, "granularity": gran_name,
+            }
     return experiments
 
 
@@ -264,6 +284,43 @@ def chat_wrapper_pieces(tok) -> tuple[str, str]:
     return before, after
 
 
+_ASSISTANT_BOUNDARY_PLACEHOLDER = "@@SPEC_PREFILL_MT_ASSISTANT_PLACEHOLDER@@"
+_USER_BOUNDARY_PLACEHOLDER = "@@SPEC_PREFILL_MT_USER_PLACEHOLDER@@"
+
+
+def chat_turn_boundary_pieces(tok) -> str:
+    """The text that closes an assistant turn and opens the next user turn
+    (e.g. Llama's `<|eot_id|><|start_header_id|>user<|end_header_id|>\\n\\n`)
+    -- derived from the tokenizer's own chat template via placeholder
+    substitution (same technique as `chat_wrapper_pieces` above), not
+    hardcoded, so this isn't tied to Llama's specific special tokens.
+
+    Only used by the sparse-attention experiment path (`run_sparse_
+    attention` below) -- that path uses GENUINE per-turn chat-template
+    boundaries (real `<|eot_id|>`-delimited turns), unlike M-k*-g*/M000's
+    flattened-text-block rendering (module docstring #3's documented
+    simplification, and its real-hardware-observed turn-5 confusion cost --
+    see that docstring section). The sparse-attention path can afford real
+    chat-template turns because it doesn't need `conversation_state.py` to
+    track per-turn wrapper-token boundaries the way physical pruning would
+    (see EXPERIMENT_PLAN.md's sparse-attention section: nothing is ever
+    pruned from the target's own resident cache in that architecture, so
+    there's no candidate-pool bookkeeping that the wrapper tokens would
+    need to be excluded from)."""
+    rendered = tok.apply_chat_template(
+        [
+            {"role": "user", "content": "Q"},
+            {"role": "assistant", "content": _ASSISTANT_BOUNDARY_PLACEHOLDER},
+            {"role": "user", "content": _USER_BOUNDARY_PLACEHOLDER},
+        ],
+        add_generation_prompt=False,
+        tokenize=False,
+    )
+    after_assistant = rendered.split(_ASSISTANT_BOUNDARY_PLACEHOLDER, 1)[1]
+    boundary = after_assistant.split(_USER_BOUNDARY_PLACEHOLDER, 1)[0]
+    return boundary
+
+
 def build_conversation_state(context: str, tok, keep_mode: str, conversation_id: str):
     from vllm_patch.conversation_state import ConversationState
 
@@ -293,6 +350,94 @@ def drive_single_request_to_completion(llm_engine, request_id: str):
             if output.request_id == request_id:
                 latest_output = output
     return latest_output
+
+
+def drive_one_turn_of_session(llm_engine, request_id: str):
+    """Same helper as `validate_resumable_session.py`'s own
+    `drive_one_turn_of_session` -- confirmed on real hardware there that a
+    resumable request's own turn-level stop does NOT make
+    `has_unfinished_requests()` go False (it parks in `RequestStatus.
+    WAITING_FOR_STREAMING_REQ` and re-enqueues, not finishes), so this
+    watches `output.outputs[0].finish_reason` directly instead of relying
+    on `drive_single_request_to_completion`'s "loop until nothing's left"
+    shape, which would spin forever here."""
+    last_output = None
+    while llm_engine.has_unfinished_requests():
+        for output in llm_engine.step():
+            if output.request_id != request_id:
+                continue
+            last_output = output
+            if output.outputs[0].finish_reason is not None:
+                return last_output
+    return last_output
+
+
+def build_sparse_session_request(request_id, prompt_token_ids, sampling_params, resumable=True):
+    """Same technique as `validate_resumable_session.py`'s own
+    `build_resumable_request` -- `LLMEngine.add_request()` has no
+    `resumable=` kwarg (confirmed by reading its real signature), so this
+    constructs an `EngineCoreRequest` directly and passes it AS the
+    `prompt` argument, which `add_request()` accepts verbatim via its
+    `isinstance(prompt, EngineCoreRequest)` branch."""
+    import time as _time
+
+    from vllm.v1.engine import EngineCoreRequest
+
+    return EngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=None,
+        arrival_time=_time.time(),
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        resumable=resumable,
+    )
+
+
+class LedgerToTargetPositionMap:
+    """Translates `conversation_state.py`'s pure-CONTENT ledger positions
+    (context + turn queries + turn outputs only -- see that module's
+    docstring) into the sparse-attention target session's own real
+    token-stream positions, which additionally contain chat-template
+    wrapper tokens (`chat_before`/`chat_after`/`turn_boundary`, from
+    `chat_wrapper_pieces`/`chat_turn_boundary_pieces`) interspersed between
+    turns. `sparse_target_runner.py`'s gather logic reads positions in the
+    TARGET's own numbering (`self.input_batch.num_computed_tokens_cpu`
+    counts every real submitted token, wrapper included) -- a
+    speculator-selected CONTENT position must be translated before being
+    registered via `sparse_selection_registry`, or it would point at the
+    wrong physical block once enough wrapper tokens have accumulated.
+
+    Tracks a monotonic step function: the offset (target position - ledger
+    position) only ever increases, and only at the exact ledger positions
+    where a wrapper insertion happens -- recorded via `add_wrapper` each
+    time this driver actually submits one."""
+
+    def __init__(self, initial_offset: int):
+        # initial_offset = len(chat_before_ids) -- ledger position 0
+        # (context's first token) maps to target position
+        # len(chat_before_ids), since chat_before precedes everything.
+        self._breakpoints = [(0, initial_offset)]
+
+    def add_wrapper(self, ledger_position: int, wrapper_len: int) -> None:
+        """Call once, right after submitting `wrapper_len` target-only
+        tokens that logically sit at `ledger_position` (i.e. every ledger
+        position >= `ledger_position` from now on is shifted by an
+        additional `wrapper_len`)."""
+        current_offset = self._breakpoints[-1][1]
+        self._breakpoints.append((ledger_position, current_offset + wrapper_len))
+
+    def translate(self, ledger_position: int) -> int:
+        offset = self._breakpoints[0][1]
+        for threshold, off in self._breakpoints:
+            if ledger_position >= threshold:
+                offset = off
+            else:
+                break
+        return ledger_position + offset
 
 
 def run_baseline(
@@ -548,6 +693,192 @@ def run_specprefill(
     return predictions, stats
 
 
+def run_sparse_attention(
+    llm,
+    tok,
+    proposer,
+    spec_config,
+    conversations,
+    max_tokens,
+    keep_mode,
+    speculator_max_num_batched_tokens,
+    target_max_num_batched_tokens,
+) -> tuple[list[dict], dict]:
+    """SPARSE-k*-g*: persistent full-KV-cache target session, speculator-
+    selected sparse attention over it during decode (see
+    `vllm_patch/sparse_target_runner.py`'s module docstring for the
+    mechanism, validated end-to-end on real hardware by
+    `validate_resumable_session.py`/`validate_sparse_attention.py`).
+    Structurally different from `run_specprefill` in three ways:
+
+    1. **One target session (one resumable `request_id`) per conversation,
+       not one `add_request` per turn.** Turn 2+ delivers only the NEW
+       content (this turn's wrapper/query tokens) as a session update --
+       everything from earlier turns is already resident in the target's
+       own KV cache, never resubmitted.
+    2. **The target always receives the FULL, unpruned content** (context
+       on turn 0, this turn's query every turn, joined by real
+       chat-template turn boundaries via `chat_turn_boundary_pieces` --
+       NOT the flattened-text-block rendering `run_baseline`/
+       `run_specprefill` use, see that function's own docstring for why
+       this pipeline can afford real per-turn boundaries).
+       `compute_pruned_turn`'s `pruned_token_ids` (the physically-shrunk
+       subset the OTHER pipeline sends to the target) is not used for the
+       target's own prompt here -- only `kept_positions` (which tokens the
+       speculator judged important) is used, to build the decode-time
+       attention selection registered via `register_sparse_selection`.
+    3. **Self-generated history**: `state.complete_turn` is fed the
+       target's own actual generated output for this turn, not the
+       dataset's golden answer -- this pipeline's target session already
+       auto-appends its own output tokens to its real KV cache (that's
+       what "persistent" means here), so `conversation_state`'s ledger
+       must mirror the SAME tokens to stay in lockstep with
+       `LedgerToTargetPositionMap`'s bookkeeping. Golden answers are only
+       used for grading (`grade_scbench.py` reads the dataset directly),
+       never fed into this driver's own state.
+
+    A `LedgerToTargetPositionMap` per conversation translates
+    `conversation_state`'s pure-content ledger positions into the target
+    session's real (wrapper-inclusive) token-stream positions before every
+    `register_sparse_selection` call -- see that class's docstring. The
+    map's own wrapper breakpoints are recorded in the same order those
+    wrapper tokens are actually submitted to the target: `chat_before_ids`
+    is folded into the map's `initial_offset` (always present, before
+    anything else); `turn_boundary_ids` (turn 1+) is recorded right before
+    translating that turn's own selection, since the selection includes
+    this turn's own force-kept query, which sits AFTER the boundary in the
+    target's real stream; `chat_after_ids` is recorded right after, since
+    it only affects positions belonging to LATER turns (this turn's own
+    generated output, appended once decoding finishes).
+
+    **Two-stage length check, same reasoning as `run_specprefill`'s own
+    docstring** -- check 1 (speculator budget) is identical. Check 2
+    differs from `run_specprefill`'s: there is no pruned/shrunk prompt to
+    fall back on here, so it checks the FULL prospective target session
+    length (same shape as `run_baseline`'s single check) plus wrapper
+    overhead, since this pipeline's target session is never pruned, only
+    its ATTENTION is restricted -- it needs the whole conversation to fit
+    physically, same as the baseline.
+    """
+    from vllm import SamplingParams
+    from vllm_patch.conversation_state import ConversationState
+    from vllm_patch.pruner import compute_pruned_turn
+
+    chat_before, chat_after = chat_wrapper_pieces(tok)
+    chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
+    chat_after_ids = tok.encode(chat_after, add_special_tokens=False)
+    turn_boundary_ids = tok.encode(chat_turn_boundary_pieces(tok), add_special_tokens=False)
+    wrapper_overhead = len(chat_before_ids) + len(chat_after_ids) + len(turn_boundary_ids)
+
+    predictions = []
+    stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
+              "actual_keep_rates": [], "num_cached_tokens_speculator": [],
+              "num_skipped_too_large": 0}
+
+    keep_pct = spec_config.keep_kwargs.get("percentage")
+    desc = f"Sparse attention keep={keep_pct}"
+    progress = tqdm(conversations, desc=desc, unit="conv")
+    for conv in progress:
+        progress.set_postfix(turns=len(predictions), skipped=stats["num_skipped_too_large"])
+
+        context_ids = tok.encode(conv["context"], add_special_tokens=False)
+        state = ConversationState(conv["id"], context_ids, keep_mode)
+        position_map = LedgerToTargetPositionMap(initial_offset=len(chat_before_ids))
+        target_request_id = f"{conv['id']}::sparse-session"
+        session_started = False
+
+        for turn_idx, turn in enumerate(conv["turns"]):
+            query_ids = render_turn_query(tok, turn_idx, turn)
+
+            prospective_speculator_len = state.total_len + len(query_ids)
+            if prospective_speculator_len > speculator_max_num_batched_tokens:
+                progress.write(
+                    f"[predict_scbench] SKIP conversation id={conv['id']!r} "
+                    f"from turn {turn_idx} onward: full candidate-pool length "
+                    f"{prospective_speculator_len} exceeds "
+                    f"--speculator-max-num-batched-tokens="
+                    f"{speculator_max_num_batched_tokens} -- the speculator "
+                    f"must process the whole thing to score it."
+                )
+                stats["num_skipped_too_large"] += 1
+                break
+            prospective_target_len = state.total_len + len(query_ids) + wrapper_overhead
+            if prospective_target_len > target_max_num_batched_tokens:
+                progress.write(
+                    f"[predict_scbench] SKIP conversation id={conv['id']!r} "
+                    f"from turn {turn_idx} onward: full target session length "
+                    f"{prospective_target_len} would exceed "
+                    f"--target-max-num-batched-tokens="
+                    f"{target_max_num_batched_tokens} -- this pipeline's "
+                    f"target session is never pruned, only its ATTENTION is "
+                    f"restricted, so it needs the whole conversation to fit "
+                    f"physically, same as the baseline."
+                )
+                stats["num_skipped_too_large"] += 1
+                break
+
+            result = compute_pruned_turn(proposer, spec_config, state, query_ids)
+            query_start_ledger_pos = result.orig_len - len(query_ids)
+
+            if turn_idx > 0:
+                position_map.add_wrapper(query_start_ledger_pos, len(turn_boundary_ids))
+
+            translated_positions = sorted(
+                position_map.translate(p) for p in result.kept_positions
+            )
+            llm.llm_engine.collective_rpc(
+                "register_sparse_selection",
+                args=(target_request_id, translated_positions),
+            )
+
+            if turn_idx == 0:
+                delta_ids = chat_before_ids + context_ids + query_ids + chat_after_ids
+            else:
+                delta_ids = turn_boundary_ids + query_ids + chat_after_ids
+            position_map.add_wrapper(result.orig_len, len(chat_after_ids))
+
+            sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+            prompt = build_sparse_session_request(
+                target_request_id, delta_ids, sampling_params, resumable=True,
+            )
+            real_id = llm.llm_engine.add_request(target_request_id, prompt, sampling_params)
+            assert real_id == target_request_id, (
+                f"expected request_id={target_request_id!r} verbatim, got "
+                f"{real_id!r} -- VLLM_DISABLE_REQUEST_ID_RANDOMIZATION must "
+                f"be set (proposer.py sets this at import time)."
+            )
+            session_started = True
+            output = drive_one_turn_of_session(llm.llm_engine, target_request_id)
+            llm.llm_engine.collective_rpc(
+                "discard_sparse_selection", args=(target_request_id,),
+            )
+
+            actual_output_ids: list[int] = []
+            if output is not None:
+                completion = output.outputs[0]
+                actual_output_ids = list(completion.token_ids)
+                stats["out_lens"].append(len(completion.token_ids))
+                stats["finish"][completion.finish_reason if completion.finish_reason in
+                                 stats["finish"] else "other"] += 1
+                if output.metrics is not None and output.metrics.first_token_latency:
+                    stats["ttfts"].append(output.metrics.first_token_latency * 1000)
+                if result.orig_len > 0:
+                    stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
+                stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
+                predictions.append({
+                    "conversation_id": conv["id"], "turn_idx": turn_idx,
+                    "config": conv["config"], "pred": completion.text,
+                })
+
+            state.complete_turn(result.kept_history_pairs, actual_output_ids)
+
+        proposer.discard_conversation(conv["id"])
+        if session_started:
+            llm.llm_engine.abort_request([target_request_id])
+
+    return predictions, stats
+
+
 def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
@@ -605,7 +936,18 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         max_num_batched_tokens=target_max_num_batched_tokens,
         max_model_len=max_model_len,
     )
-    if mode != "baseline":
+    if mode == "sparse":
+        # SparseTargetWorker, not SpecPrefillWorker -- this path never
+        # physically shrinks the prompt (no RoPE-position-override
+        # machinery needed at all, see sparse_target_runner.py's module
+        # docstring), it restricts decode-step attention over a session
+        # that must stay resident turn over turn.
+        # enable_prefix_caching=True mirrors validate_resumable_session.py/
+        # validate_sparse_attention.py's own construction -- required for
+        # the resumable-session mechanism this path depends on.
+        llm_kwargs["worker_cls"] = "vllm_patch.sparse_target_runner.SparseTargetWorker"
+        llm_kwargs["enable_prefix_caching"] = True
+    elif mode != "baseline":
         llm_kwargs["worker_cls"] = "vllm_patch.worker.SpecPrefillWorker"
 
     t_engine = time.time()
@@ -615,7 +957,11 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     proposer = None
     spec_config = None
     speculator_max_num_batched_tokens = None
-    if mode == "specprefill":
+    if mode in ("specprefill", "sparse"):
+        # Same speculator construction for both -- the speculator's own
+        # job (score importance via lookahead decode) is identical either
+        # way, only how the TARGET consumes the resulting selection
+        # differs (see run_sparse_attention's module docstring).
         import torch
         from vllm_patch.proposer import SpecPrefillProposer
 
@@ -700,6 +1046,11 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     llm, tok, conversations, args.max_tokens, keep_mode,
                     target_max_num_batched_tokens,
                 )
+            elif mode == "sparse":
+                predictions, stats = run_sparse_attention(
+                    llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
+                    speculator_max_num_batched_tokens, target_max_num_batched_tokens,
+                )
             else:
                 predictions, stats = run_specprefill(
                     llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
@@ -773,10 +1124,11 @@ def main() -> None:
         help="Comma-separated experiment IDs (see --list), or one of the "
              "group keywords 'specprefill' (all M-k*-g* rows, i.e. "
              "everything except M000 baseline -- ORACLE-k* rows are NOT "
-             "included, since that mode isn't wired up yet) or 'all' "
-             "(every defined experiment, including the not-yet-implemented "
-             "ORACLE-k* rows, which will fail and be reported, not silently "
-             "skipped).",
+             "included, since that mode isn't wired up yet), 'sparse' (all "
+             "SPARSE-k*-g* rows, the persistent-cache + sparse-attention "
+             "architecture), or 'all' (every defined experiment, including "
+             "the not-yet-implemented ORACLE-k* rows, which will fail and "
+             "be reported, not silently skipped).",
     )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
     parser.add_argument("--target-model", default=os.environ.get("LLAMA31_8B_MODEL_PATH"))
@@ -831,6 +1183,8 @@ def main() -> None:
     exp_arg = args.exp.strip().lower()
     if exp_arg == "specprefill":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "specprefill"]
+    elif exp_arg == "sparse":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "sparse"]
     elif exp_arg == "all":
         exp_ids = list(EXPERIMENTS.keys())
     else:

@@ -17,6 +17,12 @@ with a loaded model and are not exercised here -- see `validate_proposer.py`
 and each module's own "Known risk areas" notes for what a live run would
 need to confirm.
 
+Also covers `predict_scbench.py::LedgerToTargetPositionMap` (a driver-level,
+not `vllm_patch/`, class -- imported here anyway since it's pure Python,
+CPU-testable, and the sparse-attention experiment path's correctness
+depends on its arithmetic being exactly right; see that class's own
+docstring for what it's translating between and why).
+
 Run with: python3 test_vllm_patch.py
 """
 
@@ -47,6 +53,7 @@ from vllm_patch.scoring import (
     chunk_select_from_smoothed_attention,
     compute_attention_score,
 )
+from predict_scbench import LedgerToTargetPositionMap
 
 
 class _FakeRequest:
@@ -365,6 +372,45 @@ def test_sparse_selection_registry_lifecycle():
         assert sparse_selection_registry.get("req-1") is None
     finally:
         sparse_selection_registry.clear()
+
+
+def test_ledger_to_target_position_map_multi_turn_trace():
+    """Hand-computed trace matching a real multi-turn shape: chat_before (3
+    tokens) + context (10 tokens, ledger 0-9) + turn1 query (2 tokens,
+    ledger 10-11) + chat_after (4 tokens, target-only) + turn1 output (3
+    tokens, ledger 12-14) + turn_boundary (5 tokens, target-only) + turn2
+    query (2 tokens, ledger 15-16). Verifies both that positions translate
+    correctly as wrappers accumulate, AND that earlier mappings don't
+    retroactively change once later wrappers are recorded (the ledger is
+    append-only, so a position's mapping, once past, must stay fixed)."""
+    m = LedgerToTargetPositionMap(initial_offset=3)  # len(chat_before_ids)
+
+    # context + turn1 query: ledger [0,12) -> target [3,15), no wrapper yet
+    assert m.translate(0) == 3
+    assert m.translate(9) == 12  # last context token
+    assert m.translate(11) == 14  # last query token
+
+    m.add_wrapper(ledger_position=12, wrapper_len=4)  # chat_after inserted
+    # turn1 output: ledger [12,15) -> target [19,22)
+    assert m.translate(12) == 19
+    assert m.translate(14) == 21
+
+    m.add_wrapper(ledger_position=15, wrapper_len=5)  # turn_boundary inserted
+    # turn2 query: ledger [15,17) -> target [27,29)
+    assert m.translate(15) == 27
+    assert m.translate(16) == 28
+
+    # Earlier mappings unaffected by later wrapper insertions.
+    assert m.translate(0) == 3
+    assert m.translate(12) == 19
+
+
+def test_ledger_to_target_position_map_no_wrappers_added_yet():
+    """Before any add_wrapper call, every position uses only the initial
+    offset -- the single-turn (turn 1 only) case."""
+    m = LedgerToTargetPositionMap(initial_offset=5)
+    assert m.translate(0) == 5
+    assert m.translate(100) == 105
 
 
 def test_prune_record_validation():
