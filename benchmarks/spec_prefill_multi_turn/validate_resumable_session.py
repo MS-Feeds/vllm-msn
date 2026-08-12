@@ -31,13 +31,16 @@ returning `True` even after a turn's own generation has genuinely stopped
 -- the existing `drive_single_request_to_completion` helper (used
 throughout `predict_scbench.py`'s other experiment paths) would loop
 forever if reused here unmodified. This script instead watches each step's
-`RequestOutput.finish_reason` directly and stops consuming steps for the
+`RequestOutput.outputs[0].finish_reason` (confirmed on real hardware to be
+where `finish_reason` actually lives -- it is NOT a top-level `RequestOutput`
+attribute, an earlier version of this script assumed it was and hit
+`AttributeError: 'RequestOutput' object has no attribute 'finish_reason'`;
+this matches `predict_scbench.py`'s own established `completion =
+output.outputs[0]; completion.finish_reason` pattern, which this script
+should have followed from the start) and stops consuming steps for the
 CURRENT TURN once that turn's own generation reports a finish reason --
 NOT once the whole request/session is "finished" -- see
-`drive_one_turn_of_session` below. Confirm this assumption is actually
-correct here on real hardware; if `finish_reason` behaves differently for a
-resumable request than for a normal one, that's the first thing this script
-should reveal.
+`drive_one_turn_of_session` below.
 
 **What this script checks, concretely**:
   A. Construct a resumable session request (turn 1), drive it to its own
@@ -89,8 +92,15 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
     reason -- NOT until the whole (resumable) request/session is finished,
     which per this script's module docstring may never happen on its own
     for a parked session. Returns the last RequestOutput observed for this
-    request_id (whose `.finish_reason` should be non-None if this turn
-    genuinely stopped normally), or None if the engine ran out of
+    request_id (whose `.outputs[0].finish_reason` should be non-None if
+    this turn genuinely stopped normally -- confirmed against this
+    pipeline's own existing usage elsewhere, e.g. predict_scbench.py's
+    `completion = output.outputs[0]; completion.finish_reason`:
+    `finish_reason` lives on the per-sample `CompletionOutput` inside
+    `RequestOutput.outputs`, not on `RequestOutput` itself -- an earlier
+    version of this function read `output.finish_reason` directly and hit
+    `AttributeError: 'RequestOutput' object has no attribute
+    'finish_reason'` on real hardware), or None if the engine ran out of
     unfinished requests without ever producing one (a real failure worth
     surfacing distinctly, not silently returning an empty result).
 
@@ -106,7 +116,7 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
             if output.request_id != request_id:
                 continue
             last_output = output
-            if output.finish_reason is not None:
+            if output.outputs[0].finish_reason is not None:
                 return last_output
     return last_output
 
@@ -195,7 +205,7 @@ def main() -> None:
 
     print(
         f"[validate_resumable_session] Step A: turn 1 finish_reason="
-        f"{output1.finish_reason!r}, generated={output1.outputs[0].text!r}, "
+        f"{output1.outputs[0].finish_reason!r}, generated={output1.outputs[0].text!r}, "
         f"num_cached_tokens={output1.num_cached_tokens} (expected 0 or small -- "
         f"nothing real to hit yet on a fresh conversation)"
     )
@@ -229,7 +239,7 @@ def main() -> None:
 
     print(
         f"[validate_resumable_session] Step B: turn 2 finish_reason="
-        f"{output2.finish_reason!r}, generated={output2.outputs[0].text!r}, "
+        f"{output2.outputs[0].finish_reason!r}, generated={output2.outputs[0].text!r}, "
         f"num_cached_tokens={output2.num_cached_tokens} "
         f"(THE key assertion below -- expected close to {len(turn1_ids)}, "
         f"the whole of turn 1's prompt, since nothing should have evicted it "
