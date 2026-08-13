@@ -213,6 +213,7 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
         for turn_idx, turn in enumerate(sample["turns"]):
             total_turns += 1
             key = (conversation_id, turn_idx)
+            question = turn["input"]
             answer = turn["answer"]
 
             if key not in pred_by_key:
@@ -222,6 +223,7 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
                         "conversation_id": conversation_id,
                         "turn_idx": turn_idx,
                         "config": config,
+                        "input": question,
                         "answer": answer,
                         "pred": None,
                         "score": None,
@@ -238,6 +240,7 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
                         "conversation_id": conversation_id,
                         "turn_idx": turn_idx,
                         "config": config,
+                        "input": question,
                         "answer": answer,
                         "pred": pred,
                         "score": None,
@@ -255,6 +258,7 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
                     "conversation_id": conversation_id,
                     "turn_idx": turn_idx,
                     "config": config,
+                    "input": question,
                     "answer": answer,
                     "pred": pred,
                     "score": score,
@@ -285,7 +289,7 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
 def write_per_turn_csv(result: dict, path: Path) -> None:
     import csv
 
-    fieldnames = ["conversation_id", "turn_idx", "config", "answer", "pred", "score"]
+    fieldnames = ["conversation_id", "turn_idx", "config", "input", "answer", "pred", "score"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
