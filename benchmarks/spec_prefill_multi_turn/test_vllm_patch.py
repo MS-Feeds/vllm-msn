@@ -748,6 +748,85 @@ def test_ledger_to_target_position_map_no_wrappers_added_yet():
     assert m.translate(100) == 105
 
 
+def test_prospective_target_len_matches_real_submitted_token_count():
+    """Regression test for a real crash: `run_sparse_attention`'s
+    pre-submission length guard (`predict_scbench.py`) used to compute
+    `prospective_target_len` from a single constant `wrapper_overhead`
+    (one chat_before + one chat_after + one turn_boundary), but the REAL
+    target session accumulates one chat_after AND one turn_boundary PER
+    TURN -- so the old check increasingly undercounted true resident
+    length as a conversation progressed, letting a real run overrun
+    `--target-max-num-batched-tokens` deep into a conversation instead of
+    being cleanly skipped (`ValueError: could not broadcast input array
+    from shape (131084,) into shape (131072,)` inside vLLM's own
+    `add_request`).
+
+    This builds actual token-id lists (unique sentinel ints per piece) and
+    concatenates them in EXACTLY the order `run_sparse_attention` submits
+    them (chat_before + context + query0 + chat_after, then per later turn
+    turn_boundary + query_i + chat_after, with each turn's own output
+    tokens landing in between via `state.complete_turn`), then checks that
+    the NEW `position_map`-based formula matches `len()` of the real
+    concatenated stream at every turn boundary -- not just a hand-derived
+    formula cross-check, but the same token-accounting the real pipeline
+    does."""
+    chat_before_ids = [-1, -2, -3]
+    chat_after_ids = [-4, -5, -6, -7]
+    turn_boundary_ids = [-8, -9, -10, -11, -12]
+    context_ids = list(range(100, 110))  # 10 tokens
+
+    # Per-turn (query_len, output_len) -- output_len is what gets appended
+    # to the ledger via state.complete_turn AFTER that turn's generation,
+    # mirroring a real multi-turn conversation's shape.
+    turns = [(2, 3), (2, 3), (2, 0), (2, 5)]
+
+    real_stream: list[int] = []
+    # ConversationState.total_len == len(context_ids) immediately at
+    # construction (context is appended to the ledger in __init__, not on
+    # the first begin_turn -- see conversation_state.py) -- state_total_len
+    # here mirrors that, NOT reset to 0.
+    state_total_len = len(context_ids)
+
+    position_map = LedgerToTargetPositionMap(initial_offset=len(chat_before_ids))
+    real_stream.extend(chat_before_ids)
+
+    for turn_idx, (query_len, output_len) in enumerate(turns):
+        query_ids = [1000 + turn_idx * 100 + i for i in range(query_len)]
+
+        # The check itself, exactly as run_sparse_attention now computes it
+        # (BEFORE any add_wrapper call for this turn).
+        prospective_target_len = (
+            position_map.translate(state_total_len)
+            + (len(turn_boundary_ids) if turn_idx > 0 else 0)
+            + len(query_ids)
+            + len(chat_after_ids)
+        )
+
+        query_start_ledger_pos = state_total_len
+        if turn_idx > 0:
+            position_map.add_wrapper(query_start_ledger_pos, len(turn_boundary_ids))
+            real_stream.extend(turn_boundary_ids)
+        elif turn_idx == 0:
+            real_stream.extend(context_ids)
+
+        real_stream.extend(query_ids)
+        state_total_len += query_len
+        position_map.add_wrapper(state_total_len, len(chat_after_ids))
+        real_stream.extend(chat_after_ids)
+
+        assert prospective_target_len == len(real_stream), (
+            f"turn {turn_idx}: prospective={prospective_target_len} "
+            f"real={len(real_stream)}"
+        )
+
+        # This turn's own output, appended to the ledger (and, in the real
+        # pipeline, to the target's persistent KV cache) before the next
+        # turn's check runs.
+        output_ids = [2000 + turn_idx * 100 + i for i in range(output_len)]
+        real_stream.extend(output_ids)
+        state_total_len += output_len
+
+
 def test_prune_record_validation():
     record = PruneRecord(kept_positions=[0, 3, 5], orig_len=8)
     assert record.num_kept == 3

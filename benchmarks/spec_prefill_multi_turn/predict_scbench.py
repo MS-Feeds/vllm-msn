@@ -941,10 +941,32 @@ def run_sparse_attention(
     docstring** -- check 1 (speculator budget) is identical. Check 2
     differs from `run_specprefill`'s: there is no pruned/shrunk prompt to
     fall back on here, so it checks the FULL prospective target session
-    length (same shape as `run_baseline`'s single check) plus wrapper
-    overhead, since this pipeline's target session is never pruned, only
-    its ATTENTION is restricted -- it needs the whole conversation to fit
-    physically, same as the baseline.
+    length (same shape as `run_baseline`'s single check), since this
+    pipeline's target session is never pruned, only its ATTENTION is
+    restricted -- it needs the whole conversation to fit physically, same
+    as the baseline.
+
+    **Real bug this fixes, confirmed via a real crash** (`ValueError:
+    could not broadcast input array from shape (131084,) into shape
+    (131072,)` inside `gpu_input_batch.py::add_request`, i.e. the target
+    session's real length overran `--target-max-num-batched-tokens`
+    despite this check supposedly guarding against exactly that): an
+    earlier version of this check used a single constant `wrapper_overhead
+    = len(chat_before_ids) + len(chat_after_ids) + len(turn_boundary_ids)`
+    (one of EACH wrapper piece), but the REAL target session accumulates
+    one `chat_after_ids` per turn AND one `turn_boundary_ids` per turn
+    (from turn 1 onward) -- see this function's own turn loop, which
+    submits `turn_boundary_ids + query_ids + chat_after_ids` as `delta_ids`
+    EVERY turn, not once. A single constant therefore increasingly
+    UNDERcounted the true resident length as a conversation progressed
+    (by roughly `turn_idx * (chat_after_len + turn_boundary_len)` tokens),
+    letting a conversation slip past this guard and crash the engine deep
+    into a run instead of being cleanly skipped up front. Fixed by
+    computing the check from `position_map` itself -- the SAME
+    wrapper-accumulation bookkeeping already used for translating
+    `kept_positions` below, so there's only one place tracking "how many
+    wrapper tokens are actually resident so far," not two that can drift
+    apart.
     """
     from vllm import SamplingParams
     from vllm_patch.conversation_state import ConversationState
@@ -954,7 +976,6 @@ def run_sparse_attention(
     chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
     chat_after_ids = tok.encode(chat_after, add_special_tokens=False)
     turn_boundary_ids = tok.encode(chat_turn_boundary_pieces(tok), add_special_tokens=False)
-    wrapper_overhead = len(chat_before_ids) + len(chat_after_ids) + len(turn_boundary_ids)
 
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
@@ -1010,7 +1031,22 @@ def run_sparse_attention(
                 )
                 stats["num_skipped_too_large"] += 1
                 break
-            prospective_target_len = state.total_len + len(query_ids) + wrapper_overhead
+            # position_map.translate(state.total_len) gives the REAL target-
+            # stream position of "everything resident so far" (context +
+            # every prior turn's query/output, PLUS every prior turn's own
+            # chat_after_ids/turn_boundary_ids wrapper insertions already
+            # accounted for by position_map's breakpoints) -- see this
+            # function's own docstring for why a single constant
+            # `wrapper_overhead` used to undercount this. What's added on
+            # top here is exactly this turn's own not-yet-submitted delta:
+            # turn_boundary_ids (turn_idx > 0 only) + this turn's query +
+            # chat_after_ids, mirroring delta_ids's own construction below.
+            prospective_target_len = (
+                position_map.translate(state.total_len)
+                + (len(turn_boundary_ids) if turn_idx > 0 else 0)
+                + len(query_ids)
+                + len(chat_after_ids)
+            )
             if prospective_target_len > target_max_num_batched_tokens:
                 progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
