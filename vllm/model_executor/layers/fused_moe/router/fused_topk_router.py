@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+import os
 
 import torch
 
@@ -77,6 +78,24 @@ def fused_topk(
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
     M, _ = hidden_states.size()
+
+    # Prototype path for Gemma4's fixed top-2 router. Keep it opt-in until
+    # numerical parity and GPU performance are measured against ops.topk_softmax.
+    if (
+        topk == 2
+        and scoring_func == "softmax"
+        and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1"
+    ):
+        probs = torch.softmax(gating_output, dim=-1)
+        topk_weights, topk_ids = torch.topk(probs, k=2, dim=-1)
+        if renormalize:
+            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        if indices_type is not None:
+            topk_ids = topk_ids.to(indices_type)
+        token_expert_indices = torch.arange(
+            M, dtype=torch.int32, device=hidden_states.device
+        ).unsqueeze(1).expand(M, 2)
+        return topk_weights, topk_ids, token_expert_indices
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device
