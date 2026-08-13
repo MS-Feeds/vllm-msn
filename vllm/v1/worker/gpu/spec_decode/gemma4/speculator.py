@@ -26,15 +26,20 @@ logger = init_logger(__name__)
 
 class Gemma4Speculator(AutoRegressiveSpeculator):
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        """Keep prefill graphs, but avoid unsafe draft decode replay.
+        """Avoid unsafe Gemma4 draft graph replay.
 
-        Gemma4 draft decode reuses dynamic MTP/Marlin routing metadata across
-        speculative steps. Full graph replay has produced asynchronous illegal
+        Gemma4 MTP reuses dynamic routing and KV-sharing metadata in both draft
+        prefill and draft decode. Graph replay has produced asynchronous illegal
         memory accesses on the relay-attention A100 path. Target-model graphs
-        and draft prefill graphs remain enabled; only the draft decode manager
-        falls back to eager execution.
+        remain enabled; the entire draft model falls back to eager execution.
         """
         super().init_cudagraph_manager(cudagraph_mode)
+        self.prefill_cudagraph_manager = type(self.prefill_cudagraph_manager)(
+            self.vllm_config,
+            self.device,
+            CUDAGraphMode.NONE,
+            self.num_speculative_steps + 1,
+        )
         self.decode_cudagraph_manager = type(self.decode_cudagraph_manager)(
             self.vllm_config,
             self.device,
