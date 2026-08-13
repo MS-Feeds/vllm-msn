@@ -35,28 +35,44 @@ def _gemma4_top2_softmax_kernel(
         other=-float("inf"),
     ).to(tl.float32)
 
-    full_max = tl.max(logits, axis=0)
-    exp_logits = tl.exp(logits - full_max)
-    full_sum = tl.sum(tl.where(mask, exp_logits, 0.0), axis=0)
-
-    first_id = tl.argmax(logits, axis=0)
-    second_logits = tl.where(offsets == first_id, -float("inf"), logits)
-    second_id = tl.argmax(second_logits, axis=0)
-    first_weight = tl.load(logits_ptr + token * num_experts + first_id) - full_max
-    second_weight = tl.load(logits_ptr + token * num_experts + second_id) - full_max
+    # Keep both winners in one reduction. This avoids a second argmax pass and
+    # avoids the full softmax denominator when selected weights are renormalized.
+    best_value = tl.full((), -float("inf"), tl.float32)
+    second_value = tl.full((), -float("inf"), tl.float32)
+    best_id = tl.full((), 0, tl.int32)
+    second_id = tl.full((), 0, tl.int32)
+    for offset in tl.static_range(0, BLOCK_SIZE):
+        value = tl.load(
+            logits_ptr + token * num_experts + offset,
+            mask=offset < num_experts,
+            other=-float("inf"),
+        ).to(tl.float32)
+        is_new_best = value > best_value
+        is_new_second = value > second_value
+        old_best_value = best_value
+        old_best_id = best_id
+        second_value = tl.where(is_new_best, old_best_value, tl.where(is_new_second, value, second_value))
+        second_id = tl.where(is_new_best, old_best_id, tl.where(is_new_second, offset, second_id))
+        best_value = tl.where(is_new_best, value, best_value)
+        best_id = tl.where(is_new_best, offset, best_id)
 
     if renormalize:
-        selected_sum = tl.exp(first_weight) + tl.exp(second_weight)
-        first_out = tl.exp(first_weight) / selected_sum
-        second_out = tl.exp(second_weight) / selected_sum
+        selected_max = tl.maximum(best_value, second_value)
+        best_exp = tl.exp(best_value - selected_max)
+        second_exp = tl.exp(second_value - selected_max)
+        selected_sum = best_exp + second_exp
+        first_out = best_exp / selected_sum
+        second_out = second_exp / selected_sum
     else:
-        first_out = tl.exp(first_weight) / full_sum
-        second_out = tl.exp(second_weight) / full_sum
+        full_max = tl.max(logits, axis=0)
+        full_sum = tl.sum(tl.where(mask, tl.exp(logits - full_max), 0.0), axis=0)
+        first_out = tl.exp(best_value - full_max) / full_sum
+        second_out = tl.exp(second_value - full_max) / full_sum
 
     weight_base = token * 2
     tl.store(weights_ptr + weight_base, first_out)
     tl.store(weights_ptr + weight_base + 1, second_out)
-    tl.store(ids_ptr + weight_base, first_id)
+    tl.store(ids_ptr + weight_base, best_id)
     tl.store(ids_ptr + weight_base + 1, second_id)
     tl.store(token_expert_indices_ptr + weight_base, token)
     tl.store(token_expert_indices_ptr + weight_base + 1, token)
