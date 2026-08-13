@@ -12,6 +12,7 @@ from collections import defaultdict
 import torch.nn as nn
 
 from vllm.compilation.backends import set_model_tag
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config import VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
@@ -24,6 +25,23 @@ logger = init_logger(__name__)
 
 
 class Gemma4Speculator(AutoRegressiveSpeculator):
+    def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        """Keep prefill graphs, but avoid unsafe draft decode replay.
+
+        Gemma4 draft decode reuses dynamic MTP/Marlin routing metadata across
+        speculative steps. Full graph replay has produced asynchronous illegal
+        memory accesses on the relay-attention A100 path. Target-model graphs
+        and draft prefill graphs remain enabled; only the draft decode manager
+        falls back to eager execution.
+        """
+        super().init_cudagraph_manager(cudagraph_mode)
+        self.decode_cudagraph_manager = type(self.decode_cudagraph_manager)(
+            self.vllm_config,
+            self.device,
+            CUDAGraphMode.NONE,
+            decode_query_len=1,
+        )
+
     @property
     def advance_draft_positions(self) -> bool:
         # Gemma4 MTP is Q-only and reads K/V from the target's existing cache.
