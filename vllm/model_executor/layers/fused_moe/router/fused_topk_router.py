@@ -4,6 +4,7 @@ from collections.abc import Callable
 import os
 
 import torch
+from vllm.triton_utils import tl, triton
 
 import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -13,6 +14,78 @@ from vllm.model_executor.layers.fused_moe.config import (
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+
+@triton.jit
+def _gemma4_top2_softmax_kernel(
+    logits_ptr,
+    weights_ptr,
+    ids_ptr,
+    token_expert_indices_ptr,
+    num_experts,
+    renormalize: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_experts
+    logits = tl.load(
+        logits_ptr + token * num_experts + offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    full_max = tl.max(logits, axis=0)
+    exp_logits = tl.exp(logits - full_max)
+    full_sum = tl.sum(tl.where(mask, exp_logits, 0.0), axis=0)
+
+    first_id = tl.argmax(logits, axis=0)
+    second_logits = tl.where(offsets == first_id, -float("inf"), logits)
+    second_id = tl.argmax(second_logits, axis=0)
+    first_weight = tl.load(logits_ptr + token * num_experts + first_id) - full_max
+    second_weight = tl.load(logits_ptr + token * num_experts + second_id) - full_max
+
+    if renormalize:
+        selected_sum = tl.exp(first_weight) + tl.exp(second_weight)
+        first_out = tl.exp(first_weight) / selected_sum
+        second_out = tl.exp(second_weight) / selected_sum
+    else:
+        first_out = tl.exp(first_weight) / full_sum
+        second_out = tl.exp(second_weight) / full_sum
+
+    weight_base = token * 2
+    tl.store(weights_ptr + weight_base, first_out)
+    tl.store(weights_ptr + weight_base + 1, second_out)
+    tl.store(ids_ptr + weight_base, first_id)
+    tl.store(ids_ptr + weight_base + 1, second_id)
+    tl.store(token_expert_indices_ptr + weight_base, token)
+    tl.store(token_expert_indices_ptr + weight_base + 1, token)
+
+
+def _gemma4_top2_softmax(
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    indices_type: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, num_experts = gating_output.shape
+    block_size = 1 << (num_experts - 1).bit_length()
+    weights = torch.empty((num_tokens, 2), dtype=torch.float32, device=gating_output.device)
+    ids = torch.empty(
+        (num_tokens, 2),
+        dtype=torch.int32 if indices_type is None else indices_type,
+        device=gating_output.device,
+    )
+    token_expert_indices = torch.empty((num_tokens, 2), dtype=torch.int32, device=gating_output.device)
+    _gemma4_top2_softmax_kernel[(num_tokens,)](
+        gating_output,
+        weights,
+        ids,
+        token_expert_indices,
+        num_experts,
+        renormalize=renormalize,
+        BLOCK_SIZE=block_size,
+    )
+    return weights, ids, token_expert_indices
 
 
 def vllm_topk_softmax(
@@ -86,16 +159,7 @@ def fused_topk(
         and scoring_func == "softmax"
         and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1"
     ):
-        probs = torch.softmax(gating_output, dim=-1)
-        topk_weights, topk_ids = torch.topk(probs, k=2, dim=-1)
-        if renormalize:
-            topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        if indices_type is not None:
-            topk_ids = topk_ids.to(indices_type)
-        token_expert_indices = torch.arange(
-            M, dtype=torch.int32, device=hidden_states.device
-        ).unsqueeze(1).expand(M, 2)
-        return topk_weights, topk_ids, token_expert_indices
+        return _gemma4_top2_softmax(gating_output, renormalize, indices_type)
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device
