@@ -1212,6 +1212,35 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # the resumable-session mechanism this path depends on.
         llm_kwargs["worker_cls"] = "vllm_patch.sparse_target_runner.SparseTargetWorker"
         llm_kwargs["enable_prefix_caching"] = True
+        # async_scheduling=False -- a real crash this fixes, not a
+        # defensive guess. Real hardware hit `RuntimeError: Invalid
+        # request status: RUNNING` inside Scheduler.schedule() on a
+        # session's first resumption AFTER the EOS/stop-token fix started
+        # letting turns stop naturally instead of always hitting
+        # max_tokens. Root cause, confirmed by reading vLLM source:
+        # UniProcExecutor.max_concurrent_batches returns 2 whenever
+        # SchedulerConfig.async_scheduling is on (the default), which
+        # routes EngineCore through step_with_batch_queue -- a PIPELINED
+        # mode where AsyncScheduler._update_after_schedule optimistically
+        # schedules a request's NEXT step before the CURRENT step's real
+        # output (and thus whether it actually stopped) is known. For an
+        # ordinary request that's fine (nothing else touches it once it's
+        # truly finished). For a RESUMABLE session, `_handle_stopped_
+        # request` immediately re-parks/re-enqueues the SAME request the
+        # instant a real stop is observed -- while a "phantom" already-
+        # pipelined step for that same request can still be in flight,
+        # leading the scheduler to later find it already RUNNING when it
+        # expected WAITING/PREEMPTED. This combination (async pipelining +
+        # resumable sessions + a stop that can happen mid-pipeline, i.e.
+        # a genuine EOS match rather than always hitting max_tokens) was
+        # never exercised before the EOS fix, since every turn previously
+        # ran to the token cap. Disabling async scheduling forces the
+        # plain, non-pipelined `step()` path (`batch_queue` stays None),
+        # sidestepping the race entirely -- a real perf cost (no overlap
+        # between scheduling and execution) but a correctness requirement
+        # for this pipeline's own resumable-session mechanism until/unless
+        # this is fixed further upstream.
+        llm_kwargs["async_scheduling"] = False
     elif mode != "baseline":
         llm_kwargs["worker_cls"] = "vllm_patch.worker.SpecPrefillWorker"
 

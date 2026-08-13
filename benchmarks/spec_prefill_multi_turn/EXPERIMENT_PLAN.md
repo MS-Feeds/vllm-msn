@@ -652,11 +652,48 @@ input_processor.generation_config_fields`/`renderer.get_eos_token_id()`/
 `tokenizer` -- the exact same objects the normal path would have used --
 to populate `sampling_params` via `update_from_generation_config`/
 `update_from_tokenizer` before building the `EngineCoreRequest`, reusing
-vLLM's own logic rather than reimplementing it. **Unvalidated on real
-hardware past this fix** -- re-run `validate_resumable_session.py` first
-(cheap, fast), then a `SPARSE-k*-g*` smoke test, and actually read a few
-turns of the resulting predictions file (not just the timing logs) to
-confirm generation now stops cleanly instead of degenerating.
+vLLM's own logic rather than reimplementing it.
+
+**Eighth finding -- a SECOND, previously-latent bug the seventh's fix
+exposed (not introduced), a real engine crash.** Re-running after the
+seventh fix hit `RuntimeError: Invalid request status: RUNNING` inside
+`Scheduler.schedule()`, on a session's very first resumption. Traced
+through vLLM source to a genuine race between two mechanisms that had
+never been exercised together before:
+
+1. **Async scheduling** (`SchedulerConfig.async_scheduling`, on by
+   default in this fork) makes `UniProcExecutor.max_concurrent_batches`
+   return 2, routing `EngineCore` through `step_with_batch_queue` -- a
+   PIPELINED mode where `AsyncScheduler._update_after_schedule`
+   optimistically schedules a request's NEXT step before the CURRENT
+   step's real output (and thus whether it actually stopped) is known.
+   This is fine for an ordinary request. For a **resumable session**,
+   `Scheduler._handle_stopped_request` immediately re-parks/re-enqueues
+   the SAME request the instant a real stop is observed -- while a
+   "phantom" already-pipelined step for that same request can still be
+   in flight. When the scheduler later reaches that phantom step, it
+   finds the request already back in `RUNNING` (from the resumption)
+   where it expected `WAITING`/`PREEMPTED`, and crashes.
+2. This combination was never exercised before the seventh fix: every
+   turn previously ran to `max_tokens` (a scheduler-predictable stopping
+   point), never stopping mid-pipeline via a genuine EOS match, which is
+   exactly the condition needed to trigger this race.
+
+Fixed by passing `async_scheduling=False` when constructing any engine
+that uses the resumable-session mechanism -- `predict_scbench.py`'s
+sparse-mode target (`run_experiment`) and `validate_resumable_session.py`'s
+own engine, both updated. Forces the plain, non-pipelined `step()` path
+(`batch_queue` stays `None`), sidestepping the race entirely. Real
+tradeoff: no overlap between scheduling and execution, some throughput
+cost -- but a correctness requirement for this pipeline's own use of
+resumable sessions until/unless fixed further upstream in vLLM itself.
+
+**Both the seventh and eighth fixes are unvalidated on real hardware as
+a PAIR** -- re-run `validate_resumable_session.py` first (cheap, fast,
+and its own turns can hit real EOS now too), then a `SPARSE-k*-g*` smoke
+test, and actually read a few turns of the resulting predictions file
+(not just the timing logs) to confirm generation stops cleanly instead
+of degenerating AND the engine doesn't crash on resumption.
 
 ---
 

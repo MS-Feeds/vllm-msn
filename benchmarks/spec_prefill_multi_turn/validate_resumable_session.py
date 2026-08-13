@@ -187,6 +187,22 @@ def main() -> None:
         disable_log_stats=False,  # needed for RequestOutput.num_cached_tokens
         enable_prefix_caching=True,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        # async_scheduling=False -- required for resumable sessions, not
+        # optional here. Async scheduling (this fork's default) pipelines
+        # a request's next step before its current step's real output
+        # (and thus whether it stopped) is known; combined with resumable
+        # sessions immediately re-parking a request the instant a real
+        # stop is observed, a still-in-flight "phantom" pipelined step for
+        # that same request can later collide with the scheduler's
+        # invariants (confirmed on real hardware: `RuntimeError: Invalid
+        # request status: RUNNING` inside Scheduler.schedule(), triggered
+        # specifically once a turn stops via a genuine EOS/stop-token
+        # match instead of always hitting max_tokens -- see
+        # `predict_scbench.py::run_experiment`'s identical fix for the
+        # full trace through vLLM source). This script's own turns can
+        # legitimately hit real EOS (real chat-template prompts, not just
+        # synthetic token ids), so it needs the same fix.
+        async_scheduling=False,
     )
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
