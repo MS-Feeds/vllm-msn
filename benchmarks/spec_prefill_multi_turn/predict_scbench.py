@@ -435,16 +435,62 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
     return last_output
 
 
-def build_sparse_session_request(request_id, prompt_token_ids, sampling_params, resumable=True):
+def build_sparse_session_request(llm_engine, request_id, prompt_token_ids, sampling_params, resumable=True):
     """Same technique as `validate_resumable_session.py`'s own
     `build_resumable_request` -- `LLMEngine.add_request()` has no
     `resumable=` kwarg (confirmed by reading its real signature), so this
     constructs an `EngineCoreRequest` directly and passes it AS the
     `prompt` argument, which `add_request()` accepts verbatim via its
-    `isinstance(prompt, EngineCoreRequest)` branch."""
+    `isinstance(prompt, EngineCoreRequest)` branch (`request = prompt`,
+    `llm_engine.py:233` -- confirmed by reading the real source, not
+    assumed).
+
+    **Real bug this fixes, confirmed via real-hardware evidence (not
+    theoretical)**: that verbatim-acceptance branch means
+    `self.input_processor.process_inputs(...)` -- the NORMAL path's own
+    request construction -- never runs for a directly-built
+    `EngineCoreRequest`. That method is the ONLY place `SamplingParams.
+    update_from_generation_config(...)` gets called
+    (`input_processor.py:315-318`), which is what populates a request's
+    real stop-token set from the model's own `generation_config.json`
+    (for a Llama-3.x-Instruct model, this includes the CHAT-TEMPLATE's own
+    turn-ending token, e.g. `<|eot_id|>`, IN ADDITION to the base
+    tokenizer's `eos_token_id` -- confirmed by reading `SamplingParams.
+    update_from_generation_config`'s real body: without this call,
+    `_eos_token_id` is never set and `stop_token_ids` never gets the
+    chat-specific ids added). A bare `SamplingParams(max_tokens=...,
+    temperature=...)`, as constructed in `run_sparse_attention`, has NONE
+    of this -- so the target's own real turn-ending token was never
+    recognized as a stop condition for ANY sparse-session turn.
+
+    Real symptom this produced (from an actual predictions file): the
+    model would generate a correct, concise answer, then -- having no
+    recognized way to stop -- continue sampling from a now
+    completely-off-distribution continuation, degenerating into repeating
+    the literal word "assistant"/"Assistant" (or, in one turn, a
+    different repetition loop) until hitting `max_tokens`. This also fully
+    explains the earlier "sparse decode consistently takes ~1.5-1.6s /
+    ~63 steps" finding -- it was never really about weight-loading or
+    per-layer overhead, it was hitting the token cap on effectively every
+    turn because it structurally could never stop early.
+
+    Fixed by reusing vLLM's own exact logic (not reimplementing it,
+    which could silently drift from whatever a future vLLM version
+    changes here) via the already-constructed engine's own
+    `input_processor` -- the same `generation_config_fields`/`renderer`/
+    `tokenizer` the NORMAL `add_request()` path would have used for this
+    exact model."""
     import time as _time
 
     from vllm.v1.engine import EngineCoreRequest
+
+    input_processor = llm_engine.input_processor
+    sampling_params.update_from_generation_config(
+        input_processor.generation_config_fields,
+        input_processor.renderer.get_eos_token_id(),
+    )
+    if input_processor.tokenizer is not None:
+        sampling_params.update_from_tokenizer(input_processor.tokenizer)
 
     return EngineCoreRequest(
         request_id=request_id,
@@ -1007,7 +1053,7 @@ def run_sparse_attention(
 
             sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
             prompt = build_sparse_session_request(
-                target_request_id, delta_ids, sampling_params, resumable=True,
+                llm.llm_engine, target_request_id, delta_ids, sampling_params, resumable=True,
             )
             t_gen_start = time.time()
             real_id = llm.llm_engine.add_request(target_request_id, prompt, sampling_params)

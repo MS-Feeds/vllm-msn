@@ -121,15 +121,35 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
     return last_output
 
 
-def build_resumable_request(request_id, prompt_token_ids, sampling_params, resumable=True):
+def build_resumable_request(llm_engine, request_id, prompt_token_ids, sampling_params, resumable=True):
     """Constructs an EngineCoreRequest directly and returns it -- the one
     confirmed way to set resumable=True, since LLMEngine.add_request()'s
     own signature has no such kwarg (confirmed by reading its real
     signature, not assumed). Passing this object AS the `prompt` argument
     to add_request() is accepted verbatim via its
     `isinstance(prompt, EngineCoreRequest)` branch (with a deprecation
-    warning -- expected, not a sign something is wrong)."""
+    warning -- expected, not a sign something is wrong) -- which means
+    `input_processor.process_inputs()` never runs for it, so
+    `SamplingParams.update_from_generation_config()` (the ONLY place a
+    request's real stop-token set gets populated from the model's own
+    generation_config.json, e.g. a Llama-3.x-Instruct model's chat-
+    specific `<|eot_id|>`) never runs either -- confirmed as a real bug
+    in `predict_scbench.py`'s own copy of this same pattern (real symptom:
+    the target never recognized its own turn-ending token as a stop
+    condition, so every SPARSE-pipeline turn degenerated into repeating
+    "assistant" until hitting `max_tokens`). Fixed the same way here:
+    reuse the already-constructed engine's own `input_processor` to
+    populate `sampling_params` exactly as the normal `add_request()` path
+    would have, before building the `EngineCoreRequest`."""
     from vllm.v1.engine import EngineCoreRequest
+
+    input_processor = llm_engine.input_processor
+    sampling_params.update_from_generation_config(
+        input_processor.generation_config_fields,
+        input_processor.renderer.get_eos_token_id(),
+    )
+    if input_processor.tokenizer is not None:
+        sampling_params.update_from_tokenizer(input_processor.tokenizer)
 
     return EngineCoreRequest(
         request_id=request_id,
@@ -185,7 +205,7 @@ def main() -> None:
     turn1_ids = tok.encode(turn1_text, add_special_tokens=False)
     print(f"[validate_resumable_session] Step A: submitting turn 1 ({len(turn1_ids)} tokens)")
 
-    req1 = build_resumable_request(request_id, turn1_ids, sampling_params, resumable=True)
+    req1 = build_resumable_request(llm_engine, request_id, turn1_ids, sampling_params, resumable=True)
     real_id = llm_engine.add_request(request_id, req1, sampling_params)
     assert real_id == request_id, (
         f"expected add_request() to use request_id={request_id!r} verbatim "
@@ -232,7 +252,7 @@ def main() -> None:
           f"new tokens only, per Scheduler._update_request_as_session's extend-not-replace "
           f"semantics)")
 
-    req2 = build_resumable_request(request_id, turn2_ids, sampling_params, resumable=True)
+    req2 = build_resumable_request(llm_engine, request_id, turn2_ids, sampling_params, resumable=True)
     real_id_2 = llm_engine.add_request(request_id, req2, sampling_params)
     assert real_id_2 == request_id, (
         f"expected the SAME request_id back on turn 2 ({request_id!r}), got "

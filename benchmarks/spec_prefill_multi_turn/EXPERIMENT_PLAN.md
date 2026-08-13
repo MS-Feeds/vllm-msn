@@ -599,6 +599,65 @@ hardware** -- re-run `validate_sparse_attention.py` (its Steps A/B/C
 exercise this exact write path) before trusting it, then compare the
 target-generation timing log against the pre-fix ~0.5-1s gap.
 
+**Seventh finding -- SUPERSEDES the sixth's framing, a real CORRECTNESS
+bug, not a performance one.** Added prefill/decode-split logging
+(`drive_single_request_to_completion`/`drive_one_turn_of_session`) plus
+direct per-turn timing of the metadata-patch overhead itself
+(`pop_override_timing`) specifically to check the sixth finding's theory
+against real numbers. The metadata-patch overhead measured tiny (~0.12-
+0.17s/turn) -- real, but nowhere near enough to explain the gap. What
+actually explained it: `SPARSE-k*-g*` was hitting `max_tokens` (~63
+decode steps) on **every single turn**, while `M000` stopped naturally
+after 13-48 tokens -- a 3-5x difference in decode STEP COUNT, not
+per-step cost. Inspecting the actual predictions confirmed why: the model
+would produce a correct, concise answer, then continue generating (having
+no way to stop) into the literal words "assistant"/"Assistant" repeated
+until the token cap, or a different degenerate repetition loop --
+classic "never found a recognized stop condition" behavior, not a model-
+quality/attention-restriction issue.
+
+Root cause, confirmed by reading vLLM source directly: `LLMEngine.
+add_request()` accepts a pre-built `EngineCoreRequest` VERBATIM
+(`llm_engine.py`'s `isinstance(prompt, EngineCoreRequest)` branch just
+does `request = prompt`), which means `InputProcessor.process_inputs()`
+-- the NORMAL request-construction path `add_request()` otherwise uses --
+never runs. That method is the ONLY place `SamplingParams.
+update_from_generation_config(...)` gets called
+(`input_processor.py:315-318`), which populates a request's real
+stop-token set from the model's own `generation_config.json` -- for a
+Llama-3.x-Instruct model, this is where the CHAT-TEMPLATE's own
+turn-ending token (e.g. `<|eot_id|>`) gets added, IN ADDITION to the base
+tokenizer's `eos_token_id` (confirmed by reading `update_from_generation_
+config`'s real body: without this call, `_eos_token_id` is never set at
+all, and `stop_token_ids` never gets the chat-specific ids). Both
+`predict_scbench.py::build_sparse_session_request` and
+`validate_resumable_session.py::build_resumable_request` construct
+`EngineCoreRequest` directly (the only confirmed way to set
+`resumable=True`, since `add_request()` has no such kwarg) with a bare
+`SamplingParams(max_tokens=..., temperature=...)` -- neither had ever
+been through this population step, for ANY resumable-session turn, ever.
+
+**Why `validate_sparse_attention.py`'s "all passed" and
+`validate_resumable_session.py`'s own TTFT-based "PASS" didn't catch
+this**: neither validation script's success criteria depends on the
+model actually stopping cleanly -- the needle-in-a-haystack test only
+checks whether a short, fixed-`max_tokens` generation contains an
+expected substring, and the TTFT test only checks turn-2 latency, not
+answer quality/termination. This bug could hide behind both without
+either failing.
+
+Fixed in both files: `build_sparse_session_request`/`build_resumable_
+request` now take the already-constructed `llm_engine` and call `self.
+input_processor.generation_config_fields`/`renderer.get_eos_token_id()`/
+`tokenizer` -- the exact same objects the normal path would have used --
+to populate `sampling_params` via `update_from_generation_config`/
+`update_from_tokenizer` before building the `EngineCoreRequest`, reusing
+vLLM's own logic rather than reimplementing it. **Unvalidated on real
+hardware past this fix** -- re-run `validate_resumable_session.py` first
+(cheap, fast), then a `SPARSE-k*-g*` smoke test, and actually read a few
+turns of the resulting predictions file (not just the timing logs) to
+confirm generation now stops cleanly instead of degenerating.
+
 ---
 
 ## SpecPrefill settings
