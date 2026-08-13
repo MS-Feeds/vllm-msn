@@ -359,12 +359,39 @@ def render_golden_answer(tok, turn: dict) -> list[int]:
 def drive_single_request_to_completion(llm_engine, request_id: str):
     """Same discipline as predict_longbench_v2.py's drive_engine_to_completion
     (never break early, never abort) -- specialized to exactly one in-flight
-    request, per module docstring #1's MVP scope."""
+    request, per module docstring #1's MVP scope.
+
+    Logs the prefill/decode split -- added specifically to let
+    baseline/specprefill/sparse's target-side "weight-loading is a shared,
+    roughly-constant per-decode-step floor; sparse additionally pays for
+    per-layer metadata-patch bookkeeping" theory (discussed at length
+    interactively) be checked against real numbers instead of taken on
+    faith: baseline and specprefill's DECODE-only time here should be
+    directly comparable to sparse's own decode-only time (see
+    `drive_one_turn_of_session` below) if that theory is right, since both
+    run through the exact same target model/layer count -- if sparse's is
+    noticeably higher, that's the metadata-patch overhead (also now
+    directly measured, see `sparse_target_runner.py::pop_override_timing`)
+    showing up on top of the same shared floor."""
     latest_output = None
+    t_start = time.time()
+    t_prefill_done = None
     while llm_engine.has_unfinished_requests():
         for output in llm_engine.step():
             if output.request_id == request_id:
+                if latest_output is None:
+                    t_prefill_done = time.time()
+                    print(
+                        f"[predict_scbench] {request_id!r}: target prefill "
+                        f"done in {t_prefill_done - t_start:.2f}s"
+                    )
                 latest_output = output
+    if t_prefill_done is not None and latest_output is not None:
+        print(
+            f"[predict_scbench] {request_id!r}: target decode done in "
+            f"{time.time() - t_prefill_done:.2f}s "
+            f"({len(latest_output.outputs[0].token_ids)} tokens generated)"
+        )
     return latest_output
 
 
@@ -376,14 +403,34 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
     WAITING_FOR_STREAMING_REQ` and re-enqueues, not finishes), so this
     watches `output.outputs[0].finish_reason` directly instead of relying
     on `drive_single_request_to_completion`'s "loop until nothing's left"
-    shape, which would spin forever here."""
+    shape, which would spin forever here.
+
+    Logs the prefill/decode split -- "prefill" here means the DELTA
+    (this turn's new tokens) only, since everything earlier is already
+    resident in the session's own persistent cache, not a full-context
+    prefill -- see `drive_single_request_to_completion`'s own docstring
+    for why this split exists (checking the shared-decode-floor /
+    sparse-specific-overhead theory against real numbers)."""
     last_output = None
+    t_start = time.time()
+    t_prefill_done = None
     while llm_engine.has_unfinished_requests():
         for output in llm_engine.step():
             if output.request_id != request_id:
                 continue
+            if last_output is None:
+                t_prefill_done = time.time()
+                print(
+                    f"[predict_scbench] {request_id!r}: target delta-prefill "
+                    f"done in {t_prefill_done - t_start:.2f}s"
+                )
             last_output = output
             if output.outputs[0].finish_reason is not None:
+                if t_prefill_done is not None:
+                    print(
+                        f"[predict_scbench] {request_id!r}: target decode "
+                        f"done in {time.time() - t_prefill_done:.2f}s"
+                    )
                 return last_output
     return last_output
 
@@ -975,6 +1022,27 @@ def run_sparse_attention(
                 f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
                 f"generation done in {time.time() - t_gen_start:.2f}s "
                 f"({len(delta_ids)} new delta tokens submitted)"
+            )
+            # Direct measurement of the per-layer metadata-patch bookkeeping
+            # cost hypothesized (and discussed at length interactively) as
+            # sparse's own extra decode-step overhead on top of the
+            # weight-loading floor it shares with baseline/specprefill --
+            # see sparse_target_runner.py::pop_override_timing's docstring
+            # for exactly what this measures (CPU-side dispatch time, not
+            # confirmed GPU execution time) and why.
+            override_total, override_steps = llm.llm_engine.collective_rpc(
+                "pop_override_timing", args=(target_request_id,),
+            )[0]
+            if override_steps > 0:
+                override_msg = (
+                    f"{override_total:.3f}s across {override_steps} decode "
+                    f"steps ({override_total / override_steps * 1000:.2f}ms/step avg)"
+                )
+            else:
+                override_msg = "no decode steps recorded"
+            progress.write(
+                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: sparse "
+                f"metadata-patch overhead: {override_msg}"
             )
             llm.llm_engine.collective_rpc(
                 "discard_sparse_selection", args=(target_request_id,),

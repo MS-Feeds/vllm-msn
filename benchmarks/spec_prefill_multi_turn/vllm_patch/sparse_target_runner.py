@@ -126,7 +126,8 @@ is where these should be checked first, before trusting any real sweep:
    independently recomputed per layer.
 """
 
-from typing import TYPE_CHECKING, Dict, List, Optional
+import time
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -219,6 +220,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 # (num_computed >= num_prompt) get gathered.
                 continue
 
+            t_override_start = time.time()
             base_block_indices = self._get_base_block_indices(req_id, selected_positions, block_size)
             gathered = self._compute_gathered_view(
                 req_idx=req_idx,
@@ -262,6 +264,46 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 self._patch_layer_metadata(
                     layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
                 )
+
+            self._accumulate_override_timing(req_id, time.time() - t_override_start)
+
+    def _override_timing_accum(self) -> Dict[str, tuple]:
+        # Lazily-initialized, same reasoning as _base_block_indices_cache
+        # above. Keyed by req_id -> (total_elapsed_seconds, num_steps) --
+        # accumulated across every decode step of a turn, popped (and
+        # reset) once by the driver via pop_override_timing below.
+        if not hasattr(self, "_sparse_override_timing_accum"):
+            self._sparse_override_timing_accum: Dict[str, tuple] = {}
+        return self._sparse_override_timing_accum
+
+    def _accumulate_override_timing(self, req_id: str, elapsed: float) -> None:
+        accum = self._override_timing_accum()
+        total, count = accum.get(req_id, (0.0, 0))
+        accum[req_id] = (total + elapsed, count + 1)
+
+    def pop_override_timing(self, request_id: str) -> Tuple[float, int]:
+        """Returns `(total_seconds, num_decode_steps_patched)` accumulated
+        for `request_id` since the last call, then resets it -- lets the
+        driver directly confirm/measure the per-layer metadata-patch
+        overhead (see this module's own "Per-layer caching" and
+        `_apply_sparse_attention_overrides`'s comment above for why this
+        was suspected as a real cost, not just theorized) instead of only
+        inferring it from the overall turn-timing gap vs. baseline.
+
+        **Measures CPU-side dispatch time, not confirmed GPU execution
+        time** -- no `torch.cuda.synchronize()` is inserted around the
+        timed region in `_apply_sparse_attention_overrides` (that would
+        itself perturb the very cost being measured, forcing
+        synchronization this pipeline wouldn't otherwise need at that
+        point). Under `enforce_eager=True`, CPU-side dispatch overhead
+        (the Python loop plus each op's kernel-launch cost) is exactly
+        the thing hypothesized to dominate this mechanism's cost, so this
+        is the right thing to measure for that question -- but treat the
+        returned number as a lower bound on true wall-clock GPU cost, not
+        an exact figure, since queued-but-not-yet-executed GPU work isn't
+        captured here."""
+        accum = self._override_timing_accum()
+        return accum.pop(request_id, (0.0, 0))
 
     def _compute_gathered_view(
         self,
@@ -370,3 +412,8 @@ class SparseTargetWorker(Worker):
 
     def discard_sparse_selection(self, request_id: str) -> None:
         sparse_selection_registry.discard(request_id)
+
+    def pop_override_timing(self, request_id: str) -> Tuple[float, int]:
+        """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
+        pop_override_timing`'s docstring for what this measures and why."""
+        return self.model_runner.pop_override_timing(request_id)

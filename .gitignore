@@ -251,3 +251,6 @@ outputs/
 examples/experiment_results/
 benchmarks/gemma4_moe_fp8/datasets/
 .deps/
+
+# Nested git repo, not a submodule of this repo
+benchmarks/rlm/
