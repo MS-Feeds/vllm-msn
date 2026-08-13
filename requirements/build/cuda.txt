@@ -2,7 +2,7 @@
 cmake>=3.26.1
 ninja
 packaging>=24.2
-setuptools>=83.0.0,<84.0.0
+setuptools>=84.0.0,<85.0.0
 setuptools-scm>=8
 torch==2.12.1
 wheel
