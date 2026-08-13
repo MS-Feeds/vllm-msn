@@ -26,6 +26,8 @@ docstring for what it's translating between and why).
 Run with: python3 test_vllm_patch.py
 """
 
+import math
+import random
 import sys
 import traceback
 from pathlib import Path
@@ -39,7 +41,9 @@ from vllm_patch.conversation_state import ConversationState
 from vllm_patch.kv_cache_utils import (
     _find_kv_split_dim,
     block_indices_from_positions,
+    compute_base_gather_view,
     compute_sparse_gather_view,
+    compute_sparse_gather_view_incremental,
     gather_keys_for_slots,
     stack_decode_only_steps,
     tensor_from_wire,
@@ -127,6 +131,65 @@ def test_aggregate_and_select_pipeline():
     )
     kept_all = chunk_select_from_smoothed_attention(token_importance, cfg_keep_all)
     assert kept_all[0].numel() == 16
+
+
+def _reference_chunked_topk(sample_ti: torch.Tensor, chunk_size: int, percentage: float):
+    """Deliberately slow, obviously-correct reference implementation of
+    `chunk_select_from_smoothed_attention`'s chunked branch (plain Python,
+    no vectorization tricks) -- used to cross-check
+    `scoring._chunked_topk_indices`'s vectorized implementation, which
+    replaced an equivalent per-chunk Python loop (see that function's
+    docstring for why: the original loop's `.item()`-per-kept-chunk call
+    is a real GPU-sync cost on real hardware). Random-valued inputs make
+    tie-breaking between torch.topk and Python's sorted() irrelevant in
+    practice (ties on continuous random floats have probability ~0)."""
+    seq_len = sample_ti.shape[0]
+    chunks = [sample_ti[i : i + chunk_size] for i in range(0, seq_len, chunk_size)]
+    chunk_means = [c.mean().item() for c in chunks]
+    chunk_cnt = len(chunks)
+    keep_cnt = math.ceil(chunk_cnt * percentage)
+    kept_chunk_order = sorted(range(chunk_cnt), key=lambda i: -chunk_means[i])[:keep_cnt]
+    indices = []
+    for ci in sorted(kept_chunk_order):
+        start = ci * chunk_size
+        end = min(start + chunk_size, seq_len)
+        indices.extend(range(start, end))
+    return sorted(indices)
+
+
+def test_chunk_select_from_smoothed_attention_matches_reference_divisible_and_not():
+    """Cross-checks the vectorized `_chunked_topk_indices` (which replaced
+    a per-chunk `.mean()`/`.item()` Python loop -- see scoring.py) against
+    an independent, unvectorized reference across both a length exactly
+    divisible by chunk_size and one that isn't (the padding/remainder-chunk
+    path)."""
+    torch.manual_seed(42)
+    for seq_len in [96, 100, 4000, 4010]:  # 96/4000 divisible by 32, 100/4010 not
+        for percentage in [0.3, 0.5, 1.0]:
+            sample_ti = torch.rand(seq_len)
+            cfg = SpecConfig(
+                keep_strategy="percentage",
+                keep_kwargs={"chunk": True, "chunk_size": 32, "percentage": percentage},
+            )
+            got = chunk_select_from_smoothed_attention([sample_ti], cfg)[0]
+            expected = _reference_chunked_topk(sample_ti, 32, percentage)
+            assert got.tolist() == expected, (
+                f"seq_len={seq_len} percentage={percentage}: "
+                f"got {got.tolist()} expected {expected}"
+            )
+
+
+def test_chunk_select_from_smoothed_attention_chunk_larger_than_seq_len():
+    """A single, partially-empty chunk (seq_len < chunk_size) must still
+    keep exactly the real tokens, not the padded tail."""
+    torch.manual_seed(7)
+    sample_ti = torch.rand(10)
+    cfg = SpecConfig(
+        keep_strategy="percentage",
+        keep_kwargs={"chunk": True, "chunk_size": 32, "percentage": 1.0},
+    )
+    got = chunk_select_from_smoothed_attention([sample_ti], cfg)[0]
+    assert got.tolist() == list(range(10))
 
 
 def test_score_and_select_indices_returns_sorted_local_indices():
@@ -463,6 +526,168 @@ def test_compute_sparse_gather_view_does_not_mutate_caller_base_set():
         num_computed=17,  # force-keep tail would add block 4 if it mutated the input
     )
     assert base_block_indices == original
+
+
+def _run_both_gather_paths(full_block_table_row, block_size, base_block_indices, num_prompt, num_computed, base_view=None):
+    """Runs both the old ground-truth `compute_sparse_gather_view` (full
+    recompute every call) and the new `compute_base_gather_view` +
+    `compute_sparse_gather_view_incremental` (base view cached/reused
+    across calls, like `sparse_target_runner.py` now does) for one decode
+    step, returning `(old_result, new_result, base_view)` so callers can
+    compare and reuse `base_view` across a simulated multi-step turn."""
+    if base_view is None:
+        base_view = compute_base_gather_view(
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            base_block_indices=base_block_indices,
+            num_prompt=num_prompt,
+        )
+
+    old_error = None
+    try:
+        old_result = compute_sparse_gather_view(
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            base_block_indices=set(base_block_indices),
+            num_prompt=num_prompt,
+            num_computed=num_computed,
+        )
+    except ValueError as e:
+        old_result = None
+        old_error = e
+
+    new_error = None
+    try:
+        new_result = compute_sparse_gather_view_incremental(
+            base_view=base_view,
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            num_prompt=num_prompt,
+            num_computed=num_computed,
+        )
+    except ValueError as e:
+        new_result = None
+        new_error = e
+
+    assert (old_error is None) == (new_error is None), (
+        f"error mismatch at num_computed={num_computed}: old={old_error!r} new={new_error!r}"
+    )
+    if old_error is None:
+        if old_result is None or new_result is None:
+            assert old_result is None and new_result is None, (
+                f"None mismatch at num_computed={num_computed}: old={old_result} new={new_result}"
+            )
+        else:
+            old_row, old_seq_len = old_result
+            new_row, new_seq_len = new_result
+            assert torch.equal(old_row, new_row), (
+                f"row mismatch at num_computed={num_computed}: old={old_row} new={new_row}"
+            )
+            assert old_seq_len == new_seq_len, (
+                f"seq_len mismatch at num_computed={num_computed}: old={old_seq_len} new={new_seq_len}"
+            )
+    return base_view
+
+
+def test_gather_view_incremental_matches_full_recompute_on_existing_scenarios():
+    """Re-runs every scenario the original `compute_sparse_gather_view`
+    unit tests above cover (basic selection, force-keep tail, combined,
+    degenerate, out-of-range, ascending-order) through the new cached
+    `compute_base_gather_view` + `compute_sparse_gather_view_incremental`
+    path and asserts byte-for-byte identical behavior, including the
+    ValueError case -- this is the regression guard for
+    `sparse_target_runner.py`'s per-turn caching optimization (see that
+    module's docstring's "Per-turn caching" section)."""
+    block_size = 4
+
+    _run_both_gather_paths(
+        torch.tensor([100, 101, 102, 103, 104, 105]), block_size,
+        block_indices_from_positions([1, 14], block_size), num_prompt=24, num_computed=24,
+    )
+    _run_both_gather_paths(
+        torch.tensor([100, 101, 102, 103, 104]), block_size,
+        set(), num_prompt=16, num_computed=18,
+    )
+    _run_both_gather_paths(
+        torch.tensor([100, 101, 102, 103, 104]), block_size,
+        block_indices_from_positions([0], block_size), num_prompt=16, num_computed=17,
+    )
+    _run_both_gather_paths(
+        torch.tensor([100, 101]), block_size,
+        block_indices_from_positions([0, 4], block_size), num_prompt=8, num_computed=8,
+    )
+    _run_both_gather_paths(
+        torch.tensor([100, 101]), block_size,
+        block_indices_from_positions([100], block_size), num_prompt=8, num_computed=8,
+    )
+    _run_both_gather_paths(
+        torch.tensor([100, 101, 102, 103]), block_size,
+        block_indices_from_positions([12, 0, 4], block_size), num_prompt=16, num_computed=16,
+    )
+
+
+def test_gather_view_incremental_matches_full_recompute_across_decode_steps():
+    """The property that actually matters for `sparse_target_runner.py`'s
+    optimization: build `base_view` ONCE (like the runner's per-turn cache
+    does) and reuse it across every decode step of a simulated turn,
+    comparing against the old fresh-every-step computation at each step --
+    including steps that straddle the boundary block (num_prompt not a
+    clean multiple of block_size, so the last historical block is only
+    partially occupied at first and fills up as decode progresses) and
+    steps that hit the degenerate "selection covers everything" case."""
+    random.seed(0)
+    for trial in range(8):
+        block_size = random.choice([4, 8, 16])
+        num_prompt = random.randint(20, 200)
+        max_tokens = 20
+        # Headroom must cover every block num_computed can reach across the
+        # whole simulated turn (num_prompt + max_tokens - 1), plus one for
+        # the ceil-division boundary -- an earlier version of this test
+        # under-allocated headroom and got an IndexError from the OLD
+        # ground-truth function itself (not a new-vs-old mismatch).
+        num_full_blocks = -(-(num_prompt + max_tokens) // block_size) + 1
+        full_block_table_row = torch.arange(1000, 1000 + num_full_blocks, dtype=torch.int64)
+        max_pos = num_prompt - 1
+        num_selected = random.randint(0, max_pos) if max_pos > 0 else 0
+        selected_positions = random.sample(range(max_pos), num_selected) if max_pos > 0 else []
+        base_block_indices = block_indices_from_positions(selected_positions, block_size)
+
+        base_view = None
+        for step in range(max_tokens):
+            num_computed = num_prompt + step
+            base_view = _run_both_gather_paths(
+                full_block_table_row, block_size, base_block_indices,
+                num_prompt, num_computed, base_view=base_view,
+            )
+
+
+def test_compute_base_gather_view_caches_stable_rows_not_recomputed_per_step():
+    """`base_view.stable_rows`/`stable_seq_len` must be the SAME object
+    across steps (never rebuilt) -- this is the actual optimization: if a
+    caller reused `base_view` the way `sparse_target_runner.py` does, the
+    stable portion must not be re-gathered on every call to
+    `compute_sparse_gather_view_incremental`."""
+    block_size = 4
+    # 8 blocks -- enough headroom for num_computed up to 26 (needs block
+    # index up to (26-1)//4 == 6, i.e. 7 blocks; 8 leaves margin).
+    full_block_table_row = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107])
+    base_block_indices = block_indices_from_positions([1, 14], block_size)  # blocks 0, 3
+    base_view = compute_base_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        base_block_indices=base_block_indices,
+        num_prompt=24,
+    )
+    stable_rows_id = id(base_view.stable_rows)
+    for num_computed in [24, 25, 26]:
+        compute_sparse_gather_view_incremental(
+            base_view=base_view,
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            num_prompt=24,
+            num_computed=num_computed,
+        )
+        assert id(base_view.stable_rows) == stable_rows_id
 
 
 def test_sparse_selection_registry_lifecycle():

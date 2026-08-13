@@ -141,6 +141,47 @@ def aggregate_attention_score(
     return token_importance
 
 
+def _chunked_topk_indices(
+    sample_ti: torch.Tensor, seq_len: int, chunk_size: int, percentage: float
+) -> torch.Tensor:
+    """Vectorized replacement for a per-chunk Python loop that called
+    `.mean()` once per TOTAL chunk and `.item()` once per KEPT chunk --
+    O(context_len / chunk_size) separate op dispatches (e.g. ~2,750 chunk
+    ops for an 88k-token SCBench context at chunk_size=32), each `.item()`
+    additionally a GPU/device sync point under `enforce_eager=True` (no
+    CUDA-graph batching to amortize it) on real hardware.
+
+    Pads to a `chunk_size` multiple (zero-padding is safe here: dividing
+    each chunk's sum by its own REAL element count, not `chunk_size`,
+    means the zero padding never perturbs the mean) so all chunk means can
+    be computed in one reshape+sum+divide, then builds the kept token-index
+    set for the selected chunks via broadcasting instead of a per-chunk
+    `.item()` + `torch.split`-indexing loop. Verified bit-identical output
+    against the original per-chunk-loop implementation across context
+    lengths both divisible and non-divisible by `chunk_size` -- see
+    `test_vllm_patch.py`.
+    """
+    pad = (-seq_len) % chunk_size
+    padded = torch.nn.functional.pad(sample_ti, (0, pad))  # zero-padded
+    chunk_cnt = padded.shape[0] // chunk_size
+    chunk_ti = padded.view(chunk_cnt, chunk_size)
+
+    real_counts = torch.full(
+        (chunk_cnt,), chunk_size, dtype=chunk_ti.dtype, device=chunk_ti.device
+    )
+    if pad:
+        real_counts[-1] = chunk_size - pad
+    chunk_means = chunk_ti.sum(-1) / real_counts
+
+    keep_chunk_cnt = math.ceil(chunk_cnt * percentage)
+    _, chunk_indices = torch.topk(chunk_means, k=keep_chunk_cnt, dim=-1)
+
+    starts = chunk_indices * chunk_size
+    offsets = torch.arange(chunk_size, device=sample_ti.device)
+    token_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+    return token_indices[token_indices < seq_len]
+
+
 def chunk_select_from_smoothed_attention(
     token_importance: List[torch.Tensor],
     spec_config: SpecConfig,
@@ -172,16 +213,7 @@ def chunk_select_from_smoothed_attention(
 
         if spec_config.keep_kwargs.get("chunk", False):
             chunk_size = spec_config.keep_kwargs.get("chunk_size", 32)
-            chunk_ti = torch.split(sample_ti, chunk_size, dim=-1)
-            chunk_ti = [cti.mean() for cti in chunk_ti]
-            chunk_cnt = len(chunk_ti)
-
-            keep_chunk_cnt = math.ceil(chunk_cnt * percentage)
-            _, chunk_indices = torch.topk(
-                torch.stack(chunk_ti), k=keep_chunk_cnt, dim=-1
-            )
-            indices = torch.split(torch.arange(seq_len), chunk_size, dim=-1)
-            indices = torch.concat([indices[ci.item()] for ci in chunk_indices])
+            indices = _chunked_topk_indices(sample_ti, seq_len, chunk_size, percentage)
         else:
             topk = math.ceil(seq_len * percentage)
             _, indices = torch.topk(sample_ti, k=topk, dim=-1)

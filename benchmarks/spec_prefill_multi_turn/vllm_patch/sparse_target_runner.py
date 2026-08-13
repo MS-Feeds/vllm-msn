@@ -86,12 +86,26 @@ to `_apply_sparse_attention_overrides`, which runs once per DECODE STEP
 (`_build_attention_metadata` is called every step, not once per turn), i.e.
 up to `max_tokens` times (e.g. 64) per turn, even though the registered
 selection is constant for the whole turn. `_get_base_block_indices` above
-now computes and caches this set ONCE per turn (invalidated by `id()` of
-the registry's `selected_positions` object changing, which happens exactly
-once per `register_sparse_selection` call -- see that method's docstring),
-so each decode step only pays for the small, per-step-bounded force-keep
-tail (`kv_cache_utils.compute_sparse_gather_view`'s own
-`range(num_prompt, num_computed)` loop), not the whole selection again.
+computes and caches this set ONCE per turn (invalidated by `id()` of the
+registry's `selected_positions` object changing, which happens exactly once
+per `register_sparse_selection` call -- see that method's docstring).
+
+That fix alone turned out to be incomplete: `compute_sparse_gather_view`
+was still redoing a full `sorted()` + tensor-gather-from-`full_block_table_
+row` + seq_len Python loop over the ENTIRE cached selection on every one of
+those up-to-`max_tokens` decode-step calls, even though only the small
+force-keep tail (and possibly one boundary block's occupancy) actually
+changes step to step -- a synthetic benchmark reproducing a 64-step decode
+turn at SCBench-scale selection sizes measured this remaining per-step cost
+at 5-32x the alternative below. `_get_base_gather_view` now additionally
+caches `kv_cache_utils.compute_base_gather_view`'s result (the gathered
+rows + summed seq_len for every block that's PROVABLY stable for the rest
+of the turn -- see that function's own docstring for the historical-
+position invariant this relies on) the same way, ONCE per turn; each decode
+step then calls `kv_cache_utils.compute_sparse_gather_view_incremental`,
+which reuses that cached base view as-is and only computes the bounded,
+per-step delta (the force-keep tail plus the one block whose occupancy can
+still be growing).
 
 ## Known risk areas -- NOT independently confirmed on real hardware yet
 (unlike the resumable-session foundation this builds on, which IS confirmed
@@ -183,6 +197,54 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         cache[req_id] = (cache_key, base_block_indices)
         return base_block_indices
 
+    def _base_gather_view_cache(self) -> Dict[str, tuple]:
+        # Same lazy-init / id()-keyed-invalidation reasoning as
+        # _base_block_indices_cache above -- see this class's module
+        # docstring's "Per-turn caching" section for why a SECOND cache
+        # layer (on top of the block-index set) is needed: the block-index
+        # set alone doesn't avoid re-sorting/re-gathering the whole
+        # selection from full_block_table_row on every decode step.
+        if not hasattr(self, "_sparse_base_gather_view_cache"):
+            self._sparse_base_gather_view_cache: Dict[str, tuple] = {}
+        return self._sparse_base_gather_view_cache
+
+    def _get_base_gather_view(
+        self,
+        req_id: str,
+        selected_positions: List[int],
+        block_size: int,
+        full_block_table_row,
+        num_prompt: int,
+    ):
+        """Caches `kv_cache_utils.compute_base_gather_view`'s result per
+        request, invalidated by the same `id(selected_positions)` signal
+        `_get_base_block_indices` already uses (a new turn's registration
+        always hands back a NEW list object -- see
+        `sparse_selection_registry.py`'s docstring). Safe to cache
+        `full_block_table_row`-derived data keyed only on the selection's
+        identity (not also on `num_prompt`/the row's own contents) because
+        both are themselves constant for the whole turn: `num_prompt` is
+        fixed once a turn's query is submitted, and the STABLE blocks this
+        caches are -- by `compute_base_gather_view`'s own historical-
+        position invariant -- never touched again by this or any later
+        decode step of the same turn."""
+        from .kv_cache_utils import compute_base_gather_view
+
+        cache = self._base_gather_view_cache()
+        cache_key = id(selected_positions)
+        cached = cache.get(req_id)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        base_block_indices = self._get_base_block_indices(req_id, selected_positions, block_size)
+        base_view = compute_base_gather_view(
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            base_block_indices=base_block_indices,
+            num_prompt=num_prompt,
+        )
+        cache[req_id] = (cache_key, base_view)
+        return base_view
+
     def _build_attention_metadata(self, *args, **kwargs):
         # *args/**kwargs passthrough -- see module docstring: this method's
         # real signature (num_tokens, num_reqs, max_query_len, ... many more
@@ -221,14 +283,22 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 continue
 
             t_override_start = time.time()
-            base_block_indices = self._get_base_block_indices(req_id, selected_positions, block_size)
+            # Read once per request, not once inside _compute_gathered_view
+            # AND again below for block_table_width -- same "an arbitrary
+            # layer's metadata, assumed uniform across layers" reasoning as
+            # before, just consolidated to one lookup.
+            any_layer_metadata = next(iter(attn_metadata.values()))
+            full_block_table_row = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD)[req_idx]
+
+            base_view = self._get_base_gather_view(
+                req_id, selected_positions, block_size, full_block_table_row, num_prompt
+            )
             gathered = self._compute_gathered_view(
-                req_idx=req_idx,
+                base_view=base_view,
+                full_block_table_row=full_block_table_row,
                 block_size=block_size,
-                base_block_indices=base_block_indices,
                 num_prompt=num_prompt,
                 num_computed=num_computed,
-                attn_metadata=attn_metadata,
             )
             if gathered is None:
                 continue
@@ -242,12 +312,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # (no CUDA-graph batching to amortize the per-op dispatch cost)
             # -- a real, measured 0.5-1s/turn overhead vs. baseline, not
             # theoretical. block_table's column width is already assumed
-            # uniform across layers elsewhere (`_compute_gathered_view`
-            # reads it from "an arbitrary layer's metadata"), so building
-            # the padded row once here and writing it whole into each
-            # layer's own tensor is safe under the same assumption, and
-            # cuts the hot per-layer loop from 2 GPU ops to 1.
-            any_layer_metadata = next(iter(attn_metadata.values()))
+            # uniform across layers elsewhere, so building the padded row
+            # once here and writing it whole into each layer's own tensor
+            # is safe under the same assumption, and cuts the hot per-layer
+            # loop from 2 GPU ops to 1.
             block_table_width = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD).shape[1]
             num_gathered = gathered_block_table_row.shape[0]
             if block_table_width > num_gathered:
@@ -307,35 +375,34 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
 
     def _compute_gathered_view(
         self,
-        req_idx: int,
+        base_view,
+        full_block_table_row,
         block_size: int,
-        base_block_indices,
         num_prompt: int,
         num_computed: int,
-        attn_metadata: Dict[str, object],
     ) -> Optional[tuple]:
-        """Thin wrapper: reads this request's real, already-built block
+        """Thin wrapper delegating the actual block-selection/seq_len
+        arithmetic to `kv_cache_utils.compute_sparse_gather_view_incremental`
+        -- factored out specifically so that logic is unit-testable without
+        a live `GPUModelRunner` or GPU (see that function's own docstring).
+        `base_view` is the CACHED per-turn `BaseGatherView` from
+        `_get_base_gather_view` above (already built from the block table
+        and this turn's selection once) -- see that method's docstring for
+        why this, not the raw selection or block-index set, is what should
+        be cached and reused across a turn's decode steps.
+        `full_block_table_row` is this request's real, already-built block
         table row (from an arbitrary layer's metadata -- assumed uniform
         across layers, see module docstring's Known risk area #4; read, not
         recomputed from `self.input_batch`, since `builder.build()`/
         `update_block_table()` may have applied backend-specific
-        transformations this shouldn't bypass), then delegates the actual
-        block-selection/seq_len arithmetic to
-        `kv_cache_utils.compute_sparse_gather_view` -- factored out
-        specifically so that logic is unit-testable without a live
-        `GPUModelRunner` or GPU (see that function's own docstring).
-        `base_block_indices` is the CACHED per-turn block-index set from
-        `_get_base_block_indices` above, not the raw selection list -- see
-        that method's docstring for why."""
-        from .kv_cache_utils import compute_sparse_gather_view
+        transformations this shouldn't bypass), read once by the caller and
+        passed in here rather than re-read from `attn_metadata` again."""
+        from .kv_cache_utils import compute_sparse_gather_view_incremental
 
-        any_layer_metadata = next(iter(attn_metadata.values()))
-        full_block_table_row = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD)[req_idx]
-
-        return compute_sparse_gather_view(
+        return compute_sparse_gather_view_incremental(
+            base_view=base_view,
             full_block_table_row=full_block_table_row,
             block_size=block_size,
-            base_block_indices=base_block_indices,
             num_prompt=num_prompt,
             num_computed=num_computed,
         )

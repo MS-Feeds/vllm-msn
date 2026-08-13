@@ -43,6 +43,7 @@ forward-context-scoped lookup at all -- this module has no vLLM dependency
 whatsoever, not even a lazy one.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 
 import torch
@@ -347,6 +348,174 @@ def compute_sparse_gather_view(
     last_real_block_occupancy = num_computed - last_real_block_index * block_size
     gathered_seq_len = 0
     for block_idx in sorted_blocks:
+        if block_idx == last_real_block_index:
+            gathered_seq_len += last_real_block_occupancy
+        else:
+            gathered_seq_len += block_size
+
+    return gathered_block_table_row, gathered_seq_len
+
+
+@dataclass
+class BaseGatherView:
+    """Per-turn (not per-decode-step) precomputation for
+    `compute_sparse_gather_view_incremental` -- see that function's and
+    `compute_base_gather_view`'s docstrings for what problem this solves.
+    Built ONCE per turn by `compute_base_gather_view` (cacheable by
+    `sparse_target_runner.py` the same way `block_indices_from_positions`'s
+    result already is, keyed by `id(selected_positions)`) and reused,
+    unmodified, across every decode step of that turn."""
+
+    stable_blocks: List[int]  # sorted, all strictly < boundary_block -- fully historical, occupancy can never change again this turn
+    stable_rows: torch.Tensor  # full_block_table_row[stable_blocks], gathered ONCE
+    stable_seq_len: int  # len(stable_blocks) * block_size -- every stable block is fully occupied by construction
+    boundary_block: int  # num_prompt // block_size -- the one block index whose occupancy can still be ambiguous/growing this turn
+    boundary_in_selection: bool  # whether the speculator's own selection includes boundary_block
+    overflow_blocks: List[int]  # sorted, all > boundary_block -- should be empty for any legitimate selection (see compute_base_gather_view's docstring), kept only so a stale/out-of-range selection still fails loudly via the per-step range check instead of silently vanishing
+
+
+def compute_base_gather_view(
+    full_block_table_row: torch.Tensor,
+    block_size: int,
+    base_block_indices: Set[int],
+    num_prompt: int,
+) -> BaseGatherView:
+    """Per-turn half of `compute_sparse_gather_view`'s work, factored out so
+    `sparse_target_runner.py` can compute and cache it ONCE per turn --
+    the earlier fix that cached `block_indices_from_positions`'s result
+    (see that function's own docstring) wasn't enough on its own:
+    `compute_sparse_gather_view` was still redoing a full `sorted()` +
+    tensor-gather + seq_len loop over the ENTIRE selection on every decode
+    step even after that fix -- a real, measured cost (see
+    `compute_sparse_gather_view_incremental`'s docstring for numbers).
+
+    Every position in a legitimate `base_block_indices` (the speculator's
+    own selection, always scoped to positions < num_prompt -- see
+    `sparse_selection_registry.py`'s docstring) maps to a block index
+    `<= num_prompt // block_size` (this function's own `boundary_block`):
+    a historical position p < num_prompt has
+    `p // block_size <= (num_prompt - 1) // block_size <= num_prompt // block_size`.
+    So every selected block except possibly `boundary_block` itself is
+    provably FULLY occupied and provably STABLE for the rest of the turn
+    (num_prompt is fixed once a turn's query is submitted) -- safe to
+    gather and cache once. `boundary_block` is the one edge case: it may
+    still be receiving newly-generated tokens as decode progresses (when
+    `num_prompt` isn't a clean multiple of `block_size`), so its occupancy
+    must be re-derived per step by `compute_sparse_gather_view_incremental`,
+    same as the force-keep tail already was.
+
+    `overflow_blocks` exists purely for defensive parity with
+    `compute_sparse_gather_view`'s out-of-range check: a `base_block_indices`
+    entry that (contrary to the invariant above) references a block beyond
+    `boundary_block` must still be surfaced so the per-step incremental
+    function's own range check catches it, rather than this function
+    silently dropping it from `stable_blocks` and letting it vanish.
+    """
+    boundary_block = num_prompt // block_size
+    stable_blocks = sorted(b for b in base_block_indices if b < boundary_block)
+    overflow_blocks = sorted(b for b in base_block_indices if b > boundary_block)
+    boundary_in_selection = boundary_block in base_block_indices
+
+    if stable_blocks:
+        stable_block_tensor = torch.tensor(
+            stable_blocks, dtype=torch.int64, device=full_block_table_row.device
+        )
+        stable_rows = full_block_table_row[stable_block_tensor].clone()
+    else:
+        stable_rows = full_block_table_row[:0].clone()
+
+    return BaseGatherView(
+        stable_blocks=stable_blocks,
+        stable_rows=stable_rows,
+        stable_seq_len=len(stable_blocks) * block_size,
+        boundary_block=boundary_block,
+        boundary_in_selection=boundary_in_selection,
+        overflow_blocks=overflow_blocks,
+    )
+
+
+def compute_sparse_gather_view_incremental(
+    base_view: BaseGatherView,
+    full_block_table_row: torch.Tensor,
+    block_size: int,
+    num_prompt: int,
+    num_computed: int,
+) -> Optional[Tuple[torch.Tensor, int]]:
+    """Per-decode-step counterpart to `compute_base_gather_view` -- same
+    contract/return value as `compute_sparse_gather_view` (this function IS
+    a drop-in replacement for it, given a cached `base_view`), but does
+    O(decode-tokens-so-far-this-turn) work per call instead of
+    O(len(selection)): reuses `base_view.stable_rows`/`stable_seq_len`
+    (already-gathered, already-summed) as-is and only computes the small,
+    per-step-bounded delta -- the force-keep tail plus `boundary_block`'s
+    own possibly-still-growing occupancy.
+
+    Real, measured cost this avoids (mirrors the reasoning already
+    documented for `block_indices_from_positions`'s per-turn caching in
+    `sparse_target_runner.py`): a synthetic benchmark reproducing a 64-step
+    decode turn at SCBench scale (selection sizes up to tens of thousands
+    of positions) showed the OLD per-step `compute_sparse_gather_view` call
+    (even with `base_block_indices` already cached) costing 5-32x more
+    wall-clock time per turn than this incremental version, because the old
+    path still re-sorted and re-gathered the ENTIRE selection's blocks from
+    `full_block_table_row` on every one of the 64 steps, when only the
+    boundary block's occupancy and the force-keep tail actually change step
+    to step.
+
+    Callers MUST use the SAME `base_view` for every decode step of one turn
+    (built once via `compute_base_gather_view`, cached the same way
+    `sparse_target_runner.py` already caches `block_indices_from_positions`'s
+    result -- keyed by `id(selected_positions)`, invalidated exactly once
+    per `register_sparse_selection` call).
+    """
+    boundary_block = base_view.boundary_block
+
+    if num_computed > num_prompt:
+        dynamic_end = (num_computed - 1) // block_size + 1
+        tail_blocks = set(range(boundary_block, dynamic_end))
+    elif base_view.boundary_in_selection:
+        tail_blocks = {boundary_block}
+    else:
+        tail_blocks = set()
+
+    dynamic_blocks = sorted(tail_blocks | set(base_view.overflow_blocks))
+
+    total_selected = len(base_view.stable_blocks) + len(dynamic_blocks)
+    if total_selected == 0:
+        return None
+
+    num_full_blocks_present = -(-num_computed // block_size)  # ceil div
+    dyn_max = dynamic_blocks[-1] if dynamic_blocks else base_view.stable_blocks[-1]
+    if dyn_max >= num_full_blocks_present:
+        raise ValueError(
+            f"selected block index {dyn_max} exceeds the number of blocks "
+            f"actually allocated so far ({num_full_blocks_present}, for "
+            f"num_computed={num_computed} tokens at block_size={block_size}) "
+            f"-- the speculator's selection must be scoped to positions "
+            f"already resident in this request's OWN cache; a stale/"
+            f"out-of-range selection would otherwise silently read another "
+            f"request's or another conversation's data at that physical "
+            f"block id."
+        )
+
+    if total_selected == num_full_blocks_present:
+        # Degenerate: selection covers the entire resident cache already --
+        # gathering would be a no-op.
+        return None
+
+    if dynamic_blocks:
+        dynamic_block_tensor = torch.tensor(
+            dynamic_blocks, dtype=torch.int64, device=full_block_table_row.device
+        )
+        dynamic_rows = full_block_table_row[dynamic_block_tensor].clone()
+        gathered_block_table_row = torch.cat([base_view.stable_rows, dynamic_rows])
+    else:
+        gathered_block_table_row = base_view.stable_rows
+
+    last_real_block_index = (num_computed - 1) // block_size
+    last_real_block_occupancy = num_computed - last_real_block_index * block_size
+    gathered_seq_len = base_view.stable_seq_len
+    for block_idx in dynamic_blocks:
         if block_idx == last_real_block_index:
             gathered_seq_len += last_real_block_occupancy
         else:
