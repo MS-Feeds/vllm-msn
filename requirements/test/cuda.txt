@@ -21,7 +21,7 @@ aiosignal==1.4.0
     # via aiohttp
 albumentations==1.4.6
     # via -r requirements/test/cuda.in
-alembic==1.18.4
+alembic==1.19.1
     # via optuna
 annotated-doc==0.0.4
     # via fastapi
@@ -137,7 +137,7 @@ cupy-cuda12x==13.6.0
     # via ray
 cycler==0.12.1
     # via matplotlib
-datamodel-code-generator==0.72.0
+datamodel-code-generator==0.72.2
     # via -r requirements/test/cuda.in
 dataproperty==1.1.1
     # via
@@ -227,7 +227,7 @@ genai-perf==0.0.16
     # via -r requirements/test/cuda.in
 genson==1.4.0
     # via datamodel-code-generator
-google-api-core==2.33.0
+google-api-core==2.34.0
     # via
     #   google-cloud-core
     #   google-cloud-storage
@@ -287,7 +287,7 @@ httpx==0.28.1
     #   huggingface-hub
     #   perceptron
     #   schemathesis
-huggingface-hub==1.26.0
+huggingface-hub==1.27.0
     # via
     #   accelerate
     #   datasets
@@ -304,7 +304,7 @@ humanize==4.16.0
     # via runai-model-streamer
 hyperframe==6.1.0
     # via h2
-hypothesis==6.165.0
+hypothesis==6.165.2
     # via
     #   hypothesis-graphql
     #   hypothesis-jsonschema
@@ -391,7 +391,7 @@ lxml==5.3.0
     #   blobfile
     #   gpt-oss
     #   sacrebleu
-mako==1.3.10
+mako==1.4.1
     # via alembic
 markdown-it-py==3.0.0
     # via rich
@@ -629,7 +629,7 @@ pillow==10.4.0
     #   scikit-image
     #   segmentation-models-pytorch
     #   torchvision
-platformdirs==4.11.0
+platformdirs==4.11.1
     # via
     #   black
     #   pooch
@@ -709,7 +709,7 @@ pydantic==2.13.4
     #   openai-harmony
     #   pydantic-extra-types
     #   ray
-pydantic-core==2.47.0
+pydantic-core==2.48.0
     # via pydantic
 pydantic-extra-types==2.11.1
     # via mistral-common
@@ -743,7 +743,7 @@ pytest-asyncio==0.24.0
     # via -r requirements/test/cuda.in
 pytest-cov==6.3.0
     # via -r requirements/test/cuda.in
-pytest-forked==1.6.0
+pytest-forked==1.7.5
     # via -r requirements/test/cuda.in
 pytest-mock==3.15.1
     # via genai-perf
@@ -891,7 +891,7 @@ scipy==1.15.3
     #   vocos
 segmentation-models-pytorch==0.5.0
     # via -r requirements/test/cuda.in
-sentence-transformers==5.6.0
+sentence-transformers==5.7.0
     # via
     #   -r requirements/test/cuda.in
     #   mteb

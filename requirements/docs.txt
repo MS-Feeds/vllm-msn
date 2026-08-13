@@ -157,7 +157,7 @@ regex==2026.4.4
     # via -r docs.in
 requests==2.34.2
     # via mkdocs-material
-ruff==0.16.1
+ruff==0.16.2
     # via -r docs.in
 selectolax==0.4.8
     # via mkdocs-glightbox
