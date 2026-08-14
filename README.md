@@ -232,6 +232,23 @@ arguments after the image name to replace the default command. Set `HF_TOKEN`
 at runtime if authenticated Hugging Face downloads are required; never bake it
 into the image.
 
+### Validate the deployment
+
+Use
+[`examples/deployment/deepseek_v4_a100_sample.ipynb`](examples/deployment/deepseek_v4_a100_sample.ipynb)
+to check health and model discovery, basic generation, and several reasoning
+prompts against the running OpenAI-compatible server. The notebook defaults to
+`http://127.0.0.1:8000` and `deepseek-ai/DeepSeek-V4-Flash-0731`.
+
+Set these environment variables before starting the notebook when the service
+uses a different endpoint, model name, or API key:
+
+```bash
+export VLLM_BASE_URL=http://vllm-host:8000
+export VLLM_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731
+export VLLM_API_KEY=your-api-key
+```
+
 ## Contributing
 
 We welcome and value any contributions and collaborations.
