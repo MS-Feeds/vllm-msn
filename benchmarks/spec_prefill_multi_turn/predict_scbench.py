@@ -99,6 +99,10 @@ Usage:
     python3 predict_scbench.py --exp M000 --max-conversations 2   # smoke test
     python3 predict_scbench.py --exp M000,M-k80-g32,M-k20-gtoken
     python3 predict_scbench.py --exp specprefill   # all 16 M-k*-g* rows, no baseline
+    python3 predict_scbench.py --exp SPARSE-k80-g32 --scbench-config scbench_kv
+        # restrict to just one of the 3 bundled SCBench configs
+    python3 predict_scbench.py --exp sparse --chunk-size 32
+        # just the granularity=32 rows across every SPARSE-k*-g32 keep rate
 """
 
 from __future__ import annotations
@@ -266,17 +270,39 @@ def percentile(sorted_vals: list, q: float):
     return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
 
 
-def load_conversations(path: Path, max_keep: int) -> list[dict]:
+def load_conversations(
+    path: Path, max_keep: int, config_filter: Optional[set] = None
+) -> list[dict]:
+    """`config_filter`, if given, keeps only rows whose `"config"` field is
+    in the set -- e.g. `{"scbench_kv"}` to benchmark just one of the 3
+    MVP configs `scbench_samples.jsonl` bundles together, without needing
+    to re-run `prep_scbench.py` (which would re-hit the HF Hub) just to
+    get a single-config file. Filtering happens BEFORE `max_keep` is
+    applied, not after -- so `--max-conversations N` means "N
+    conversations of the config(s) actually being benchmarked", not "N
+    conversations from the front of the mixed file, some of which might
+    then get filtered away leaving fewer than N or even zero"."""
     conversations = []
     with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            conversations.append(json.loads(line))
+            row = json.loads(line)
+            if config_filter is not None and row.get("config") not in config_filter:
+                continue
+            conversations.append(row)
             if max_keep >= 0 and len(conversations) >= max_keep:
                 break
     if not conversations:
+        if config_filter is not None:
+            raise FileNotFoundError(
+                f"No rows matching config(s) {sorted(config_filter)!r} found "
+                f"in {path} -- check --scbench-config against the actual "
+                f"\"config\" values present in that file (e.g. `cut -d'\"' "
+                f"-f4 {path} | sort -u` lists them), or that the file isn't "
+                f"simply empty/missing (run datasets/prep_scbench.py first)."
+            )
         raise FileNotFoundError(
             f"Samples file empty or not found: {path}\nRun datasets/prep_scbench.py first."
         )
@@ -1193,7 +1219,14 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
 
     print(f"\n{'=' * 70}\n{exp_id}: {label}\n{'=' * 70}")
 
-    conversations = load_conversations(args.samples, args.max_conversations)
+    config_filter = (
+        {c.strip() for c in args.scbench_config.split(",") if c.strip()}
+        if args.scbench_config else None
+    )
+    conversations = load_conversations(args.samples, args.max_conversations, config_filter)
+    if config_filter is not None:
+        print(f"[predict_scbench] filtered to config(s) {sorted(config_filter)!r}: "
+              f"{len(conversations)} conversations")
     tok = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
 
     # Clamp both max_num_batched_tokens and max_model_len to the checkpoint's
@@ -1508,6 +1541,16 @@ def main() -> None:
              "be reported, not silently skipped).",
     )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
+    parser.add_argument(
+        "--scbench-config", default=None,
+        help="Comma-separated SCBench config name(s) to restrict this run "
+             "to (e.g. 'scbench_kv', or 'scbench_kv,scbench_summary') -- "
+             "filters scbench_samples.jsonl's own \"config\" field, since "
+             "that file bundles all 3 MVP configs (scbench_qa_eng/"
+             "scbench_kv/scbench_summary) together by default. Omit to "
+             "benchmark all configs present in the samples file (previous "
+             "behavior, unchanged).",
+    )
     parser.add_argument("--target-model", default=os.environ.get("LLAMA31_8B_MODEL_PATH"))
     parser.add_argument("--speculator-model", default=os.environ.get("LLAMA32_1B_MODEL_PATH"))
     parser.add_argument("--speculator-device", default=None)
@@ -1527,6 +1570,18 @@ def main() -> None:
                          help="Generation cap per turn.")
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument("--max-conversations", type=int, default=-1)
+    parser.add_argument(
+        "--chunk-size", default=None,
+        help="Restrict to experiment rows with this KV-entry granularity: "
+             "'16', '32', '64', or 'token' (matches the g16/g32/g64/gtoken "
+             "suffix in each experiment id). Combines with --exp's group "
+             "keywords ('specprefill', 'sparse', 'all') to select e.g. "
+             "just the granularity=32 rows across every keep rate, without "
+             "hand-listing each M-k*-g32/SPARSE-k*-g32 id. M000 (no "
+             "granularity at all) is excluded whenever this is set. Has no "
+             "effect combined with an explicit --exp id list beyond "
+             "filtering out any listed ids that don't match.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
@@ -1566,6 +1621,28 @@ def main() -> None:
         exp_ids = list(EXPERIMENTS.keys())
     else:
         exp_ids = [x.strip() for x in args.exp.split(",")]
+
+    if args.chunk_size:
+        # Unknown ids are deliberately kept here (not filtered away) so the
+        # existing per-id "Unknown experiment ID" check below still catches
+        # typos -- only ids that ARE recognized get judged against
+        # --chunk-size, via each row's own "granularity" field (None for
+        # M000, which this therefore always excludes).
+        before = exp_ids
+        exp_ids = [
+            eid for eid in before
+            if eid not in EXPERIMENTS or EXPERIMENTS[eid].get("granularity") == args.chunk_size
+        ]
+        print(f"[predict_scbench] --chunk-size {args.chunk_size!r}: "
+              f"{len(exp_ids)}/{len(before)} experiment id(s) kept")
+        if not exp_ids:
+            parser.error(
+                f"--chunk-size {args.chunk_size!r} matched no experiments "
+                f"in the --exp selection {args.exp!r} -- valid granularity "
+                f"values are '16', '32', '64', 'token' (see --list for "
+                f"which ids have which)."
+            )
+
     failed_exp_ids = []
     for exp_id in exp_ids:
         if exp_id not in EXPERIMENTS:
