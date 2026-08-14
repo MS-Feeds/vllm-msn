@@ -755,6 +755,15 @@ per-turn cost the metric is meant to isolate. Both are computed from a new
 per-turn timer (`t_turn_start`) in each `run_*` function, recorded only for
 turns that actually completed (not skipped).
 
+`out_tokens_per_second` records output-token throughput: total generated
+tokens (`sum(stats["out_lens"])`) divided by the experiment's total
+`elapsed_time` -- the same "over the whole run's wall time" convention
+`turns_per_second` already uses, not a decode-only figure. That means it
+folds in prefill, speculator scoring (specprefill/sparse), and everything
+else the pipeline actually spends time on for that mode -- it answers
+"how many output tokens does this configuration produce per second of
+real wall clock," not "how fast is the model's decode loop in isolation."
+
 `DISCARD` mode and the `ORACLE` rows' full granularity cross are natural
 next steps once `M000`/`M-k*-g*` are validated and run — not part of this
 pass's default sweep.

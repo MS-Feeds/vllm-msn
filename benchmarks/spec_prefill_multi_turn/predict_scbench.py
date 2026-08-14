@@ -167,7 +167,7 @@ CSV_FIELDS = [
     "actual_keep_rate_mean",
     "ttft_mean_ms", "ttft_p50_ms", "ttft_p90_ms",
     "num_cached_tokens_speculator_mean",
-    "out_len_mean", "out_len_stdev",
+    "out_len_mean", "out_len_stdev", "out_tokens_per_second",
     "finish_stop", "finish_length", "finish_other",
 ]
 
@@ -1491,6 +1491,15 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 ),
                 "out_len_mean": statistics.mean(stats["out_lens"]) if stats["out_lens"] else None,
                 "out_len_stdev": statistics.stdev(stats["out_lens"]) if len(stats["out_lens"]) > 1 else 0.0,
+                # Total OUTPUT tokens generated / total wall time -- same
+                # "over the whole experiment's elapsed time" convention as
+                # turns_per_second (not decode-only: elapsed includes
+                # prefill, speculator scoring for specprefill/sparse, etc.
+                # -- this is throughput of the pipeline as actually run,
+                # not a claim about raw decode speed in isolation).
+                "out_tokens_per_second": (
+                    sum(stats["out_lens"]) / elapsed if elapsed > 0 and stats["out_lens"] else None
+                ),
                 "finish_stop": stats["finish"]["stop"],
                 "finish_length": stats["finish"]["length"],
                 "finish_other": stats["finish"]["other"],
@@ -1504,13 +1513,15 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             spt_excl_str = (
                 f"{spt_excl:.2f}s/turn (excl. turn0)" if spt_excl is not None else "n/a s/turn (excl. turn0)"
             )
+            otps = row["out_tokens_per_second"]
+            otps_str = f"{otps:.1f} out tok/s" if otps is not None else "n/a out tok/s"
             print(
                 f"[predict_scbench] rep {rep}/{args.reps}: {row['num_turns']} turns "
                 f"across {row['num_conversations']} processed conversations "
                 f"({row['num_conversations_loaded']} loaded, "
                 f"{row['num_skipped_too_large']} skipped) in {elapsed:.1f}s "
                 f"({row['turns_per_second']:.2f} turns/s, {spc_str}, {spt_str}, "
-                f"{spt_excl_str}), "
+                f"{spt_excl_str}, {otps_str}), "
                 f"ttft_mean={row['ttft_mean_ms']}, "
                 f"actual_keep_rate_mean={row['actual_keep_rate_mean']}, "
                 f"num_cached_tokens_speculator_mean={row['num_cached_tokens_speculator_mean']}"
