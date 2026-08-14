@@ -104,6 +104,25 @@ def _gemma4_top2_softmax(
     return weights, ids, token_expert_indices
 
 
+def _reference_topk_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    indices_type: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference Top-K path that bypasses the unstable fused CUDA operator."""
+    probabilities = torch.softmax(gating_output.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(probabilities, k=topk, dim=-1)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if indices_type is not None:
+        topk_ids = topk_ids.to(indices_type)
+    token_expert_indices = torch.arange(
+        gating_output.shape[0], dtype=torch.int32, device=gating_output.device
+    ).unsqueeze(1).expand(-1, topk)
+    return topk_weights, topk_ids, token_expert_indices
+
+
 def vllm_topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -176,6 +195,13 @@ def fused_topk(
         and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1"
     ):
         return _gemma4_top2_softmax(gating_output, renormalize, indices_type)
+    if (
+        scoring_func == "softmax"
+        and os.environ.get("VLLM_GEMMA4_REFERENCE_TOPK") == "1"
+    ):
+        return _reference_topk_softmax(
+            gating_output, topk, renormalize, indices_type
+        )
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device
