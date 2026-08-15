@@ -35,26 +35,13 @@ def _gemma4_top2_softmax_kernel(
         other=-float("inf"),
     ).to(tl.float32)
 
-    # Keep both winners in one reduction. This avoids a second argmax pass and
-    # avoids the full softmax denominator when selected weights are renormalized.
-    best_value = tl.full((), -float("inf"), tl.float32)
-    second_value = tl.full((), -float("inf"), tl.float32)
-    best_id = tl.full((), 0, tl.int32)
-    second_id = tl.full((), 0, tl.int32)
-    for offset in tl.static_range(0, BLOCK_SIZE):
-        value = tl.load(
-            logits_ptr + token * num_experts + offset,
-            mask=offset < num_experts,
-            other=-float("inf"),
-        ).to(tl.float32)
-        is_new_best = value > best_value
-        is_new_second = value > second_value
-        old_best_value = best_value
-        old_best_id = best_id
-        second_value = tl.where(is_new_best, old_best_value, tl.where(is_new_second, value, second_value))
-        second_id = tl.where(is_new_best, old_best_id, tl.where(is_new_second, offset, second_id))
-        best_value = tl.where(is_new_best, value, best_value)
-        best_id = tl.where(is_new_best, offset, best_id)
+    # The logits are already resident in registers. Let Triton lower the two
+    # reductions in parallel instead of serializing a scalar loop over experts.
+    best_id = tl.argmax(logits, axis=0)
+    second_logits = tl.where(offsets == best_id, -float("inf"), logits)
+    second_id = tl.argmax(second_logits, axis=0)
+    best_value = tl.sum(tl.where(offsets == best_id, logits, 0.0), axis=0)
+    second_value = tl.sum(tl.where(offsets == second_id, logits, 0.0), axis=0)
 
     if renormalize:
         selected_max = tl.maximum(best_value, second_value)
