@@ -40,8 +40,12 @@ def _gemma4_top2_softmax_kernel(
     best_id = tl.argmax(logits, axis=0)
     second_logits = tl.where(offsets == best_id, -float("inf"), logits)
     second_id = tl.argmax(second_logits, axis=0)
-    best_value = tl.sum(tl.where(offsets == best_id, logits, 0.0), axis=0)
-    second_value = tl.sum(tl.where(offsets == second_id, logits, 0.0), axis=0)
+    best_value = tl.load(
+        logits_ptr + token * num_experts + best_id
+    ).to(tl.float32)
+    second_value = tl.load(
+        logits_ptr + token * num_experts + second_id
+    ).to(tl.float32)
 
     if renormalize:
         selected_max = tl.maximum(best_value, second_value)
