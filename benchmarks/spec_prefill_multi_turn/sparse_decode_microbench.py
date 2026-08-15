@@ -129,68 +129,72 @@ sys.path.insert(0, str(Path(__file__).parent))
 # suffix gets appended to request_id.
 os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 
+# Top-level (not deferred into a function) is required: `worker_cls`
+# resolution (`resolve_obj_by_qualname`, vllm/utils/import_utils.py) imports
+# this module fresh in the EngineCore subprocess and does a plain
+# `getattr(module, "InstrumentedSparseTargetWorker")` -- a class only
+# defined inside a function body is never an attribute of the module at
+# all, regardless of fork vs. spawn. (An earlier version of this script
+# defined these inside a function and hit exactly that:
+# `AttributeError: module '__main__' has no attribute
+# 'InstrumentedSparseTargetWorker'` from the EngineCore subprocess.)
+from vllm.v1.worker.gpu_worker import Worker
+from vllm_patch.sparse_target_runner import (
+    SparseTargetGPUModelRunner,
+    SparseTargetWorker,
+)
+
 
 # --------------------------------------------------------------------------
 # Instrumented worker/runner -- subclasses only, no vllm_patch changes.
 # --------------------------------------------------------------------------
 
-def _install_instrumented_classes():
-    """Deferred import (needs vLLM's runtime importable) building the
-    instrumented subclasses -- see module docstring for what/why each
-    override does."""
-    from vllm.v1.worker.gpu_worker import Worker
-    from vllm_patch.sparse_target_runner import (
-        SparseTargetGPUModelRunner,
-        SparseTargetWorker,
-    )
+class InstrumentedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
+    def _block_counts_accum(self) -> Dict[str, List[int]]:
+        if not hasattr(self, "_microbench_block_counts"):
+            self._microbench_block_counts: Dict[str, List[int]] = {}
+        return self._microbench_block_counts
 
-    class InstrumentedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
-        def _block_counts_accum(self) -> Dict[str, List[int]]:
-            if not hasattr(self, "_microbench_block_counts"):
-                self._microbench_block_counts: Dict[str, List[int]] = {}
-            return self._microbench_block_counts
+    def _compute_gathered_view(
+        self, base_view, full_block_table_row, block_size, num_prompt, num_computed
+    ):
+        gathered = super()._compute_gathered_view(
+            base_view=base_view,
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            num_prompt=num_prompt,
+            num_computed=num_computed,
+        )
+        if gathered is None:
+            # Degenerate no-op case (selection covers every resident
+            # block already, e.g. keep_rate=1.0) -- the dense fallback
+            # block count is exactly the number of blocks allocated so
+            # far, same ceil-div the base module's own range checks use.
+            blocks_loaded = -(-num_computed // block_size)
+        else:
+            _, gathered_seq_len = gathered
+            blocks_loaded = -(-gathered_seq_len // block_size)
+        # Single-in-flight-request assumption -- see module docstring.
+        req_id = self.input_batch.req_ids[0]
+        self._block_counts_accum().setdefault(req_id, []).append(blocks_loaded)
+        return gathered
 
-        def _compute_gathered_view(
-            self, base_view, full_block_table_row, block_size, num_prompt, num_computed
-        ):
-            gathered = super()._compute_gathered_view(
-                base_view=base_view,
-                full_block_table_row=full_block_table_row,
-                block_size=block_size,
-                num_prompt=num_prompt,
-                num_computed=num_computed,
-            )
-            if gathered is None:
-                # Degenerate no-op case (selection covers every resident
-                # block already, e.g. keep_rate=1.0) -- the dense fallback
-                # block count is exactly the number of blocks allocated so
-                # far, same ceil-div the base module's own range checks use.
-                blocks_loaded = -(-num_computed // block_size)
-            else:
-                _, gathered_seq_len = gathered
-                blocks_loaded = -(-gathered_seq_len // block_size)
-            # Single-in-flight-request assumption -- see module docstring.
-            req_id = self.input_batch.req_ids[0]
-            self._block_counts_accum().setdefault(req_id, []).append(blocks_loaded)
-            return gathered
+    def pop_block_counts(self, request_id: str) -> List[int]:
+        return self._block_counts_accum().pop(request_id, [])
 
-        def pop_block_counts(self, request_id: str) -> List[int]:
-            return self._block_counts_accum().pop(request_id, [])
 
-    class InstrumentedSparseTargetWorker(SparseTargetWorker):
-        def init_device(self) -> None:
-            # Deliberately call Worker.init_device directly (not
-            # super().init_device(), which is SparseTargetWorker's own
-            # override) to avoid constructing the non-instrumented
-            # SparseTargetGPUModelRunner first only to immediately replace
-            # it -- same device-init side effects, one runner instead of two.
-            Worker.init_device(self)
-            self.model_runner = InstrumentedSparseTargetGPUModelRunner(self.vllm_config, self.device)
+class InstrumentedSparseTargetWorker(SparseTargetWorker):
+    def init_device(self) -> None:
+        # Deliberately call Worker.init_device directly (not
+        # super().init_device(), which is SparseTargetWorker's own
+        # override) to avoid constructing the non-instrumented
+        # SparseTargetGPUModelRunner first only to immediately replace
+        # it -- same device-init side effects, one runner instead of two.
+        Worker.init_device(self)
+        self.model_runner = InstrumentedSparseTargetGPUModelRunner(self.vllm_config, self.device)
 
-        def pop_block_counts(self, request_id: str) -> List[int]:
-            return self.model_runner.pop_block_counts(request_id)
-
-    return InstrumentedSparseTargetGPUModelRunner, InstrumentedSparseTargetWorker
+    def pop_block_counts(self, request_id: str) -> List[int]:
+        return self.model_runner.pop_block_counts(request_id)
 
 
 # --------------------------------------------------------------------------
@@ -409,10 +413,14 @@ def main() -> None:
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
 
-    InstrumentedSparseTargetGPUModelRunner, InstrumentedSparseTargetWorker = _install_instrumented_classes()
     # Make the dotted worker_cls path resolvable -- register this module
     # under a stable name importable by vLLM's worker bootstrap, mirroring
     # how `vllm_patch.sparse_target_runner.SparseTargetWorker` is resolved.
+    # (Belt-and-suspenders: the classes are already real top-level
+    # attributes of whatever module this file loaded as -- see the classes'
+    # own definition-site comment -- this additionally covers the case
+    # where the EngineCore subprocess looks up "sparse_decode_microbench"
+    # by name rather than inheriting sys.modules via fork.)
     sys.modules.setdefault("sparse_decode_microbench", sys.modules[__name__])
 
     native_max_model_len = AutoConfig.from_pretrained(model_path, trust_remote_code=True).max_position_embeddings
