@@ -178,6 +178,7 @@ def main() -> None:
         enable_prefix_caching=True,
         worker_cls="vllm_patch.sparse_target_runner.SparseTargetWorker",
         gpu_memory_utilization=args.gpu_memory_utilization,
+        async_scheduling=False,
     )
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
