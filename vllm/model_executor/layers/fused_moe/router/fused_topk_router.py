@@ -78,7 +78,7 @@ def _gemma4_top2_softmax_kernel(
     tl.store(token_expert_indices_ptr + weight_base + 1, token)
 
 
-def _gemma4_top2_softmax(
+def gemma4_top2_softmax(
     gating_output: torch.Tensor,
     renormalize: bool,
     indices_type: torch.dtype | None,
@@ -194,7 +194,7 @@ def fused_topk(
         and scoring_func == "softmax"
         and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1"
     ):
-        return _gemma4_top2_softmax(gating_output, renormalize, indices_type)
+        return gemma4_top2_softmax(gating_output, renormalize, indices_type)
     if (
         scoring_func == "softmax"
         and os.environ.get("VLLM_GEMMA4_REFERENCE_TOPK") == "1"
