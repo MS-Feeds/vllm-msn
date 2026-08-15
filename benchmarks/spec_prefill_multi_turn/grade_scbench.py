@@ -35,20 +35,29 @@ Usage:
         --samples datasets/scbench_samples.jsonl \\
         --predictions results/<exp_id>_predictions.jsonl \\
         --output results/scbench_result.json
+
+    # Grade every completed run at once (globs results/*_predictions.jsonl,
+    # writes results/<exp_id>_result.json per file plus a combined
+    # results/all_scores.csv -- the accuracy-side counterpart to
+    # predict_scbench.py's all_runs.csv on the timing side):
+    python3 grade_scbench.py --batch
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import os
 import re
 import string
 from collections import Counter
 from pathlib import Path
 from typing import Optional
 
+DEFAULT_RESULTS_DIR = Path(os.environ.get("BENCH_RESULTS_DIR", "results"))
 DEFAULT_SAMPLES = Path(__file__).parent / "datasets" / "scbench_samples.jsonl"
-DEFAULT_OUTPUT = Path(__file__).parent / "results" / "scbench_result.json"
+DEFAULT_OUTPUT = DEFAULT_RESULTS_DIR / "scbench_result.json"
 
 
 # ---------------------------------------------------------------------------
@@ -319,13 +328,103 @@ def render_summary_table(result: dict) -> str:
     return "\n".join(lines)
 
 
+def run_batch(samples_path: Path, results_dir: Path) -> None:
+    """Grades every `<exp_id>_predictions.jsonl` file in `results_dir` --
+    the naming convention `predict_scbench.py` itself writes
+    (`OUT_DIR / f"{exp_id}_predictions.jsonl"`), so `exp_id` is recovered
+    by stripping that fixed suffix off each matched filename, not parsed
+    out of file content.
+
+    Writes the same per-experiment `<exp_id>_result.json` single-file mode
+    already writes (so nothing downstream that reads those individually
+    needs to change), PLUS one combined `all_scores.csv` -- the accuracy
+    counterpart to `predict_scbench.py`'s own `all_runs.csv` (timing),
+    letting the two be joined on `exp_id` for a full picture.
+
+    **Per-config columns tolerate config-filtered runs.** A run made with
+    predict_scbench.py's own `--scbench-config` (e.g. only scbench_kv
+    predicted) grades correctly here with NO special-casing needed: `grade`
+    already treats every OTHER config's turns as `missing` (excluded from
+    every average, not scored 0 -- see that function's own docstring), so
+    `by_config` for such a run simply won't have keys for the configs that
+    were never predicted. The CSV's column set is the UNION across every
+    experiment found, so a config-filtered exp_id just gets an empty cell
+    for the configs it never touched, rather than a misleading 0.00 that
+    would look like a real (bad) score."""
+    samples = _read_jsonl(samples_path)
+    pred_files = sorted(results_dir.glob("*_predictions.jsonl"))
+    if not pred_files:
+        print(f"[grade_scbench] no *_predictions.jsonl files found in {results_dir}")
+        return
+
+    summary_rows = []
+    for pred_file in pred_files:
+        exp_id = pred_file.name[: -len("_predictions.jsonl")]
+        predictions = _read_jsonl(pred_file)
+        result = grade(samples, predictions)
+        counts = result["counts"]
+
+        aggregate_result = {k: v for k, v in result.items() if k != "per_turn"}
+        out_path = results_dir / f"{exp_id}_result.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(aggregate_result, f, indent=2)
+
+        row = {
+            "exp_id": exp_id,
+            "overall": round(result["overall"], 4),
+            "total_turns": counts["total_turns"],
+            "matched": counts["matched"],
+            "missing": counts["missing"],
+            "no_metric_assigned": counts["no_metric_assigned"],
+        }
+        row.update({k: round(v, 4) for k, v in result["by_config"].items()})
+        summary_rows.append(row)
+        print(f"[grade_scbench] {exp_id}: overall={result['overall']:.2f} "
+              f"({counts['matched']}/{counts['total_turns']} turns matched) -> {out_path}")
+
+    fixed_cols = ["exp_id", "overall", "total_turns", "matched", "missing", "no_metric_assigned"]
+    config_cols = sorted({k for row in summary_rows for k in row if k not in fixed_cols})
+    fieldnames = fixed_cols + config_cols
+
+    summary_path = results_dir / "all_scores.csv"
+    with open(summary_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow(row)
+    print(f"\n[grade_scbench] wrote combined summary ({len(summary_rows)} "
+          f"experiments) -> {summary_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Grade SCBench multi-turn predictions")
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
-    parser.add_argument("--predictions", type=Path, required=True)
+    parser.add_argument(
+        "--predictions", type=Path, default=None,
+        help="Required unless --batch is given.",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--per-turn-output", type=Path, default=None)
+    parser.add_argument(
+        "--batch", action="store_true",
+        help="Grade every <exp_id>_predictions.jsonl file in --results-dir "
+             "instead of a single --predictions file -- see module "
+             "docstring for what this writes.",
+    )
+    parser.add_argument(
+        "--results-dir", type=Path, default=DEFAULT_RESULTS_DIR,
+        help="Directory to glob for *_predictions.jsonl in --batch mode "
+             "(defaults to $BENCH_RESULTS_DIR if set, else 'results', "
+             "matching predict_scbench.py's own default output location).",
+    )
     args = parser.parse_args()
+
+    if args.batch:
+        run_batch(args.samples, args.results_dir)
+        return
+
+    if args.predictions is None:
+        parser.error("--predictions is required unless --batch is given")
 
     samples = _read_jsonl(args.samples)
     predictions = _read_jsonl(args.predictions)
