@@ -215,7 +215,7 @@ def gemma4_fused_routing_topk_softmax(
         f"got {out_ids.shape[1]}."
     )
 
-    if os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1":
+    if topk == 2 and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1":
         topk_weights, topk_ids, _ = gemma4_top2_softmax(
             gating_output, True, out_ids.dtype
         )
