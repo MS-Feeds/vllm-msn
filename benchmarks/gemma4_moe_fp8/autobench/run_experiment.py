@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import statistics
@@ -78,6 +79,26 @@ def render_chat(tok, raw_prompts: list[str]) -> list[str]:
     return out
 
 
+def save_parity_sample(llm, prompts: list[str], sample_size: int, max_tokens: int) -> None:
+    """Save deterministic output tokens for cross-branch router parity checks."""
+    from vllm import SamplingParams
+
+    sampling = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=False)
+    outputs = llm.generate(prompts[:sample_size], sampling, use_tqdm=False)
+    sample = []
+    for output in outputs:
+        completion = output.outputs[0]
+        sample.append({
+            "prompt_token_ids": output.prompt_token_ids,
+            "output_token_ids": completion.token_ids,
+            "output_sha256": hashlib.sha256(completion.text.encode("utf-8")).hexdigest(),
+        })
+    RESULTS_DIR.mkdir(exist_ok=True)
+    sample_path = RESULTS_DIR / "parity_sample.json"
+    sample_path.write_text(json.dumps(sample, indent=2), encoding="utf-8")
+    print(f"Parity sample saved: {sample_path} ({len(sample)} prompts)", flush=True)
+
+
 def percentile(sorted_vals: list, q: float):
     if not sorted_vals:
         return 0
@@ -131,6 +152,15 @@ def run_single(cfg: dict, num_prompts: int, reps: int) -> dict:
     llm = LLM(**llm_kwargs)
     engine_time = time.time() - t_engine
     print(f"Engine built in {engine_time:.1f}s", flush=True)
+
+    parity_sample_prompts = int(cfg.get("parity_sample_prompts", 0))
+    if parity_sample_prompts:
+        save_parity_sample(
+            llm,
+            prompts,
+            min(parity_sample_prompts, len(prompts)),
+            int(cfg.get("parity_sample_max_tokens", 128)),
+        )
 
     all_output_tps = []
     all_total_tps = []
