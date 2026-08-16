@@ -49,15 +49,32 @@ reasons, both confirmed against real source, not assumed:
    absolute position in the continuously-open session, correct by
    construction with no override needed.
 
-## Why only `.block_table`/`.seq_lens` need patching, not `.query_start_loc`
+## Why `.query_start_loc` doesn't need patching, but `.max_seq_len` does
 
 `query_start_loc` describes where each request's QUERY tokens start/end
 within the batched query tensor -- for a single decode step (always exactly
 1 new query token per request under this pipeline's own established
 one-in-flight-request scope, same convention `proposer.py`/`predict_
 scbench.py` already use elsewhere), this is unaffected by how much of the
-KEY/VALUE side (`block_table`/`seq_lens`) gets gathered. Only the
-KV-cache-facing fields need to shrink.
+KEY/VALUE side (`block_table`/`seq_lens`) gets gathered.
+
+`max_seq_len`, by contrast, DOES need patching, and originally wasn't --
+a real bug caught via `diagnose_h1_metadata.py` against real hardware,
+not a theoretical gap. Every backend's per-layer `AttentionMetadata` also
+carries a batch-wide `max_seq_len` scalar (e.g.
+`FlashAttentionMetadata.max_seq_len`) computed ONCE by the stock metadata
+builder from the ORIGINAL, unrestricted `seq_lens`, separate from the
+per-request `seq_lens` tensor this module already patches. The flash-attn
+backend feeds it straight to the kernel as `max_seqlen_k` alongside the
+(correctly shrunk) `block_table`/`seqused_k`
+(`vllm/v1/attention/backends/flash_attn.py`'s `forward()`), where it sizes
+the kernel's own K/V-block tiling/grid for the call -- left stale, the
+kernel kept reading/iterating the FULL pre-gather span regardless of how
+aggressively `block_table`/`seq_lens` were shrunk, which is exactly why an
+early microbenchmark measured ~flat decode latency between keep=1.0 and
+keep=0.2 despite `block_table`'s distinct block count and `seq_lens`
+themselves being genuinely, correctly restricted. See
+`_apply_sparse_attention_overrides`'s post-loop `max_seq_len` fix-up below.
 
 ## Force-keep: this turn's own in-progress decode tokens
 
@@ -138,6 +155,22 @@ is where these should be checked first, before trusting any real sweep:
    non-heterogeneous attention -- the SAME gathered block_table/seq_lens is
    written into every layer's metadata object identically, not
    independently recomputed per layer.
+5. **`max_seq_len` was originally NOT in this list and should have been --
+   confirmed as a real bug, not a theoretical gap, via
+   `diagnose_h1_metadata.py` against real hardware** (see "Why
+   `.max_seq_len` does [need patching]" above): a first pass at this
+   mechanism patched only `.block_table`/`.seq_lens`, leaving `max_seq_len`
+   at its stale, pre-gather value -- which measurably kept the flash-attn
+   backend reading the FULL pre-gather KV span regardless of how much
+   `block_table`/`seq_lens` were shrunk. Now fixed by recomputing it as
+   `seq_lens.max()` after the per-request loop, gated on `any_patched`.
+   Whether any OTHER backend-specific scheduling field (e.g. flash-attn's
+   own `scheduler_metadata`, which the stock builder may also precompute
+   from the original unrestricted length) similarly needs recomputing
+   after the gather has NOT been independently verified yet -- re-run
+   `diagnose_h1_metadata.py` and a real timing sweep after this fix lands,
+   and if keep=0.2 still doesn't show a real speedup, `scheduler_metadata`
+   staleness is the next thing to check.
 """
 
 import time
@@ -158,6 +191,12 @@ if TYPE_CHECKING:
 # citations, not independently re-verified on real hardware here).
 _BLOCK_TABLE_FIELD = "block_table"
 _SEQ_LENS_FIELD = "seq_lens"
+# Optional -- not every backend necessarily has this (unlike block_table/
+# seq_lens, which this whole mechanism requires), so it's patched
+# best-effort via hasattr() below rather than through the same strict
+# _get_field() that raises for the other two. See module docstring's
+# "Why .max_seq_len does" section for why this needs patching at all.
+_MAX_SEQ_LEN_FIELD = "max_seq_len"
 
 
 class SparseTargetGPUModelRunner(GPUModelRunner):
@@ -266,6 +305,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor
 
+        any_patched = False
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             selected_positions = sparse_selection_registry.get(req_id)
@@ -303,6 +343,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             if gathered is None:
                 continue
             gathered_block_table_row, gathered_seq_len = gathered
+            any_patched = True
 
             # Pad to the full block-table row width ONCE here, not inside
             # the per-layer loop below -- real hardware timing showed
@@ -334,6 +375,22 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 )
 
             self._accumulate_override_timing(req_id, time.time() - t_override_start)
+
+        if any_patched:
+            # See module docstring's "Why .max_seq_len does [need patching]"
+            # -- recomputed as the true post-gather max across the WHOLE
+            # batch (not just the last-patched request's own
+            # gathered_seq_len) so a batch mixing sparse-restricted and
+            # untouched/dense requests still ends up with the correct
+            # larger value. Gated on any_patched so this adds no extra
+            # GPU-sync cost (`.max().item()`) on steps/pipelines where
+            # nothing was actually gathered (e.g. keep_rate=1.0's
+            # degenerate no-op path, or any other worker_cls entirely).
+            for layer_metadata in attn_metadata.values():
+                if not hasattr(layer_metadata, _MAX_SEQ_LEN_FIELD):
+                    continue  # optional field, not every backend has it
+                seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
+                setattr(layer_metadata, _MAX_SEQ_LEN_FIELD, int(seq_lens.max().item()))
 
     def _override_timing_accum(self) -> Dict[str, tuple]:
         # Lazily-initialized, same reasoning as _base_block_indices_cache
