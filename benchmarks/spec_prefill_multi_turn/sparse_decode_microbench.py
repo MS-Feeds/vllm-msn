@@ -85,11 +85,33 @@ Python-side overhead into the very "everything else" bucket being measured,
 contaminating the timed numbers. The profiled pass's own `torch.profiler`
 `key_averages()` are bucketed into attention vs. other by CUDA kernel name
 substring match (`--attention-kernel-patterns`) and a Chrome/Perfetto trace
-is written per config. Independently, each config's TIMED decode loop is
-wrapped in `torch.cuda.nvtx.range_push/pop` so that running this whole
-script under `nsys profile --trace=cuda,nvtx -o <file> python3
-sparse_decode_microbench.py ...` produces a trace with both configs clearly
-demarcated -- this script never shells out to `nsys` itself.
+is written per config.
+
+**KNOWN BROKEN, not yet fixed**: `run_profiled_decode`'s `torch.profiler`
+context currently wraps the DRIVER process's `step()`-loop -- but vLLM runs
+the actual CUDA work in a separate EngineCore subprocess (confirmed via the
+identical NVTX bug below, and directly evidenced by this producing
+`attn_ms_per_step`/`other_ms_per_step` of exactly `0.000` for every config
+on real hardware: the driver process launches no kernels of its own for
+`torch.profiler` to see). Treat `attn_ms_per_step`/`other_ms_per_step` in
+the output table as not-yet-trustworthy until this is fixed the same way
+the NVTX push below was -- profiling needs to be started/stopped from
+INSIDE the worker process (e.g. via a `collective_rpc`-triggered
+`torch.profiler` session, or vLLM's own built-in start/stop-profile RPC
+surface if this fork exposes one), not from the driver.
+
+The NVTX range used for `nsys` diffing IS fixed: it's pushed/popped inside
+`InstrumentedSparseTargetGPUModelRunner` (worker-process side, keyed by
+`request_id`, label `f"decode/{request_id}"`), not from this script's own
+step()-loop -- an earlier version pushed driver-side and `ncu
+--nvtx-include` confirmed on real hardware that it matched ZERO kernels
+("No kernels were profiled"), since NVTX ranges are per-process and the
+driver's own `step()` calls never launch a kernel themselves. Running this
+whole script under `nsys profile --trace=cuda,nvtx -o <file> python3
+sparse_decode_microbench.py ...` produces a trace where each
+(keep_rate, rep)'s decode phase is demarcated by its own
+`decode/microbench-<keep_rate>-<rep>` range -- this script never shells out
+to `nsys` itself.
 
 ## Roofline
 
@@ -119,7 +141,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -154,6 +176,44 @@ class InstrumentedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
         if not hasattr(self, "_microbench_block_counts"):
             self._microbench_block_counts: Dict[str, List[int]] = {}
         return self._microbench_block_counts
+
+    def _nvtx_pushed_reqs(self):
+        if not hasattr(self, "_nvtx_pushed_req_ids"):
+            self._nvtx_pushed_req_ids = set()
+        return self._nvtx_pushed_req_ids
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        attn_metadata, spec_decode_meta = super()._build_attention_metadata(*args, **kwargs)
+        self._maybe_push_nvtx(attn_metadata)
+        return attn_metadata, spec_decode_meta
+
+    def _maybe_push_nvtx(self, attn_metadata) -> None:
+        # Pushed HERE (inside the EngineCore subprocess where the actual
+        # attention kernels launch), NOT from the driver's step()-loop --
+        # NVTX ranges are per-process, and vLLM's real CUDA work happens in
+        # a separate EngineCore subprocess from the driver. An earlier
+        # version of this pushed driver-side, which `ncu --nvtx-include`
+        # confirmed sees ZERO kernels ("No kernels were profiled") since
+        # the driver's own step() calls never launch a kernel themselves.
+        if not attn_metadata or self.input_batch.num_reqs == 0:
+            return
+        req_id = self.input_batch.req_ids[0]
+        num_computed = int(self.input_batch.num_computed_tokens_cpu_tensor[0])
+        num_prompt = int(self.input_batch.num_prompt_tokens_cpu_tensor[0])
+        if num_computed < num_prompt:
+            return  # prefill, not decode -- excluded, same boundary as elsewhere
+        pushed = self._nvtx_pushed_reqs()
+        if req_id not in pushed:
+            import torch
+            torch.cuda.nvtx.range_push(f"decode/{req_id}")
+            pushed.add(req_id)
+
+    def pop_nvtx_range(self, request_id: str) -> None:
+        pushed = self._nvtx_pushed_reqs()
+        if request_id in pushed:
+            import torch
+            torch.cuda.nvtx.range_pop()
+            pushed.discard(request_id)
 
     def _compute_gathered_view(
         self, base_view, full_block_table_row, block_size, num_prompt, num_computed
@@ -195,6 +255,9 @@ class InstrumentedSparseTargetWorker(SparseTargetWorker):
 
     def pop_block_counts(self, request_id: str) -> List[int]:
         return self.model_runner.pop_block_counts(request_id)
+
+    def pop_nvtx_range(self, request_id: str) -> None:
+        self.model_runner.pop_nvtx_range(request_id)
 
 
 # --------------------------------------------------------------------------
@@ -256,13 +319,18 @@ def run_decode_only(
     context_ids: List[int],
     positions: List[int],
     decode_tokens: int,
-    nvtx_label: Optional[str] = None,
 ) -> List[float]:
     """Registers `positions` as the sparse selection, submits one one-shot
     request for `context_ids` + `decode_tokens` forced generated tokens, and
     returns the wall-clock seconds for each genuine decode step (excludes
     the prefill/first-token step entirely). See module docstring for the
-    boundary-detection and synchronization methodology."""
+    boundary-detection and synchronization methodology.
+
+    NVTX range for `nsys` diffing is pushed/popped INSIDE
+    `InstrumentedSparseTargetGPUModelRunner` (worker-process side, keyed by
+    `request_id`), not here -- see that class's own comment for why a
+    driver-side push is invisible to `ncu`/`nsys` (vLLM's real CUDA work
+    runs in a separate EngineCore subprocess)."""
     import torch
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -281,35 +349,32 @@ def run_decode_only(
 
     step_latencies: List[float] = []
     first_token_seen = False
-    if nvtx_label:
-        torch.cuda.nvtx.range_push(nvtx_label)
-    try:
-        while llm_engine.has_unfinished_requests():
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            outputs = llm_engine.step()
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
+    while llm_engine.has_unfinished_requests():
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = llm_engine.step()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
 
-            out = next((o for o in outputs if o.request_id == request_id), None)
-            if out is None:
-                continue
-            has_token = len(out.outputs[0].token_ids) > 0
-            if not first_token_seen:
-                # This step is prefill (+ the first generated token) --
-                # excluded entirely, per "excluding prefill/TTFT entirely".
-                if has_token:
-                    first_token_seen = True
-                continue
-            # Every step after the first-token step is a pure decode step:
-            # exactly one new token, single request, batch=1.
-            step_latencies.append(t1 - t0)
-            if out.finished:
-                break
-    finally:
-        if nvtx_label:
-            torch.cuda.nvtx.range_pop()
+        out = next((o for o in outputs if o.request_id == request_id), None)
+        if out is None:
+            continue
+        has_token = len(out.outputs[0].token_ids) > 0
+        if not first_token_seen:
+            # This step is prefill (+ the first generated token) --
+            # excluded entirely, per "excluding prefill/TTFT entirely".
+            if has_token:
+                first_token_seen = True
+            continue
+        # Every step after the first-token step is a pure decode step:
+        # exactly one new token, single request, batch=1.
+        step_latencies.append(t1 - t0)
+        if out.finished:
+            break
 
+    # Pops the NVTX range from inside the worker process -- runs after
+    # every decode-step kernel launch for this request has been enqueued.
+    llm_engine.collective_rpc("pop_nvtx_range", args=(request_id,))
     llm_engine.collective_rpc("discard_sparse_selection", args=(request_id,))
     return step_latencies
 
@@ -477,7 +542,6 @@ def main() -> None:
             t_rep = time.time()
             latencies = run_decode_only(
                 llm_engine, request_id, context_ids, positions, args.decode_tokens,
-                nvtx_label=f"decode/keep={keep_rate}/rep={rep}",
             )
             block_counts = llm_engine.collective_rpc("pop_block_counts", args=(request_id,))[0]
             print(f"[sparse_decode_microbench] keep={keep_rate} rep={rep}: "

@@ -17,40 +17,54 @@ already dozens of launches at Llama-3.1-8B's 32 layers); a handful of
 steady-state decode steps is enough to read a stable per-kernel DRAM byte
 count, this doesn't need the full 512-token decode run.
 
-Uses the REAL, un-instrumented `SparseTargetWorker` (not
-`sparse_decode_microbench.py`'s `InstrumentedSparseTargetWorker`) -- no
-Python-level counting needed here, ncu measures hardware truth directly.
+## NVTX must be pushed inside the EngineCore subprocess, not the driver
 
-## Why NVTX scoping, not --launch-skip/--launch-count
+First version of this script pushed `torch.cuda.nvtx.range_push` from the
+driver's own step()-loop -- and `ncu --nvtx-include` matched ZERO kernels
+("No kernels were profiled"), confirmed on real hardware. Root cause: vLLM
+runs the actual CUDA work in a SEPARATE `EngineCore` subprocess (visible as
+`(EngineCore pid=...)` in logs) -- the driver process's `llm_engine.step()`
+just sends an RPC and blocks on the reply; it never launches a kernel
+itself. NVTX ranges are per-process, so a range pushed in the driver is
+invisible to anything happening in EngineCore.
 
-Prefill for a 77k-token context is chunked (`max_num_batched_tokens`), so
-the number of attention-kernel launches before the first genuine decode
-step depends on chunk count and isn't worth computing by hand. Instead this
-script pushes an NVTX range ONLY once the first generated token is observed
-(i.e. only around genuine, single-query decode steps -- same
-prefill/TTFT-exclusion boundary `sparse_decode_microbench.py`'s timed loop
-uses), so `ncu --nvtx --nvtx-include "decode_kv_probe/keep=<rate>/"`
-captures exactly the kernels launched during real decode steps and nothing
-from prefill.
+Fix: `NvtxScopedSparseTargetGPUModelRunner` below pushes the range itself,
+from inside `_build_attention_metadata` -- which genuinely executes in the
+EngineCore subprocess (same place `SparseTargetGPUModelRunner`'s own
+override already runs, confirmed by its logging showing up under the
+`(EngineCore pid=...)` prefix). It pushes once, on the first genuine decode
+step (same prefill-exclusion boundary used elsewhere), and the driver pops
+it via an RPC call (`pop_nvtx_range`) after the request finishes -- that RPC
+executes synchronously in the SAME subprocess/thread, so it closes the range
+only after every decode-step kernel launch for this request has already
+been enqueued.
 
-Usage (run ONCE per keep rate, each under its own `ncu` invocation):
+Uses the REAL, un-instrumented gather logic from `SparseTargetGPUModelRunner`
+(only the NVTX push/pop is added) -- no Python-level byte counting needed
+here, ncu measures hardware truth directly.
 
-    ncu --nvtx --nvtx-include "decode_kv_probe/keep=1.0/" \\
+Usage (run ONCE per keep rate, each under its own `ncu` invocation -- the
+NVTX label is `f"decode/{request_id}"`, and `request_id` is
+`f"ncu-probe-{keep_rate}"`, so e.g. for --keep-rate 1.0 the label is
+"decode/ncu-probe-1.0"):
+
+    ncu --nvtx --nvtx-include "decode/ncu-probe-1.0/" \\
         --kernel-name regex:".*[Ff]lash.*|.*[Aa]ttn.*" \\
         --metrics dram__bytes_read.sum,dram__bytes_write.sum \\
         --target-processes all -o ncu_keep_1.0 \\
         python3 ncu_kv_bytes_probe.py --model $LLAMA31_8B_MODEL_PATH \\
             --context-tokens 77000 --decode-steps 5 --keep-rate 1.0 --kv-granularity 16
 
-    ncu --nvtx --nvtx-include "decode_kv_probe/keep=0.2/" \\
+    ncu --nvtx --nvtx-include "decode/ncu-probe-0.2/" \\
         --kernel-name regex:".*[Ff]lash.*|.*[Aa]ttn.*" \\
         --metrics dram__bytes_read.sum,dram__bytes_write.sum \\
         --target-processes all -o ncu_keep_0.2 \\
         python3 ncu_kv_bytes_probe.py --model $LLAMA31_8B_MODEL_PATH \\
             --context-tokens 77000 --decode-steps 5 --keep-rate 0.2 --kv-granularity 16
 
---target-processes all is required -- vLLM's actual CUDA work runs in the
-EngineCore subprocess, not this driver process.
+--target-processes all is still required -- ncu also needs to find and
+attach to the EngineCore subprocess in the first place, on top of the NVTX
+fix above.
 
 Then, per captured kernel launch, compare against the PER-LAYER expected
 bytes (not the per-step total across all 32 layers -- ncu's report is a
@@ -69,14 +83,65 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Set
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 
+# Top-level, not deferred -- worker_cls resolution needs these as real
+# module attributes at import time in the EngineCore subprocess (see
+# sparse_decode_microbench.py's own comment on this exact failure mode).
+from vllm.v1.worker.gpu_worker import Worker
+from vllm_patch.sparse_target_runner import SparseTargetGPUModelRunner, SparseTargetWorker
+
 # Reuse the already-verified context/selection builders rather than
 # reimplementing them -- see sparse_decode_microbench.py.
 from sparse_decode_microbench import build_synthetic_context, compute_keep_positions
+
+
+class NvtxScopedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
+    def _nvtx_pushed_reqs(self) -> Set[str]:
+        if not hasattr(self, "_nvtx_pushed_req_ids"):
+            self._nvtx_pushed_req_ids: Set[str] = set()
+        return self._nvtx_pushed_req_ids
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        attn_metadata, spec_decode_meta = super()._build_attention_metadata(*args, **kwargs)
+        self._maybe_push_nvtx(attn_metadata)
+        return attn_metadata, spec_decode_meta
+
+    def _maybe_push_nvtx(self, attn_metadata) -> None:
+        # See module docstring -- this runs inside the EngineCore
+        # subprocess, unlike a range pushed from the driver's step()-loop.
+        if not attn_metadata or self.input_batch.num_reqs == 0:
+            return
+        req_id = self.input_batch.req_ids[0]
+        num_computed = int(self.input_batch.num_computed_tokens_cpu_tensor[0])
+        num_prompt = int(self.input_batch.num_prompt_tokens_cpu_tensor[0])
+        if num_computed < num_prompt:
+            return  # prefill, not decode -- excluded, same boundary as elsewhere
+        pushed = self._nvtx_pushed_reqs()
+        if req_id not in pushed:
+            import torch
+            torch.cuda.nvtx.range_push(f"decode/{req_id}")
+            pushed.add(req_id)
+
+    def pop_nvtx_range(self, request_id: str) -> None:
+        pushed = self._nvtx_pushed_reqs()
+        if request_id in pushed:
+            import torch
+            torch.cuda.nvtx.range_pop()
+            pushed.discard(request_id)
+
+
+class NvtxScopedSparseTargetWorker(SparseTargetWorker):
+    def init_device(self) -> None:
+        Worker.init_device(self)
+        self.model_runner = NvtxScopedSparseTargetGPUModelRunner(self.vllm_config, self.device)
+
+    def pop_nvtx_range(self, request_id: str) -> None:
+        self.model_runner.pop_nvtx_range(request_id)
 
 
 def main() -> None:
@@ -99,7 +164,8 @@ def main() -> None:
     from transformers import AutoConfig
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
-    import torch
+
+    sys.modules.setdefault("ncu_kv_bytes_probe", sys.modules[__name__])
 
     native_max_model_len = AutoConfig.from_pretrained(model_path, trust_remote_code=True).max_position_embeddings
     max_model_len = args.context_tokens + args.decode_steps + 64
@@ -114,7 +180,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         block_size=args.kv_granularity,
         max_model_len=max_model_len,
-        worker_cls="vllm_patch.sparse_target_runner.SparseTargetWorker",
+        worker_cls="ncu_kv_bytes_probe.NvtxScopedSparseTargetWorker",
         enable_prefix_caching=True,
         async_scheduling=False,
     )
@@ -130,6 +196,7 @@ def main() -> None:
     print(f"[ncu_probe] {len(positions)} blocks registered")
 
     request_id = f"ncu-probe-{args.keep_rate}"
+    print(f"[ncu_probe] NVTX label will be 'decode/{request_id}' -- use that in --nvtx-include")
     llm_engine.collective_rpc("register_sparse_selection", args=(request_id, positions))
 
     sampling_params = SamplingParams(
@@ -142,30 +209,13 @@ def main() -> None:
         f"VLLM_DISABLE_REQUEST_ID_RANDOMIZATION must be set."
     )
 
-    nvtx_label = f"decode_kv_probe/keep={args.keep_rate}/"
-    first_token_seen = False
-    nvtx_pushed = False
-    print("[ncu_probe] running prefill (NOT NVTX-scoped -- ncu should exclude this via --nvtx-include)")
-    try:
-        while llm_engine.has_unfinished_requests():
-            outputs = llm_engine.step()
-            out = next((o for o in outputs if o.request_id == request_id), None)
-            if out is None:
-                continue
-            has_token = len(out.outputs[0].token_ids) > 0
-            if not first_token_seen:
-                if has_token:
-                    first_token_seen = True
-                    print(f"[ncu_probe] prefill done -- entering NVTX range {nvtx_label!r} for decode steps")
-                    torch.cuda.nvtx.range_push(nvtx_label)
-                    nvtx_pushed = True
-                continue
-            if out.finished:
-                break
-    finally:
-        if nvtx_pushed:
-            torch.cuda.nvtx.range_pop()
+    while llm_engine.has_unfinished_requests():
+        llm_engine.step()
 
+    # Pops the NVTX range from INSIDE the EngineCore subprocess (same
+    # reasoning as the push -- see module docstring) -- runs after every
+    # decode-step kernel launch for this request has already been enqueued.
+    llm_engine.collective_rpc("pop_nvtx_range", args=(request_id,))
     llm_engine.collective_rpc("discard_sparse_selection", args=(request_id,))
     print("[ncu_probe] done")
 
