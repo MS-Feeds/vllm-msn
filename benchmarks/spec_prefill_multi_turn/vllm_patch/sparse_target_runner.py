@@ -162,8 +162,14 @@ is where these should be checked first, before trusting any real sweep:
    mechanism patched only `.block_table`/`.seq_lens`, leaving `max_seq_len`
    at its stale, pre-gather value -- which measurably kept the flash-attn
    backend reading the FULL pre-gather KV span regardless of how much
-   `block_table`/`seq_lens` were shrunk. Now fixed by recomputing it as
-   `seq_lens.max()` after the per-request loop, gated on `any_patched`.
+   `block_table`/`seq_lens` were shrunk. Fixed by recomputing it as
+   `seq_lens.max()` after the per-request loop, gated on `any_patched` --
+   and computed from a SINGLE representative layer, not once per layer
+   (a first version of this exact fix called `.max().item()` separately for
+   each of Llama-3.1-8B's 32 layers, adding 32 GPU-sync points to every
+   sparse-path decode step and -- confirmed on real hardware -- making the
+   sparse path measurably SLOWER than dense, not just a smaller
+   improvement than expected).
    Whether any OTHER backend-specific scheduling field (e.g. flash-attn's
    own `scheduler_metadata`, which the stock builder may also precompute
    from the original unrestricted length) similarly needs recomputing
@@ -383,14 +389,29 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # gathered_seq_len) so a batch mixing sparse-restricted and
             # untouched/dense requests still ends up with the correct
             # larger value. Gated on any_patched so this adds no extra
-            # GPU-sync cost (`.max().item()`) on steps/pipelines where
-            # nothing was actually gathered (e.g. keep_rate=1.0's
-            # degenerate no-op path, or any other worker_cls entirely).
-            for layer_metadata in attn_metadata.values():
-                if not hasattr(layer_metadata, _MAX_SEQ_LEN_FIELD):
-                    continue  # optional field, not every backend has it
-                seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
-                setattr(layer_metadata, _MAX_SEQ_LEN_FIELD, int(seq_lens.max().item()))
+            # GPU-sync cost on steps/pipelines where nothing was actually
+            # gathered (e.g. keep_rate=1.0's degenerate no-op path, or any
+            # other worker_cls entirely).
+            #
+            # Computed via `.max().item()` ONCE here, from a single
+            # representative layer's seq_lens -- NOT once per layer inside
+            # the loop below. An earlier version called `.max().item()`
+            # separately for each of Llama-3.1-8B's 32 layers, i.e. 32
+            # GPU-sync points added to EVERY decode step on the sparse path
+            # (and only the sparse path -- keep_rate=1.0 never hits this
+            # block at all). Under enforce_eager=True with no CUDA-graph
+            # batching to overlap/amortize a sync, that measurably made the
+            # sparse path SLOWER than dense on real hardware, not just less
+            # of an improvement -- confirmed by a real timing regression,
+            # not theorized. Safe to read only one layer's seq_lens for
+            # this, same "assumed uniform across all layers" reasoning this
+            # function already relies on for `block_table_width` above.
+            any_layer_metadata = next(iter(attn_metadata.values()))
+            if hasattr(any_layer_metadata, _MAX_SEQ_LEN_FIELD):
+                seq_lens = self._get_field(any_layer_metadata, _SEQ_LENS_FIELD)
+                new_max_seq_len = int(seq_lens.max().item())
+                for layer_metadata in attn_metadata.values():
+                    setattr(layer_metadata, _MAX_SEQ_LEN_FIELD, new_max_seq_len)
 
     def _override_timing_accum(self) -> Dict[str, tuple]:
         # Lazily-initialized, same reasoning as _base_block_indices_cache
