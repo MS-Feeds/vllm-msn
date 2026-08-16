@@ -102,16 +102,20 @@ surface if this fork exposes one), not from the driver.
 
 The NVTX range used for `nsys` diffing IS fixed: it's pushed/popped inside
 `InstrumentedSparseTargetGPUModelRunner` (worker-process side, keyed by
-`request_id`, label `f"decode/{request_id}"`), not from this script's own
-step()-loop -- an earlier version pushed driver-side and `ncu
+`request_id`, label `f"decode_kv_probe_{request_id}"`), not from this
+script's own step()-loop -- an earlier version pushed driver-side and `ncu
 --nvtx-include` confirmed on real hardware that it matched ZERO kernels
 ("No kernels were profiled"), since NVTX ranges are per-process and the
-driver's own `step()` calls never launch a kernel themselves. Running this
-whole script under `nsys profile --trace=cuda,nvtx -o <file> python3
+driver's own `step()` calls never launch a kernel themselves. The range
+name deliberately avoids "/" -- Nsight Compute's `--nvtx-include` treats
+"/" as a range-NESTING separator, not a literal character, and an earlier
+label (`f"decode/{request_id}"`) collided with that and silently continued
+to match nothing even after the process-placement fix. Running this whole
+script under `nsys profile --trace=cuda,nvtx -o <file> python3
 sparse_decode_microbench.py ...` produces a trace where each
 (keep_rate, rep)'s decode phase is demarcated by its own
-`decode/microbench-<keep_rate>-<rep>` range -- this script never shells out
-to `nsys` itself.
+`decode_kv_probe_microbench-<keep_rate>-<rep>` range -- this script never
+shells out to `nsys` itself.
 
 ## Roofline
 
@@ -205,7 +209,7 @@ class InstrumentedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
         pushed = self._nvtx_pushed_reqs()
         if req_id not in pushed:
             import torch
-            torch.cuda.nvtx.range_push(f"decode/{req_id}")
+            torch.cuda.nvtx.range_push(f"decode_kv_probe_{req_id}")
             pushed.add(req_id)
 
     def pop_nvtx_range(self, request_id: str) -> None:

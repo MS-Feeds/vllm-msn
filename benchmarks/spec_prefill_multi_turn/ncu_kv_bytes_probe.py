@@ -43,20 +43,55 @@ Uses the REAL, un-instrumented gather logic from `SparseTargetGPUModelRunner`
 (only the NVTX push/pop is added) -- no Python-level byte counting needed
 here, ncu measures hardware truth directly.
 
-Usage (run ONCE per keep rate, each under its own `ncu` invocation -- the
-NVTX label is `f"decode/{request_id}"`, and `request_id` is
-`f"ncu-probe-{keep_rate}"`, so e.g. for --keep-rate 1.0 the label is
-"decode/ncu-probe-1.0"):
+## NVTX range naming -- avoid "/" in the range name itself
 
-    ncu --nvtx --nvtx-include "decode/ncu-probe-1.0/" \\
-        --kernel-name regex:".*[Ff]lash.*|.*[Aa]ttn.*" \\
+An earlier version of this script named the range `f"decode/{request_id}"`
+-- Nsight Compute's `--nvtx-include` filter treats "/" as a RANGE-NESTING
+separator (`"A/B"` means "kernels launched while nested inside range B,
+itself nested inside range A"), not a literal character allowed in a single
+range's own name. That collided with this script's actual (single,
+unnested) range and produced "No kernels were profiled" even after the
+process-placement fix below was already correct. The range name is now
+`f"decode_kv_probe_{request_id}"` (underscores only) to avoid any ambiguity
+with ncu's own filter syntax.
+
+If you STILL see "No kernels were profiled" after that, debug in stages
+rather than guessing further -- first confirm ncu can see ANY kernels at
+all in the right process, decoupled from NVTX filtering entirely:
+
+    ncu --target-processes all --metrics dram__bytes_read.sum \\
+        -o ncu_debug_unfiltered \\
+        python3 ncu_kv_bytes_probe.py --model $LLAMA31_8B_MODEL_PATH \\
+            --context-tokens 4096 --decode-steps 3 --keep-rate 1.0 --kv-granularity 16
+
+(small context/few steps -- with NO --nvtx and NO --kernel-name filter,
+this captures every kernel in the whole run, so keep it cheap.) Then:
+
+    ncu --import ncu_debug_unfiltered.ncu-rep --print-summary per-kernel
+
+If that lists kernels, ncu is attaching to the EngineCore subprocess fine,
+and the real attention kernel's exact name is now known -- use it (not a
+guessed "flash"/"attn" substring) to build an accurate `--kernel-name`
+regex, and add `--nvtx --nvtx-include "decode_kv_probe_ncu-probe-1.0/"`
+back in. If it lists NOTHING, the problem is process attachment itself
+(check `--target-processes all` took effect, and that ncu has the
+perf-counter permissions needed to profile at all -- see the ERR_NVGPUCTRPERM
+note from before).
+
+Usage (run ONCE per keep rate, each under its own `ncu` invocation -- the
+NVTX label is `f"decode_kv_probe_{request_id}"`, and `request_id` is
+`f"ncu-probe-{keep_rate}"`, so e.g. for --keep-rate 1.0 the label is
+"decode_kv_probe_ncu-probe-1.0"):
+
+    ncu --nvtx --nvtx-include "decode_kv_probe_ncu-probe-1.0/" \\
+        --kernel-name regex:".*[Ff]lash.*|.*[Aa]ttn.*" --kernel-name-base demangled \\
         --metrics dram__bytes_read.sum,dram__bytes_write.sum \\
         --target-processes all -o ncu_keep_1.0 \\
         python3 ncu_kv_bytes_probe.py --model $LLAMA31_8B_MODEL_PATH \\
             --context-tokens 77000 --decode-steps 5 --keep-rate 1.0 --kv-granularity 16
 
-    ncu --nvtx --nvtx-include "decode/ncu-probe-0.2/" \\
-        --kernel-name regex:".*[Ff]lash.*|.*[Aa]ttn.*" \\
+    ncu --nvtx --nvtx-include "decode_kv_probe_ncu-probe-0.2/" \\
+        --kernel-name regex:".*[Ff]lash.*|.*[Aa]ttn.*" --kernel-name-base demangled \\
         --metrics dram__bytes_read.sum,dram__bytes_write.sum \\
         --target-processes all -o ncu_keep_0.2 \\
         python3 ncu_kv_bytes_probe.py --model $LLAMA31_8B_MODEL_PATH \\
@@ -124,7 +159,7 @@ class NvtxScopedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
         pushed = self._nvtx_pushed_reqs()
         if req_id not in pushed:
             import torch
-            torch.cuda.nvtx.range_push(f"decode/{req_id}")
+            torch.cuda.nvtx.range_push(f"decode_kv_probe_{req_id}")
             pushed.add(req_id)
 
     def pop_nvtx_range(self, request_id: str) -> None:
@@ -196,7 +231,7 @@ def main() -> None:
     print(f"[ncu_probe] {len(positions)} blocks registered")
 
     request_id = f"ncu-probe-{args.keep_rate}"
-    print(f"[ncu_probe] NVTX label will be 'decode/{request_id}' -- use that in --nvtx-include")
+    print(f"[ncu_probe] NVTX label will be 'decode_kv_probe_{request_id}' -- use that in --nvtx-include")
     llm_engine.collective_rpc("register_sparse_selection", args=(request_id, positions))
 
     sampling_params = SamplingParams(
