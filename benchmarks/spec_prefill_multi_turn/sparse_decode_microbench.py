@@ -445,12 +445,32 @@ def run_profiled_decode(
 # main
 # --------------------------------------------------------------------------
 
+def _str2bool(v: str) -> bool:
+    if v.lower() in ("true", "1", "yes"):
+        return True
+    if v.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got {v!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=None, help="Defaults to $LLAMA31_8B_MODEL_PATH.")
     parser.add_argument("--context-tokens", type=int, default=77000)
     parser.add_argument("--decode-tokens", type=int, default=512)
     parser.add_argument("--keep-rates", default="1.0,0.2", help="Comma-separated keep rates.")
+    parser.add_argument("--enforce-eager", type=_str2bool, default=True,
+                         help="true (default, matches every prior run in this set) or false -- runs the "
+                              "EXISTING, unmodified sparse override with CUDA graphs on. block_table/seq_lens "
+                              "are already written in-place into vLLM's own persistent graph-safe buffers (see "
+                              "the approved plan's Phase 2 finding), so this tests whether that alone is enough "
+                              "before any further allocation-reduction changes to vllm_patch/. UNVERIFIED risk, "
+                              "not yet confirmed against a live capture: vLLM's capture-time dummy run has no "
+                              "request registered in sparse_selection_registry, so _apply_sparse_attention_"
+                              "overrides skips entirely during capture -- the graph gets captured in its dense "
+                              "shape. Re-run diagnose_h1_metadata.py-style correctness checks (or better, "
+                              "validate_sparse_attention.py's needle test) before trusting any timing numbers "
+                              "this produces with --enforce-eager false.")
     parser.add_argument("--kv-granularity", type=int, default=16, help="Engine KV-cache block_size.")
     parser.add_argument("--keep-mode", default="keep", choices=["keep", "discard"],
                          help="Echoed into output only -- inert for this single-turn benchmark, see module docstring.")
@@ -500,7 +520,7 @@ def main() -> None:
     llm_kwargs = dict(
         model=model_path,
         trust_remote_code=True,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         disable_log_stats=False,
         gpu_memory_utilization=args.gpu_memory_utilization,
         block_size=args.kv_granularity,
@@ -518,6 +538,10 @@ def main() -> None:
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
     vllm_config = llm_engine.vllm_config
+    cc = vllm_config.compilation_config
+    print(f"[sparse_decode_microbench] resolved: enforce_eager={vllm_config.model_config.enforce_eager} "
+          f"cudagraph_mode={cc.cudagraph_mode} "
+          f"cudagraph_capture_sizes={list(cc.cudagraph_capture_sizes) if cc.cudagraph_capture_sizes else []}")
     actual_block_size = vllm_config.cache_config.block_size
     print(f"[sparse_decode_microbench] requested block_size={args.kv_granularity}, "
           f"engine actually using block_size={actual_block_size}")
