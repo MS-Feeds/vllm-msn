@@ -154,12 +154,26 @@ def run_one_probe(llm_engine, tok, request_id, context_ids, question_text, sampl
     return last_output.outputs[0].text
 
 
+def _str2bool(v: str) -> bool:
+    if v.lower() in ("true", "1", "yes"):
+        return True
+    if v.lower() in ("false", "0", "no"):
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got {v!r}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=None, help="Defaults to $LLAMA31_8B_MODEL_PATH.")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--max-tokens", type=int, default=12)
     parser.add_argument("--num-filler-blocks-each-side", type=int, default=4)
+    parser.add_argument("--enforce-eager", type=_str2bool, default=True,
+                         help="true (default, this script's original behavior) or false -- runs the needle test "
+                              "with CUDA graphs on, to behaviorally confirm the sparse restriction is still "
+                              "correct under graph replay (not just that block_table/seq_lens LOOK shrunk -- see "
+                              "sparse_decode_microbench.py's --enforce-eager help for the specific, unverified "
+                              "capture-time-dummy-run risk this is meant to catch).")
     args = parser.parse_args()
 
     model_path = args.model or os.environ.get("LLAMA31_8B_MODEL_PATH")
@@ -169,11 +183,11 @@ def main() -> None:
     from vllm import LLM, SamplingParams
 
     print(f"[validate_sparse_attention] constructing target engine (worker_cls="
-          f"SparseTargetWorker) from {model_path}")
+          f"SparseTargetWorker) from {model_path}, enforce_eager={args.enforce_eager}")
     llm = LLM(
         model=model_path,
         trust_remote_code=True,
-        enforce_eager=True,
+        enforce_eager=args.enforce_eager,
         disable_log_stats=False,
         enable_prefix_caching=True,
         worker_cls="vllm_patch.sparse_target_runner.SparseTargetWorker",
@@ -182,6 +196,11 @@ def main() -> None:
     )
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
+
+    cc = llm.llm_engine.vllm_config.compilation_config
+    print(f"[validate_sparse_attention] resolved: enforce_eager={llm.llm_engine.vllm_config.model_config.enforce_eager} "
+          f"cudagraph_mode={cc.cudagraph_mode} "
+          f"cudagraph_capture_sizes={list(cc.cudagraph_capture_sizes) if cc.cudagraph_capture_sizes else []}")
 
     block_size = llm.llm_engine.vllm_config.cache_config.block_size
     print(f"[validate_sparse_attention] engine block_size={block_size}")
