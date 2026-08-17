@@ -174,6 +174,20 @@ def main() -> None:
                               "correct under graph replay (not just that block_table/seq_lens LOOK shrunk -- see "
                               "sparse_decode_microbench.py's --enforce-eager help for the specific, unverified "
                               "capture-time-dummy-run risk this is meant to catch).")
+    parser.add_argument("--max-model-len", type=int, default=4096,
+                         help="Explicit, not left at vLLM's default -- every OTHER script in this benchmark set "
+                              "(sparse_decode_microbench.py, gpu_vs_host_timing.py, ncu_kv_bytes_probe.py, "
+                              "diagnose_h1_metadata.py) sets this explicitly and none of them have hit the "
+                              "get_supported_tasks() engine-construction hang this script hit on real hardware "
+                              "(LLM.__init__ -> get_supported_tasks -> call_utility -> future.result() never "
+                              "returning) -- this script previously left it at vLLM's default (which for "
+                              "Llama-3.1-8B means ~131072), the one identified difference worth testing directly "
+                              "rather than guessing further. The needle test's own context is small (a handful "
+                              "of filler blocks + one short question), so 4096 is generous headroom, not a tight fit.")
+    parser.add_argument("--max-num-batched-tokens", type=int, default=4096)
+    parser.add_argument("--kv-granularity", type=int, default=16,
+                         help="Explicit block_size, matching every other script in this set (was previously left "
+                              "at vLLM's default here).")
     args = parser.parse_args()
 
     model_path = args.model or os.environ.get("LLAMA31_8B_MODEL_PATH")
@@ -193,6 +207,9 @@ def main() -> None:
         worker_cls="vllm_patch.sparse_target_runner.SparseTargetWorker",
         gpu_memory_utilization=args.gpu_memory_utilization,
         async_scheduling=False,
+        max_model_len=args.max_model_len,
+        max_num_batched_tokens=args.max_num_batched_tokens,
+        block_size=args.kv_granularity,
     )
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
