@@ -137,7 +137,9 @@ def prepare_fp8_layer_for_marlin(
     device = layer.weight.device
 
     # WORKSPACE
-    layer.workspace = marlin_make_workspace_new(device)
+    layer.workspace = marlin_make_workspace_new(
+        device, existing=getattr(layer, "workspace", None)
+    )
 
     # WEIGHT
     # Repack weights to marlin format
@@ -288,9 +290,9 @@ def prepare_fp8_moe_layer_for_marlin(
 
     # WORKSPACE
     device = layer.w13_weight.device
-    # NOTE(rob): we do not need to register the workspace as a param
-    # because it is not used as part of the weight reloading process.
-    layer.workspace = marlin_make_workspace_new(device, 4)
+    layer.workspace = marlin_make_workspace_new(
+        device, 4, existing=getattr(layer, "workspace", None)
+    )
     perm = torch.empty(0, dtype=torch.int, device=device)
 
     # WEIGHT
@@ -480,7 +482,9 @@ def prepare_mxfp8_layer_for_marlin(layer: torch.nn.Module) -> None:
     device = layer.weight.device
 
     # WORKSPACE
-    layer.workspace = marlin_make_workspace_new(device)
+    layer.workspace = marlin_make_workspace_new(
+        device, existing=getattr(layer, "workspace", None)
+    )
 
     # WEIGHT - repack FP8 weights to Marlin format
     perm = torch.empty(0, dtype=torch.int, device=device)
@@ -570,7 +574,9 @@ def prepare_mxfp8_moe_layer_for_marlin(
     param_dtype = torch.get_default_dtype()
     perm = torch.empty(0, dtype=torch.int, device=device)
 
-    layer.workspace = marlin_make_workspace_new(device, 4)
+    layer.workspace = marlin_make_workspace_new(
+        device, 4, existing=getattr(layer, "workspace", None)
+    )
 
     def repack_weight(weight: torch.Tensor, name: str) -> torch.Tensor:
         if "w13" in name:
