@@ -176,13 +176,11 @@ is where these should be checked first, before trusting any real sweep:
    sparse-path decode step and -- confirmed on real hardware -- making the
    sparse path measurably SLOWER than dense, not just a smaller
    improvement than expected).
-   Whether any OTHER backend-specific scheduling field (e.g. flash-attn's
-   own `scheduler_metadata`, which the stock builder may also precompute
-   from the original unrestricted length) similarly needs recomputing
-   after the gather has NOT been independently verified yet -- re-run
-   `diagnose_h1_metadata.py` and a real timing sweep after this fix lands,
-   and if keep=0.2 still doesn't show a real speedup, `scheduler_metadata`
-   staleness is the next thing to check.
+   The follow-on question this raised -- whether any OTHER backend-specific
+   scheduling field similarly needed recomputing after the gather -- is now
+   answered: see item 7 below. `scheduler_metadata` staleness turned out to
+   be exactly that, and a correctness bug, not just the performance one
+   `max_seq_len` was.
 6. **The per-turn caches were keyed on `id(selected_positions)` -- a real,
    confirmed correctness bug, not a style nit.** `id()` is only guaranteed
    unique while the object is alive; the cache entry it invalidates against
@@ -200,6 +198,29 @@ is where these should be checked first, before trusting any real sweep:
    `sparse_selection_registry.py`, which has no relationship to any
    object's memory address and so cannot collide this way. See that
    module's "Generation counter" section for the full trace.
+7. **`scheduler_metadata` was stale too -- a second, independent
+   correctness bug, confirmed even AFTER items 5 and 6 above were both
+   fixed.** With the `max_seq_len` and `id()` bugs both fixed, real SCBench
+   runs became deterministic but still produced garbled, repetition-loop
+   output from the very first decode token -- even at `keep=0.8` (losing
+   only 20% of context), with the SAME model/dataset's `M000` baseline
+   clean throughout. `diagnose_target_gather_metadata.py` proved
+   `block_table`/`seq_lens`/`max_seq_len` were all being patched exactly
+   as expected (an independently-computed block count matched the real
+   gather's reported count at every decode step) -- yet the output was
+   still broken, meaning the bug had to be in something the gather never
+   touched at all. `scheduler_metadata` (`vllm/v1/attention/backends/
+   flash_attn.py`'s FA3 ahead-of-time work-scheduling tensor, see
+   `_SCHEDULER_METADATA_FIELD`'s own comment above for the mechanism) is
+   built ONCE by the stock builder from the PRE-GATHER `seq_lens`/
+   `max_seq_len`, encoding how the kernel should partition/process K/V
+   tiles for the ORIGINAL, unrestricted context length -- never patched by
+   anything in this file until now, regardless of how correctly the
+   logical fields were shrunk. Fixed by nulling it out (not recomputing
+   it) for any patched request, falling back to FA3's own non-AOT
+   scheduling from the corrected fields directly -- `schedule()`'s own
+   `else: return None` branch in the stock builder already proves `None`
+   is a legitimate input the kernel must handle.
 """
 
 import time
@@ -226,6 +247,28 @@ _SEQ_LENS_FIELD = "seq_lens"
 # _get_field() that raises for the other two. See module docstring's
 # "Why .max_seq_len does" section for why this needs patching at all.
 _MAX_SEQ_LEN_FIELD = "max_seq_len"
+# Also optional/best-effort, same reasoning as _MAX_SEQ_LEN_FIELD -- FA3's
+# ahead-of-time work-scheduling tensor, built ONCE by the stock builder
+# from the PRE-GATHER seq_lens/max_seq_len (vllm/v1/attention/backends/
+# flash_attn.py's `schedule()` -> `get_scheduler_metadata(cache_seqlens=
+# seqlens, max_seqlen_k=max_seq_len, page_size=block_size, ...)`) and never
+# recomputed by anything in this module. Confirmed as a REAL, correctness
+# (not just performance) bug via `diagnose_target_gather_metadata.py`
+# against real hardware: block_table/seq_lens/max_seq_len all patch
+# correctly, but the target still produced garbled, repetition-loop output
+# from the very first decode token -- because the kernel was still handed
+# a work schedule built for the ORIGINAL, unrestricted context length,
+# telling it to partition/process far more K/V tiles than the shrunk data
+# actually has. Fixed by nulling it out for any patched request rather
+# than trying to recompute it -- `schedule()`'s own `else: return None`
+# branch (when `aot_schedule` is off) proves `None` is already a
+# legitimate input `flash_attn_varlen_func` must handle, so this falls
+# back to FA3's own non-AOT scheduling from the now-correct seq_lens/
+# block_table directly, instead of risking a subtly wrong hand-rolled call
+# to `get_scheduler_metadata` (which needs several backend-internal values
+# -- num_heads, headdim, qkv_dtype, num_splits -- not readily available in
+# this override's own scope).
+_SCHEDULER_METADATA_FIELD = "scheduler_metadata"
 
 
 class SparseTargetGPUModelRunner(GPUModelRunner):
@@ -453,6 +496,21 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 new_max_seq_len = int(seq_lens.max().item())
                 for layer_metadata in attn_metadata.values():
                     setattr(layer_metadata, _MAX_SEQ_LEN_FIELD, new_max_seq_len)
+
+            # See _SCHEDULER_METADATA_FIELD's own comment above -- a real,
+            # confirmed correctness bug (not a performance one, unlike
+            # everything else patched in this method): FA3's ahead-of-time
+            # work-scheduling tensor is built from the PRE-GATHER seq_lens/
+            # max_seq_len and never recomputed, so the kernel was being
+            # handed a schedule sized for the full, unrestricted context
+            # regardless of how correctly block_table/seq_lens/max_seq_len
+            # themselves were shrunk. No GPU sync needed to null this out
+            # (plain attribute assignment), so it isn't gated on avoiding
+            # sync cost the way the max_seq_len recompute above is --
+            # always done whenever anything was actually patched.
+            if hasattr(any_layer_metadata, _SCHEDULER_METADATA_FIELD):
+                for layer_metadata in attn_metadata.values():
+                    setattr(layer_metadata, _SCHEDULER_METADATA_FIELD, None)
 
     def _override_timing_accum(self) -> Dict[str, tuple]:
         # Lazily-initialized, same reasoning as _base_block_indices_cache
