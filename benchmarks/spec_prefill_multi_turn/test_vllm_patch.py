@@ -709,6 +709,49 @@ def test_sparse_selection_registry_lifecycle():
         sparse_selection_registry.clear()
 
 
+def test_sparse_selection_registry_generation_counter():
+    """Regression test for the real bug `get_with_generation()` replaced:
+    the runner's per-turn caches used to key on `id(selected_positions)`,
+    which is only unique while the object is alive -- once a turn's
+    selection list is freed and a later allocation happens to reuse its
+    address, a stale cache entry could silently match a different turn's
+    selection (confirmed as the cause of non-deterministic SPARSE output
+    on real hardware, see sparse_selection_registry.py's "Generation
+    counter" section). Deliberately does NOT try to force an actual id()
+    collision here (that depends on CPython allocator internals, not this
+    module's own logic, and would make the test flaky/environment-
+    dependent) -- what's actually guaranteed, and what this asserts, is
+    that the generation strictly changes across registrations regardless
+    of what id() happens to do, which is the property the old scheme
+    lacked and this one provides unconditionally."""
+    sparse_selection_registry.clear()
+    try:
+        assert sparse_selection_registry.get_with_generation("req-1") is None
+
+        sparse_selection_registry.register("req-1", [0, 4, 8])
+        gen1, positions1 = sparse_selection_registry.get_with_generation("req-1")
+        assert positions1 == [0, 4, 8]
+
+        sparse_selection_registry.register("req-1", [12, 16])
+        gen2, positions2 = sparse_selection_registry.get_with_generation("req-1")
+        assert positions2 == [12, 16]
+        assert gen2 != gen1, "generation must change across registrations"
+
+        # A second request_id's own generation sequence is independent --
+        # the counter is global/monotonic, not per-request_id, but that
+        # must never cause two DIFFERENT requests' current generations to
+        # collide either.
+        sparse_selection_registry.register("req-2", [1, 2])
+        gen_req2, _ = sparse_selection_registry.get_with_generation("req-2")
+        assert gen_req2 not in (gen1, gen2)
+
+        sparse_selection_registry.discard("req-1")
+        assert sparse_selection_registry.get_with_generation("req-1") is None
+        sparse_selection_registry.discard("req-2")
+    finally:
+        sparse_selection_registry.clear()
+
+
 def test_ledger_to_target_position_map_multi_turn_trace():
     """Hand-computed trace matching a real multi-turn shape: chat_before (3
     tokens) + context (10 tokens, ledger 0-9) + turn1 query (2 tokens,

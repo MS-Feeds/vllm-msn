@@ -103,9 +103,15 @@ to `_apply_sparse_attention_overrides`, which runs once per DECODE STEP
 (`_build_attention_metadata` is called every step, not once per turn), i.e.
 up to `max_tokens` times (e.g. 64) per turn, even though the registered
 selection is constant for the whole turn. `_get_base_block_indices` above
-computes and caches this set ONCE per turn (invalidated by `id()` of the
-registry's `selected_positions` object changing, which happens exactly once
-per `register_sparse_selection` call -- see that method's docstring).
+computes and caches this set ONCE per turn, invalidated by
+`sparse_selection_registry`'s monotonic generation counter changing (which
+happens exactly once per `register_sparse_selection` call -- see that
+module's docstring). This cache was originally keyed on `id()` of the
+registry's `selected_positions` object instead -- a real, confirmed bug
+(non-deterministic output from stale cache hits after the old list was
+freed and its address reused by a later turn's own allocation), fixed by
+switching to the generation counter; see `sparse_selection_registry.py`'s
+"Generation counter" section for the full trace.
 
 That fix alone turned out to be incomplete: `compute_sparse_gather_view`
 was still redoing a full `sorted()` + tensor-gather-from-`full_block_table_
@@ -177,6 +183,23 @@ is where these should be checked first, before trusting any real sweep:
    `diagnose_h1_metadata.py` and a real timing sweep after this fix lands,
    and if keep=0.2 still doesn't show a real speedup, `scheduler_metadata`
    staleness is the next thing to check.
+6. **The per-turn caches were keyed on `id(selected_positions)` -- a real,
+   confirmed correctness bug, not a style nit.** `id()` is only guaranteed
+   unique while the object is alive; the cache entry it invalidates against
+   OUTLIVES the object (nothing clears `_sparse_base_block_indices_cache`/
+   `_sparse_base_gather_view_cache` when a turn ends), so once the old
+   `selected_positions` list is freed and CPython reuses its address for
+   the very next turn's own `list(...)` allocation, the cache can silently
+   serve a STALE, mismatched selection for the new turn. Confirmed as the
+   real cause of a production symptom: `predict_scbench.py` SPARSE runs
+   produced genuinely non-deterministic output -- different generations
+   from IDENTICAL temperature=0 re-runs of the same conversation/turn --
+   that degenerated into repetition loops, consistent with attending to a
+   selection computed for a different (older, shorter) context. Fixed by
+   replacing `id()` with a monotonic generation counter in
+   `sparse_selection_registry.py`, which has no relationship to any
+   object's memory address and so cannot collide this way. See that
+   module's "Generation counter" section for the full trace.
 """
 
 import time
@@ -212,38 +235,46 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         # _build_attention_metadata override: GPUModelRunner's real
         # constructor signature is large and version-sensitive, so this
         # avoids needing to know or forward it just to add one cache dict.
-        # Keyed by req_id -> (id(selected_positions) at cache time, the
-        # resulting block-index set) -- id() is a safe cache key here
-        # specifically because sparse_selection_registry.py's `register()`
-        # always stores a NEW list object (`list(selected_positions)`) and
-        # keeps it alive for the request's whole turn, so id() can't be
-        # silently reused for a DIFFERENT selection while this cache entry
-        # is still valid.
+        # Keyed by req_id -> (selection_generation at cache time, the
+        # resulting block-index set). NOT id(selected_positions) -- a real,
+        # confirmed bug: id() is only unique while the object is alive, and
+        # the cache entry OUTLIVES it (nothing clears this dict when a turn
+        # ends), so once the old list is freed and its address gets reused
+        # by the NEXT turn's own `list(selected_positions)` allocation, a
+        # stale cache entry could silently match a completely different
+        # turn's selection. Confirmed as the real cause of non-deterministic
+        # SPARSE output (different results from identical temperature=0
+        # re-runs) that degenerated into repetition loops -- see
+        # `sparse_selection_registry.py`'s "Generation counter" section for
+        # the full trace. `selection_generation` is a monotonic counter with
+        # no relationship to any object's memory address, so it can't
+        # collide this way.
         if not hasattr(self, "_sparse_base_block_indices_cache"):
             self._sparse_base_block_indices_cache: Dict[str, tuple] = {}
         return self._sparse_base_block_indices_cache
 
-    def _get_base_block_indices(self, req_id: str, selected_positions: List[int], block_size: int):
+    def _get_base_block_indices(
+        self, req_id: str, selected_positions: List[int], block_size: int, selection_generation: int
+    ):
         # Caches `block_indices_from_positions` per request, invalidated
-        # whenever the registry hands back a different `selected_positions`
-        # object (a new turn's registration) -- see module docstring:
-        # without this, this O(len(selected_positions)) computation (which
-        # can be tens of thousands of entries for a large SCBench context)
-        # was being redone on EVERY decode step of a turn (up to
-        # `max_tokens` times), a real, measured per-conversation slowdown.
+        # whenever `selection_generation` changes (a new turn's
+        # registration -- see module docstring): without this, this
+        # O(len(selected_positions)) computation (which can be tens of
+        # thousands of entries for a large SCBench context) was being redone
+        # on EVERY decode step of a turn (up to `max_tokens` times), a real,
+        # measured per-conversation slowdown.
         from .kv_cache_utils import block_indices_from_positions
 
         cache = self._base_block_indices_cache()
-        cache_key = id(selected_positions)
         cached = cache.get(req_id)
-        if cached is not None and cached[0] == cache_key:
+        if cached is not None and cached[0] == selection_generation:
             return cached[1]
         base_block_indices = block_indices_from_positions(selected_positions, block_size)
-        cache[req_id] = (cache_key, base_block_indices)
+        cache[req_id] = (selection_generation, base_block_indices)
         return base_block_indices
 
     def _base_gather_view_cache(self) -> Dict[str, tuple]:
-        # Same lazy-init / id()-keyed-invalidation reasoning as
+        # Same lazy-init / generation-keyed-invalidation reasoning as
         # _base_block_indices_cache above -- see this class's module
         # docstring's "Per-turn caching" section for why a SECOND cache
         # layer (on top of the block-index set) is needed: the block-index
@@ -260,34 +291,36 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         block_size: int,
         full_block_table_row,
         num_prompt: int,
+        selection_generation: int,
     ):
         """Caches `kv_cache_utils.compute_base_gather_view`'s result per
-        request, invalidated by the same `id(selected_positions)` signal
-        `_get_base_block_indices` already uses (a new turn's registration
-        always hands back a NEW list object -- see
-        `sparse_selection_registry.py`'s docstring). Safe to cache
-        `full_block_table_row`-derived data keyed only on the selection's
-        identity (not also on `num_prompt`/the row's own contents) because
-        both are themselves constant for the whole turn: `num_prompt` is
-        fixed once a turn's query is submitted, and the STABLE blocks this
-        caches are -- by `compute_base_gather_view`'s own historical-
-        position invariant -- never touched again by this or any later
-        decode step of the same turn."""
+        request, invalidated by the same `selection_generation` signal
+        `_get_base_block_indices` already uses (see
+        `sparse_selection_registry.py`'s "Generation counter" section for
+        why this replaced an earlier, buggy `id(selected_positions)`
+        scheme). Safe to cache `full_block_table_row`-derived data keyed
+        only on the selection's generation (not also on `num_prompt`/the
+        row's own contents) because both are themselves constant for the
+        whole turn: `num_prompt` is fixed once a turn's query is submitted,
+        and the STABLE blocks this caches are -- by `compute_base_gather_
+        view`'s own historical-position invariant -- never touched again by
+        this or any later decode step of the same turn."""
         from .kv_cache_utils import compute_base_gather_view
 
         cache = self._base_gather_view_cache()
-        cache_key = id(selected_positions)
         cached = cache.get(req_id)
-        if cached is not None and cached[0] == cache_key:
+        if cached is not None and cached[0] == selection_generation:
             return cached[1]
-        base_block_indices = self._get_base_block_indices(req_id, selected_positions, block_size)
+        base_block_indices = self._get_base_block_indices(
+            req_id, selected_positions, block_size, selection_generation
+        )
         base_view = compute_base_gather_view(
             full_block_table_row=full_block_table_row,
             block_size=block_size,
             base_block_indices=base_block_indices,
             num_prompt=num_prompt,
         )
-        cache[req_id] = (cache_key, base_view)
+        cache[req_id] = (selection_generation, base_view)
         return base_view
 
     def _build_attention_metadata(self, *args, **kwargs):
@@ -314,9 +347,16 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         any_patched = False
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
-            selected_positions = sparse_selection_registry.get(req_id)
-            if selected_positions is None:
+            # get_with_generation(), not get() -- one atomic snapshot of
+            # (generation, positions) under a single lock, not two separate
+            # calls. See sparse_selection_registry.py's "Generation counter"
+            # section: reading these separately could race against a
+            # concurrent register() the same way the id()-based cache this
+            # replaced already did, just narrower.
+            registered = sparse_selection_registry.get_with_generation(req_id)
+            if registered is None:
                 continue  # no active selection for this request -- leave untouched
+            selection_generation, selected_positions = registered
 
             num_computed = int(num_computed_tokens_cpu[req_idx])
             num_prompt = int(num_prompt_tokens_cpu[req_idx])
@@ -337,7 +377,8 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             full_block_table_row = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD)[req_idx]
 
             base_view = self._get_base_gather_view(
-                req_id, selected_positions, block_size, full_block_table_row, num_prompt
+                req_id, selected_positions, block_size, full_block_table_row, num_prompt,
+                selection_generation,
             )
             gathered = self._compute_gathered_view(
                 base_view=base_view,

@@ -44,12 +44,49 @@ Populated inside the target Worker's own process (see
 always runs out-of-process from the driver, confirmed on real hardware for
 the physical-pruning pipeline's own identical cross-process requirement
 (see `worker.py`'s docstring).
+
+## Generation counter -- a real bug this fixes, not defensive plumbing
+
+`sparse_target_runner.py`'s per-turn caches used to key their invalidation
+on `id(selected_positions)` -- the theory being that `register()` always
+stores a NEW list object, so a fresh `id()` each turn reliably signals
+"this is a different selection, recompute." That's true only while the
+OLD list is still alive. Once a turn ends (`discard()` drops this
+registry's own reference) and nothing else holds the object, CPython frees
+it immediately and its address becomes eligible for reuse by the very next
+allocation -- which can easily be the NEXT turn's own `list(selected_
+positions)` call. If that new list happens to land at the same freed
+address, `id()` collides with the OLD (already-freed) list's id, and the
+runner's cache -- which is never proactively cleared, only compared by
+key -- silently believes "same selection as last turn, reuse the cached
+block indices," gathering blocks that belong to an entirely different,
+stale selection.
+
+Confirmed as the real cause of a production symptom, not a theoretical
+gap: `predict_scbench.py` SPARSE runs showed genuinely non-deterministic
+output (different generations from IDENTICAL re-runs at temperature=0)
+that degenerated into repetition loops -- exactly what attending to a
+stale, mismatched selection would produce, and exactly the kind of bug
+that would depend on incidental memory-allocator timing rather than on
+the model's own (deterministic) computation, explaining the run-to-run
+variance.
+
+`_next_generation` is a simple monotonic counter, incremented on every
+`register()` call regardless of `request_id` -- it has no relationship to
+any object's lifetime or memory address, so it cannot collide the way
+`id()` did. Exposed via `get_with_generation()` (not a separate call from
+`get()`) specifically so a caller reads the positions and the generation
+that produced them as one atomic snapshot under a single lock acquisition
+-- reading them via two separate calls would reopen a narrower version of
+the same class of bug if `register()` ran in between.
 """
 
 import threading
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 _registry: Dict[str, List[int]] = {}
+_generations: Dict[str, int] = {}
+_next_generation = 0
 _lock = threading.Lock()
 
 
@@ -59,8 +96,11 @@ def register(request_id: str, selected_positions: List[int]) -> None:
     docstring), sorted or not (callers should sort for determinism, but
     this module doesn't require it -- `sparse_target_runner.py`'s gather
     doesn't care about input order, it just goes into a block-index set)."""
+    global _next_generation
     with _lock:
         _registry[request_id] = list(selected_positions)
+        _generations[request_id] = _next_generation
+        _next_generation += 1
 
 
 def get(request_id: str) -> Optional[List[int]]:
@@ -71,12 +111,28 @@ def get(request_id: str) -> Optional[List[int]]:
         return _registry.get(request_id)
 
 
+def get_with_generation(request_id: str) -> Optional[Tuple[int, List[int]]]:
+    """Returns (generation, selected_positions) as one atomic snapshot, or
+    None if there's no active selection -- see module docstring's
+    "Generation counter" section for why this must be one call, not
+    `get()` plus a separate generation lookup. Callers that only need the
+    positions (e.g. tests, or anything not doing per-turn caching) should
+    keep using plain `get()`."""
+    with _lock:
+        positions = _registry.get(request_id)
+        if positions is None:
+            return None
+        return _generations[request_id], positions
+
+
 def discard(request_id: str) -> None:
     with _lock:
         _registry.pop(request_id, None)
+        _generations.pop(request_id, None)
 
 
 def clear() -> None:
     """For tests only -- resets the whole registry."""
     with _lock:
         _registry.clear()
+        _generations.clear()
