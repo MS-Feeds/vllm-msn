@@ -221,6 +221,37 @@ is where these should be checked first, before trusting any real sweep:
    scheduling from the corrected fields directly -- `schedule()`'s own
    `else: return None` branch in the stock builder already proves `None`
    is a legitimate input the kernel must handle.
+8. **Off-by-one: the gather was built for `num_computed_tokens`, not the
+   step's real sequence length -- a THIRD independent correctness bug,
+   confirmed after 5, 6 and 7 were all fixed and still producing
+   repetition loops at every keep rate below the dense baseline.** This
+   method fed `self.input_batch.num_computed_tokens_cpu_tensor[req_idx]`
+   straight into `kv_cache_utils`'s gather as if it were the sequence
+   length. It isn't: the stock runner computes
+   `self.seq_lens[:num_reqs] = self.num_computed_tokens[:num_reqs] +
+   num_scheduled_tokens_gpu` (`gpu_model_runner.py`), i.e.
+   `num_computed_tokens_cpu` is the count BEFORE this step's own scheduled
+   token, so a decode step's true length is one MORE. Every length the
+   gather derived (`num_full_blocks_present`, `last_real_block_index`,
+   `last_real_block_occupancy`, and the `range(num_prompt, ...)`
+   force-keep tail) was therefore one token short, with two consequences
+   on EVERY decode step: the token currently being decoded could not
+   attend to its own key/value, and whenever it happened to open a fresh
+   block (`seq_len % block_size == 1`) the block physically holding it
+   wasn't in the gathered block table at all. Fixed by reading
+   `_step_seq_len()` (from `optimistic_seq_lens_cpu`, the same CPU tensor
+   the stock builder derives `seq_lens`/`max_seq_len` from) and renaming
+   the `kv_cache_utils` parameter from `num_computed` to `seq_len` so the
+   contract can't be misread the same way again.
+
+   Why the existing checks all missed it: the gather's own unit tests were
+   self-consistent with the wrong caller (they passed the same
+   "num_computed" convention the caller did), `compute_sparse_gather_view`
+   returns `None` for a full selection so keep=1.0-shaped cases never
+   exercised the arithmetic, and `diagnose_target_gather_metadata.py`
+   compares only the BLOCK COUNT of the gather against an independent
+   recomputation -- never the `seq_lens` value, which is where the whole
+   defect lived.
 """
 
 import time
@@ -408,8 +439,23 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 # deliberately left at full, unrestricted attention (see
                 # module docstring's "Force-keep" section and the approved
                 # plan's decode-only scope decision). Only decode steps
-                # (num_computed >= num_prompt) get gathered.
+                # (num_computed >= num_prompt) get gathered. This guard is
+                # the ONE place `num_computed` is the right quantity to
+                # compare against -- everything below needs `step_seq_len`
+                # instead, see the next comment.
                 continue
+
+            # The step's TOTAL sequence length -- NOT `num_computed`. See
+            # module docstring's "Off-by-one" section: `num_computed_tokens
+            # _cpu` is the count BEFORE this step's own scheduled token, so
+            # for a decode step the real length is one more. This is read
+            # from `optimistic_seq_lens_cpu` -- the exact CPU-side tensor
+            # the stock builder itself derives `AttentionMetadata.seq_lens`
+            # /`max_seq_len` from, already populated by `_prepare_inputs`
+            # before this override runs -- so it needs no GPU sync (unlike
+            # reading the built `seq_lens` GPU tensor back) and cannot
+            # drift from what the kernel would otherwise have been told.
+            step_seq_len = self._step_seq_len(req_idx)
 
             t_override_start = time.time()
             # Read once per request, not once inside _compute_gathered_view
@@ -428,7 +474,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 full_block_table_row=full_block_table_row,
                 block_size=block_size,
                 num_prompt=num_prompt,
-                num_computed=num_computed,
+                seq_len=step_seq_len,
             )
             if gathered is None:
                 continue
@@ -550,13 +596,48 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         accum = self._override_timing_accum()
         return accum.pop(request_id, (0.0, 0))
 
+    def _step_seq_len(self, req_idx: int) -> int:
+        """This step's TOTAL sequence length for `req_idx` -- the same
+        `num_computed_tokens + num_scheduled_tokens` the stock builder puts
+        in `AttentionMetadata.seq_lens[req_idx]`, read from the CPU-side
+        tensor it derives that from (`self.optimistic_seq_lens_cpu`,
+        populated in `_prepare_inputs` well before this override runs, and
+        used by the stock `_build_attention_metadata` itself for
+        `max_seq_len`). Read from CPU deliberately: pulling the built
+        `seq_lens` GPU tensor back would force a sync on every decode step
+        of the sparse path, exactly the class of cost the `max_seq_len`
+        fix-up already had to be restructured to avoid (see module
+        docstring's Known risk area #5).
+
+        Factored into its own method (rather than inlined) so a test can
+        drive `_apply_sparse_attention_overrides` against a stub runner
+        without having to fabricate the whole `optimistic_seq_lens_cpu`
+        buffer, and so the "which length does the gather need?" question --
+        the entire content of the off-by-one bug this fixes -- has exactly
+        one answer in exactly one place.
+        """
+        try:
+            return int(self.optimistic_seq_lens_cpu[req_idx])
+        except AttributeError as exc:
+            raise AttributeError(
+                f"{type(self).__name__} has no 'optimistic_seq_lens_cpu' -- "
+                f"this module reads the step's true sequence length "
+                f"(num_computed_tokens + num_scheduled_tokens) from it, the "
+                f"same CPU tensor the stock _build_attention_metadata uses "
+                f"for max_seq_len. If this vLLM version renamed it, update "
+                f"_step_seq_len; do NOT fall back to "
+                f"num_computed_tokens_cpu_tensor, which is one token short "
+                f"for a decode step and was a real, confirmed correctness "
+                f"bug (see this module's 'Off-by-one' docstring section)."
+            ) from exc
+
     def _compute_gathered_view(
         self,
         base_view,
         full_block_table_row,
         block_size: int,
         num_prompt: int,
-        num_computed: int,
+        seq_len: int,
     ) -> Optional[tuple]:
         """Thin wrapper delegating the actual block-selection/seq_len
         arithmetic to `kv_cache_utils.compute_sparse_gather_view_incremental`
@@ -581,7 +662,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             full_block_table_row=full_block_table_row,
             block_size=block_size,
             num_prompt=num_prompt,
-            num_computed=num_computed,
+            seq_len=seq_len,
         )
 
     @staticmethod

@@ -220,21 +220,28 @@ class InstrumentedSparseTargetGPUModelRunner(SparseTargetGPUModelRunner):
             pushed.discard(request_id)
 
     def _compute_gathered_view(
-        self, base_view, full_block_table_row, block_size, num_prompt, num_computed
+        self, base_view, full_block_table_row, block_size, num_prompt, seq_len
     ):
+        # `seq_len`, not `num_computed` -- renamed in lockstep with
+        # `sparse_target_runner.py`/`kv_cache_utils.py` when the gather's
+        # length parameter was corrected from `num_computed_tokens` to the
+        # step's real `num_computed_tokens + num_scheduled_tokens` (see
+        # `compute_sparse_gather_view`'s `seq_len` Args entry). This
+        # override must keep the base method's exact signature or the
+        # base's own keyword call raises TypeError.
         gathered = super()._compute_gathered_view(
             base_view=base_view,
             full_block_table_row=full_block_table_row,
             block_size=block_size,
             num_prompt=num_prompt,
-            num_computed=num_computed,
+            seq_len=seq_len,
         )
         if gathered is None:
             # Degenerate no-op case (selection covers every resident
             # block already, e.g. keep_rate=1.0) -- the dense fallback
             # block count is exactly the number of blocks allocated so
             # far, same ceil-div the base module's own range checks use.
-            blocks_loaded = -(-num_computed // block_size)
+            blocks_loaded = -(-seq_len // block_size)
         else:
             _, gathered_seq_len = gathered
             blocks_loaded = -(-gathered_seq_len // block_size)

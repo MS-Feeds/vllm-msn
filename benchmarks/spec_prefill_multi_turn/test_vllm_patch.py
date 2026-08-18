@@ -23,6 +23,22 @@ CPU-testable, and the sparse-attention experiment path's correctness
 depends on its arithmetic being exactly right; see that class's own
 docstring for what it's translating between and why).
 
+`sparse_target_runner.py::SparseTargetGPUModelRunner` is a PARTIAL
+exception to the "no vLLM runtime" rule above: `_apply_sparse_attention_
+overrides` and `_step_seq_len` are exercised here against a hand-built
+fake runner, with stub base classes standing in for the two vLLM symbols
+that module imports at top level (see `_load_sparse_target_runner`'s
+docstring for exactly what that does and does NOT prove). This exists
+because both of the bugs that produced repetition-loop SPARSE output --
+the gather being fed `num_computed_tokens` instead of the step's real
+`seq_len`, and the chat-template scaffolding never reaching the registered
+selection -- lived in caller wiring that the pure-`kv_cache_utils` tests
+were structurally unable to see: those tests were self-consistent with the
+wrong caller. `_build_attention_metadata` is still not exercised (its body
+is the `super()` call a stub can't honestly stand in for), and every
+field-name/backend assumption remains `validate_sparse_attention.py`'s job
+on real hardware.
+
 Run with: python3 test_vllm_patch.py
 """
 
@@ -386,10 +402,12 @@ def test_gather_keys_for_slots():
 
 
 def test_compute_sparse_gather_view_basic_selection():
-    """block_size=4, 6 blocks resident (24 tokens computed, decode step at
-    the very start so num_prompt == num_computed == 24 -- no in-progress
-    decode tail to force-keep yet). Selecting positions in blocks 0 and 3
-    should gather exactly those two blocks, in ascending order."""
+    """block_size=4, 6 blocks resident, `seq_len == num_prompt == 24` --
+    a pure-arithmetic edge case with no in-progress decode tail at all
+    (a REAL decode step always has `seq_len >= num_prompt + 1`, see
+    `test_gather_view_includes_the_token_being_decoded`). Selecting
+    positions in blocks 0 and 3 should gather exactly those two blocks,
+    in ascending order."""
     block_size = 4
     full_block_table_row = torch.tensor([100, 101, 102, 103, 104, 105])  # 6 blocks
     result = compute_sparse_gather_view(
@@ -397,7 +415,7 @@ def test_compute_sparse_gather_view_basic_selection():
         block_size=block_size,
         base_block_indices=block_indices_from_positions([1, 14], block_size),  # blocks 0, 3
         num_prompt=24,
-        num_computed=24,
+        seq_len=24,
     )
     assert result is not None
     gathered_row, gathered_seq_len = result
@@ -407,20 +425,21 @@ def test_compute_sparse_gather_view_basic_selection():
 
 def test_compute_sparse_gather_view_force_keeps_in_progress_decode_tail():
     """Even with an empty selection, tokens generated so far THIS turn
-    (num_prompt..num_computed) must always be force-included -- the model
+    (num_prompt..seq_len) must always be force-included -- the model
     needs coherent access to what it just generated within the same turn,
     regardless of what the speculator chose."""
     block_size = 4
     full_block_table_row = torch.tensor([100, 101, 102, 103, 104])  # 5 blocks
     # num_prompt=16 (4 blocks fully resident before this turn's decode
-    # started), num_computed=18 (2 tokens generated so far this turn, both
-    # landing in block index 4 -- positions 16, 17).
+    # started), seq_len=18 -- so positions 16 and 17 belong to this turn's
+    # own generated tail (position 17 being the token currently decoding),
+    # both landing in block index 4.
     result = compute_sparse_gather_view(
         full_block_table_row=full_block_table_row,
         block_size=block_size,
         base_block_indices=set(),  # nothing selected by the speculator at all
         num_prompt=16,
-        num_computed=18,
+        seq_len=18,
     )
     assert result is not None
     gathered_row, gathered_seq_len = result
@@ -436,7 +455,7 @@ def test_compute_sparse_gather_view_combines_selection_and_force_keep():
         block_size=block_size,
         base_block_indices=block_indices_from_positions([0], block_size),  # block 0
         num_prompt=16,
-        num_computed=17,  # 1 token generated so far this turn -> block 4
+        seq_len=17,  # 1 token generated so far this turn -> block 4
     )
     assert result is not None
     gathered_row, gathered_seq_len = result
@@ -455,7 +474,7 @@ def test_compute_sparse_gather_view_degenerate_full_selection_returns_none():
         block_size=block_size,
         base_block_indices=block_indices_from_positions([0, 4], block_size),  # blocks 0, 1
         num_prompt=8,
-        num_computed=8,
+        seq_len=8,
     )
     assert result is None
 
@@ -472,7 +491,7 @@ def test_compute_sparse_gather_view_out_of_range_raises():
             block_size=block_size,
             base_block_indices=block_indices_from_positions([100], block_size),  # block 25
             num_prompt=8,
-            num_computed=8,
+            seq_len=8,
         )
         raise AssertionError("expected ValueError for out-of-range block selection")
     except ValueError:
@@ -492,7 +511,7 @@ def test_compute_sparse_gather_view_preserves_ascending_order():
         # blocks 3, 0, 1 -- deliberately unordered input positions
         base_block_indices=block_indices_from_positions([12, 0, 4], block_size),
         num_prompt=16,
-        num_computed=16,
+        seq_len=16,
     )
     assert result is not None
     gathered_row, _ = result
@@ -523,12 +542,12 @@ def test_compute_sparse_gather_view_does_not_mutate_caller_base_set():
         block_size=block_size,
         base_block_indices=base_block_indices,
         num_prompt=16,
-        num_computed=17,  # force-keep tail would add block 4 if it mutated the input
+        seq_len=17,  # force-keep tail would add block 4 if it mutated the input
     )
     assert base_block_indices == original
 
 
-def _run_both_gather_paths(full_block_table_row, block_size, base_block_indices, num_prompt, num_computed, base_view=None):
+def _run_both_gather_paths(full_block_table_row, block_size, base_block_indices, num_prompt, seq_len, base_view=None):
     """Runs both the old ground-truth `compute_sparse_gather_view` (full
     recompute every call) and the new `compute_base_gather_view` +
     `compute_sparse_gather_view_incremental` (base view cached/reused
@@ -550,7 +569,7 @@ def _run_both_gather_paths(full_block_table_row, block_size, base_block_indices,
             block_size=block_size,
             base_block_indices=set(base_block_indices),
             num_prompt=num_prompt,
-            num_computed=num_computed,
+            seq_len=seq_len,
         )
     except ValueError as e:
         old_result = None
@@ -563,28 +582,28 @@ def _run_both_gather_paths(full_block_table_row, block_size, base_block_indices,
             full_block_table_row=full_block_table_row,
             block_size=block_size,
             num_prompt=num_prompt,
-            num_computed=num_computed,
+            seq_len=seq_len,
         )
     except ValueError as e:
         new_result = None
         new_error = e
 
     assert (old_error is None) == (new_error is None), (
-        f"error mismatch at num_computed={num_computed}: old={old_error!r} new={new_error!r}"
+        f"error mismatch at seq_len={seq_len}: old={old_error!r} new={new_error!r}"
     )
     if old_error is None:
         if old_result is None or new_result is None:
             assert old_result is None and new_result is None, (
-                f"None mismatch at num_computed={num_computed}: old={old_result} new={new_result}"
+                f"None mismatch at seq_len={seq_len}: old={old_result} new={new_result}"
             )
         else:
             old_row, old_seq_len = old_result
             new_row, new_seq_len = new_result
             assert torch.equal(old_row, new_row), (
-                f"row mismatch at num_computed={num_computed}: old={old_row} new={new_row}"
+                f"row mismatch at seq_len={seq_len}: old={old_row} new={new_row}"
             )
             assert old_seq_len == new_seq_len, (
-                f"seq_len mismatch at num_computed={num_computed}: old={old_seq_len} new={new_seq_len}"
+                f"seq_len mismatch at seq_len={seq_len}: old={old_seq_len} new={new_seq_len}"
             )
     return base_view
 
@@ -602,27 +621,27 @@ def test_gather_view_incremental_matches_full_recompute_on_existing_scenarios():
 
     _run_both_gather_paths(
         torch.tensor([100, 101, 102, 103, 104, 105]), block_size,
-        block_indices_from_positions([1, 14], block_size), num_prompt=24, num_computed=24,
+        block_indices_from_positions([1, 14], block_size), num_prompt=24, seq_len=24,
     )
     _run_both_gather_paths(
         torch.tensor([100, 101, 102, 103, 104]), block_size,
-        set(), num_prompt=16, num_computed=18,
+        set(), num_prompt=16, seq_len=18,
     )
     _run_both_gather_paths(
         torch.tensor([100, 101, 102, 103, 104]), block_size,
-        block_indices_from_positions([0], block_size), num_prompt=16, num_computed=17,
+        block_indices_from_positions([0], block_size), num_prompt=16, seq_len=17,
     )
     _run_both_gather_paths(
         torch.tensor([100, 101]), block_size,
-        block_indices_from_positions([0, 4], block_size), num_prompt=8, num_computed=8,
+        block_indices_from_positions([0, 4], block_size), num_prompt=8, seq_len=8,
     )
     _run_both_gather_paths(
         torch.tensor([100, 101]), block_size,
-        block_indices_from_positions([100], block_size), num_prompt=8, num_computed=8,
+        block_indices_from_positions([100], block_size), num_prompt=8, seq_len=8,
     )
     _run_both_gather_paths(
         torch.tensor([100, 101, 102, 103]), block_size,
-        block_indices_from_positions([12, 0, 4], block_size), num_prompt=16, num_computed=16,
+        block_indices_from_positions([12, 0, 4], block_size), num_prompt=16, seq_len=16,
     )
 
 
@@ -640,7 +659,7 @@ def test_gather_view_incremental_matches_full_recompute_across_decode_steps():
         block_size = random.choice([4, 8, 16])
         num_prompt = random.randint(20, 200)
         max_tokens = 20
-        # Headroom must cover every block num_computed can reach across the
+        # Headroom must cover every block seq_len can reach across the
         # whole simulated turn (num_prompt + max_tokens - 1), plus one for
         # the ceil-division boundary -- an earlier version of this test
         # under-allocated headroom and got an IndexError from the OLD
@@ -654,10 +673,16 @@ def test_gather_view_incremental_matches_full_recompute_across_decode_steps():
 
         base_view = None
         for step in range(max_tokens):
-            num_computed = num_prompt + step
+            # `num_prompt + 1 + step`, not `num_prompt + step` -- these are
+            # REAL decode-step sequence lengths (`num_computed_tokens +
+            # num_scheduled_tokens`), so the smallest one a decode step can
+            # ever present is `num_prompt + 1`. See
+            # `kv_cache_utils.compute_sparse_gather_view`'s `seq_len` Args
+            # entry for the off-by-one this distinction encodes.
+            seq_len = num_prompt + 1 + step
             base_view = _run_both_gather_paths(
                 full_block_table_row, block_size, base_block_indices,
-                num_prompt, num_computed, base_view=base_view,
+                num_prompt, seq_len, base_view=base_view,
             )
 
 
@@ -668,7 +693,7 @@ def test_compute_base_gather_view_caches_stable_rows_not_recomputed_per_step():
     stable portion must not be re-gathered on every call to
     `compute_sparse_gather_view_incremental`."""
     block_size = 4
-    # 8 blocks -- enough headroom for num_computed up to 26 (needs block
+    # 8 blocks -- enough headroom for seq_len up to 26 (needs block
     # index up to (26-1)//4 == 6, i.e. 7 blocks; 8 leaves margin).
     full_block_table_row = torch.tensor([100, 101, 102, 103, 104, 105, 106, 107])
     base_block_indices = block_indices_from_positions([1, 14], block_size)  # blocks 0, 3
@@ -679,15 +704,561 @@ def test_compute_base_gather_view_caches_stable_rows_not_recomputed_per_step():
         num_prompt=24,
     )
     stable_rows_id = id(base_view.stable_rows)
-    for num_computed in [24, 25, 26]:
+    for seq_len in [24, 25, 26]:
         compute_sparse_gather_view_incremental(
             base_view=base_view,
             full_block_table_row=full_block_table_row,
             block_size=block_size,
             num_prompt=24,
-            num_computed=num_computed,
+            seq_len=seq_len,
         )
         assert id(base_view.stable_rows) == stable_rows_id
+
+
+def _kernel_visible_positions(
+    gathered_row, gathered_seq_len, full_block_table_row, block_size
+):
+    """Decode a `(gathered_block_table_row, gathered_seq_len)` pair back
+    into the set of CONVERSATION positions a paged-attention kernel would
+    actually read, by doing exactly what the kernel does: for each logical
+    index `i` in `[0, gathered_seq_len)`, look up physical block
+    `gathered_row[i // block_size]` and slot `i % block_size`, then map
+    that physical block id back to the logical block it originally
+    occupied in `full_block_table_row`.
+
+    This is the piece the whole sparse mechanism's correctness actually
+    rests on, and the piece no existing check covered: `diagnose_target_
+    gather_metadata.py` compares the gather's BLOCK COUNT against an
+    independent recomputation, which is blind to a wrong `seq_lens` --
+    and a wrong `seq_lens` was exactly the bug (see
+    `test_gather_view_exposes_the_token_being_decoded`).
+
+    Requires `full_block_table_row` to hold distinct physical block ids,
+    which every caller in this file arranges.
+    """
+    physical_to_logical = {
+        int(block_id): logical
+        for logical, block_id in enumerate(full_block_table_row.tolist())
+    }
+    assert len(physical_to_logical) == len(full_block_table_row), (
+        "helper requires distinct physical block ids in full_block_table_row"
+    )
+    visible = []
+    for i in range(gathered_seq_len):
+        physical = int(gathered_row[i // block_size])
+        visible.append(physical_to_logical[physical] * block_size + (i % block_size))
+    return visible
+
+
+def test_kernel_visible_positions_helper_is_faithful_on_an_ungathered_row():
+    """Sanity-check the helper itself before trusting it below: handed a
+    row that gathers NOTHING (identity block table, full seq_len), it must
+    reproduce `range(seq_len)` exactly -- i.e. it models a plain, dense
+    paged-attention read correctly."""
+    block_size = 4
+    full_block_table_row = torch.tensor([100, 101, 102, 103])
+    visible = _kernel_visible_positions(full_block_table_row, 14, full_block_table_row, block_size)
+    assert visible == list(range(14))
+
+
+def test_gather_view_exposes_the_token_being_decoded():
+    """**Regression test for the off-by-one that caused the repetition
+    loops.** `sparse_target_runner.py` used to pass
+    `num_computed_tokens_cpu_tensor[req_idx]` as the gather's length, but
+    that counter excludes the step's own scheduled token -- the stock
+    runner builds `seq_lens = num_computed_tokens + num_scheduled_tokens`.
+    Every gathered view was therefore one token short, so the token
+    currently being decoded could never attend to its OWN key/value, on
+    every decode step of every turn at every keep rate below the dense
+    baseline.
+
+    The invariant, stated in kernel terms: the highest conversation
+    position the kernel can reach must be `seq_len - 1` -- the token being
+    decoded right now."""
+    block_size = 16
+    num_prompt = 160  # 10 clean blocks of prompt
+    full_block_table_row = torch.arange(1000, 1000 + 32, dtype=torch.int64)
+    # Drop block 3 so the gather is non-degenerate (a full selection
+    # returns None and patches nothing, which is why keep=1.0-shaped
+    # cases never exercised this arithmetic at all).
+    base_block_indices = block_indices_from_positions(
+        [p for p in range(num_prompt) if p // block_size != 3], block_size
+    )
+    base_view = compute_base_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        base_block_indices=base_block_indices,
+        num_prompt=num_prompt,
+    )
+    for step in range(6):
+        seq_len = num_prompt + 1 + step  # a real decode step's seq_lens value
+        result = compute_sparse_gather_view_incremental(
+            base_view=base_view,
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            num_prompt=num_prompt,
+            seq_len=seq_len,
+        )
+        assert result is not None, f"unexpected degenerate result at seq_len={seq_len}"
+        gathered_row, gathered_seq_len = result
+        visible = _kernel_visible_positions(
+            gathered_row, gathered_seq_len, full_block_table_row, block_size
+        )
+        assert seq_len - 1 in visible, (
+            f"the token being decoded (position {seq_len - 1}) is not visible "
+            f"to the kernel at seq_len={seq_len}; highest visible position is "
+            f"{max(visible)} -- this is the off-by-one regression"
+        )
+        assert max(visible) == seq_len - 1, (
+            f"kernel can reach position {max(visible)} at seq_len={seq_len}, "
+            f"past the token being decoded ({seq_len - 1})"
+        )
+
+
+def test_gather_view_opens_a_fresh_block_for_the_decoding_token():
+    """The sharper half of the same off-by-one: when the decoding token is
+    the first occupant of a brand-new block (`seq_len % block_size == 1`),
+    the old code didn't merely under-count `seq_lens` -- the block
+    physically holding that token wasn't in the gathered block table at
+    all, because the force-keep tail was derived from the short length.
+
+    `num_prompt` is a clean multiple of `block_size` here, so the very
+    first decode step is exactly that case."""
+    block_size = 8
+    num_prompt = 64  # 8 clean blocks -> position 64 opens block 8
+    full_block_table_row = torch.arange(1000, 1000 + 16, dtype=torch.int64)
+    base_block_indices = block_indices_from_positions(
+        [p for p in range(num_prompt) if p // block_size != 5], block_size
+    )
+    base_view = compute_base_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        base_block_indices=base_block_indices,
+        num_prompt=num_prompt,
+    )
+    result = compute_sparse_gather_view_incremental(
+        base_view=base_view,
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        num_prompt=num_prompt,
+        seq_len=num_prompt + 1,
+    )
+    assert result is not None
+    gathered_row, gathered_seq_len = result
+    # Block 8 (physical id 1008) must be gathered, holding exactly 1 token.
+    assert 1008 in gathered_row.tolist(), (
+        f"block holding the decoding token was not gathered: {gathered_row.tolist()}"
+    )
+    visible = _kernel_visible_positions(
+        gathered_row, gathered_seq_len, full_block_table_row, block_size
+    )
+    assert visible[-1] == num_prompt, (
+        f"expected position {num_prompt} last, got {visible[-1]}"
+    )
+    assert visible.count(num_prompt) == 1
+
+
+def test_gather_view_exposes_only_selected_or_this_turns_own_positions():
+    """The complement of the two tests above: widening the view must not
+    have made it expose blocks nobody asked for. Everything the kernel can
+    read has to come from either the speculator's own selection or this
+    turn's force-kept tail `[num_prompt, seq_len)`."""
+    block_size = 8
+    num_prompt = 60  # deliberately NOT a multiple of block_size
+    full_block_table_row = torch.arange(1000, 1000 + 16, dtype=torch.int64)
+    selected_positions = [1, 2, 30, 31, 59]
+    base_block_indices = block_indices_from_positions(selected_positions, block_size)
+    base_view = compute_base_gather_view(
+        full_block_table_row=full_block_table_row,
+        block_size=block_size,
+        base_block_indices=base_block_indices,
+        num_prompt=num_prompt,
+    )
+    for step in range(6):
+        seq_len = num_prompt + 1 + step
+        result = compute_sparse_gather_view_incremental(
+            base_view=base_view,
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            num_prompt=num_prompt,
+            seq_len=seq_len,
+        )
+        assert result is not None
+        gathered_row, gathered_seq_len = result
+        visible = set(
+            _kernel_visible_positions(
+                gathered_row, gathered_seq_len, full_block_table_row, block_size
+            )
+        )
+        allowed_blocks = set(base_block_indices) | {
+            p // block_size for p in range(num_prompt, seq_len)
+        }
+        for pos in visible:
+            assert pos // block_size in allowed_blocks, (
+                f"position {pos} (block {pos // block_size}) is visible at "
+                f"seq_len={seq_len} but belongs to no selected or force-kept block"
+            )
+            assert pos < seq_len, (
+                f"position {pos} is visible at seq_len={seq_len} but hasn't "
+                f"been written yet -- the kernel would read an uninitialized slot"
+            )
+
+
+def _load_sparse_target_runner():
+    """Import `vllm_patch.sparse_target_runner` even though vLLM isn't
+    installed, by standing in minimal base classes for the two symbols it
+    imports at module level (`GPUModelRunner`, `Worker`). Only stubs when
+    the real package is genuinely absent, so this never shadows a real
+    install.
+
+    **What this does and does NOT prove.** The stub base classes are empty,
+    and `SparseTargetGPUModelRunner` never calls up into them from the
+    method under test -- `_apply_sparse_attention_overrides` reads only
+    attributes the test itself supplies. So these tests exercise this
+    module's OWN logic (which length it reads, what it writes into each
+    layer's metadata) with no pretence of validating the surrounding vLLM
+    contract; that the fields exist and mean what this module assumes is
+    still `validate_sparse_attention.py`'s job on real hardware, per the
+    module's own "Known risk areas". The `_build_attention_metadata`
+    override is deliberately NOT exercised here, since its whole body is
+    the `super()` call the stub can't honestly stand in for."""
+    import importlib
+    import types
+
+    try:
+        importlib.import_module("vllm.v1.worker.gpu_model_runner")
+    except ImportError:
+        stubs = {
+            "vllm": {},
+            "vllm.v1": {},
+            "vllm.v1.worker": {},
+            "vllm.v1.worker.gpu_model_runner": {
+                "GPUModelRunner": type("GPUModelRunner", (), {})
+            },
+            "vllm.v1.worker.gpu_worker": {"Worker": type("Worker", (), {})},
+        }
+        for name, attrs in stubs.items():
+            module = sys.modules.setdefault(name, types.ModuleType(name))
+            for attr, value in attrs.items():
+                setattr(module, attr, value)
+            if "." in name:
+                parent, _, child = name.rpartition(".")
+                setattr(sys.modules[parent], child, module)
+    return importlib.import_module("vllm_patch.sparse_target_runner")
+
+
+class _FakeLayerMetadata:
+    """Stands in for one backend's per-layer `AttentionMetadata`, carrying
+    exactly the four fields `sparse_target_runner.py` patches."""
+
+    def __init__(self, block_table, seq_lens, max_seq_len, scheduler_metadata="AOT-SCHEDULE"):
+        self.block_table = block_table
+        self.seq_lens = seq_lens
+        self.max_seq_len = max_seq_len
+        self.scheduler_metadata = scheduler_metadata
+
+
+class _FakeInputBatch:
+    def __init__(self, req_ids, num_computed_tokens, num_prompt_tokens):
+        self.req_ids = list(req_ids)
+        self.num_reqs = len(self.req_ids)
+        self.num_computed_tokens_cpu_tensor = torch.tensor(
+            num_computed_tokens, dtype=torch.int32
+        )
+        self.num_prompt_tokens_cpu_tensor = torch.tensor(
+            num_prompt_tokens, dtype=torch.int32
+        )
+
+
+def _make_fake_runner(
+    runner_module,
+    block_size,
+    req_ids,
+    num_computed_tokens,
+    num_prompt_tokens,
+    step_seq_lens,
+    block_table_width=32,
+    num_layers=3,
+):
+    """Builds a `SparseTargetGPUModelRunner` with only the attributes
+    `_apply_sparse_attention_overrides` reads, bypassing
+    `GPUModelRunner.__init__` entirely (whose real signature this module
+    deliberately never depends on -- see its `*args/**kwargs` passthrough).
+
+    `step_seq_lens` is what a REAL `_prepare_inputs` would have put in
+    `optimistic_seq_lens_cpu`: `num_computed_tokens + num_scheduled_tokens`.
+    Passing it separately from `num_computed_tokens` is the entire point --
+    the two differ by exactly the off-by-one these tests guard."""
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+    runner.input_batch = _FakeInputBatch(req_ids, num_computed_tokens, num_prompt_tokens)
+    runner.optimistic_seq_lens_cpu = torch.tensor(step_seq_lens, dtype=torch.int32)
+
+    cache_config = type("CacheConfig", (), {"block_size": block_size})()
+    runner.vllm_config = type("VllmConfig", (), {"cache_config": cache_config})()
+
+    num_reqs = len(req_ids)
+    # Distinct physical block ids per row so _kernel_visible_positions can
+    # invert the gather unambiguously.
+    block_table = torch.stack([
+        torch.arange(1000 + r * block_table_width,
+                     1000 + (r + 1) * block_table_width, dtype=torch.int64)
+        for r in range(num_reqs)
+    ])
+    seq_lens = torch.tensor(step_seq_lens, dtype=torch.int32)
+    stale_max_seq_len = int(seq_lens.max().item())
+    attn_metadata = {
+        f"layer.{i}": _FakeLayerMetadata(
+            block_table=block_table.clone(),
+            seq_lens=seq_lens.clone(),
+            max_seq_len=stale_max_seq_len,
+        )
+        for i in range(num_layers)
+    }
+    return runner, attn_metadata
+
+
+def test_apply_overrides_uses_the_step_seq_len_not_num_computed_tokens():
+    """**The runner-level regression test for the off-by-one.** The bug
+    was never in `kv_cache_utils`'s arithmetic -- it was in which number
+    this method handed it. `num_computed_tokens_cpu_tensor[req_idx]` is
+    the count BEFORE this step's scheduled token; the stock runner builds
+    `seq_lens = num_computed_tokens + num_scheduled_tokens`.
+
+    Setup: block_size=16, a 160-token prompt (10 clean blocks), the first
+    decode step -- so `num_computed_tokens == 160` while the real
+    `seq_lens` for the step is 161. The selection drops block 3.
+
+    Correct: 9 stable blocks (0,1,2,4..9) + block 10 holding the decoding
+    token at position 160 -> 10 blocks, `seq_lens = 9*16 + 1 = 145`.
+    The old code, fed 160, produced 9 blocks and `seq_lens = 144` -- block
+    10 absent entirely, the decoding token invisible to itself."""
+    runner_module = _load_sparse_target_runner()
+    block_size, num_prompt = 16, 160
+    runner, attn_metadata = _make_fake_runner(
+        runner_module, block_size,
+        req_ids=["conv::sparse-session"],
+        num_computed_tokens=[num_prompt],      # first decode step
+        num_prompt_tokens=[num_prompt],
+        step_seq_lens=[num_prompt + 1],        # what vLLM tells the kernel
+    )
+    selection = [p for p in range(num_prompt) if p // block_size != 3]
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register("conv::sparse-session", selection)
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    for layer_name, layer in attn_metadata.items():
+        patched_seq_len = int(layer.seq_lens[0])
+        assert patched_seq_len == 145, (
+            f"{layer_name}: patched seq_lens={patched_seq_len}, expected 145. "
+            f"144 means the old num_computed_tokens value is being used again"
+        )
+        gathered = layer.block_table[0, :10]
+        assert gathered.tolist() == [1000, 1001, 1002, 1004, 1005, 1006, 1007,
+                                     1008, 1009, 1010], (
+            f"{layer_name}: unexpected gathered blocks {gathered.tolist()} -- "
+            f"1010 (holding the decoding token at position 160) must be present"
+        )
+        # Everything past the gathered prefix is NULL-padded, not stale.
+        assert layer.block_table[0, 10:].abs().sum().item() == 0
+
+
+def test_apply_overrides_result_lets_the_kernel_reach_the_decoding_token():
+    """Same setup as above, stated in the terms that actually matter: feed
+    the PATCHED metadata through the same paged-read model the kernel uses
+    and check the decoding token is reachable. Guards the wiring end to
+    end (which length is read, what is written, how it is padded) rather
+    than the individual field values."""
+    runner_module = _load_sparse_target_runner()
+    block_size, num_prompt = 16, 176  # 11 clean blocks
+    runner, attn_metadata = _make_fake_runner(
+        runner_module, block_size,
+        req_ids=["r0"],
+        num_computed_tokens=[num_prompt + 3],
+        num_prompt_tokens=[num_prompt],
+        step_seq_lens=[num_prompt + 4],
+    )
+    original_row = attn_metadata["layer.0"].block_table[0].clone()
+    selection = [p for p in range(num_prompt) if p // block_size not in (2, 7)]
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register("r0", selection)
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    layer = attn_metadata["layer.0"]
+    patched_seq_len = int(layer.seq_lens[0])
+    visible = _kernel_visible_positions(
+        layer.block_table[0], patched_seq_len, original_row, block_size
+    )
+    assert max(visible) == num_prompt + 3, (
+        f"kernel's highest reachable position is {max(visible)}, expected "
+        f"{num_prompt + 3} (the token being decoded)"
+    )
+    # The dropped blocks really are dropped -- the fix widened the view by
+    # exactly one token, it didn't quietly disable the gather.
+    assert not any(pos // block_size in (2, 7) for pos in visible)
+
+
+def test_apply_overrides_leaves_prefill_steps_untouched():
+    """`num_computed_tokens < num_prompt_tokens` means this turn's own
+    query is still being prefilled -- deliberately full attention. The
+    guard must key on `num_computed_tokens`, NOT on the step seq_len,
+    which is larger and would misclassify the last prefill chunk as a
+    decode step."""
+    runner_module = _load_sparse_target_runner()
+    block_size, num_prompt = 16, 160
+    runner, attn_metadata = _make_fake_runner(
+        runner_module, block_size,
+        req_ids=["r0"],
+        num_computed_tokens=[96],        # mid-prefill
+        num_prompt_tokens=[num_prompt],
+        step_seq_lens=[160],             # this chunk finishes the prompt
+    )
+    before = {name: (layer.block_table.clone(), layer.seq_lens.clone(),
+                     layer.max_seq_len, layer.scheduler_metadata)
+              for name, layer in attn_metadata.items()}
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register("r0", list(range(0, 96, 2)))
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    for name, layer in attn_metadata.items():
+        old_bt, old_sl, old_max, old_sched = before[name]
+        assert torch.equal(layer.block_table, old_bt)
+        assert torch.equal(layer.seq_lens, old_sl)
+        assert layer.max_seq_len == old_max
+        assert layer.scheduler_metadata == old_sched
+
+
+def test_apply_overrides_leaves_unregistered_requests_untouched():
+    """No registered selection (e.g. a different pipeline's request, or a
+    turn whose selection was already discarded) means no patching at all."""
+    runner_module = _load_sparse_target_runner()
+    runner, attn_metadata = _make_fake_runner(
+        runner_module, 16,
+        req_ids=["not-registered"],
+        num_computed_tokens=[160],
+        num_prompt_tokens=[160],
+        step_seq_lens=[161],
+    )
+    before = attn_metadata["layer.0"].seq_lens.clone()
+
+    sparse_selection_registry.clear()
+    try:
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    assert torch.equal(attn_metadata["layer.0"].seq_lens, before)
+    assert attn_metadata["layer.0"].scheduler_metadata == "AOT-SCHEDULE"
+
+
+def test_apply_overrides_fixes_max_seq_len_and_nulls_scheduler_metadata():
+    """Covers the two previously-confirmed bugs alongside the new one, so a
+    later refactor can't quietly drop either: `max_seq_len` must be
+    recomputed from the POST-gather seq_lens (it sizes the FA kernel's K/V
+    tiling), and FA3's ahead-of-time `scheduler_metadata` must be nulled
+    on every layer (it encodes a work schedule built for the original,
+    unrestricted context length)."""
+    runner_module = _load_sparse_target_runner()
+    block_size, num_prompt = 16, 160
+    runner, attn_metadata = _make_fake_runner(
+        runner_module, block_size,
+        req_ids=["r0"],
+        num_computed_tokens=[num_prompt],
+        num_prompt_tokens=[num_prompt],
+        step_seq_lens=[num_prompt + 1],
+    )
+    assert attn_metadata["layer.0"].max_seq_len == num_prompt + 1  # stale, pre-gather
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register(
+            "r0", [p for p in range(num_prompt) if p // block_size != 3]
+        )
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    for name, layer in attn_metadata.items():
+        assert layer.max_seq_len == 145, (
+            f"{name}: max_seq_len={layer.max_seq_len}, expected the post-gather "
+            f"145 -- a stale value keeps the kernel iterating the full span"
+        )
+        assert layer.scheduler_metadata is None, f"{name}: scheduler_metadata not nulled"
+
+
+def test_step_seq_len_raises_a_clear_error_if_the_runner_field_is_missing():
+    """`optimistic_seq_lens_cpu` is a vLLM-version-sensitive attribute. If
+    it ever disappears, this must fail loudly and point at the right fix --
+    the one thing that must NOT happen is a silent fallback to
+    `num_computed_tokens_cpu_tensor`, which is the original bug."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+    try:
+        runner._step_seq_len(0)
+        raise AssertionError("expected AttributeError for missing optimistic_seq_lens_cpu")
+    except AttributeError as exc:
+        assert "optimistic_seq_lens_cpu" in str(exc)
+        assert "num_computed_tokens_cpu_tensor" in str(exc)
+
+
+def test_apply_overrides_per_turn_cache_invalidates_on_a_new_selection():
+    """The per-turn caches are keyed on the registry's generation counter.
+    Registering a DIFFERENT selection for the same request id (what the
+    next turn does) must produce a different gather, not a stale cache
+    hit -- the failure mode that made SPARSE output non-deterministic
+    before `id(selected_positions)` was replaced."""
+    runner_module = _load_sparse_target_runner()
+    block_size, num_prompt = 16, 160
+
+    runner, attn_metadata = _make_fake_runner(
+        runner_module, block_size,
+        req_ids=["same-id"],
+        num_computed_tokens=[num_prompt],
+        num_prompt_tokens=[num_prompt],
+        step_seq_lens=[num_prompt + 1],
+    )
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register(
+            "same-id", [p for p in range(num_prompt) if p // block_size != 3]
+        )
+        runner._apply_sparse_attention_overrides(attn_metadata)
+        first = attn_metadata["layer.0"].block_table[0, :10].tolist()
+
+        # Same request id, same length of selection, different blocks --
+        # only the generation counter distinguishes them.
+        _, attn_metadata_2 = _make_fake_runner(
+            runner_module, block_size,
+            req_ids=["same-id"],
+            num_computed_tokens=[num_prompt],
+            num_prompt_tokens=[num_prompt],
+            step_seq_lens=[num_prompt + 1],
+        )
+        sparse_selection_registry.register(
+            "same-id", [p for p in range(num_prompt) if p // block_size != 6]
+        )
+        runner._apply_sparse_attention_overrides(attn_metadata_2)
+        second = attn_metadata_2["layer.0"].block_table[0, :10].tolist()
+    finally:
+        sparse_selection_registry.clear()
+
+    assert first != second, (
+        f"the second turn's gather reused the first turn's cached blocks "
+        f"({first}) -- the generation-counter invalidation is broken"
+    )
+    assert 1003 not in first and 1003 in second
+    assert 1006 in first and 1006 not in second
 
 
 def test_sparse_selection_registry_lifecycle():
@@ -789,6 +1360,135 @@ def test_ledger_to_target_position_map_no_wrappers_added_yet():
     m = LedgerToTargetPositionMap(initial_offset=5)
     assert m.translate(0) == 5
     assert m.translate(100) == 105
+
+
+def test_wrapper_target_spans_cover_the_attention_sink():
+    """**Regression test for the second cause of the repetition loops.**
+    `translate(p) = p + offset` with `offset >= initial_offset`, so no
+    ledger position can EVER map below `len(chat_before_ids)` -- meaning
+    target positions `[0, len(chat_before_ids))`, which hold
+    `<|begin_of_text|>` and the system header, were unreachable by
+    `run_sparse_attention`'s registered selection at every keep rate, and
+    so were dropped from decode attention whenever the gather fired.
+    Dropping the attention sink is the textbook cause of exactly the
+    observed symptom (fluent start, then a repetition loop).
+
+    `wrapper_target_positions()` must therefore always contain target
+    position 0."""
+    m = LedgerToTargetPositionMap(initial_offset=3)
+    assert m.wrapper_target_spans() == [(0, 3)]
+    assert m.wrapper_target_positions() == [0, 1, 2]
+    assert 0 in m.wrapper_target_positions()
+
+    m.add_wrapper(ledger_position=12, wrapper_len=4)
+    m.add_wrapper(ledger_position=15, wrapper_len=5)
+    assert 0 in m.wrapper_target_positions(), (
+        "the attention sink dropped out of the wrapper set once later "
+        "wrappers were recorded"
+    )
+
+
+def test_wrapper_target_spans_match_the_multi_turn_trace():
+    """Same hand-computed shape as
+    `test_ledger_to_target_position_map_multi_turn_trace`, checked from the
+    wrapper side: chat_before occupies target [0,3); chat_after (4 tokens,
+    inserted at ledger 12, which sits at target 19 afterwards) occupies
+    [15,19); turn_boundary (5 tokens, inserted at ledger 15, at target 27
+    afterwards) occupies [22,27)."""
+    m = LedgerToTargetPositionMap(initial_offset=3)
+    m.add_wrapper(ledger_position=12, wrapper_len=4)
+    m.add_wrapper(ledger_position=15, wrapper_len=5)
+    assert m.wrapper_target_spans() == [(0, 3), (15, 19), (22, 27)]
+    # Each span is exactly wrapper_len wide.
+    assert [end - start for start, end in m.wrapper_target_spans()] == [3, 4, 5]
+
+
+def test_wrapper_target_positions_are_exactly_the_untranslatable_ones():
+    """The invariant that makes this correct rather than merely plausible:
+    for any target stream, every position is EITHER the image of some
+    ledger position under `translate` OR a wrapper position -- never both,
+    never neither. Registering the union of the two therefore covers the
+    whole resident stream with nothing double-counted or missed.
+
+    Checked exhaustively over a simulated multi-turn stream."""
+    initial_offset = 3
+    ledger_len_at_end = 17
+    m = LedgerToTargetPositionMap(initial_offset=initial_offset)
+    m.add_wrapper(ledger_position=12, wrapper_len=4)
+    m.add_wrapper(ledger_position=15, wrapper_len=5)
+
+    translated = {m.translate(p) for p in range(ledger_len_at_end)}
+    wrappers = set(m.wrapper_target_positions())
+    total_len = ledger_len_at_end + initial_offset + 4 + 5
+
+    assert not (translated & wrappers), (
+        f"overlap between translated and wrapper positions: "
+        f"{sorted(translated & wrappers)}"
+    )
+    assert translated | wrappers == set(range(total_len)), (
+        f"gap in coverage: {sorted(set(range(total_len)) - (translated | wrappers))}"
+    )
+
+
+def test_wrapper_target_spans_ignore_zero_length_wrappers():
+    """A tokenizer whose chat template contributes no `chat_after`/
+    `turn_boundary` tokens must not produce empty spans (which would put
+    meaningless entries in the registered selection)."""
+    m = LedgerToTargetPositionMap(initial_offset=0)
+    m.add_wrapper(ledger_position=10, wrapper_len=0)
+    assert m.wrapper_target_spans() == []
+    assert m.wrapper_target_positions() == []
+
+    m2 = LedgerToTargetPositionMap(initial_offset=2)
+    m2.add_wrapper(ledger_position=10, wrapper_len=0)
+    m2.add_wrapper(ledger_position=10, wrapper_len=3)
+    assert m2.wrapper_target_spans() == [(0, 2), (12, 15)]
+
+
+def test_registered_selection_covers_the_wrapper_scaffolding():
+    """End-to-end shape of what `run_sparse_attention` now registers: the
+    union of translated ledger positions and every wrapper span. Mirrors
+    the driver's own ordering -- this turn's `chat_after` is recorded
+    BEFORE the union is built (those tokens are part of the delta being
+    submitted, so they're resident during this turn's decode), and
+    recording it does not move any translated position, since every kept
+    position is `< result.orig_len`.
+
+    Checks the properties the fix exists for: the sink is in, this turn's
+    generation header is in, and the speculator's own choices survive."""
+    len_chat_before, len_chat_after, len_turn_boundary = 3, 4, 5
+    m = LedgerToTargetPositionMap(initial_offset=len_chat_before)
+
+    # --- turn 0: context (ledger 0-9) + query (ledger 10-11) ---
+    orig_len = 12
+    kept_positions = [0, 3, 10, 11]  # sparse history + force-kept query
+    m.add_wrapper(ledger_position=orig_len, wrapper_len=len_chat_after)
+    registered = sorted(
+        set(m.translate(p) for p in kept_positions) | set(m.wrapper_target_positions())
+    )
+    assert 0 in registered, "attention sink missing from turn 0's selection"
+    assert registered[:3] == [0, 1, 2], "chat_before span missing"
+    # chat_after occupies target [15,19) -- this turn's assistant generation
+    # header, resident for this turn's own decode.
+    assert set(range(15, 19)) <= set(registered)
+    # The speculator's own choices are untouched by the union.
+    assert {m.translate(p) for p in kept_positions} <= set(registered)
+    # Nothing invented past the end of what's resident.
+    assert max(registered) < orig_len + len_chat_before + len_chat_after
+
+    # --- turn 1: output (ledger 12-14) then query (ledger 15-16) ---
+    orig_len_2 = 17
+    m.add_wrapper(ledger_position=15, wrapper_len=len_turn_boundary)
+    m.add_wrapper(ledger_position=orig_len_2, wrapper_len=len_chat_after)
+    registered_2 = sorted(
+        set(m.translate(p) for p in [0, 13, 15, 16])
+        | set(m.wrapper_target_positions())
+    )
+    assert 0 in registered_2, "attention sink missing from turn 1's selection"
+    # Both turns' scaffolding is present: chat_before, turn 0's chat_after,
+    # the turn boundary, and turn 1's own chat_after.
+    for span in m.wrapper_target_spans():
+        assert set(range(*span)) <= set(registered_2), f"wrapper span {span} not registered"
 
 
 def test_prospective_target_len_matches_real_submitted_token_count():

@@ -574,6 +574,59 @@ class LedgerToTargetPositionMap:
                 break
         return ledger_position + offset
 
+    def wrapper_target_spans(self) -> list[tuple[int, int]]:
+        """Every `[start, end)` span of TARGET positions occupied by
+        wrapper tokens recorded so far, in ascending order -- the exact
+        complement of what `translate` can ever produce.
+
+        **Why this exists -- a real, confirmed correctness bug, not
+        completeness for its own sake.** `translate(p) = p + offset` with
+        `offset >= initial_offset = len(chat_before_ids)`, so the smallest
+        target position any translated ledger position can EVER reach is
+        `len(chat_before_ids)`. Target positions `[0, len(chat_before_ids))`
+        -- `<|begin_of_text|>` and the whole system header, ~40 tokens for
+        Llama-3.1, i.e. block 0 and its neighbours -- were therefore
+        unreachable by `run_sparse_attention`'s registered selection at
+        EVERY keep rate, and so were dropped from decode-time attention
+        whenever the gather fired at all. Dropping the initial sink tokens
+        from what a decoder may attend to is the canonical trigger for
+        fluent-start-then-repetition-loop degeneration (StreamingLLM's
+        attention-sink result), and it matched the observed symptom
+        exactly: clean `M000` (which never gathers), repetition loops on
+        every `SPARSE-k*` row. The same reachability argument applies to
+        every mid-stream `chat_after_ids`/`turn_boundary_ids` insertion --
+        those are target-only tokens with no ledger position at all, so
+        the turn structure itself (`<|eot_id|>`, the assistant generation
+        header) was equally unselectable.
+
+        `run_specprefill` never had this bug because it builds its own
+        `full_kept_positions` with `list(range(len(chat_before_ids)))`
+        prepended explicitly (see its call site); `run_sparse_attention`
+        registered bare `translate`d positions instead. This method is the
+        sparse path's equivalent, derived from the SAME breakpoint
+        bookkeeping `translate` uses so the two can't drift apart.
+
+        Derivation: a breakpoint `(ledger_pos, offset_i)` following
+        `(_, offset_prev)` means ledger position `ledger_pos - 1` sits at
+        target `ledger_pos - 1 + offset_prev` while `ledger_pos` sits at
+        `ledger_pos + offset_i`, so the wrapper tokens submitted between
+        them occupy `[ledger_pos + offset_prev, ledger_pos + offset_i)` --
+        exactly `offset_i - offset_prev == wrapper_len` positions.
+        """
+        spans = [(0, self._breakpoints[0][1])]
+        for (_, prev_offset), (ledger_pos, offset) in zip(
+            self._breakpoints, self._breakpoints[1:]
+        ):
+            spans.append((ledger_pos + prev_offset, ledger_pos + offset))
+        return [(start, end) for start, end in spans if end > start]
+
+    def wrapper_target_positions(self) -> list[int]:
+        """Flattened `wrapper_target_spans()` -- the positions to union
+        into a registered sparse selection so the chat-template scaffolding
+        (attention sink included) is always attendable. See
+        `wrapper_target_spans`'s docstring for why this is load-bearing."""
+        return [p for start, end in self.wrapper_target_spans() for p in range(start, end)]
+
 
 def _progress_postfix(
     predictions: list, stats: dict, t_loop_start: float, conversations_processed: int
@@ -1099,8 +1152,30 @@ def run_sparse_attention(
             if turn_idx > 0:
                 position_map.add_wrapper(query_start_ledger_pos, len(turn_boundary_ids))
 
+            # Record THIS turn's own chat_after_ids BEFORE translating, not
+            # after. Safe -- a breakpoint at `result.orig_len` only shifts
+            # ledger positions `>= result.orig_len`, and every entry in
+            # `result.kept_positions` is `< result.orig_len` by
+            # construction (`orig_len == force_keep_query[-1][1] + 1`, see
+            # `pruner.py::_positions_from_kept_indices`), so no translated
+            # position changes. Required, because those tokens ARE resident
+            # for this turn's decode (they're part of `delta_ids` below,
+            # submitted before generation starts), so they must appear in
+            # `wrapper_target_positions()` when the selection is registered
+            # a few lines down -- registering after would leave this turn's
+            # own assistant generation header unattendable.
+            position_map.add_wrapper(result.orig_len, len(chat_after_ids))
+
+            # Union the speculator's own selection with every chat-template
+            # wrapper span -- see `LedgerToTargetPositionMap.wrapper_target_
+            # spans`'s docstring for the confirmed repetition-loop bug this
+            # fixes (the attention sink at target position 0 was previously
+            # unreachable by `translate`, so it was dropped from decode
+            # attention at every keep rate). Mirrors `run_specprefill`'s own
+            # `full_kept_positions`, which has always done this explicitly.
             translated_positions = sorted(
-                position_map.translate(p) for p in result.kept_positions
+                set(position_map.translate(p) for p in result.kept_positions)
+                | set(position_map.wrapper_target_positions())
             )
             llm.llm_engine.collective_rpc(
                 "register_sparse_selection",
@@ -1111,7 +1186,6 @@ def run_sparse_attention(
                 delta_ids = chat_before_ids + context_ids + query_ids + chat_after_ids
             else:
                 delta_ids = turn_boundary_ids + query_ids + chat_after_ids
-            position_map.add_wrapper(result.orig_len, len(chat_after_ids))
 
             sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
             prompt = build_sparse_session_request(

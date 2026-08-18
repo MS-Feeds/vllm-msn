@@ -251,7 +251,7 @@ def compute_sparse_gather_view(
     block_size: int,
     base_block_indices: Set[int],
     num_prompt: int,
-    num_computed: int,
+    seq_len: int,
 ) -> Optional[Tuple[torch.Tensor, int]]:
     """Pure-tensor core of `sparse_target_runner.py`'s
     `SparseTargetGPUModelRunner._compute_gathered_view` -- lives here (not
@@ -284,11 +284,26 @@ def compute_sparse_gather_view(
             session`'s real behavior (confirmed: it extends
             `session.prompt_token_ids` with the new turn's tokens before
             decode begins).
-        num_computed: this request's tokens actually computed so far
-            (`self.input_batch.num_computed_tokens_cpu_tensor[req_idx]`) --
-            for a decode step this is `>= num_prompt`, and
-            `num_computed - num_prompt` is exactly how many tokens THIS
-            turn has generated so far, always force-included regardless of
+        seq_len: this request's TOTAL sequence length for THIS step --
+            i.e. exactly what the stock metadata builder puts in
+            `AttentionMetadata.seq_lens[req_idx]`, which is
+            `num_computed_tokens + num_scheduled_tokens` (see
+            `gpu_model_runner.py`'s `self.seq_lens[:num_reqs] =
+            self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu`),
+            NOT `num_computed_tokens_cpu_tensor[req_idx]` on its own.
+
+            **This parameter used to be named `num_computed` and was
+            genuinely fed `num_computed_tokens_cpu_tensor[req_idx]` by
+            `sparse_target_runner.py` -- a real, confirmed off-by-one, not
+            a naming nit.** `num_computed_tokens_cpu` is the count BEFORE
+            this step's own scheduled token, so a decode step's true
+            length is one MORE than it: passing it here built every
+            gathered view one token short, which meant the token currently
+            being decoded could never attend to its OWN key/value (and, at
+            a block boundary, that the block physically holding it wasn't
+            gathered at all). Positions `[num_prompt, seq_len)` -- this
+            turn's own generated tokens INCLUDING the one being decoded
+            right now -- are always force-included regardless of
             `base_block_indices` (see module docstring's "Force-keep"
             reasoning in `sparse_target_runner.py`).
 
@@ -314,7 +329,7 @@ def compute_sparse_gather_view(
             by then).
     """
     selected_block_indices = set(base_block_indices)  # copy -- never mutate caller's cache
-    for pos in range(num_prompt, num_computed):
+    for pos in range(num_prompt, seq_len):
         selected_block_indices.add(pos // block_size)
 
     if not selected_block_indices:
@@ -322,12 +337,12 @@ def compute_sparse_gather_view(
 
     sorted_blocks = sorted(selected_block_indices)
 
-    num_full_blocks_present = -(-num_computed // block_size)  # ceil div
+    num_full_blocks_present = -(-seq_len // block_size)  # ceil div
     if max(sorted_blocks) >= num_full_blocks_present:
         raise ValueError(
             f"selected block index {max(sorted_blocks)} exceeds the number "
             f"of blocks actually allocated so far ({num_full_blocks_present}, "
-            f"for num_computed={num_computed} tokens at block_size="
+            f"for seq_len={seq_len} tokens at block_size="
             f"{block_size}) -- the speculator's selection must be scoped to "
             f"positions already resident in this request's OWN cache; a "
             f"stale/out-of-range selection would otherwise silently read "
@@ -344,8 +359,8 @@ def compute_sparse_gather_view(
     )
     gathered_block_table_row = full_block_table_row[block_index_tensor].clone()
 
-    last_real_block_index = (num_computed - 1) // block_size
-    last_real_block_occupancy = num_computed - last_real_block_index * block_size
+    last_real_block_index = (seq_len - 1) // block_size
+    last_real_block_occupancy = seq_len - last_real_block_index * block_size
     gathered_seq_len = 0
     for block_idx in sorted_blocks:
         if block_idx == last_real_block_index:
@@ -439,7 +454,7 @@ def compute_sparse_gather_view_incremental(
     full_block_table_row: torch.Tensor,
     block_size: int,
     num_prompt: int,
-    num_computed: int,
+    seq_len: int,
 ) -> Optional[Tuple[torch.Tensor, int]]:
     """Per-decode-step counterpart to `compute_base_gather_view` -- same
     contract/return value as `compute_sparse_gather_view` (this function IS
@@ -449,6 +464,14 @@ def compute_sparse_gather_view_incremental(
     (already-gathered, already-summed) as-is and only computes the small,
     per-step-bounded delta -- the force-keep tail plus `boundary_block`'s
     own possibly-still-growing occupancy.
+
+    `seq_len` carries exactly the same contract as
+    `compute_sparse_gather_view`'s parameter of the same name -- the
+    step's TOTAL sequence length (`num_computed_tokens +
+    num_scheduled_tokens`, i.e. what the stock builder puts in
+    `AttentionMetadata.seq_lens[req_idx]`), NOT `num_computed_tokens` on
+    its own. See that function's own `seq_len` Args entry for the
+    confirmed off-by-one that came from feeding it the latter.
 
     Real, measured cost this avoids (mirrors the reasoning already
     documented for `block_indices_from_positions`'s per-turn caching in
@@ -470,8 +493,8 @@ def compute_sparse_gather_view_incremental(
     """
     boundary_block = base_view.boundary_block
 
-    if num_computed > num_prompt:
-        dynamic_end = (num_computed - 1) // block_size + 1
+    if seq_len > num_prompt:
+        dynamic_end = (seq_len - 1) // block_size + 1
         tail_blocks = set(range(boundary_block, dynamic_end))
     elif base_view.boundary_in_selection:
         tail_blocks = {boundary_block}
@@ -484,13 +507,13 @@ def compute_sparse_gather_view_incremental(
     if total_selected == 0:
         return None
 
-    num_full_blocks_present = -(-num_computed // block_size)  # ceil div
+    num_full_blocks_present = -(-seq_len // block_size)  # ceil div
     dyn_max = dynamic_blocks[-1] if dynamic_blocks else base_view.stable_blocks[-1]
     if dyn_max >= num_full_blocks_present:
         raise ValueError(
             f"selected block index {dyn_max} exceeds the number of blocks "
             f"actually allocated so far ({num_full_blocks_present}, for "
-            f"num_computed={num_computed} tokens at block_size={block_size}) "
+            f"seq_len={seq_len} tokens at block_size={block_size}) "
             f"-- the speculator's selection must be scoped to positions "
             f"already resident in this request's OWN cache; a stale/"
             f"out-of-range selection would otherwise silently read another "
@@ -512,8 +535,8 @@ def compute_sparse_gather_view_incremental(
     else:
         gathered_block_table_row = base_view.stable_rows
 
-    last_real_block_index = (num_computed - 1) // block_size
-    last_real_block_occupancy = num_computed - last_real_block_index * block_size
+    last_real_block_index = (seq_len - 1) // block_size
+    last_real_block_occupancy = seq_len - last_real_block_index * block_size
     gathered_seq_len = base_view.stable_seq_len
     for block_idx in dynamic_blocks:
         if block_idx == last_real_block_index:

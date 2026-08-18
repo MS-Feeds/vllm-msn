@@ -185,7 +185,23 @@ def main() -> None:
               f"results below with caution.")
 
     initial_offset = len(chat_before_ids)
-    translated_positions = sorted(p + initial_offset for p in result.kept_positions)
+    # Union with the chat-template wrapper spans, exactly as
+    # `predict_scbench.py::run_sparse_attention` now does (see
+    # `LedgerToTargetPositionMap.wrapper_target_spans`'s docstring): a bare
+    # `p + initial_offset` can never reach target positions
+    # `[0, len(chat_before_ids))`, so registering only those left the
+    # attention sink out of the selection -- a confirmed cause of the
+    # repetition-loop output this script exists to diagnose. Turn 0 only
+    # here (this script is single-turn by construction), so the wrapper
+    # spans are exactly chat_before at the front and chat_after at the end.
+    wrapper_positions = (
+        list(range(initial_offset))
+        + list(range(initial_offset + result.orig_len,
+                     initial_offset + result.orig_len + len(chat_after_ids)))
+    )
+    translated_positions = sorted(
+        set(p + initial_offset for p in result.kept_positions) | set(wrapper_positions)
+    )
     block_size = args.kv_granularity
     expected_block_indices = {p // block_size for p in translated_positions}
     print(f"[diagnose_target_gather] translated {len(translated_positions)} positions to target-stream "
