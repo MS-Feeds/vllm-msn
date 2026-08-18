@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable
+import os
 
 import torch
+from vllm.triton_utils import tl, triton
 
 import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -12,6 +14,104 @@ from vllm.model_executor.layers.fused_moe.config import (
     get_routing_method_type,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+
+
+@triton.jit
+def _gemma4_top2_softmax_kernel(
+    logits_ptr,
+    weights_ptr,
+    ids_ptr,
+    token_expert_indices_ptr,
+    num_experts,
+    renormalize: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_experts
+    logits = tl.load(
+        logits_ptr + token * num_experts + offsets,
+        mask=mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    # The logits are already resident in registers. Let Triton lower the two
+    # reductions in parallel instead of serializing a scalar loop over experts.
+    best_id = tl.argmax(logits, axis=0)
+    second_logits = tl.where(offsets == best_id, -float("inf"), logits)
+    second_id = tl.argmax(second_logits, axis=0)
+    best_value = tl.load(
+        logits_ptr + token * num_experts + best_id
+    ).to(tl.float32)
+    second_value = tl.load(
+        logits_ptr + token * num_experts + second_id
+    ).to(tl.float32)
+
+    if renormalize:
+        selected_max = tl.maximum(best_value, second_value)
+        best_exp = tl.exp(best_value - selected_max)
+        second_exp = tl.exp(second_value - selected_max)
+        selected_sum = best_exp + second_exp
+        first_out = best_exp / selected_sum
+        second_out = second_exp / selected_sum
+    else:
+        full_max = tl.max(logits, axis=0)
+        full_sum = tl.sum(tl.where(mask, tl.exp(logits - full_max), 0.0), axis=0)
+        first_out = tl.exp(best_value - full_max) / full_sum
+        second_out = tl.exp(second_value - full_max) / full_sum
+
+    weight_base = token * 2
+    tl.store(weights_ptr + weight_base, first_out)
+    tl.store(weights_ptr + weight_base + 1, second_out)
+    tl.store(ids_ptr + weight_base, best_id)
+    tl.store(ids_ptr + weight_base + 1, second_id)
+    tl.store(token_expert_indices_ptr + weight_base, token)
+    tl.store(token_expert_indices_ptr + weight_base + 1, token)
+
+
+def gemma4_top2_softmax(
+    gating_output: torch.Tensor,
+    renormalize: bool,
+    indices_type: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, num_experts = gating_output.shape
+    block_size = 1 << (num_experts - 1).bit_length()
+    weights = torch.empty((num_tokens, 2), dtype=torch.float32, device=gating_output.device)
+    ids = torch.empty(
+        (num_tokens, 2),
+        dtype=torch.int32 if indices_type is None else indices_type,
+        device=gating_output.device,
+    )
+    token_expert_indices = torch.empty((num_tokens, 2), dtype=torch.int32, device=gating_output.device)
+    _gemma4_top2_softmax_kernel[(num_tokens,)](
+        gating_output,
+        weights,
+        ids,
+        token_expert_indices,
+        num_experts,
+        renormalize=renormalize,
+        BLOCK_SIZE=block_size,
+    )
+    return weights, ids, token_expert_indices
+
+
+def _reference_topk_softmax(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    indices_type: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference Top-K path that bypasses the unstable fused CUDA operator."""
+    probabilities = torch.softmax(gating_output.float(), dim=-1)
+    topk_weights, topk_ids = torch.topk(probabilities, k=topk, dim=-1)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+    if indices_type is not None:
+        topk_ids = topk_ids.to(indices_type)
+    token_expert_indices = torch.arange(
+        gating_output.shape[0], dtype=torch.int32, device=gating_output.device
+    ).unsqueeze(1).expand(-1, topk)
+    return topk_weights, topk_ids, token_expert_indices
 
 
 def vllm_topk_softmax(
@@ -77,6 +177,22 @@ def fused_topk(
     assert hidden_states.size(0) == gating_output.size(0), "Number of tokens mismatch"
 
     M, _ = hidden_states.size()
+
+    # Prototype path for Gemma4's fixed top-2 router. Keep it opt-in until
+    # numerical parity and GPU performance are measured against ops.topk_softmax.
+    if (
+        topk == 2
+        and scoring_func == "softmax"
+        and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1"
+    ):
+        return gemma4_top2_softmax(gating_output, renormalize, indices_type)
+    if (
+        scoring_func == "softmax"
+        and os.environ.get("VLLM_GEMMA4_REFERENCE_TOPK") == "1"
+    ):
+        return _reference_topk_softmax(
+            gating_output, topk, renormalize, indices_type
+        )
 
     topk_weights = torch.empty(
         M, topk, dtype=torch.float32, device=hidden_states.device

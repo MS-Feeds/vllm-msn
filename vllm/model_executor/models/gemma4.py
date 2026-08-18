@@ -22,6 +22,7 @@ from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import replace
 from itertools import islice
+import os
 
 import regex as re
 import torch
@@ -46,6 +47,7 @@ from vllm.model_executor.layers.fused_moe import (
 )
 from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
     dispatch_topk_softmax_func,
+    gemma4_top2_softmax,
 )
 from vllm.model_executor.layers.gemma4_fused_ops import (
     gemma_dual_rmsnorm_residual_scalar,
@@ -213,14 +215,21 @@ def gemma4_fused_routing_topk_softmax(
         f"got {out_ids.shape[1]}."
     )
 
-    topk_func = dispatch_topk_softmax_func()
-    topk_func(
-        out_weights,
-        out_ids,
-        token_expert_indices,
-        gating_output,
-        True,
-    )
+    if topk == 2 and os.environ.get("VLLM_GEMMA4_TOP2_ROUTER") == "1":
+        topk_weights, topk_ids, _ = gemma4_top2_softmax(
+            gating_output, True, out_ids.dtype
+        )
+        out_weights.copy_(topk_weights)
+        out_ids.copy_(topk_ids)
+    else:
+        topk_func = dispatch_topk_softmax_func()
+        topk_func(
+            out_weights,
+            out_ids,
+            token_expert_indices,
+            gating_output,
+            True,
+        )
     out_weights.mul_(per_expert_scale[out_ids].to(out_weights.dtype))
     return out_weights, out_ids
 
