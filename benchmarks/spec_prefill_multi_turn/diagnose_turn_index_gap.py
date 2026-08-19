@@ -77,18 +77,84 @@ def _read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
-def _load_golds(samples_path: Path) -> dict[tuple[str, int], str]:
-    """`(conversation_id, turn_idx) -> gold answer`, matching how
-    `grade_scbench.py` joins predictions back to the dataset."""
+def _load_golds(samples_path: Path) -> tuple[dict[tuple[str, int], str], dict[str, str]]:
+    """`(conversation_id, turn_idx) -> gold answer` (matching how
+    `grade_scbench.py` joins predictions back to the dataset), plus
+    `conversation_id -> context` for the gold-position analysis below."""
     golds: dict[tuple[str, int], str] = {}
+    contexts: dict[str, str] = {}
     for row in _read_jsonl(samples_path):
+        contexts[str(row["id"])] = row.get("context") or ""
         for turn_idx, turn in enumerate(row.get("turns") or []):
             golds[(str(row["id"]), turn_idx)] = str(turn["answer"])
-    return golds
+    return golds, contexts
 
 
 def _gold_prefix(gold: str) -> str:
     return gold[: max(_MIN_PREFIX_CHARS, int(len(gold) * _PREFIX_FRACTION))]
+
+
+def analyze_gold_position(
+    predictions: list[dict],
+    golds: dict[tuple[str, int], str],
+    contexts: dict[str, str],
+) -> tuple[dict, dict]:
+    """Where in the shared context each turn's gold answer actually sits,
+    and whether that position predicts failure.
+
+    **The question this settles**, once truncation is ruled out (flat, short
+    prediction lengths) and the turn-0 deficit is known to be all
+    clean-miss: is turn 0 harder because its answers sit somewhere harder to
+    retrieve from, or because it's the only turn with no worked example of
+    the retrieval task already in context?
+
+        mean position flat across turns  -> position is ruled out. Turns 1-4
+            are easier because each one has prior `Question N: <key>
+            Answer N: <value>` exchanges demonstrating the task -- ordinary
+            in-context learning, a property of the benchmark's multi-turn
+            structure, not of this pipeline. There is nothing to fix.
+        mean position lower at turn 0    -> turn 0's answers sit earlier in
+            the context, and an attention-based scorer with recency bias
+            would miss them by position alone.
+
+    The second return value breaks clean-miss rate down by which quartile of
+    the context the gold sits in, pooled across turns -- if position matters
+    at all, it shows up here regardless of how it's distributed per turn.
+
+    Positions are character offsets of the gold's FIRST occurrence in the
+    raw context, normalized to [0,1]. Golds that don't appear verbatim
+    (summarization-style configs) are skipped rather than counted at 0.
+    """
+    by_turn: dict[int, list[float]] = defaultdict(list)
+    by_quartile: dict[int, dict] = defaultdict(lambda: {"n": 0, "miss": 0})
+
+    for pred in predictions:
+        conv_id = str(pred["conversation_id"])
+        turn_idx = int(pred["turn_idx"])
+        gold = golds.get((conv_id, turn_idx))
+        context = contexts.get(conv_id)
+        if not gold or not context:
+            continue
+        where = context.find(gold)
+        if where < 0:
+            continue
+        rel = where / len(context)
+        by_turn[turn_idx].append(rel)
+
+        q = min(3, int(rel * 4))
+        by_quartile[q]["n"] += 1
+        if gold not in (pred["pred"] or ""):
+            by_quartile[q]["miss"] += 1
+
+    turn_rows = {
+        t: {"n": len(v), "mean_rel_pos": statistics.mean(v)}
+        for t, v in sorted(by_turn.items()) if v
+    }
+    quartile_rows = {
+        q: {"n": b["n"], "miss_pct": 100.0 * b["miss"] / (b["n"] or 1)}
+        for q, b in sorted(by_quartile.items())
+    }
+    return turn_rows, quartile_rows
 
 
 def analyze(predictions: list[dict], golds: dict[tuple[str, int], str], max_tokens: int) -> dict:
@@ -189,7 +255,7 @@ def main() -> None:
 
     if not args.samples.exists():
         parser.error(f"{args.samples} not found -- run datasets/prep_scbench.py first")
-    golds = _load_golds(args.samples)
+    golds, contexts = _load_golds(args.samples)
     print(f"[diagnose_turn_index_gap] loaded {len(golds)} gold answers from {args.samples}")
 
     if args.experiments:
@@ -204,8 +270,23 @@ def main() -> None:
             print(f"[diagnose_turn_index_gap] SKIP {pred_file} (not found)")
             continue
         exp_id = pred_file.name[: -len("_predictions.jsonl")]
-        rows = analyze(_read_jsonl(pred_file), golds, args.max_tokens)
+        predictions = _read_jsonl(pred_file)
+        rows = analyze(predictions, golds, args.max_tokens)
         _print_table(exp_id, rows)
+
+        turn_pos, quartile = analyze_gold_position(predictions, golds, contexts)
+        if turn_pos:
+            print(f"\n  where the gold sits in the context (0.0 = start, 1.0 = end):")
+            for turn_idx, r in turn_pos.items():
+                print(f"    turn {turn_idx}: mean {r['mean_rel_pos']:.3f}  (n={r['n']})")
+            spread = (max(r["mean_rel_pos"] for r in turn_pos.values())
+                      - min(r["mean_rel_pos"] for r in turn_pos.values()))
+            print(f"    spread across turns: {spread:.3f} "
+                  f"-- near 0 means position is NOT what makes turn 0 harder")
+            print(f"  clean-miss by context quartile (pooled across turns):")
+            for q, r in quartile.items():
+                print(f"    Q{q + 1} [{q * 0.25:.2f}-{(q + 1) * 0.25:.2f}]: "
+                      f"{r['miss_pct']:.1f}% miss  (n={r['n']})")
 
     print("\nReading the table:")
     print("  prefix-only high at turn 0  -> truncation/garbling, not a retrieval miss.")
