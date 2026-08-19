@@ -76,7 +76,7 @@ from vllm_patch.scoring import (
     score_and_select_indices,
 )
 from vllm_patch.pruner import _positions_from_kept_indices
-from predict_scbench import LedgerToTargetPositionMap
+from predict_scbench import LedgerToTargetPositionMap, build_turn_delta_ids
 
 
 class _FakeRequest:
@@ -1360,6 +1360,133 @@ def test_ledger_to_target_position_map_no_wrappers_added_yet():
     m = LedgerToTargetPositionMap(initial_offset=5)
     assert m.translate(0) == 5
     assert m.translate(100) == 105
+
+
+def _simulate_baseline_stream(context_ids, per_turn_query_ids, per_turn_output_ids,
+                              chat_before_ids, chat_after_ids, turn_boundary_ids):
+    """Reproduces `run_baseline`'s accumulation: it resubmits the whole
+    accumulated prompt as a fresh one-shot request each turn, appending
+    this turn's own output (minus its last token) before the next turn's
+    delta. Returns the list of prompts actually submitted, one per turn."""
+    chat_ids: list = []
+    submitted = []
+    for turn_idx, query_ids in enumerate(per_turn_query_ids):
+        chat_ids = chat_ids + build_turn_delta_ids(
+            turn_idx=turn_idx, query_ids=query_ids,
+            chat_before_ids=chat_before_ids, context_ids=context_ids,
+            chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
+        )
+        submitted.append(list(chat_ids))
+        chat_ids = chat_ids + per_turn_output_ids[turn_idx][:-1]
+    return submitted
+
+
+def _simulate_sparse_session_stream(context_ids, per_turn_query_ids, per_turn_output_ids,
+                                    chat_before_ids, chat_after_ids, turn_boundary_ids):
+    """Reproduces what `run_sparse_attention`'s persistent target session
+    physically holds: it submits only each turn's delta, and vLLM's
+    `_update_request_as_session` folds the turn's COMPUTED output tokens
+    (all but the final sampled one, whose KV was never computed) into the
+    session prompt before the next delta arrives. Returns the resident
+    token stream as of each turn's generation start."""
+    resident: list = []
+    per_turn = []
+    for turn_idx, query_ids in enumerate(per_turn_query_ids):
+        resident = resident + build_turn_delta_ids(
+            turn_idx=turn_idx, query_ids=query_ids,
+            chat_before_ids=chat_before_ids, context_ids=context_ids,
+            chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
+        )
+        per_turn.append(list(resident))
+        resident = resident + per_turn_output_ids[turn_idx][:-1]
+    return per_turn
+
+
+def test_baseline_and_sparse_build_the_same_chat_stream():
+    """**The property the M000 rendering change exists to establish.**
+    M000 and SPARSE reach their prompts by different mechanics -- baseline
+    resubmits the whole accumulated prompt as a one-shot request per turn,
+    the sparse path submits only a delta into a resumable session -- but
+    for the comparison to isolate the attention gather, the tokens the
+    model sees must be identical at every turn.
+
+    Before this change M000 flattened the whole conversation into a single
+    user message while SPARSE used real `<|eot_id|>` turns, which made
+    every turn index except 0 incomparable (M000 decayed 70/74/61/59/51 on
+    `scbench_kv` while SPARSE stayed flat and high, i.e. sparse attention
+    appeared to beat dense attention -- see `run_baseline`'s docstring)."""
+    chat_before_ids = [1, 2, 3]
+    chat_after_ids = [80, 81]
+    turn_boundary_ids = [90, 91, 92]
+    context_ids = [10, 11, 12, 13, 14]
+    per_turn_query_ids = [[20, 21], [30, 31, 32], [40]]
+    # Last element of each is the "sampled but never computed" token both
+    # paths drop; the second turn ends on a length cap rather than EOS.
+    per_turn_output_ids = [[50, 51, 999], [60, 61, 62, 999], [70, 999]]
+
+    baseline = _simulate_baseline_stream(
+        context_ids, per_turn_query_ids, per_turn_output_ids,
+        chat_before_ids, chat_after_ids, turn_boundary_ids)
+    sparse = _simulate_sparse_session_stream(
+        context_ids, per_turn_query_ids, per_turn_output_ids,
+        chat_before_ids, chat_after_ids, turn_boundary_ids)
+
+    assert baseline == sparse, (
+        f"M000 and SPARSE diverge.\n  turn-by-turn baseline: {baseline}\n"
+        f"  turn-by-turn sparse:   {sparse}"
+    )
+    # Spelled out for turn 0, the one turn that was already comparable
+    # before the change -- it must stay comparable after it.
+    assert baseline[0] == [1, 2, 3] + context_ids + [20, 21] + [80, 81]
+    # And turn 1 now closes turn 0's assistant message with a real boundary
+    # rather than continuing one flattened user message.
+    assert baseline[1] == baseline[0] + [50, 51] + turn_boundary_ids + [30, 31, 32] + [80, 81]
+
+
+def test_turn_delta_drops_the_models_own_end_of_turn_token_exactly_once():
+    """The `[:-1]` on each turn's output is what keeps the stream
+    well-formed: when a turn stops on the model's own `<|eot_id|>`, that
+    token is the one dropped and `turn_boundary_ids` supplies its own
+    immediately after. Keeping both would emit a DOUBLE end-of-turn marker
+    every turn."""
+    eot = 128009  # stand-in for <|eot_id|>, the first token of a boundary
+    chat_before_ids, chat_after_ids, turn_boundary_ids = [1], [80], [eot, 91]
+    stream = _simulate_baseline_stream(
+        context_ids=[10],
+        per_turn_query_ids=[[20], [30]],
+        per_turn_output_ids=[[50, eot], [60, eot]],
+        chat_before_ids=chat_before_ids, chat_after_ids=chat_after_ids,
+        turn_boundary_ids=turn_boundary_ids,
+    )
+    turn1 = stream[1]
+    # ... 50, then exactly ONE eot (the boundary's), then 91.
+    assert turn1 == [1, 10, 20, 80, 50, eot, 91, 30, 80], turn1
+    assert turn1.count(eot) == 1
+
+
+def test_build_turn_delta_ids_ignores_context_after_turn_zero():
+    """Turn 0 opens the conversation; later turns must not re-emit
+    `chat_before`/`context`, which are already resident. Passing them
+    unconditionally keeps the call sites branch-free."""
+    later = build_turn_delta_ids(
+        turn_idx=3, query_ids=[7], chat_before_ids=[1, 2], context_ids=[3, 4],
+        chat_after_ids=[8], turn_boundary_ids=[9],
+    )
+    assert later == [9, 7, 8]
+    assert 1 not in later and 3 not in later
+
+
+def test_build_turn_delta_ids_does_not_alias_its_inputs():
+    """Both callers accumulate with `chat_ids = chat_ids + delta_ids`, so a
+    delta that aliased a caller's list would be corrupted by a later
+    append somewhere else."""
+    chat_before_ids = [1, 2]
+    delta = build_turn_delta_ids(
+        turn_idx=0, query_ids=[7], chat_before_ids=chat_before_ids,
+        context_ids=[3], chat_after_ids=[8], turn_boundary_ids=[9],
+    )
+    delta[0] = 999
+    assert chat_before_ids == [1, 2]
 
 
 def test_wrapper_target_spans_cover_the_attention_sink():

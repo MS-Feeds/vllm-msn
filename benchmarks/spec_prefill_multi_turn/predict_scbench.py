@@ -58,6 +58,20 @@ in the ways EXPERIMENT_PLAN.md's architectural decisions require:
    ("Question 1: ... Answer 1: ... Question 2: ...") inside that one
    message -- see `render_turn_query`/`render_golden_answer` below.
 
+   **This now describes `run_specprefill` (M-k*-g*/ORACLE) ONLY.**
+   `run_sparse_attention` always used genuine `<|eot_id|>`-delimited chat
+   turns (it doesn't need the ledger to track wrapper boundaries -- see
+   `chat_turn_boundary_pieces`), and `run_baseline` (M000) was changed to
+   match it after a real graded run showed the rendering difference
+   dominating the M000-vs-SPARSE comparison at every turn index except 0
+   (see `run_baseline`'s own docstring for the numbers and the reasoning).
+   The consequence, stated plainly because it's a real cost: M000 and
+   SPARSE are no longer in SCBench's DEFAULT `use_chat_template=False`
+   mode, so their absolute scores are no longer directly comparable to
+   published SCBench numbers -- they are comparable to EACH OTHER, which
+   is what those two rows exist for. M-k*-g*/ORACLE stay in the default
+   mode and stay comparable to published numbers.
+
    **Not an ad hoc shortcut** -- confirmed (not assumed) to match SCBench's
    own official reference harness's DEFAULT evaluation mode
    (`use_chat_template=False` in
@@ -371,15 +385,53 @@ def build_conversation_state(context: str, tok, keep_mode: str, conversation_id:
 
 
 def render_turn_query(tok, turn_idx: int, turn: dict) -> list[int]:
-    """This turn's own force-kept region -- see module docstring #3 for why
-    the whole conversation is rendered as plain text inside one chat
-    message rather than real alternating chat-template turns."""
+    """This turn's own force-kept region. The `Question N:`/`Answer N:`
+    plain-text framing is kept for EVERY path, including the two that now
+    use real chat-template turn boundaries (`run_baseline`,
+    `run_sparse_attention`) -- it's SCBench's own question framing, not a
+    substitute for turn structure, and dropping it would change the task
+    text itself rather than just the rendering. See module docstring #3 for
+    which paths wrap it in real `<|eot_id|>` turns and which keep the whole
+    conversation inside one flattened chat message."""
     question_text = f"\n\nQuestion {turn_idx + 1}: {turn['input']}\nAnswer {turn_idx + 1}:"
     return tok.encode(question_text, add_special_tokens=False)
 
 
 def render_golden_answer(tok, turn: dict) -> list[int]:
     return tok.encode(f" {turn['answer']}", add_special_tokens=False)
+
+
+def build_turn_delta_ids(
+    turn_idx: int,
+    query_ids: list[int],
+    chat_before_ids: list[int],
+    context_ids: list[int],
+    chat_after_ids: list[int],
+    turn_boundary_ids: list[int],
+) -> list[int]:
+    """The token delta one turn contributes to a genuine
+    `<|eot_id|>`-delimited chat stream: turn 0 opens the conversation with
+    `chat_before + context + query + chat_after`, every later turn closes
+    the previous assistant turn and opens a new user turn with
+    `turn_boundary + query + chat_after`. The model's own generated tokens
+    land between one turn's delta and the next.
+
+    **Shared by `run_baseline` (M000) and `run_sparse_attention`
+    (SPARSE-k*) so the two cannot drift.** They arrive at the same stream
+    by different mechanics -- baseline resubmits the whole accumulated
+    prompt as a fresh one-shot request each turn, while the sparse path
+    submits only this delta into a persistent, resumable session -- and
+    the point of M000 as a control is that both nonetheless see the same
+    tokens (see `run_baseline`'s docstring for the rendering confound this
+    removes, and `test_vllm_patch.py`'s `test_baseline_and_sparse_build_
+    the_same_chat_stream` for the property checked directly).
+
+    `context_ids`/`chat_before_ids` are ignored for `turn_idx > 0`, since
+    the conversation is already open by then -- passed unconditionally so
+    callers don't have to branch before calling."""
+    if turn_idx == 0:
+        return list(chat_before_ids) + list(context_ids) + list(query_ids) + list(chat_after_ids)
+    return list(turn_boundary_ids) + list(query_ids) + list(chat_after_ids)
 
 
 def drive_single_request_to_completion(llm_engine, request_id: str):
@@ -651,11 +703,45 @@ def _progress_postfix(
 
 
 def run_baseline(
-    llm, tok, conversations, max_tokens, keep_mode, target_max_num_batched_tokens
+    llm, tok, conversations, max_tokens, target_max_num_batched_tokens
 ) -> tuple[list[dict], dict]:
     """M000: plain add_request per turn, no worker_cls/proposer/pruning --
-    still uses ConversationState for ledger bookkeeping (module docstring
-    #4) but keeps every candidate token unconditionally.
+    keeps every token of the conversation unconditionally.
+
+    **Renders GENUINE per-turn chat-template boundaries, identical to
+    `run_sparse_attention`'s own submitted token stream** -- not the
+    flattened "whole conversation as plain text inside one user message"
+    form this function used to build (module docstring #3's documented
+    simplification). Changed deliberately, to remove a confound that made
+    the M000-vs-SPARSE comparison unreadable at every turn index except 0.
+
+    Why it mattered: at turn 0 the two paths already produced byte-identical
+    prompts (`chat_before + context + query + chat_after`), so turn 0 was
+    the only apples-to-apples row in the sweep. From turn 1 onward the old
+    flattened rendering diverged from SPARSE's real `<|eot_id|>`-delimited
+    turns, and a real graded run showed M000 decaying across turn index
+    (70/74/61/59/51 on `scbench_kv`) while every SPARSE row stayed flat and
+    high (e.g. k80: 64/81/81/84/86) -- i.e. SPARSE appeared to BEAT dense
+    attention by 20-35 points at turns 1-4, which sparse attention cannot
+    do on the same prompt. That gap was the rendering, not the attention
+    (consistent with module docstring #3's own separately-observed "turn-5
+    confusion cost" for the flattened form). With both paths on real chat
+    turns, a per-turn-index difference between M000 and SPARSE is
+    attributable to the attention gather again.
+
+    Note this leaves `run_specprefill` (M-k*-g*/ORACLE) still on the
+    flattened rendering AND still on golden-answer history (module
+    docstring #2) -- those rows are comparable to each other, not to M000
+    or SPARSE, and were not touched here.
+
+    **The ledger (`ConversationState`) is no longer used by this path.**
+    Its only jobs here were producing the flattened prompt and estimating
+    prompt length; the real submitted stream (`chat_ids` below) now does
+    both, exactly rather than approximately. Keeping a parallel ledger that
+    nothing reads would be exactly the two-places-tracking-the-same-thing
+    drift hazard `LedgerToTargetPositionMap`'s docstring warns about.
+    `run_specprefill`/`run_sparse_attention` still use it, since both need
+    the pure-content position numbering the speculator scores against.
 
     **Pre-flight length check, skip-and-report (not crash).** Ported from
     the single-turn pipeline's `predict_longbench_v2.py::submit_baseline_
@@ -671,13 +757,15 @@ def run_baseline(
     baseline-skips-more asymmetry the single-turn pipeline's own grading
     already accounts for.
 
-    Checked BEFORE `state.begin_turn` mutates the ledger (using
-    `state.total_len` -- the ledger length as of right before this turn's
-    query, valid to check without begin_turn's side effects) so an
-    oversized turn can be skipped cleanly, with `state` simply abandoned
-    (no partial-turn cleanup needed) -- since context only grows turn over
-    turn in baseline mode (no pruning ever shrinks it), once one turn is
-    too large every later turn in the same conversation will be too;
+    Computed from `chat_ids` (the real, wrapper-inclusive stream submitted
+    so far) plus this turn's own not-yet-appended delta, so it counts
+    exactly what `add_request` will receive -- no `wrapper_overhead`
+    estimate to drift, which is the same class of bug `run_sparse_
+    attention`'s own docstring records having to fix (a single constant
+    increasingly undercounted a growing conversation and let a real run
+    overrun the budget deep into a sweep instead of skipping cleanly).
+    Since nothing ever shrinks the stream in baseline mode, once one turn
+    is too large every later turn in the same conversation will be too;
     skipping the rest of that conversation rather than checking turn by
     turn avoids paying for tokenization + a doomed size check repeatedly.
     """
@@ -687,7 +775,10 @@ def run_baseline(
     chat_before, chat_after = chat_wrapper_pieces(tok)
     chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
     chat_after_ids = tok.encode(chat_after, add_special_tokens=False)
-    wrapper_len = len(chat_before_ids) + len(chat_after_ids)
+    # Same pieces, from the same helpers, in the same order as
+    # `run_sparse_attention` -- the whole point of this path's rendering
+    # change is that the two produce the same token stream.
+    turn_boundary_ids = tok.encode(chat_turn_boundary_pieces(tok), add_special_tokens=False)
 
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
@@ -700,12 +791,25 @@ def run_baseline(
     for conv in progress:
         progress.set_postfix(_progress_postfix(predictions, stats, t_loop_start, conversations_processed))
         turns_before = len(predictions)
-        state = build_conversation_state(conv["context"], tok, keep_mode, conv["id"])
+        # The real submitted token stream, grown in place exactly as
+        # `run_sparse_attention` grows its persistent session: turn 0
+        # contributes `chat_before + context + query + chat_after`, every
+        # later turn contributes `turn_boundary + query + chat_after`, and
+        # each turn's own generated tokens land in between. This IS the
+        # prompt -- there is no separate ledger to keep in sync (see this
+        # function's docstring).
+        context_ids = tok.encode(conv["context"], add_special_tokens=False)
+        chat_ids: list[int] = []
         for turn_idx, turn in enumerate(conv["turns"]):
             t_turn_start = time.time()
             query_ids = render_turn_query(tok, turn_idx, turn)
 
-            prospective_len = state.total_len + len(query_ids) + wrapper_len
+            delta_ids = build_turn_delta_ids(
+                turn_idx=turn_idx, query_ids=query_ids,
+                chat_before_ids=chat_before_ids, context_ids=context_ids,
+                chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
+            )
+            prospective_len = len(chat_ids) + len(delta_ids)
             if prospective_len > target_max_num_batched_tokens:
                 progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
@@ -718,9 +822,8 @@ def run_baseline(
                 stats["num_skipped_too_large"] += 1
                 break
 
-            candidate_pool, force_keep_query = state.begin_turn(query_ids)
-            full_ids = [tid for tid, _ in candidate_pool] + [tid for tid, _ in force_keep_query]
-            prompt_ids = chat_before_ids + full_ids + chat_after_ids
+            chat_ids = chat_ids + delta_ids
+            prompt_ids = chat_ids
 
             request_id = f"{conv['id']}::turn{turn_idx}"
             sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
@@ -759,8 +862,30 @@ def run_baseline(
                 # no cumulative-output slicing needed (see that function's
                 # own docstring for why THAT pipeline needs it and this one
                 # doesn't).
-                actual_output_ids = list(completion.token_ids)
-                stats["out_lens"].append(len(actual_output_ids))
+                new_output_ids = list(completion.token_ids)
+                stats["out_lens"].append(len(new_output_ids))
+                # Drop the last generated token before appending to the
+                # conversation, matching `run_sparse_attention` exactly.
+                # There it's forced: `_update_request_as_session` discards
+                # the last sampled token (its KV was never computed), so
+                # the sparse target's real resident history simply does not
+                # contain it. Mirrored here for two reasons, one of them
+                # load-bearing rather than cosmetic:
+                #   1. Comparability -- if M000's history carried one extra
+                #      token per turn that SPARSE's physically cannot, this
+                #      change would trade the rendering confound it exists
+                #      to remove for a smaller one in the other direction.
+                #   2. Well-formedness -- when a turn stops on the model's
+                #      own `<|eot_id|>`, that token is the one dropped, and
+                #      `turn_boundary_ids` supplies its own `<|eot_id|>`
+                #      immediately after. Keeping both would emit a DOUBLE
+                #      end-of-turn marker into the chat stream every turn.
+                # Applied unconditionally (not just when the last token is
+                # an EOS) precisely because the sparse path drops it
+                # unconditionally: on a `length`-capped turn both paths
+                # then lose the same single token, instead of diverging on
+                # exactly the turns most likely to be scored differently.
+                actual_output_ids = new_output_ids[:-1]
                 stats["finish"][completion.finish_reason if completion.finish_reason in
                                  stats["finish"] else "other"] += 1
                 if output.metrics is not None and output.metrics.first_token_latency:
@@ -772,7 +897,11 @@ def run_baseline(
                     "config": conv["config"], "pred": completion.text,
                 })
 
-            state.complete_turn(candidate_pool, actual_output_ids)
+            # Append this turn's own output to the conversation, so the
+            # next turn's `turn_boundary_ids` closes a real assistant turn.
+            # Empty when `output is None` (nothing generated), which just
+            # leaves the stream where it was.
+            chat_ids = chat_ids + actual_output_ids
 
         if len(predictions) > turns_before:
             conversations_processed += 1
@@ -1182,10 +1311,13 @@ def run_sparse_attention(
                 args=(target_request_id, translated_positions),
             )
 
-            if turn_idx == 0:
-                delta_ids = chat_before_ids + context_ids + query_ids + chat_after_ids
-            else:
-                delta_ids = turn_boundary_ids + query_ids + chat_after_ids
+            # Shared with `run_baseline` so M000 and SPARSE submit the same
+            # token stream -- see `build_turn_delta_ids`'s docstring.
+            delta_ids = build_turn_delta_ids(
+                turn_idx=turn_idx, query_ids=query_ids,
+                chat_before_ids=chat_before_ids, context_ids=context_ids,
+                chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
+            )
 
             sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
             prompt = build_sparse_session_request(
@@ -1480,7 +1612,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             t0 = time.time()
             if mode == "baseline":
                 predictions, stats = run_baseline(
-                    llm, tok, conversations, args.max_tokens, keep_mode,
+                    llm, tok, conversations, args.max_tokens,
                     target_max_num_batched_tokens,
                 )
             elif mode == "sparse":
