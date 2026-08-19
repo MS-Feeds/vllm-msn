@@ -217,6 +217,40 @@ def analyze(predictions: list[dict], golds: dict[tuple[str, int], str], max_toke
     return out
 
 
+def _print_provenance(exp_id: str, predictions: list[dict],
+                      golds: dict[tuple[str, int], str], contexts: dict[str, str]) -> None:
+    """One line describing what's actually IN the predictions file, printed
+    before its table.
+
+    **Not decoration -- a real confusion this prevents.** A stale or
+    overwritten `<exp_id>_predictions.jsonl` produces a perfectly
+    plausible-looking table that silently describes a different run: a
+    graded `M000_result.json` reporting 100 conversations x 5 turns of
+    `scbench_kv` was compared against an `M000_predictions.jsonl` that had
+    since been replaced by 23 conversations of a prose config with 7 turn
+    indices, and nothing in the output said so. The gold-in-context rate is
+    the sharpest tell for retrieval configs specifically: `scbench_kv`
+    answers appear verbatim in the context essentially always, so anything
+    well below 100% means the file isn't what it claims to be."""
+    configs = sorted({str(p.get("config", "?")) for p in predictions})
+    conv_ids = {str(p["conversation_id"]) for p in predictions}
+    turn_ids = sorted({int(p["turn_idx"]) for p in predictions})
+    joined = sum(1 for p in predictions
+                 if (str(p["conversation_id"]), int(p["turn_idx"])) in golds)
+    in_context = sum(
+        1 for p in predictions
+        if (gold := golds.get((str(p["conversation_id"]), int(p["turn_idx"]))))
+        and gold in contexts.get(str(p["conversation_id"]), "")
+    )
+    print(f"\n[{exp_id}] {len(predictions)} rows | {len(conv_ids)} conversations | "
+          f"turn_idx {turn_ids} | configs {configs}")
+    print(f"[{exp_id}] joined to dataset: {joined}/{len(predictions)} | "
+          f"gold appears verbatim in context: {in_context}/{len(predictions)}")
+    if joined < len(predictions):
+        print(f"[{exp_id}] WARNING: {len(predictions) - joined} row(s) did not join to any "
+              f"gold -- every unjoined row is silently dropped from the table below.")
+
+
 def _print_table(exp_id: str, rows: dict) -> None:
     print(f"\n=== {exp_id} ===")
     print(f"{'turn':>4} {'n':>5} {'score':>7} {'prefix-only':>12} "
@@ -271,6 +305,7 @@ def main() -> None:
             continue
         exp_id = pred_file.name[: -len("_predictions.jsonl")]
         predictions = _read_jsonl(pred_file)
+        _print_provenance(exp_id, predictions, golds, contexts)
         rows = analyze(predictions, golds, args.max_tokens)
         _print_table(exp_id, rows)
 

@@ -1,0 +1,331 @@
+#!/usr/bin/env python3
+"""Analytic FLOP model for the combined speculator + target system.
+
+Answers the question wall-clock can't: **is the compute the speculator adds
+smaller than the compute the target saves?** Every other metric this
+pipeline collects (`turns_per_second`, `ttft_*_ms`, `seconds_per_turn_*` in
+`results/all_runs.csv`) is wall-clock under `enforce_eager=True` on one GPU,
+which conflates the algorithmic cost with dispatch overhead, the absence of
+CUDA graphs, and memory-bandwidth stalls -- exactly the confound
+`gpu_vs_host_timing.py` exists to separate. FLOPs separate the *algorithmic*
+cost from the *implementation* cost, so optimization work can target the
+right one.
+
+Pure Python -- no torch, no vLLM import -- so it stays unit-testable in the
+same CPU-only environment `test_vllm_patch.py` already runs in. Lives at the
+benchmark top level rather than in `vllm_patch/` because it's a measurement
+concern, not part of the Algorithm-1 patch.
+
+Mirrors `sparse_decode_microbench.py::bytes_per_token_kv`'s convention:
+everything is derived from `hf_config` at runtime, nothing about a specific
+checkpoint is hardcoded.
+
+## What is and isn't counted
+
+Counted: every matmul -- QKV/O projections, the SwiGLU MLP, `lm_head`, and
+both attention GEMMs (`QK^T` and `AV`), plus the speculator's own scoring
+GEMM (`vllm_patch/scoring.py::compute_attention_score`), which is real GPU
+work outside both models' forward passes and is invisible to every other
+metric collected here.
+
+NOT counted: RMSNorm, RoPE, softmax, residual adds, elementwise activations.
+Together these are well under 1% of the total at these shapes. **This is a
+matmul-FLOP model, not a total-instruction count** -- don't compare it
+against a hardware instruction counter and expect exact agreement.
+
+A multiply-accumulate is 2 FLOPs throughout.
+
+## GQA does not reduce attention FLOPs
+
+`num_kv_heads < num_heads` shrinks the KV *cache* (which is why
+`bytes_per_token_kv` scales with `num_kv_heads`) but not the attention
+arithmetic: every one of the `num_heads` query heads still does a full
+`head_dim` dot product against its group's K and V. So attention terms here
+scale with `num_heads`, and only the QKV projection scales with
+`num_kv_heads`. Getting this backwards is the easiest way to silently
+under-count attention by 4x on Llama-3.1-8B (32 q heads vs. 8 kv heads).
+
+## FLOPs are not the whole story for the SPARSE row -- read them with
+## `bytes_per_token_kv`, not instead of it
+
+Decode is memory-bound, not compute-bound (the premise of
+`sparse_decode_microbench.py`'s whole roofline analysis). So the SPARSE
+path, which leaves target prefill fully dense and only shrinks decode
+attention, can legitimately show MORE total FLOPs than M000 -- it adds the
+speculator's cost and saves almost nothing on a compute axis that decode
+was never limited by. A turn-0 projection at 77k context and 64 output
+tokens puts SPARSE at ~120% of M000's FLOPs at every keep rate.
+
+That is a real finding about where SPARSE's saving lives, not a verdict
+against it: its saving is in KV bytes read per decode step, which is
+`bytes_per_token_kv`'s axis, and in the growing-context multi-turn regime
+this pipeline exists to test. Use this model to see what the SPECULATOR
+costs and whether SPECPREFILL's prefill trade pays off; use the byte
+accounting for whether the sparse decode pays off. Neither alone answers
+both questions.
+
+## lm_head is charged per logits row, not per token
+
+vLLM computes logits only for tokens it needs to sample from: one row per
+prefill (the last token) and one per decode step -- not for every prefill
+token. Charging `lm_head` per prefill token would over-count a 100k-token
+prefill by ~100k x 2 x hidden x vocab, which for Llama-3.1-8B is larger
+than the entire rest of the prefill.
+"""
+
+from dataclasses import asdict, dataclass
+from typing import Dict, List, Sequence
+
+
+@dataclass(frozen=True)
+class ModelFlopConfig:
+    """Shape parameters needed to count FLOPs, derived from an `hf_config`."""
+
+    num_layers: int
+    hidden: int
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    intermediate: int
+    vocab: int
+
+    # -- per-token, position-independent (dense) work ----------------------
+
+    @property
+    def qkv_flops_per_token(self) -> int:
+        # Q is [hidden -> num_heads*head_dim]; K and V are each
+        # [hidden -> num_kv_heads*head_dim]. This is the ONE place
+        # num_kv_heads legitimately shrinks the arithmetic.
+        return 2 * self.hidden * (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
+
+    @property
+    def o_proj_flops_per_token(self) -> int:
+        return 2 * self.num_heads * self.head_dim * self.hidden
+
+    @property
+    def mlp_flops_per_token(self) -> int:
+        # SwiGLU: gate + up (both hidden -> intermediate) and down
+        # (intermediate -> hidden) == 3 GEMMs of hidden*intermediate MACs.
+        return 6 * self.hidden * self.intermediate
+
+    @property
+    def linear_flops_per_token(self) -> int:
+        """All non-attention matmul work for one token through every layer.
+
+        Excludes `lm_head` (charged per logits row, not per token -- see the
+        module docstring)."""
+        return self.num_layers * (
+            self.qkv_flops_per_token + self.o_proj_flops_per_token + self.mlp_flops_per_token
+        )
+
+    @property
+    def lm_head_flops(self) -> int:
+        return 2 * self.hidden * self.vocab
+
+    # -- attention ---------------------------------------------------------
+
+    @property
+    def _attn_flops_per_query_key_pair(self) -> int:
+        # 2 GEMMs (QK^T and AV) x 2 FLOPs/MAC x head_dim, per query head.
+        return 4 * self.num_heads * self.head_dim
+
+    def attn_prefill_flops(self, n_new: int, n_cached: int = 0) -> int:
+        """Causal attention for `n_new` new tokens on top of `n_cached`
+        already-resident ones.
+
+        Query token `i` (0-indexed among the new ones) attends
+        `n_cached + i + 1` keys, so the total key count is
+        `n_new*n_cached + n_new*(n_new+1)/2`.
+        """
+        if n_new <= 0:
+            return 0
+        n_cached = max(n_cached, 0)
+        key_visits = n_new * n_cached + n_new * (n_new + 1) // 2
+        return self.num_layers * self._attn_flops_per_query_key_pair * key_visits
+
+    def attn_decode_step_flops(self, attended_len: int) -> int:
+        """One decode step's attention against `attended_len` resident keys."""
+        if attended_len <= 0:
+            return 0
+        return self.num_layers * self._attn_flops_per_query_key_pair * attended_len
+
+    def scoring_flops(self, look_ahead: int, ctx_len: int) -> int:
+        """`vllm_patch/scoring.py::compute_attention_score` -- Algorithm 1
+        line 12, `Q @ K^T / sqrt(d)` per layer.
+
+        `QK^T` ONLY, no `AV`: the scorer wants the score matrix itself, not
+        an attention output, so it never contracts back against V. That's
+        why this is `2 * ...` where `attn_*` above is `4 * ...`.
+
+        Tracked as its own line item because it's real GPU work that no
+        other metric in this directory can see -- but **measured, it turns
+        out to be negligible**, and that's worth knowing before anyone
+        spends effort optimizing it. It scales with `look_ahead` (8), not
+        with the number of prefilled tokens, so at 77k context on the 1B
+        speculator it's ~0.04 TFLOP against ~538 TFLOP for that same
+        speculator's prefill: about 0.007% of the turn. The speculator's
+        cost is its PREFILL, essentially in full. Keep the column anyway --
+        it's what makes that statement a measurement rather than a guess,
+        and it would stop being true if `look_ahead_cnt` were ever swept up
+        by orders of magnitude.
+        """
+        if look_ahead <= 0 or ctx_len <= 0:
+            return 0
+        return self.num_layers * 2 * self.num_heads * self.head_dim * look_ahead * ctx_len
+
+
+def model_flop_config(hf_config) -> ModelFlopConfig:
+    """Derives a `ModelFlopConfig` from a HuggingFace config.
+
+    Same field-extraction fallbacks as `sparse_decode_microbench.py::
+    bytes_per_token_kv` (`num_key_value_heads` defaulting to
+    `num_attention_heads` for non-GQA models, `head_dim` defaulting to
+    `hidden_size // num_attention_heads`) -- kept identical deliberately so
+    the two derived quantities can never disagree about a model's shape.
+    """
+    num_heads = hf_config.num_attention_heads
+    return ModelFlopConfig(
+        num_layers=hf_config.num_hidden_layers,
+        hidden=hf_config.hidden_size,
+        num_heads=num_heads,
+        num_kv_heads=getattr(hf_config, "num_key_value_heads", None) or num_heads,
+        head_dim=getattr(hf_config, "head_dim", None) or (hf_config.hidden_size // num_heads),
+        intermediate=hf_config.intermediate_size,
+        vocab=hf_config.vocab_size,
+    )
+
+
+@dataclass
+class FlopBreakdown:
+    """Per-stage FLOP attribution for one turn (or summed over many).
+
+    The BREAKDOWN is the deliverable, not the total -- the point is knowing
+    which stage to optimize. `spec_*` stages are zero for the M000 baseline
+    (no speculator at all).
+    """
+
+    spec_prefill: int = 0
+    spec_lookahead: int = 0
+    spec_scoring: int = 0
+    target_prefill: int = 0
+    target_decode: int = 0
+
+    STAGES = ("spec_prefill", "spec_lookahead", "spec_scoring",
+              "target_prefill", "target_decode")
+
+    @property
+    def total(self) -> int:
+        return sum(getattr(self, s) for s in self.STAGES)
+
+    @property
+    def speculator_total(self) -> int:
+        return self.spec_prefill + self.spec_lookahead + self.spec_scoring
+
+    @property
+    def speculator_fraction(self) -> float:
+        total = self.total
+        return self.speculator_total / total if total else 0.0
+
+    def __iadd__(self, other: "FlopBreakdown") -> "FlopBreakdown":
+        for stage in self.STAGES:
+            setattr(self, stage, getattr(self, stage) + getattr(other, stage))
+        return self
+
+    def as_dict(self) -> Dict[str, int]:
+        d = asdict(self)
+        d["total"] = self.total
+        return d
+
+
+def speculator_turn_flops(
+    cfg: ModelFlopConfig,
+    pool_len: int,
+    num_cached: int,
+    look_ahead: int,
+) -> FlopBreakdown:
+    """Everything the speculator costs for one turn.
+
+    Args:
+        cfg: the SPECULATOR's shape (Llama-3.2-1B in this pipeline).
+        pool_len: total submitted length -- candidate pool + this turn's
+            query (`PrunedTurnResult.orig_len`).
+        num_cached: prefix-cache hits on the speculator's persistent engine
+            (`PrunedTurnResult.num_cached_tokens`). The speculator runs with
+            `enable_prefix_caching=True` and a conversation-scoped cache, so
+            in a growing multi-turn conversation this is most of `pool_len`
+            after turn 0 -- ignoring it would badly over-count.
+        look_ahead: lookahead decode steps ACTUALLY taken
+            (`PrunedTurnResult.actual_look_ahead_cnt`, which can be less
+            than the configured `look_ahead_cnt` if the sample hit EOS).
+
+    The lookahead steps attend a sequence that grows by one each step
+    (`pool_len + 1 + j` after `j` prior steps), and each samples a token, so
+    each pays `lm_head` as well.
+    """
+    n_new = max(pool_len - num_cached, 0)
+    prefill = n_new * cfg.linear_flops_per_token + cfg.attn_prefill_flops(n_new, num_cached)
+
+    lookahead = 0
+    for j in range(max(look_ahead, 0)):
+        lookahead += cfg.linear_flops_per_token + cfg.lm_head_flops
+        lookahead += cfg.attn_decode_step_flops(pool_len + 1 + j)
+
+    scoring = cfg.scoring_flops(look_ahead, pool_len)
+    return FlopBreakdown(spec_prefill=prefill, spec_lookahead=lookahead, spec_scoring=scoring)
+
+
+def target_prefill_flops(cfg: ModelFlopConfig, prompt_len: int, num_cached: int) -> int:
+    """Target prefill for one turn.
+
+    `num_cached` comes from `RequestOutput.num_cached_tokens` -- MEASURED,
+    not assumed. It matters in all three modes: baseline never sets
+    `enable_prefix_caching` explicitly but gets vLLM's default, sparse runs
+    a resumable session, and specprefill's pruned prompts still share the
+    constant chat-wrapper prefix.
+
+    One `lm_head` row is charged (the first sampled token), never per-token
+    -- see the module docstring.
+    """
+    n_new = max(prompt_len - num_cached, 0)
+    return (
+        n_new * cfg.linear_flops_per_token
+        + cfg.attn_prefill_flops(n_new, min(num_cached, prompt_len))
+        + (cfg.lm_head_flops if n_new > 0 else 0)
+    )
+
+
+def target_decode_flops(cfg: ModelFlopConfig, attended_lens: Sequence[int]) -> int:
+    """Target decode, one entry in `attended_lens` per decode step.
+
+    For the SPARSE path these are the gathered (block-padded) lengths the
+    attention kernel was actually told to read -- i.e. **hardware-executed**
+    work, not an idealized token-exact figure. That's the right quantity for
+    optimization: it's what the GPU does.
+
+    For baseline/specprefill the sequence is simply
+    `prompt_len + i + 1 for i in range(out_len)` -- attention is dense
+    there, see `dense_decode_attended_lens`.
+    """
+    total = 0
+    for attended in attended_lens:
+        total += cfg.linear_flops_per_token + cfg.lm_head_flops
+        total += cfg.attn_decode_step_flops(attended)
+    return total
+
+
+def dense_decode_attended_lens(prompt_len: int, num_decode_steps: int) -> List[int]:
+    """Attended length per decode step for an UNRESTRICTED (dense) decode.
+
+    Step `i` attends the whole prompt plus the `i` tokens generated before
+    it, plus itself. Used for M000 and SPECPREFILL, whose decode attention
+    is never gathered, so no runner-side instrumentation is needed at all --
+    only the SPARSE path has to measure (see
+    `vllm_patch/sparse_target_runner.py::pop_attended_lens`).
+
+    **`num_decode_steps` is one LESS than the number of generated tokens.**
+    The first output token is sampled from the prefill's own logits row
+    (already charged by `target_prefill_flops`); only tokens 2..N cost a
+    decode step. Passing `out_len` here instead would over-count by one
+    full step per turn.
+    """
+    return [prompt_len + i + 1 for i in range(max(num_decode_steps, 0))]

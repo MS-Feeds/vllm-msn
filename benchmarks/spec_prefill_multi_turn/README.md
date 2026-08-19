@@ -56,6 +56,17 @@ the same protocol-markdown + `datasets/`/`results/` structure. Has its own
 - `grade_scbench.py` — scores predictions against `prep_scbench.py`'s
   samples, with per-SCBench-config metrics ported from the official
   `microsoft/MInference/scbench/eval_utils.py`.
+- `flops_model.py` — analytic FLOP model for the combined speculator +
+  target system, driven by per-turn token counts measured during the run.
+  Answers what wall-clock can't: whether the compute the speculator adds is
+  smaller than the compute the target saves. Wired into `predict_scbench.py`
+  (per-turn `flops` in the predictions JSONL, per-stage TFLOP columns in
+  `all_runs.csv`); pure Python, no GPU needed.
+- `validate_flops_model.py` — GPU-node validation of that model, without
+  `ncu`: `torch.profiler(with_flops=True)` for the dense term, a
+  cross-check of the sparse gather's attended lengths against
+  `sparse_decode_microbench.py`'s independent block counts for the
+  attention term, and an above-peak falsification bound.
 - `datasets/` — SCBench prompt sets (gitignored).
 - `results/` — gitignored output directory.
 

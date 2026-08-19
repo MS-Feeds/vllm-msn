@@ -76,7 +76,22 @@ from vllm_patch.scoring import (
     score_and_select_indices,
 )
 from vllm_patch.pruner import _positions_from_kept_indices
-from predict_scbench import LedgerToTargetPositionMap, build_turn_delta_ids
+from predict_scbench import (
+    CSV_FIELDS,
+    LedgerToTargetPositionMap,
+    _flop_summary_fields,
+    _num_decode_steps,
+    build_turn_delta_ids,
+)
+from flops_model import (
+    FlopBreakdown,
+    ModelFlopConfig,
+    dense_decode_attended_lens,
+    model_flop_config,
+    speculator_turn_flops,
+    target_decode_flops,
+    target_prefill_flops,
+)
 
 
 class _FakeRequest:
@@ -1878,6 +1893,219 @@ def test_spec_config_rejects_invalid_keep_mode():
 def test_spec_config_keep_mode_defaults_to_keep():
     cfg = SpecConfig(keep_strategy="percentage")
     assert cfg.keep_mode == "keep"
+
+
+# --------------------------------------------------------------------------
+# flops_model.py -- the analytic FLOP model (see its module docstring)
+# --------------------------------------------------------------------------
+
+def _llama31_8b_flop_cfg():
+    return ModelFlopConfig(
+        num_layers=32, hidden=4096, num_heads=32, num_kv_heads=8,
+        head_dim=128, intermediate=14336, vocab=128256,
+    )
+
+
+def _tiny_flop_cfg():
+    return ModelFlopConfig(
+        num_layers=2, hidden=8, num_heads=2, num_kv_heads=1,
+        head_dim=4, intermediate=16, vocab=32,
+    )
+
+
+def test_flops_prefill_attention_matches_brute_force():
+    """Closed form vs. an explicit per-query-token loop -- the one place an
+    off-by-one in the causal triangle would hide."""
+    cfg = _tiny_flop_cfg()
+    per_pair = cfg.num_layers * 4 * cfg.num_heads * cfg.head_dim
+    for n_new, n_cached in [(1, 0), (5, 0), (1, 100), (7, 13), (64, 4096)]:
+        brute = sum(n_cached + i + 1 for i in range(n_new)) * per_pair
+        assert cfg.attn_prefill_flops(n_new, n_cached) == brute, (n_new, n_cached)
+
+
+def test_flops_dense_term_is_exactly_two_n():
+    """`linear_flops_per_token` must equal 2 x non-embedding params -- the
+    standard cross-check that catches a transposed projection dimension."""
+    cfg = _llama31_8b_flop_cfg()
+    params = cfg.num_layers * (
+        cfg.hidden * (cfg.num_heads + 2 * cfg.num_kv_heads) * cfg.head_dim  # QKV
+        + cfg.num_heads * cfg.head_dim * cfg.hidden                          # O
+        + 3 * cfg.hidden * cfg.intermediate                                  # SwiGLU
+    )
+    assert cfg.linear_flops_per_token == 2 * params
+    # ~6.98B non-embedding params for Llama-3.1-8B -> ~13.96 GFLOP/token.
+    assert 13.9e9 < cfg.linear_flops_per_token < 14.0e9
+
+
+def test_flops_lm_head_charged_once_per_prefill_not_per_token():
+    """Charging lm_head per prefill token would dwarf the prefill itself at
+    SCBench context lengths -- pin it to exactly one row."""
+    cfg = _llama31_8b_flop_cfg()
+    prompt_len = 100_000
+    got = target_prefill_flops(cfg, prompt_len, num_cached=0)
+    expected = (
+        prompt_len * cfg.linear_flops_per_token
+        + cfg.attn_prefill_flops(prompt_len, 0)
+        + cfg.lm_head_flops
+    )
+    assert got == expected
+    # A fully-cached prefill computes nothing at all, lm_head included.
+    assert target_prefill_flops(cfg, prompt_len, num_cached=prompt_len) == 0
+
+
+def test_flops_gqa_shrinks_qkv_but_not_attention():
+    """num_kv_heads shrinks the KV cache (bytes_per_token_kv's axis) and the
+    QKV projection -- never the attention arithmetic."""
+    gqa = _llama31_8b_flop_cfg()
+    mha = ModelFlopConfig(**{**gqa.__dict__, "num_kv_heads": gqa.num_heads})
+    assert gqa.qkv_flops_per_token < mha.qkv_flops_per_token
+    assert gqa.attn_prefill_flops(64, 1024) == mha.attn_prefill_flops(64, 1024)
+    assert gqa.attn_decode_step_flops(4096) == mha.attn_decode_step_flops(4096)
+
+
+def test_flops_scoring_is_qk_only_so_half_of_full_attention():
+    """compute_attention_score never contracts against V, so it must cost
+    exactly half of what an equivalent full attention would."""
+    cfg = _tiny_flop_cfg()
+    look_ahead, ctx_len = 8, 4096
+    full = cfg.num_layers * 4 * cfg.num_heads * cfg.head_dim * look_ahead * ctx_len
+    assert cfg.scoring_flops(look_ahead, ctx_len) * 2 == full
+    # Linear in context length -- the property that makes it worth its own
+    # column rather than folding into the speculator forward cost.
+    assert cfg.scoring_flops(8, 8192) == 2 * cfg.scoring_flops(8, 4096)
+
+
+def test_flops_sparse_decode_is_cheaper_than_dense_and_monotone():
+    cfg = _llama31_8b_flop_cfg()
+    dense = dense_decode_attended_lens(prompt_len=32768, num_decode_steps=64)
+    half = [n // 2 for n in dense]
+    quarter = [n // 4 for n in dense]
+    f_dense = target_decode_flops(cfg, dense)
+    f_half = target_decode_flops(cfg, half)
+    f_quarter = target_decode_flops(cfg, quarter)
+    assert f_quarter < f_half < f_dense
+    # The per-step weight cost (linear + lm_head) is NOT saved by sparsity,
+    # so halving attention must not halve the total -- if it does, the
+    # weight term has gone missing.
+    assert f_half > f_dense / 2
+
+
+def test_dense_decode_attended_lens_is_one_short_of_out_len():
+    """The first output token comes from the prefill's logits row, so N
+    generated tokens cost N-1 decode steps."""
+    lens = dense_decode_attended_lens(prompt_len=10, num_decode_steps=3)
+    assert lens == [11, 12, 13]
+    assert dense_decode_attended_lens(10, 0) == []
+    assert dense_decode_attended_lens(10, -5) == []
+
+
+def test_flops_breakdown_accumulates_and_attributes():
+    a = FlopBreakdown(spec_prefill=10, spec_scoring=5, target_decode=85)
+    b = FlopBreakdown(spec_lookahead=100, target_prefill=100)
+    total = FlopBreakdown()
+    total += a
+    total += b
+    assert total.total == 300
+    assert total.speculator_total == 115
+    assert abs(total.speculator_fraction - 115 / 300) < 1e-12
+    assert FlopBreakdown().speculator_fraction == 0.0
+    d = a.as_dict()
+    assert d["total"] == 100 and d["spec_prefill"] == 10 and d["target_prefill"] == 0
+
+
+def test_flops_speculator_turn_respects_prefix_cache_and_lookahead():
+    cfg = _tiny_flop_cfg()
+    pool_len, look_ahead = 1000, 4
+    cold = speculator_turn_flops(cfg, pool_len, num_cached=0, look_ahead=look_ahead)
+    warm = speculator_turn_flops(cfg, pool_len, num_cached=900, look_ahead=look_ahead)
+    # Prefix-cache hits shrink prefill only; lookahead and scoring both
+    # still run over the FULL pool -- ignoring that would make a warm turn
+    # look nearly free, which it isn't.
+    assert warm.spec_prefill < cold.spec_prefill
+    assert warm.spec_lookahead == cold.spec_lookahead
+    assert warm.spec_scoring == cold.spec_scoring
+    # Lookahead steps attend a growing sequence: pool_len+1 .. pool_len+k.
+    expected_lookahead = sum(
+        cfg.linear_flops_per_token + cfg.lm_head_flops
+        + cfg.attn_decode_step_flops(pool_len + 1 + j)
+        for j in range(look_ahead)
+    )
+    assert cold.spec_lookahead == expected_lookahead
+    # EOS on the first candidate token: no lookahead, and nothing to score.
+    none = speculator_turn_flops(cfg, pool_len, num_cached=0, look_ahead=0)
+    assert none.spec_lookahead == 0 and none.spec_scoring == 0
+    assert none.spec_prefill == cold.spec_prefill
+
+
+def test_flops_model_config_hf_fallbacks():
+    """Same fallbacks as bytes_per_token_kv: a config with neither head_dim
+    nor num_key_value_heads must still resolve."""
+    class _HF:
+        num_hidden_layers = 4
+        hidden_size = 64
+        num_attention_heads = 8
+        intermediate_size = 256
+        vocab_size = 1000
+
+    cfg = model_flop_config(_HF())
+    assert cfg.num_kv_heads == 8       # defaulted to num_attention_heads
+    assert cfg.head_dim == 8           # hidden_size // num_attention_heads
+
+    class _HFGqa(_HF):
+        num_key_value_heads = 2
+        head_dim = 16
+
+    gqa = model_flop_config(_HFGqa())
+    assert gqa.num_kv_heads == 2 and gqa.head_dim == 16
+
+
+def test_flops_hand_computed_tiny_breakdown():
+    """Pins the stage split itself, not just the total, against numbers
+    worked out by hand rather than by re-running the implementation."""
+    cfg = ModelFlopConfig(
+        num_layers=1, hidden=2, num_heads=1, num_kv_heads=1,
+        head_dim=2, intermediate=4, vocab=8,
+    )
+    # qkv = 2*2*(1+2)*2 = 24; o = 2*1*2*2 = 8; mlp = 6*2*4 = 48 -> 80/token
+    assert cfg.linear_flops_per_token == 80
+    assert cfg.lm_head_flops == 32  # 2 * hidden * vocab
+    # per query/key pair = 4*1*2 = 8
+    assert cfg._attn_flops_per_query_key_pair == 8
+    # prefill 3 tokens, nothing cached: keys visited = 1+2+3 = 6 -> 48
+    assert cfg.attn_prefill_flops(3, 0) == 48
+    assert target_prefill_flops(cfg, prompt_len=3, num_cached=0) == 3 * 80 + 48 + 32
+    # two decode steps attending 4 and 5 keys
+    assert target_decode_flops(cfg, [4, 5]) == 2 * (80 + 32) + 8 * (4 + 5)
+
+
+def test_flop_summary_fields_match_the_csv_schema():
+    """Every key `_flop_summary_fields` emits must exist in CSV_FIELDS, in
+    both the populated and the empty case -- a mismatch means DictWriter
+    raises mid-run, after the experiment has already been paid for."""
+    turn = FlopBreakdown(spec_prefill=1e12, spec_lookahead=2e12, spec_scoring=3e12,
+                         target_prefill=4e12, target_decode=10e12)
+    populated = _flop_summary_fields([turn, turn], elapsed=10.0, peak_tflops=312.0)
+    empty = _flop_summary_fields([], elapsed=10.0, peak_tflops=None)
+    assert set(populated) == set(empty)
+    missing = set(populated) - set(CSV_FIELDS)
+    assert not missing, f"emitted keys absent from CSV_FIELDS: {sorted(missing)}"
+    assert all(v is None for v in empty.values())
+
+    # Stage columns are per-turn MEANS, total_tflops is the experiment.
+    assert populated["spec_prefill_tflops_per_turn_mean"] == 1.0
+    assert populated["total_tflops_per_turn_mean"] == 20.0
+    assert populated["total_tflops"] == 40.0
+    assert abs(populated["speculator_flops_fraction"] - 6 / 20) < 1e-12
+    assert populated["achieved_tflops_per_s"] == 4.0
+    assert abs(populated["mfu"] - 4.0 / 312.0) < 1e-12
+    # No peak given -> no MFU claim, rather than a guessed one.
+    assert _flop_summary_fields([turn], elapsed=1.0, peak_tflops=None)["mfu"] is None
+
+
+def test_num_decode_steps_excludes_the_prefill_sampled_token():
+    assert _num_decode_steps(0) == 0
+    assert _num_decode_steps(1) == 0
+    assert _num_decode_steps(64) == 63
 
 
 def _run_all():

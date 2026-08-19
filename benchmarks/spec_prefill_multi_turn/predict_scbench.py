@@ -133,6 +133,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from flops_model import (
+    FlopBreakdown,
+    dense_decode_attended_lens,
+    model_flop_config,
+    speculator_turn_flops,
+    target_decode_flops,
+    target_prefill_flops,
+)
+
 sys.path.insert(0, str(Path(__file__).parent))  # for `vllm_patch` imports
 
 try:
@@ -183,6 +192,14 @@ CSV_FIELDS = [
     "num_cached_tokens_speculator_mean",
     "out_len_mean", "out_len_stdev", "out_tokens_per_second",
     "finish_stop", "finish_length", "finish_other",
+    # Analytic FLOP accounting -- see flops_model.py's module docstring for
+    # what is and isn't counted. Per-turn means (not totals) for the stage
+    # breakdown, so rows with different turn counts stay comparable;
+    # total_tflops is the whole experiment, matching elapsed_time's scope.
+    "spec_prefill_tflops_per_turn_mean", "spec_lookahead_tflops_per_turn_mean",
+    "spec_scoring_tflops_per_turn_mean", "target_prefill_tflops_per_turn_mean",
+    "target_decode_tflops_per_turn_mean", "total_tflops_per_turn_mean",
+    "total_tflops", "speculator_flops_fraction", "achieved_tflops_per_s", "mfu",
 ]
 
 # See EXPERIMENT_PLAN.md's "SpecPrefill settings" -- algorithm hyperparameters
@@ -702,6 +719,91 @@ def _progress_postfix(
     return postfix
 
 
+_TFLOP = 1e12
+
+
+def _flop_summary_fields(turn_flops, elapsed, peak_tflops) -> dict:
+    """Rolls per-turn `FlopBreakdown`s into this experiment's CSV columns.
+
+    Stage columns are per-turn MEANS so rows with different turn counts (a
+    skipped oversized conversation costs turns) stay comparable;
+    `total_tflops` is the whole experiment, matching `elapsed_time`'s own
+    scope.
+
+    `achieved_tflops_per_s` divides by the FULL experiment elapsed time --
+    the same "over the whole experiment's elapsed time" convention
+    `turns_per_second`/`out_tokens_per_second` already use, including
+    tokenization, scoring, and every host-side gap. It is therefore a
+    PIPELINE-level throughput number, not a claim about kernel efficiency,
+    and will read well below peak for that reason. Its real job is the
+    falsification bound: if it ever exceeds the device's peak, the FLOP
+    model is provably wrong (a transposed dimension, a duplicated
+    num_layers factor) -- no profiler needed to catch that class of bug.
+    """
+    if not turn_flops:
+        return {f: None for f in (
+            "spec_prefill_tflops_per_turn_mean", "spec_lookahead_tflops_per_turn_mean",
+            "spec_scoring_tflops_per_turn_mean", "target_prefill_tflops_per_turn_mean",
+            "target_decode_tflops_per_turn_mean", "total_tflops_per_turn_mean",
+            "total_tflops", "speculator_flops_fraction", "achieved_tflops_per_s", "mfu",
+        )}
+
+    total = FlopBreakdown()
+    for bd in turn_flops:
+        total += bd
+    n = len(turn_flops)
+    total_tflops = total.total / _TFLOP
+    achieved = total_tflops / elapsed if elapsed > 0 else None
+    return {
+        "spec_prefill_tflops_per_turn_mean": total.spec_prefill / n / _TFLOP,
+        "spec_lookahead_tflops_per_turn_mean": total.spec_lookahead / n / _TFLOP,
+        "spec_scoring_tflops_per_turn_mean": total.spec_scoring / n / _TFLOP,
+        "target_prefill_tflops_per_turn_mean": total.target_prefill / n / _TFLOP,
+        "target_decode_tflops_per_turn_mean": total.target_decode / n / _TFLOP,
+        "total_tflops_per_turn_mean": total.total / n / _TFLOP,
+        "total_tflops": total_tflops,
+        "speculator_flops_fraction": total.speculator_fraction,
+        "achieved_tflops_per_s": achieved,
+        "mfu": (achieved / peak_tflops) if (achieved and peak_tflops) else None,
+    }
+
+
+def _target_flop_config(llm):
+    """Target model's `ModelFlopConfig`, from the engine's own resolved
+    config -- same `llm_engine.vllm_config.model_config.hf_config` access
+    path `sparse_decode_microbench.py` uses for `bytes_per_token_kv`, so the
+    two derived quantities can never disagree about the model's shape."""
+    return model_flop_config(llm.llm_engine.vllm_config.model_config.hf_config)
+
+
+def _speculator_flop_config(proposer):
+    """Speculator's `ModelFlopConfig`, read from its own persistent engine
+    (`proposer.llm_engine`, see `vllm_patch/proposer.py`) rather than
+    re-loading the checkpoint's config from disk."""
+    return model_flop_config(proposer.llm_engine.vllm_config.model_config.hf_config)
+
+
+def _record_turn_flops(stats, breakdown: FlopBreakdown, **flop_inputs) -> dict:
+    """Accumulates one turn's FLOP breakdown into `stats` and returns the
+    fields to merge into that turn's prediction record.
+
+    `flop_inputs` (the raw token counts the breakdown was computed from) is
+    carried into the JSONL alongside the FLOPs deliberately: the model is
+    analytic, so a surprising FLOP number is only debuggable if the inputs
+    that produced it are visible next to it. Cheap -- a handful of ints per
+    turn."""
+    stats["flops"].append(breakdown)
+    return {"flops": breakdown.as_dict(), "flop_inputs": flop_inputs}
+
+
+def _num_decode_steps(out_len: int) -> int:
+    """Decode steps for `out_len` generated tokens.
+
+    One less: the first output token is sampled from the prefill's own
+    logits row, which `target_prefill_flops` already charges."""
+    return max(out_len - 1, 0)
+
+
 def run_baseline(
     llm, tok, conversations, max_tokens, target_max_num_batched_tokens
 ) -> tuple[list[dict], dict]:
@@ -783,7 +885,8 @@ def run_baseline(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0, "turn_elapsed": []}
+              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": []}
+    target_flop_cfg = _target_flop_config(llm)
 
     t_loop_start = time.time()
     conversations_processed = 0
@@ -892,9 +995,40 @@ def run_baseline(
                     stats["ttfts"].append(output.metrics.first_token_latency * 1000)
                 stats["actual_keep_rates"].append(1.0)
                 stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
+
+                # M000 pays no speculator cost at all -- every spec_* stage
+                # stays zero, which is exactly what makes this row the
+                # denominator every other row's speculator_flops_fraction
+                # is judged against.
+                #
+                # `num_cached_tokens` is READ, not assumed: this path never
+                # sets enable_prefix_caching explicitly, but vLLM v1
+                # defaults it on, and each turn resubmits the whole
+                # cumulative conversation -- so most of a later turn's
+                # prompt is a cache hit and charging it as fresh prefill
+                # would wildly over-count the baseline it's the reference
+                # for.
+                num_cached = output.num_cached_tokens or 0
+                out_len = len(new_output_ids)
+                bd = FlopBreakdown(
+                    target_prefill=target_prefill_flops(
+                        target_flop_cfg, len(prompt_ids), num_cached),
+                    target_decode=target_decode_flops(
+                        target_flop_cfg,
+                        dense_decode_attended_lens(
+                            len(prompt_ids), _num_decode_steps(out_len)),
+                    ),
+                )
+                flop_fields = _record_turn_flops(
+                    stats, bd,
+                    target_prompt_len=len(prompt_ids),
+                    target_cached_tokens=num_cached,
+                    decode_steps=_num_decode_steps(out_len),
+                )
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": completion.text,
+                    **flop_fields,
                 })
 
             # Append this turn's own output to the conversation, so the
@@ -968,7 +1102,10 @@ def run_specprefill(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0, "turn_elapsed": []}
+              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": []}
+
+    target_flop_cfg = _target_flop_config(llm)
+    spec_flop_cfg = _speculator_flop_config(proposer)
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
     desc = f"SpecPrefill keep={keep_pct}"
@@ -1072,9 +1209,43 @@ def run_specprefill(
                     stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
                 stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
+
+                # The whole point of this row: the speculator pays a FULL
+                # prefill over the unpruned candidate pool (pruning shrinks
+                # what the TARGET sees, never what the speculator must
+                # process to decide the pruning -- the same asymmetry the
+                # two-stage length check above exists for), and the target
+                # pays a SHRUNK dense prefill over `prompt_ids`. Whether
+                # that trade wins at this keep rate is exactly the
+                # arithmetic these two numbers settle.
+                num_cached = output.num_cached_tokens or 0
+                out_len = len(completion.token_ids)
+                bd = speculator_turn_flops(
+                    spec_flop_cfg,
+                    pool_len=result.orig_len,
+                    num_cached=result.num_cached_tokens,
+                    look_ahead=result.actual_look_ahead_cnt,
+                )
+                bd.target_prefill = target_prefill_flops(
+                    target_flop_cfg, len(prompt_ids), num_cached)
+                bd.target_decode = target_decode_flops(
+                    target_flop_cfg,
+                    dense_decode_attended_lens(
+                        len(prompt_ids), _num_decode_steps(out_len)),
+                )
+                flop_fields = _record_turn_flops(
+                    stats, bd,
+                    spec_pool_len=result.orig_len,
+                    spec_cached_tokens=result.num_cached_tokens,
+                    spec_look_ahead=result.actual_look_ahead_cnt,
+                    target_prompt_len=len(prompt_ids),
+                    target_cached_tokens=num_cached,
+                    decode_steps=_num_decode_steps(out_len),
+                )
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": completion.text,
+                    **flop_fields,
                 })
 
             golden_answer_ids = render_golden_answer(tok, turn)
@@ -1188,7 +1359,10 @@ def run_sparse_attention(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0, "turn_elapsed": []}
+              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": []}
+
+    target_flop_cfg = _target_flop_config(llm)
+    spec_flop_cfg = _speculator_flop_config(proposer)
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
     desc = f"Sparse attention keep={keep_pct}"
@@ -1222,6 +1396,14 @@ def run_sparse_attention(
         # turns into a real SCBench conversation (kept_positions translated
         # to a target position far beyond anything actually computed).
         prev_cumulative_output_len = 0
+        # Target-side resident KV length, for FLOP accounting only. Tracked
+        # explicitly rather than read from `RequestOutput.num_cached_tokens`
+        # because this path is a resumable SESSION, not a fresh request per
+        # turn: the prior history is already resident in the session's own
+        # KV, which is a different thing from a prefix-cache hit, and the
+        # two are not interchangeable in `num_cached_tokens`. This is the
+        # `n_cached` that `delta_ids`' prefill attention runs against.
+        target_resident_len = 0
 
         for turn_idx, turn in enumerate(conv["turns"]):
             t_turn_start = time.time()
@@ -1358,6 +1540,33 @@ def run_sparse_attention(
                 f"[predict_scbench] {conv['id']!r} turn {turn_idx}: sparse "
                 f"metadata-patch overhead: {override_msg}"
             )
+            # Per-decode-step attended KV length -- the one FLOP input that
+            # can't be derived driver-side on this path, since it's decided
+            # per step by how the selection maps onto block boundaries. Must
+            # be popped BEFORE discard_sparse_selection below only for
+            # symmetry with pop_override_timing; the accumulator itself is
+            # keyed by request_id and independent of the registry. See
+            # sparse_target_runner.py::pop_attended_lens.
+            attended_lens = llm.llm_engine.collective_rpc(
+                "pop_attended_lens", args=(target_request_id,),
+            )[0]
+            # attended_lens is recorded on a strict SUPERSET of the steps
+            # override timing is: it's appended before the `gathered is
+            # None` early-out (dense-fallback steps are real attention
+            # work), while the timing accumulator only fires on steps that
+            # actually patched metadata. So `>=` is the invariant, not
+            # equality -- at keep_rate=1.0 every step is a dense fallback
+            # and override_steps is legitimately 0 while attended_lens is
+            # full. Fewer attended samples than patched steps, on the other
+            # hand, means the accumulator is missing steps it should have
+            # seen, and the decode FLOPs below are under-counted.
+            if len(attended_lens) < override_steps:
+                progress.write(
+                    f"[predict_scbench] WARNING {conv['id']!r} turn "
+                    f"{turn_idx}: attended-length samples ({len(attended_lens)}) "
+                    f"< metadata-patch steps ({override_steps}) -- decode "
+                    f"FLOPs for this turn are under-counted."
+                )
             llm.llm_engine.collective_rpc(
                 "discard_sparse_selection", args=(target_request_id,),
             )
@@ -1396,10 +1605,56 @@ def run_sparse_attention(
                 # re-decode just this turn's own new tokens rather than use
                 # it directly.
                 pred_text = tok.decode(new_output_ids, skip_special_tokens=True)
+
+                # The structural asymmetry this row exists to expose: the
+                # speculator is paid for IN FULL (same cost as the
+                # SpecPrefill row), the target's PREFILL is fully dense
+                # (the gather is decode-only -- sparse_target_runner.py
+                # `continue`s while num_computed < num_prompt), and only
+                # decode attention shrinks. Reading these three stages
+                # against each other is what tells you whether the decode
+                # saving can ever pay for the speculator at a given
+                # context length.
+                bd = speculator_turn_flops(
+                    spec_flop_cfg,
+                    pool_len=result.orig_len,
+                    num_cached=result.num_cached_tokens,
+                    look_ahead=result.actual_look_ahead_cnt,
+                )
+                bd.target_prefill = target_prefill_flops(
+                    target_flop_cfg,
+                    prompt_len=target_resident_len + len(delta_ids),
+                    num_cached=target_resident_len,
+                )
+                # Measured per step, not derived -- these are the
+                # block-padded lengths the kernel was actually handed.
+                bd.target_decode = target_decode_flops(target_flop_cfg, attended_lens)
+                flop_fields = _record_turn_flops(
+                    stats, bd,
+                    spec_pool_len=result.orig_len,
+                    spec_cached_tokens=result.num_cached_tokens,
+                    spec_look_ahead=result.actual_look_ahead_cnt,
+                    target_resident_len=target_resident_len,
+                    target_delta_len=len(delta_ids),
+                    decode_steps=len(attended_lens),
+                    decode_attended_len_mean=(
+                        sum(attended_lens) / len(attended_lens) if attended_lens else 0
+                    ),
+                )
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": pred_text,
+                    **flop_fields,
                 })
+
+            # Advance the resident-length tracker by exactly what this turn
+            # added to the session's KV: the submitted delta, plus every
+            # generated token whose KV was actually computed. That's
+            # `actual_output_ids`, NOT `new_output_ids` -- the final sampled
+            # token was never fed back through the model, so it has no KV,
+            # which is the same reason it's dropped before feeding the
+            # ledger a few lines above.
+            target_resident_len += len(delta_ids) + len(actual_output_ids)
 
             state.complete_turn(result.kept_history_pairs, actual_output_ids)
 
@@ -1709,6 +1964,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "finish_stop": stats["finish"]["stop"],
                 "finish_length": stats["finish"]["length"],
                 "finish_other": stats["finish"]["other"],
+                **_flop_summary_fields(stats["flops"], elapsed, args.peak_tflops),
             }
             append_csv_row(row)
             spc = row["seconds_per_conversation"]
@@ -1732,6 +1988,31 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 f"actual_keep_rate_mean={row['actual_keep_rate_mean']}, "
                 f"num_cached_tokens_speculator_mean={row['num_cached_tokens_speculator_mean']}"
             )
+            if row["total_tflops_per_turn_mean"] is not None:
+                print(
+                    f"[predict_scbench] rep {rep}/{args.reps} FLOPs/turn (TFLOP): "
+                    f"spec_prefill={row['spec_prefill_tflops_per_turn_mean']:.2f} "
+                    f"spec_lookahead={row['spec_lookahead_tflops_per_turn_mean']:.2f} "
+                    f"spec_scoring={row['spec_scoring_tflops_per_turn_mean']:.2f} "
+                    f"target_prefill={row['target_prefill_tflops_per_turn_mean']:.2f} "
+                    f"target_decode={row['target_decode_tflops_per_turn_mean']:.2f} "
+                    f"| total={row['total_tflops_per_turn_mean']:.2f} "
+                    f"speculator_share={row['speculator_flops_fraction']:.1%} "
+                    f"achieved={row['achieved_tflops_per_s']:.2f} TFLOP/s"
+                    + (f" mfu={row['mfu']:.1%}" if row["mfu"] is not None else "")
+                )
+                if args.peak_tflops and row["achieved_tflops_per_s"] > args.peak_tflops:
+                    # §4c falsification bound: above-peak throughput is
+                    # arithmetically impossible, so the model (not the
+                    # hardware) is wrong. Costs nothing and catches the
+                    # whole transposed-dimension class of bug without a
+                    # profiler.
+                    print(
+                        f"[predict_scbench] WARNING: achieved_tflops_per_s="
+                        f"{row['achieved_tflops_per_s']:.2f} EXCEEDS --peak-tflops="
+                        f"{args.peak_tflops} -- the FLOP model is over-counting; "
+                        f"treat every FLOP column in this row as wrong."
+                    )
     finally:
         del llm
         if proposer is not None:
@@ -1786,6 +2067,13 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=64,
                          help="Generation cap per turn.")
     parser.add_argument("--reps", type=int, default=1)
+    parser.add_argument(
+        "--peak-tflops", type=float, default=None,
+        help="Device peak dense throughput in TFLOP/s, used only to emit the "
+             "`mfu` column (e.g. 312 for A100 BF16). Left unset by default "
+             "rather than guessed from the device name -- an MFU against the "
+             "wrong peak is worse than no MFU. Does not affect any FLOP count.",
+    )
     parser.add_argument("--max-conversations", type=int, default=-1)
     parser.add_argument(
         "--chunk-size", default=None,

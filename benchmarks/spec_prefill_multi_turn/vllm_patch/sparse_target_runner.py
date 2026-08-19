@@ -476,6 +476,21 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 num_prompt=num_prompt,
                 seq_len=step_seq_len,
             )
+            # Recorded BEFORE the `gathered is None` early-out below, not
+            # after -- that branch is the degenerate "selection already
+            # covers every resident block" case (keep_rate=1.0, or a
+            # selection grown large enough to span everything), which is a
+            # DENSE decode step, not a zero-work one. Skipping it would
+            # make the k=1.0 row silently under-count its own attention
+            # cost, i.e. look cheaper than the baseline it should exactly
+            # match. `InstrumentedSparseTargetGPUModelRunner._compute_
+            # gathered_view` (sparse_decode_microbench.py) already treats
+            # this same branch as a full `ceil(seq_len / block_size)`
+            # dense read for its block accounting -- same reasoning, same
+            # fallback quantity, expressed in tokens instead of blocks.
+            self._accumulate_attended_len(
+                req_id, step_seq_len if gathered is None else gathered[1]
+            )
             if gathered is None:
                 continue
             gathered_block_table_row, gathered_seq_len = gathered
@@ -595,6 +610,50 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         captured here."""
         accum = self._override_timing_accum()
         return accum.pop(request_id, (0.0, 0))
+
+    def _attended_lens_accum(self) -> Dict[str, List[int]]:
+        # Same lazily-initialized, req_id-keyed, pop-and-reset shape as
+        # _override_timing_accum above.
+        if not hasattr(self, "_sparse_attended_lens_accum"):
+            self._sparse_attended_lens_accum: Dict[str, List[int]] = {}
+        return self._sparse_attended_lens_accum
+
+    def _accumulate_attended_len(self, req_id: str, attended_len: int) -> None:
+        self._attended_lens_accum().setdefault(req_id, []).append(int(attended_len))
+
+    def pop_attended_lens(self, request_id: str) -> List[int]:
+        """Returns this turn's per-decode-step attended KV length for
+        `request_id` (one entry per step, in order), then resets it.
+
+        The FLOP driver for `flops_model.py::target_decode_flops` -- the
+        only quantity in that whole model that can't be derived from token
+        counts the driver already holds, because it's decided per step
+        inside `_compute_gathered_view` by how the selection happens to map
+        onto block boundaries.
+
+        **These are block-PADDED lengths, not token-exact ones** -- the
+        gather works in whole KV blocks, so a selection of 3 tokens spread
+        across 3 blocks costs `3 * block_size` attended positions, and this
+        reports that larger number. That's deliberate: it's what the
+        attention kernel was actually told to read, so the FLOPs derived
+        from it are hardware-executed work rather than an idealized lower
+        bound. It's also exactly the same quantity
+        `sparse_decode_microbench.py`'s `pop_block_counts` reports (in
+        blocks rather than tokens), which is what makes the two
+        cross-checkable: `block_counts[i] == ceil(attended_lens[i] /
+        block_size)` must hold step for step.
+
+        Prefill steps are absent by construction -- `_apply_sparse_
+        attention_overrides` `continue`s on `num_computed < num_prompt`
+        before ever reaching the gather, so this only ever sees genuine
+        decode steps (the same prefill/decode boundary every other probe in
+        this directory uses).
+
+        Costs one list append per decode step and no GPU sync -- negligible
+        next to the per-layer metadata patching already in that loop, so
+        it's always on rather than gated behind a flag.
+        """
+        return self._attended_lens_accum().pop(request_id, [])
 
     def _step_seq_len(self, req_idx: int) -> int:
         """This step's TOTAL sequence length for `req_idx` -- the same
@@ -742,3 +801,8 @@ class SparseTargetWorker(Worker):
         """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
         pop_override_timing`'s docstring for what this measures and why."""
         return self.model_runner.pop_override_timing(request_id)
+
+    def pop_attended_lens(self, request_id: str) -> List[int]:
+        """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
+        pop_attended_lens`'s docstring for what this measures and why."""
+        return self.model_runner.pop_attended_lens(request_id)
