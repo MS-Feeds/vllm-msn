@@ -30,14 +30,27 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    ops.topk_softmax(
-        topk_weights,
-        topk_indices,
-        token_expert_indices,
-        gating_output,
-        renormalize,
-        is_padding=_get_padding_mask(topk_indices.shape[0]),
-    )
+    is_padding = _get_padding_mask(topk_indices.shape[0])
+    try:
+        ops.topk_softmax(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            is_padding=is_padding,
+        )
+    except RuntimeError as error:
+        if is_padding is not None or "expected at most 6 argument" not in str(error):
+            raise
+        # The base container's extension predates the optional padding argument.
+        ops.topk_softmax(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+        )
 
     return topk_weights, topk_indices
 
