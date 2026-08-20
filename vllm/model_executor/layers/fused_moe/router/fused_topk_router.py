@@ -44,12 +44,15 @@ def vllm_topk_softmax(
         if is_padding is not None or "expected at most 6 argument" not in str(error):
             raise
         # The base container's extension predates the optional padding argument.
-        ops.topk_softmax(
+        # Bypass the newer Python wrapper, which always passes both optional
+        # arguments, and call the six-argument native ABI directly.
+        torch.ops._moe_C.topk_softmax(
             topk_weights,
             topk_indices,
             token_expert_indices,
             gating_output,
             renormalize,
+            None,
         )
 
     return topk_weights, topk_indices
