@@ -212,15 +212,62 @@ single-turn pipeline's confirmed-on-hardware fix for its own
 question/instruction suffix (`../spec_prefill_llama/predict_longbench_v2.py`'s
 documented gibberish-output bug at aggressive keep rates).
 
-**5. Oracle upper bound.** Reuses the SAME `vllm_patch/scoring.py`/
-`vllm_patch/kv_cache_utils.py` machinery, but scores using the TARGET
-model's own attention (a teacher-forced forward pass over the NEXT turn's
-already-known golden query, only possible because of golden-context mode)
-instead of the speculator's estimate -- `vllm_patch/pruner.py`'s
-`compute_oracle_kept_pairs` implements the shared scoring/selection core;
-`predict_scbench.py`'s oracle-mode driving loop (installing the query-capture
-hook on the TARGET's own attention layers) is flagged as **not yet wired up**
-in this pass -- see that script's `run_experiment`'s oracle branch.
+**5. Oracle upper bound — WIRED UP, by a different route than planned.**
+Still the same idea: score using the TARGET model's own attention instead of
+the speculator's estimate of it, so the `ORACLE-k{N}` vs. `SPARSE-k{N}-g32`
+gap measures estimator quality and the `ORACLE-k{N}` vs. `M000` gap measures
+what the sparse-attention mechanism costs with the estimator held perfect.
+Those two gaps are the entire point of the row: the graded SPARSE sweep shows
+a large `scbench_kv` degradation, and nothing in it says whether the 1B
+speculator is picking the wrong blocks or whether block-granular sparse
+decode is lossy no matter who picks.
+
+What changed is HOW. The original plan was a teacher-forced forward pass over
+the next turn's golden query, driven through the target's own engine with a
+query-capture hook on its attention layers (`vllm_patch/pruner.py`'s
+`compute_oracle_kept_pairs`, still present, still unused). Two problems with
+that, both structural rather than incidental:
+
+1. The target's engine now holds a **persistent, resumable conversation
+   session** (see the sparse-attention architecture section below) whose KV
+   cache IS the conversation. A teacher-forced scoring pass through it would
+   write its own tokens into that session, corrupting the conversation it is
+   supposed to be scoring, and there is no unwind mechanism.
+2. It needs a new capture hook on the target runner -- new, unvalidated
+   plumbing, on the one code path this pipeline's correctness rests on.
+
+The wired-up version avoids both by keeping the scorer in a **separate
+engine**: `predict_scbench.py` runs the ordinary sparse driving loop with
+`SpecPrefillProposer` constructed over the TARGET checkpoint
+(`--oracle-scorer-model`, defaulting to `--target-model`) instead of the 1B
+speculator, on the same GPU slot the speculator would have used
+(`--oracle-scorer-device`, defaulting to `--speculator-device`). No new
+mechanism at all: the scoring math, the capture hook, the driving loop, and
+the block-gather are all the already-validated speculator-path code, with one
+constructor argument different. `run_sparse_attention` serves both rows and
+branches on nothing.
+
+The cost of the deviation, stated plainly: the oracle's lookahead queries come
+from tokens the scorer generated itself (the target's own dense-context
+continuation), not from the dataset's golden answer. So this is the ceiling
+for *"what if the draft model were as good as the target?"* -- SpecPrefill's
+own self-speculation limit -- not for *"what if we knew the right answer?"*.
+The latter is strictly stronger and would still need `compute_oracle_kept_
+pairs` plus teacher-forced Q from the golden answer's positions; it remains
+available as a follow-up, and `compute_oracle_kept_pairs` is kept for it.
+
+Two further consequences worth knowing before reading the numbers:
+
+- **ORACLE-k\* moves into the SPARSE rendering group.** It drives
+  `run_sparse_attention`, so it uses genuine `<|eot_id|>`-delimited chat turns
+  like `M000`/`SPARSE-k*-g*`, not `run_specprefill`'s flattened
+  single-exchange rendering. This is required, not incidental: a ceiling
+  measured under a different prompt rendering than the rows it bounds is not a
+  ceiling.
+- **Scoring cost rises ~8x per turn** (8B scorer instead of 1B). Prefix caching
+  keeps that to turn 0 of each conversation for KEEP mode, but an oracle row
+  is still meaningfully slower than its SPARSE partner. This is why the row
+  pairs with one representative granularity (32) rather than the full cross.
 
 **6. KV entry granularity.** Maps directly onto the existing `chunk_size`
 parameter (`token` = flat/non-chunked selection, `16`/`32`/`64` = the
@@ -260,13 +307,13 @@ Llama-3.2-1B speculator, the exact pair this protocol calls for):
    (conversation-aware: threads `conversation_state.py` through, plus a
    shared scoring core for the oracle path), `config.py` (+1 field,
    `keep_mode`).
-4. **Not yet wired up**: the oracle path's driving loop in
-   `predict_scbench.py` (needs a query-capture hook installed on the
-   TARGET's own attention layers, mirroring `speculator_worker.py`'s
-   speculator-side hook -- `vllm_patch/pruner.py::compute_oracle_kept_pairs`
-   is ready to consume the resulting Q/K, but nothing in `predict_scbench.py`
-   produces them yet). Run the baseline (`M000`) and SpecPrefill
-   (`M-k*-g*`) experiments first.
+4. **Oracle path: wired up** (`--exp oracle`), via a target-checkpoint
+   scorer engine rather than the originally-planned teacher-forced capture
+   hook -- see decision 5 above for the full reasoning and for what the
+   resulting ceiling does and does not bound.
+   `vllm_patch/pruner.py::compute_oracle_kept_pairs` is still present and
+   still unused, kept as the entry point for the stronger golden-answer
+   teacher-forced variant.
 5. **Multi-conversation batching -- not attempted.** Both the speculator
    (`proposer.py`) and the target driver (`predict_scbench.py`) run ONE
    conversation's ONE in-flight request at a time, by deliberate MVP-scope
@@ -726,14 +773,14 @@ implemented this pass.
 | M-k60-g{token,16,32,64} | Keep 60% | 60% | token/16/32/64 | keep |
 | M-k40-g{token,16,32,64} | Keep 40% | 40% | token/16/32/64 | keep |
 | M-k20-g{token,16,32,64} | Keep 20% | 20% | token/16/32/64 | keep |
-| ORACLE-k{80,60,40,20} | Oracle upper bound | 80/60/40/20% | 32 (representative) | keep |
+| ORACLE-k{80,60,40,20} | Oracle upper bound (SPARSE architecture, target checkpoint as scorer) | 80/60/40/20% | 32 (representative, pairs with SPARSE-k\*-g32) | keep |
 | SPARSE-k{80,60,40,20}-g{16,32,64} | Persistent cache + sparse attention (see that section above) | 80/60/40/20% | 16/32/64 (no `token` -- block-gather is block-granular only) | keep (only) |
 
 `predict_scbench.py --list` prints this matrix (generated programmatically,
 not hand-enumerated -- see that script's `_build_experiments`). Use
 `--exp specprefill` for all M-k*-g* rows, `--exp sparse` for all
-SPARSE-k*-g* rows, or `--exp all` for everything (including the
-not-yet-implemented ORACLE-k* rows).
+SPARSE-k*-g* rows, `--exp oracle` for the 4 ORACLE-k* ceiling rows, or
+`--exp all` for everything.
 
 Metrics captured per turn: per-config metric (`grade_scbench.py` --
 `in_match` for `scbench_kv`, `qa_f1_score` for `scbench_qa_eng`, ROUGE-L for
@@ -793,8 +840,14 @@ the single-turn LongBench-v2 pipelines this was built from).
   to check for).
 - Report TTFT/throughput improvement over M000 for each keep-rate row (no
   fixed pass/fail threshold -- the sweep itself is the signal).
-- Report the oracle rows as an accuracy ceiling reference once wired up
-  (see "Implementation status" #4).
+- Report the oracle rows as an accuracy ceiling reference (wired up --
+  see decision 5 and "Implementation status" #4). Read them as a pair of
+  gaps, not one number: `ORACLE-k{N}` vs. `SPARSE-k{N}-g32` is how much
+  the 1B speculator's estimate costs, `ORACLE-k{N}` vs. `M000` is how much
+  block-granular sparse decode costs when the estimate is as good as this
+  method can make it. Which of the two dominates decides where accuracy
+  work should go next, and the graded SPARSE sweep alone cannot tell them
+  apart.
 
 ---
 

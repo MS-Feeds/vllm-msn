@@ -26,15 +26,27 @@ candidate region).
 ## `compute_pruned_turn` itself
 
 `compute_pruned_turn` (speculator path) drives `SpecPrefillProposer.run_turn`
-to get Q from the speculator's own lookahead decode. The oracle path (see
-EXPERIMENT_PLAN.md's "Oracle upper bound") gets Q from a teacher-forced
-forward pass over the TARGET's own next-turn query, orchestrated separately
-by `predict_scbench.py` (it needs the target's own attention layers hooked,
-a driver-side concern this module doesn't own) -- but once IT has a
-`(query_buffer, actual_look_ahead_cnt, key_buffer)` triple in hand, from
-whatever source, the scoring/selection math is identical either way, so
-`compute_oracle_kept_pairs` below reuses the same `_score_and_select` helper
-rather than duplicating the force-keep/chunk-selection logic.
+to get Q from the speculator's own lookahead decode. A second, teacher-forced
+path gets Q from a forward pass over the TARGET's own next-turn query,
+orchestrated separately by `predict_scbench.py` (it needs the target's own
+attention layers hooked, a driver-side concern this module doesn't own) --
+but once IT has a `(query_buffer, actual_look_ahead_cnt, key_buffer)` triple
+in hand, from whatever source, the scoring/selection math is identical either
+way, so `compute_oracle_kept_pairs` below reuses the same `_score_and_select`
+helper rather than duplicating the force-keep/chunk-selection logic.
+
+**`compute_oracle_kept_pairs` is not what the ORACLE-k* rows actually run.**
+That teacher-forced target-side capture hook was never built; when the oracle
+ceiling was wired up, it was wired up a different way -- `predict_scbench.py`
+runs the ordinary speculator path with `SpecPrefillProposer` pointed at the
+TARGET checkpoint instead of the 1B speculator, which needs no new capture
+hook and no forward pass through the target's own (persistent, resumable,
+mustn't-be-corrupted) conversation session. `compute_pruned_turn` above
+therefore serves both SPARSE-k*-g* and ORACLE-k*. This function is kept as
+the ready-made entry point for the teacher-forced variant if it's ever built
+(scoring from the golden ANSWER's queries, a strictly stronger oracle than
+scoring from a lookahead the target generated itself) -- see
+EXPERIMENT_PLAN.md's "Oracle upper bound".
 """
 
 import logging
@@ -261,13 +273,19 @@ def compute_oracle_kept_pairs(
     key_buffer_per_layer: List[torch.Tensor],
     actual_look_ahead_cnt: int,
 ) -> PrunedTurnResult:
-    """Oracle-upper-bound path (EXPERIMENT_PLAN.md's "Oracle upper bound"):
-    identical scoring/selection to `compute_pruned_turn`, but the caller
-    (`predict_scbench.py`) supplies `query_buffer`/`key_buffer_per_layer`
+    """Teacher-forced oracle path -- **currently unused**, see this module's
+    docstring: the wired-up ORACLE-k* rows get their target-quality scores
+    by running `compute_pruned_turn` against a proposer that wraps the
+    TARGET checkpoint, not through here. Kept for the stronger variant it
+    enables (Q captured from the golden ANSWER's own queries rather than
+    from a lookahead the scorer generated itself).
+
+    Identical scoring/selection to `compute_pruned_turn`, but the caller
+    (`predict_scbench.py`) would supply `query_buffer`/`key_buffer_per_layer`
     from the TARGET model's own attention (a teacher-forced forward pass
     over the NEXT turn's already-known golden query, hooked the same way
-    `speculator_worker.py` hooks the speculator -- see that orchestration
-    in `predict_scbench.py`, not here) instead of the speculator's.
+    `speculator_worker.py` hooks the speculator -- that orchestration does
+    not exist yet in `predict_scbench.py`) instead of the speculator's.
 
     Still calls `conversation_state.begin_turn` (so the ledger/candidate
     pool bookkeeping stays correct for whichever KEEP/DISCARD mode this

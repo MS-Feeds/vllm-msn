@@ -44,6 +44,7 @@ Run with: python3 test_vllm_patch.py
 
 import math
 import random
+import shutil
 import sys
 import traceback
 from pathlib import Path
@@ -78,6 +79,7 @@ from vllm_patch.scoring import (
 from vllm_patch.pruner import _positions_from_kept_indices
 from predict_scbench import (
     CSV_FIELDS,
+    EXPERIMENTS,
     LedgerToTargetPositionMap,
     _flop_summary_fields,
     _num_decode_steps,
@@ -2106,6 +2108,216 @@ def test_num_decode_steps_excludes_the_prefill_sampled_token():
     assert _num_decode_steps(0) == 0
     assert _num_decode_steps(1) == 0
     assert _num_decode_steps(64) == 63
+
+
+def test_oracle_rows_pair_one_to_one_with_a_sparse_row():
+    """An ORACLE-k{N} row is only interpretable as a CEILING for
+    SPARSE-k{N}-g32 if the two differ in exactly one thing: which
+    checkpoint scores. Everything the experiment matrix itself controls --
+    keep rate, granularity, keep mode, and the driving loop implied by the
+    mode -- must match its partner row, or the "gap" between them silently
+    conflates estimator quality with whatever else drifted apart.
+
+    Locked down here because the matrix is built by two separate loops in
+    `_build_experiments` (one for ORACLE, one for SPARSE) that could
+    trivially diverge -- e.g. someone extends KEEP_RATES for SPARSE only,
+    leaving an oracle row with no partner, or flips ORACLE_GRANULARITY to a
+    value no SPARSE row was ever run at."""
+    oracle_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "oracle"]
+    assert oracle_ids, "no ORACLE-k* rows in the matrix at all"
+
+    for eid in oracle_ids:
+        cfg = EXPERIMENTS[eid]
+        partner_id = f"SPARSE-k{int(cfg['keep_percentage'] * 100)}-g{cfg['granularity']}"
+        assert partner_id in EXPERIMENTS, (
+            f"{eid} has no SPARSE partner row {partner_id!r} to be a ceiling "
+            f"for -- ORACLE_GRANULARITY and KEEP_RATES must stay inside the "
+            f"SPARSE grid"
+        )
+        partner = EXPERIMENTS[partner_id]
+        for field in ("keep_percentage", "granularity", "keep_mode"):
+            assert cfg[field] == partner[field], (
+                f"{eid} vs. {partner_id}: {field} differs "
+                f"({cfg[field]!r} vs. {partner[field]!r})"
+            )
+
+    # And the ceiling covers every keep rate that has a SPARSE row at the
+    # oracle's granularity -- a ceiling for 3 of 4 rates is a gap in the
+    # attribution, not a smaller experiment.
+    oracle_rates = {EXPERIMENTS[eid]["keep_percentage"] for eid in oracle_ids}
+    sparse_rates_at_oracle_gran = {
+        cfg["keep_percentage"]
+        for cfg in EXPERIMENTS.values()
+        if cfg["mode"] == "sparse"
+        and cfg["granularity"] == EXPERIMENTS[oracle_ids[0]]["granularity"]
+    }
+    assert oracle_rates == sparse_rates_at_oracle_gran, (
+        f"oracle keep rates {sorted(oracle_rates)} do not cover the SPARSE "
+        f"rates at the same granularity {sorted(sparse_rates_at_oracle_gran)}"
+    )
+
+
+def _run_experiment_with_stubs(exp_id):
+    """Drives `predict_scbench.run_experiment` for one row with every heavy
+    dependency stubbed out (no vLLM, no GPU, no checkpoints, no dataset),
+    and reports what it *tried* to construct: the target engine's kwargs,
+    the scorer engine's kwargs, and which driving loop it dispatched to.
+
+    Stubbing rather than mocking a real run is the point -- the thing under
+    test is `run_experiment`'s own wiring decisions, which are pure
+    branching on `exp_cfg["mode"]` and therefore fully exercisable on CPU.
+    Everything downstream of those decisions (the engines, the loop) is
+    validated on real hardware by the validate_*.py scripts instead."""
+    import argparse
+    import sys
+    import tempfile
+    import types
+    from pathlib import Path as _Path
+
+    import predict_scbench as ps
+
+    calls = {"llm_kwargs": None, "proposer_kwargs": None, "loop": None}
+
+    class _FakeLLM:
+        def __init__(self, **kwargs):
+            calls["llm_kwargs"] = kwargs
+            self.llm_engine = types.SimpleNamespace()
+
+    class _FakeProposer:
+        def __init__(self, **kwargs):
+            calls["proposer_kwargs"] = kwargs
+
+    class _FakeHFConfig:
+        max_position_embeddings = 131072
+
+    def _fake_loop(name):
+        def loop(*args, **kwargs):
+            calls["loop"] = name
+            return [], {
+                "ttfts": [], "out_lens": [], "actual_keep_rates": [],
+                "num_cached_tokens_speculator": [], "num_skipped_too_large": 0,
+                "turn_elapsed": [], "flops": [],
+                "finish": {"stop": 0, "length": 0, "other": 0},
+            }
+        return loop
+
+    import transformers
+
+    import vllm_patch.proposer as proposer_mod
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.LLM = _FakeLLM
+
+    saved = {
+        "vllm": sys.modules.get("vllm"),
+        "proposer": proposer_mod.SpecPrefillProposer,
+        "autoconfig": transformers.AutoConfig.from_pretrained,
+        "autotok": transformers.AutoTokenizer.from_pretrained,
+        "load": ps.load_conversations,
+        "sparse": ps.run_sparse_attention,
+        "specprefill": ps.run_specprefill,
+        "baseline": ps.run_baseline,
+        "csv": ps.CSV_PATH,
+        "append": ps.append_csv_row,
+        "out_dir": ps.OUT_DIR,
+    }
+    tmp_dir = tempfile.mkdtemp(prefix="oracle_wiring_test_")
+    ps.OUT_DIR = _Path(tmp_dir)
+    ps.CSV_PATH = ps.OUT_DIR / "all_runs.csv"
+    sys.modules["vllm"] = fake_vllm
+    proposer_mod.SpecPrefillProposer = _FakeProposer
+    transformers.AutoConfig.from_pretrained = staticmethod(lambda *a, **k: _FakeHFConfig())
+    transformers.AutoTokenizer.from_pretrained = staticmethod(lambda *a, **k: object())
+    ps.load_conversations = lambda *a, **k: []
+    ps.run_sparse_attention = _fake_loop("sparse")
+    ps.run_specprefill = _fake_loop("specprefill")
+    ps.run_baseline = _fake_loop("baseline")
+    ps.append_csv_row = lambda row: None
+
+    args = argparse.Namespace(
+        samples=None, max_conversations=None, scbench_config=None,
+        target_model="/ckpt/Llama-3.1-8B-Instruct",
+        speculator_model="/ckpt/Llama-3.2-1B-Instruct",
+        speculator_device=None,
+        target_gpu_memory_utilization=0.85,
+        speculator_gpu_memory_utilization=0.2,
+        target_max_num_batched_tokens=131072,
+        speculator_max_num_batched_tokens=131072,
+        oracle_scorer_model=None, oracle_scorer_device=None,
+        oracle_scorer_gpu_memory_utilization=0.6,
+        oracle_scorer_max_num_batched_tokens=None,
+        max_tokens=64, reps=1, peak_tflops=None,
+    )
+
+    try:
+        ps.run_experiment(exp_id, EXPERIMENTS[exp_id], args)
+    finally:
+        if saved["vllm"] is None:
+            del sys.modules["vllm"]
+        else:
+            sys.modules["vllm"] = saved["vllm"]
+        proposer_mod.SpecPrefillProposer = saved["proposer"]
+        transformers.AutoConfig.from_pretrained = saved["autoconfig"]
+        transformers.AutoTokenizer.from_pretrained = saved["autotok"]
+        ps.load_conversations = saved["load"]
+        ps.run_sparse_attention = saved["sparse"]
+        ps.run_specprefill = saved["specprefill"]
+        ps.run_baseline = saved["baseline"]
+        ps.CSV_PATH = saved["csv"]
+        ps.append_csv_row = saved["append"]
+        ps.OUT_DIR = saved["out_dir"]
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return calls
+
+
+def test_oracle_row_scores_with_the_target_checkpoint_on_the_sparse_loop():
+    """The whole claim of the ORACLE-k* row is "SPARSE-k{N}-g32 with exactly
+    one thing changed: who scores." Four things have to hold for that claim
+    to be true, and all four are `run_experiment` wiring decisions rather
+    than anything the driving loop can check for itself:
+
+    1. the target engine is the SPARSE one (persistent resumable session,
+       block-gather worker) -- an oracle scored against the physically-
+       pruned pipeline would be a ceiling for a different architecture;
+    2. the scorer engine holds the TARGET checkpoint, not the 1B speculator;
+    3. it gets its own memory budget (the 1B-sized 0.2 default would not fit
+       an 8B scorer plus its growing per-conversation KV);
+    4. the driving loop is `run_sparse_attention`, the same one the SPARSE
+       rows use.
+
+    Get any of them wrong and the run still completes and still writes a
+    plausible-looking score -- it just wouldn't be a ceiling for the row it
+    is being compared against. Hence a wiring test rather than trusting the
+    numbers to look wrong."""
+    oracle = _run_experiment_with_stubs("ORACLE-k20")
+
+    assert oracle["llm_kwargs"]["worker_cls"] == (
+        "vllm_patch.sparse_target_runner.SparseTargetWorker"
+    )
+    assert oracle["llm_kwargs"]["enable_prefix_caching"] is True
+    # Required by the resumable-session mechanism -- see run_experiment's own
+    # comment on the scheduler race this avoids.
+    assert oracle["llm_kwargs"]["async_scheduling"] is False
+
+    assert oracle["proposer_kwargs"]["speculator_model_path"] == "/ckpt/Llama-3.1-8B-Instruct"
+    assert oracle["proposer_kwargs"]["gpu_memory_utilization"] == 0.6
+    assert oracle["loop"] == "sparse"
+
+    # ...and the SPARSE partner row differs in exactly the one field the
+    # comparison is supposed to isolate.
+    sparse = _run_experiment_with_stubs("SPARSE-k20-g32")
+    assert sparse["proposer_kwargs"]["speculator_model_path"] == "/ckpt/Llama-3.2-1B-Instruct"
+    assert sparse["loop"] == "sparse"
+    assert sparse["llm_kwargs"] == oracle["llm_kwargs"]
+    differing = {
+        k for k in oracle["proposer_kwargs"]
+        if oracle["proposer_kwargs"][k] != sparse["proposer_kwargs"][k]
+    }
+    assert differing <= {"speculator_model_path", "gpu_memory_utilization"}, (
+        f"ORACLE and its SPARSE partner differ in more than the scorer "
+        f"checkpoint and its memory budget: {sorted(differing)}"
+    )
 
 
 def _run_all():

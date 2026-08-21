@@ -58,7 +58,7 @@ in the ways EXPERIMENT_PLAN.md's architectural decisions require:
    ("Question 1: ... Answer 1: ... Question 2: ...") inside that one
    message -- see `render_turn_query`/`render_golden_answer` below.
 
-   **This now describes `run_specprefill` (M-k*-g*/ORACLE) ONLY.**
+   **This now describes `run_specprefill` (M-k*-g*) ONLY.**
    `run_sparse_attention` always used genuine `<|eot_id|>`-delimited chat
    turns (it doesn't need the ledger to track wrapper boundaries -- see
    `chat_turn_boundary_pieces`), and `run_baseline` (M000) was changed to
@@ -69,8 +69,14 @@ in the ways EXPERIMENT_PLAN.md's architectural decisions require:
    SPARSE are no longer in SCBench's DEFAULT `use_chat_template=False`
    mode, so their absolute scores are no longer directly comparable to
    published SCBench numbers -- they are comparable to EACH OTHER, which
-   is what those two rows exist for. M-k*-g*/ORACLE stay in the default
-   mode and stay comparable to published numbers.
+   is what those two rows exist for. M-k*-g* stays in the default
+   mode and stays comparable to published numbers. ORACLE-k* moved into
+   the SPARSE group when it was wired up (it drives `run_sparse_attention`,
+   see `_build_experiments` below), so it shares SPARSE's rendering and is
+   comparable to M000/SPARSE rather than to published SCBench numbers --
+   which is the whole point of it: it is the ceiling for the SPARSE rows,
+   and a ceiling measured under a different prompt rendering than the rows
+   it bounds would not be one.
 
    **Not an ad hoc shortcut** -- confirmed (not assumed) to match SCBench's
    own official reference harness's DEFAULT evaluation mode
@@ -221,11 +227,13 @@ GRANULARITIES = {
     "64": {"chunk": True, "chunk_size": 64},
 }
 # Oracle rows pair with ONE representative granularity (32), not the full
-# granularity cross -- an oracle row needs an extra teacher-forced target
-# forward pass per turn on top of the full unpruned baseline generation, so
-# crossing it with all 4 granularities would multiply that cost 4x for a
-# reference/ceiling metric, not the main throughput comparison. Revisit if
-# granularity turns out to matter for the oracle ceiling too.
+# granularity cross -- an oracle row's scoring pass runs the 8B TARGET
+# checkpoint instead of the 1B speculator (see `_build_experiments` below),
+# so every turn's scoring costs ~8x what the speculator's does; crossing
+# that with all 4 granularities would multiply it again, for a reference/
+# ceiling metric rather than the main throughput comparison. 32 is the
+# granularity that lines ORACLE-k{N} up directly against SPARSE-k{N}-g32.
+# Revisit if granularity turns out to matter for the oracle ceiling too.
 ORACLE_GRANULARITY = "32"
 
 
@@ -245,10 +253,23 @@ def _build_experiments() -> dict:
                 "mode": "specprefill", "keep_mode": "keep",
                 "keep_percentage": rate, "granularity": gran_name,
             }
+    # Oracle upper bound: the SPARSE architecture, entirely unchanged --
+    # same driving loop, same block-gather mechanism, same keep rate, same
+    # prompt rendering -- with exactly ONE variable swapped: the importance
+    # scores come from the TARGET checkpoint scoring its own attention
+    # instead of the 1B speculator's estimate of it. So ORACLE-k{N} vs.
+    # SPARSE-k{N}-g32 isolates estimator quality, and ORACLE-k{N} vs. M000
+    # isolates what the sparse-attention mechanism itself costs even when
+    # the estimator is as good as it can get. Those two gaps are what the
+    # ceiling exists to separate; see `run_experiment`'s scorer-selection
+    # block for how the scorer engine is built, and EXPERIMENT_PLAN.md's
+    # "Oracle upper bound" for why this replaced the originally-planned
+    # teacher-forced target-side capture hook.
     for rate in KEEP_RATES:
         exp_id = f"ORACLE-k{int(rate * 100)}"
         experiments[exp_id] = {
-            "label": f"Oracle upper bound keep={int(rate * 100)}% granularity={ORACLE_GRANULARITY} keep_mode=keep",
+            "label": f"Oracle upper bound (target-model scorer, sparse attention) "
+                     f"keep={int(rate * 100)}% granularity={ORACLE_GRANULARITY} keep_mode=keep",
             "mode": "oracle", "keep_mode": "keep",
             "keep_percentage": rate, "granularity": ORACLE_GRANULARITY,
         }
@@ -1269,11 +1290,21 @@ def run_sparse_attention(
     speculator_max_num_batched_tokens,
     target_max_num_batched_tokens,
 ) -> tuple[list[dict], dict]:
-    """SPARSE-k*-g*: persistent full-KV-cache target session, speculator-
-    selected sparse attention over it during decode (see
+    """SPARSE-k*-g* **and ORACLE-k***: persistent full-KV-cache target
+    session, scorer-selected sparse attention over it during decode (see
     `vllm_patch/sparse_target_runner.py`'s module docstring for the
     mechanism, validated end-to-end on real hardware by
     `validate_resumable_session.py`/`validate_sparse_attention.py`).
+
+    **One function, two rows.** ORACLE-k* is this exact loop with `proposer`
+    wrapping the TARGET checkpoint instead of the 1B speculator -- nothing
+    in here branches on which, and nothing needs to: `proposer` is a
+    `SpecPrefillProposer` over some checkpoint either way (see
+    `run_experiment`'s scorer-selection block for the construction, and
+    `_build_experiments`'s ORACLE comment for what the resulting comparison
+    isolates). Every "speculator" below therefore means "whichever
+    checkpoint this row scores with".
+
     Structurally different from `run_specprefill` in three ways:
 
     1. **One target session (one resumable `request_id`) per conversation,
@@ -1365,7 +1396,14 @@ def run_sparse_attention(
     spec_flop_cfg = _speculator_flop_config(proposer)
 
     keep_pct = spec_config.keep_kwargs.get("percentage")
-    desc = f"Sparse attention keep={keep_pct}"
+    # Names the scorer, since SPARSE-k*-g* and ORACLE-k* run this same loop
+    # and are otherwise indistinguishable in the progress output.
+    # getattr-guarded: this is a progress-bar label, and a vLLM field
+    # rename should not be able to kill an hours-long run over one.
+    scorer_name = Path(
+        getattr(proposer.llm_engine.vllm_config.model_config, "model", None) or "scorer"
+    ).name
+    desc = f"Sparse attention keep={keep_pct} scorer={scorer_name}"
     t_loop_start = time.time()
     conversations_processed = 0
     progress = tqdm(conversations, desc=desc, unit="conv")
@@ -1731,7 +1769,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         max_num_batched_tokens=target_max_num_batched_tokens,
         max_model_len=max_model_len,
     )
-    if mode == "sparse":
+    if mode in ("sparse", "oracle"):
         # SparseTargetWorker, not SpecPrefillWorker -- this path never
         # physically shrinks the prompt (no RoPE-position-override
         # machinery needed at all, see sparse_target_runner.py's module
@@ -1781,15 +1819,60 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     proposer = None
     spec_config = None
     speculator_max_num_batched_tokens = None
-    if mode in ("specprefill", "sparse"):
-        # Same speculator construction for both -- the speculator's own
-        # job (score importance via lookahead decode) is identical either
-        # way, only how the TARGET consumes the resulting selection
-        # differs (see run_sparse_attention's module docstring).
+    scorer_model = None
+    scorer_gpu_memory_utilization = None
+    if mode in ("specprefill", "sparse", "oracle"):
+        # Same scorer construction for all three -- the scoring job (run the
+        # sequence, decode `look_ahead_cnt` lookahead tokens, score their
+        # attention over the context, chunk-select the top k%) is identical
+        # regardless of WHICH checkpoint does it and of how the TARGET
+        # consumes the resulting selection (see run_sparse_attention's own
+        # docstring).
         import torch
         from vllm_patch.proposer import SpecPrefillProposer
 
-        speculator_device = torch.device(args.speculator_device or "cuda:1")
+        # The one thing the oracle row changes: WHO scores. ORACLE-k* runs
+        # the TARGET checkpoint as its scorer -- the "perfect estimator"
+        # ceiling (the model whose attention the selection is supposed to
+        # approximate, estimating it itself) -- where SPARSE-k*-g* runs the
+        # 1B speculator. `SpecPrefillProposer` takes a checkpoint path and
+        # is otherwise model-agnostic, so this is a construction-time
+        # choice, not a second code path: everything downstream
+        # (`compute_pruned_turn`, `scoring.py`, `run_sparse_attention`) does
+        # byte-for-byte the same work on either engine.
+        #
+        # The scorer runs in its OWN engine on its OWN GPU (the same device
+        # slot the speculator would occupy, cuda:1 by default) rather than
+        # reusing the target's engine, deliberately: the target's engine
+        # holds the persistent, never-evicted conversation session that IS
+        # this architecture, and a scoring pass driven through it would have
+        # to either write its lookahead tokens into that session (corrupting
+        # the conversation) or unwind them afterwards (no such mechanism
+        # exists -- see sparse_target_runner.py's module docstring on the
+        # resumable-session mechanism). A separate engine has neither
+        # problem, and reuses the speculator path's already-validated
+        # machinery unchanged.
+        if mode == "oracle":
+            scorer_model = args.oracle_scorer_model or args.target_model
+            scorer_gpu_memory_utilization = args.oracle_scorer_gpu_memory_utilization
+            scorer_device_arg = args.oracle_scorer_device or args.speculator_device
+            scorer_max_num_batched_tokens_arg = (
+                args.oracle_scorer_max_num_batched_tokens
+                if args.oracle_scorer_max_num_batched_tokens is not None
+                else args.speculator_max_num_batched_tokens
+            )
+        else:
+            scorer_model = args.speculator_model
+            scorer_gpu_memory_utilization = args.speculator_gpu_memory_utilization
+            scorer_device_arg = args.speculator_device
+            scorer_max_num_batched_tokens_arg = args.speculator_max_num_batched_tokens
+        print(
+            f"[predict_scbench] scoring engine: {scorer_model} on "
+            f"{scorer_device_arg or 'cuda:1'} "
+            f"(gpu_memory_utilization={scorer_gpu_memory_utilization})"
+        )
+
+        speculator_device = torch.device(scorer_device_arg or "cuda:1")
         gran_kwargs = GRANULARITIES[granularity]
         spec_config = SpecConfig(
             keep_strategy="percentage",
@@ -1802,25 +1885,29 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # Same clamp-to-native-ceiling reasoning as the target above --
         # independently derived (not assumed identical to the target's, even
         # though both are Llama-3.x checkpoints here) since a different
-        # speculator model could have a different native context window.
-        # The speculator's OWN prompt is the FULL (never-pruned) candidate
+        # scorer model could have a different native context window. (For
+        # ORACLE-k* the scorer IS the target checkpoint, so this re-derives
+        # the same number the target already derived above -- deliberately
+        # re-derived rather than shared, so the block stays correct for any
+        # --oracle-scorer-model.)
+        # The scorer's OWN prompt is the FULL (never-pruned) candidate
         # pool + query (see proposer.py's module docstring) -- this is what
         # can genuinely exceed the budget for a huge SCBench context, well
         # before pruning ever gets a chance to shrink anything, so this
         # budget (not the target's) is the one that determines whether a
         # turn's SCORING pass is even possible at all.
         speculator_native_max_model_len = AutoConfig.from_pretrained(
-            args.speculator_model, trust_remote_code=True
+            scorer_model, trust_remote_code=True
         ).max_position_embeddings
-        speculator_max_num_batched_tokens = args.speculator_max_num_batched_tokens
+        speculator_max_num_batched_tokens = scorer_max_num_batched_tokens_arg
         if (
             speculator_native_max_model_len is not None
             and speculator_max_num_batched_tokens > speculator_native_max_model_len
         ):
             print(
-                f"[predict_scbench] --speculator-max-num-batched-tokens "
+                f"[predict_scbench] scorer max_num_batched_tokens "
                 f"({speculator_max_num_batched_tokens}) exceeds "
-                f"{args.speculator_model}'s native max_position_embeddings "
+                f"{scorer_model}'s native max_position_embeddings "
                 f"({speculator_native_max_model_len}) -- clamping down to it."
             )
             speculator_max_num_batched_tokens = int(speculator_native_max_model_len)
@@ -1841,25 +1928,11 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         )
 
         proposer = SpecPrefillProposer(
-            speculator_model_path=args.speculator_model,
+            speculator_model_path=scorer_model,
             device=speculator_device,
-            gpu_memory_utilization=args.speculator_gpu_memory_utilization,
+            gpu_memory_utilization=scorer_gpu_memory_utilization,
             max_num_batched_tokens=speculator_max_num_batched_tokens,
             max_model_len=speculator_max_model_len,
-        )
-    elif mode == "oracle":
-        raise NotImplementedError(
-            "Oracle-mode driving (teacher-forced target-side hook + "
-            "pruner.compute_oracle_kept_pairs) is not wired up in this "
-            "driver yet -- vllm_patch.pruner.compute_oracle_kept_pairs is "
-            "ready to consume a (query_buffer, key_buffer_per_layer, "
-            "actual_look_ahead_cnt) triple, but installing the query-"
-            "capture hook on the TARGET's own attention layers (mirroring "
-            "vllm_patch/speculator_worker.py's hook, but on "
-            "vllm_patch/worker.py's SpecPrefillWorker instead) and driving "
-            "the teacher-forced next-turn forward pass is real, not-yet-"
-            "built plumbing -- see EXPERIMENT_PLAN.md's Oracle section. "
-            "Run M000/M-k*-g* experiments first."
         )
 
     try:
@@ -1870,7 +1943,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     llm, tok, conversations, args.max_tokens,
                     target_max_num_batched_tokens,
                 )
-            elif mode == "sparse":
+            elif mode in ("sparse", "oracle"):
                 predictions, stats = run_sparse_attention(
                     llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
@@ -1922,7 +1995,14 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "look_ahead_cnt": LOOK_AHEAD_CNT if mode != "baseline" else None,
                 "pool_kernel_size": POOL_KERNEL_SIZE if mode != "baseline" else None,
                 "target_gpu_memory_utilization": args.target_gpu_memory_utilization,
-                "speculator_gpu_memory_utilization": args.speculator_gpu_memory_utilization if mode != "baseline" else None,
+                # The SCORER's utilization -- args.speculator_gpu_memory_
+                # utilization for every scoring row except ORACLE-k*, whose
+                # scorer is the target checkpoint on its own budget (see
+                # run_experiment's scorer-selection block). None for M000,
+                # which has no scorer at all. Column name kept as-is so
+                # already-written all_runs.csv files stay append-compatible;
+                # `mode`/`label` disambiguate which model the number is for.
+                "speculator_gpu_memory_utilization": scorer_gpu_memory_utilization,
                 "target_max_num_batched_tokens": target_max_num_batched_tokens,
                 "rep": rep, "seed": 0, "max_tokens": args.max_tokens,
                 "num_conversations_loaded": len(conversations),
@@ -1977,12 +2057,19 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             )
             otps = row["out_tokens_per_second"]
             otps_str = f"{otps:.1f} out tok/s" if otps is not None else "n/a out tok/s"
+            # None-guarded like every other rate above it: `turns_per_second`
+            # is None whenever `elapsed` is 0, which a real run never
+            # produces but a stubbed/instantaneous one does -- an unguarded
+            # format spec there turns a completed experiment into a
+            # TypeError at the last line of reporting.
+            tps = row["turns_per_second"]
+            tps_str = f"{tps:.2f} turns/s" if tps is not None else "n/a turns/s"
             print(
                 f"[predict_scbench] rep {rep}/{args.reps}: {row['num_turns']} turns "
                 f"across {row['num_conversations']} processed conversations "
                 f"({row['num_conversations_loaded']} loaded, "
                 f"{row['num_skipped_too_large']} skipped) in {elapsed:.1f}s "
-                f"({row['turns_per_second']:.2f} turns/s, {spc_str}, {spt_str}, "
+                f"({tps_str}, {spc_str}, {spt_str}, "
                 f"{spt_excl_str}, {otps_str}), "
                 f"ttft_mean={row['ttft_mean_ms']}, "
                 f"actual_keep_rate_mean={row['actual_keep_rate_mean']}, "
@@ -2030,13 +2117,13 @@ def main() -> None:
     parser.add_argument(
         "--exp",
         help="Comma-separated experiment IDs (see --list), or one of the "
-             "group keywords 'specprefill' (all M-k*-g* rows, i.e. "
-             "everything except M000 baseline -- ORACLE-k* rows are NOT "
-             "included, since that mode isn't wired up yet), 'sparse' (all "
-             "SPARSE-k*-g* rows, the persistent-cache + sparse-attention "
-             "architecture), or 'all' (every defined experiment, including "
-             "the not-yet-implemented ORACLE-k* rows, which will fail and "
-             "be reported, not silently skipped).",
+             "group keywords 'specprefill' (all M-k*-g* rows of the "
+             "physically-pruned architecture), 'sparse' (all SPARSE-k*-g* "
+             "rows, the persistent-cache + sparse-attention architecture), "
+             "'oracle' (all ORACLE-k* rows -- the same sparse architecture "
+             "scored by the TARGET checkpoint instead of the 1B speculator, "
+             "i.e. the accuracy ceiling for the SPARSE rows), or 'all' "
+             "(every defined experiment).",
     )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
     parser.add_argument(
@@ -2054,6 +2141,51 @@ def main() -> None:
     parser.add_argument("--speculator-device", default=None)
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.2)
+    parser.add_argument(
+        "--oracle-scorer-model", default=None,
+        help="Checkpoint the ORACLE-k* rows score with. Default: "
+             "--target-model, i.e. the target scoring its own attention -- "
+             "the 'perfect estimator' ceiling that ORACLE-k{N} vs. "
+             "SPARSE-k{N}-g32 is meant to isolate. Ignored by every "
+             "non-oracle row.",
+    )
+    parser.add_argument(
+        "--oracle-scorer-device", default=None,
+        help="GPU for the ORACLE-k* scorer engine. Defaults to "
+             "--speculator-device (cuda:1) -- the scorer occupies exactly "
+             "the device slot the speculator would have, so an oracle run "
+             "needs no more GPUs than a SPARSE run does.",
+    )
+    parser.add_argument(
+        "--oracle-scorer-gpu-memory-utilization", type=float, default=0.6,
+        help="Separate from --speculator-gpu-memory-utilization (0.2), "
+             "which is a 1B-sized figure: the oracle's scorer is the 8B "
+             "target checkpoint and needs room for ~16GB of weights plus "
+             "its own growing per-conversation KV cache. Deliberately NOT "
+             "as high as --target-gpu-memory-utilization (0.85), because "
+             "scoring allocates large transient tensors OUTSIDE the pool "
+             "this fraction reserves: speculator_worker.py's "
+             "end_capture_and_score materializes per-layer K for the whole "
+             "context (32 layers x ~88k positions x 8 kv-heads x 128 dims "
+             "~= 5.8GB in bf16 for Llama-3.1-8B, vs. ~1.4GB for the 1B "
+             "speculator) plus the attention-score tensor and its fp32 "
+             "softmax (several GB more) -- all of it from the (1 - this "
+             "fraction) headroom vLLM did not claim. 0.6 of an 80GB A100 "
+             "is ~16GB weights + ~32GB KV (~250k tokens, far more than any "
+             "SCBench conversation needs) and leaves ~32GB of headroom for "
+             "those transients. Raise it only if a real run shows KV "
+             "eviction (watch num_cached_tokens_speculator_mean), and "
+             "expect OOM during scoring, not during generation, if it goes "
+             "too high.",
+    )
+    parser.add_argument(
+        "--oracle-scorer-max-num-batched-tokens", type=int, default=None,
+        help="Overrides --speculator-max-num-batched-tokens for the "
+             "ORACLE-k* scorer only (default: use that same value). Same "
+             "meaning and same clamp-to-native-max_position_embeddings "
+             "treatment -- this is the budget that decides whether a given "
+             "SCBench conversation's scoring pass is possible at all.",
+    )
     parser.add_argument("--target-max-num-batched-tokens", type=int, default=131072)
     parser.add_argument(
         "--speculator-max-num-batched-tokens", type=int, default=131072,
@@ -2108,20 +2240,21 @@ def main() -> None:
         parser.error("--target-model or $LLAMA31_8B_MODEL_PATH is required")
 
     ensure_csv_header()
-    # Two convenience group keywords, alongside the normal comma-separated
-    # explicit-id list -- "specprefill" is what you want for "everything
-    # except baseline" in practice: it's every implemented, non-baseline
-    # experiment (the 16 M-k*-g* rows). "all" includes the ORACLE-k* rows
-    # too, which are NOT wired up yet (predict_scbench.py's oracle branch
-    # raises NotImplementedError) -- included for completeness, not because
-    # it's expected to succeed; each failure is caught per-experiment (see
-    # the try/except below) and reported at the end, not fatal to the rest
-    # of the sweep.
+    # Convenience group keywords, alongside the normal comma-separated
+    # explicit-id list -- one per architecture: "specprefill" (the 16
+    # M-k*-g* physically-pruned rows), "sparse" (the 12 SPARSE-k*-g*
+    # persistent-cache rows), "oracle" (the 4 ORACLE-k* ceiling rows, same
+    # architecture as "sparse" with the target checkpoint as scorer). A
+    # failure in any one experiment is caught per-experiment (see the
+    # try/except below) and reported at the end, not fatal to the rest of
+    # the sweep.
     exp_arg = args.exp.strip().lower()
     if exp_arg == "specprefill":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "specprefill"]
     elif exp_arg == "sparse":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "sparse"]
+    elif exp_arg == "oracle":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "oracle"]
     elif exp_arg == "all":
         exp_ids = list(EXPERIMENTS.keys())
     else:
@@ -2154,7 +2287,17 @@ def main() -> None:
             print(f"Unknown experiment ID: {exp_id!r} (see --list)")
             sys.exit(1)
         exp_cfg = EXPERIMENTS[exp_id]
-        if exp_cfg["mode"] != "baseline" and not args.speculator_model:
+        # ORACLE-k* scores with --oracle-scorer-model (defaulting to
+        # --target-model, already required above), never with the 1B
+        # speculator -- so it must NOT be gated on --speculator-model being
+        # set. Every other non-baseline row does need it.
+        if exp_cfg["mode"] == "oracle":
+            if not (args.oracle_scorer_model or args.target_model):
+                parser.error(
+                    f"{exp_id} requires --oracle-scorer-model, or "
+                    f"--target-model/$LLAMA31_8B_MODEL_PATH to fall back to"
+                )
+        elif exp_cfg["mode"] != "baseline" and not args.speculator_model:
             parser.error(f"{exp_id} requires --speculator-model or $LLAMA32_1B_MODEL_PATH")
         try:
             run_experiment(exp_id, exp_cfg, args)
