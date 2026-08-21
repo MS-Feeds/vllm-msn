@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  85/85 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  86/86 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -137,8 +137,26 @@ reserve. Too high a value OOMs during scoring, not during generation. The
 Run it with:
 
 ```bash
-python predict_scbench.py --exp oracle
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python predict_scbench.py --exp oracle --target-gpu-memory-utilization 0.75
 ```
+
+**Why those two extras** (learned from the first real ORACLE-k20 run, which
+OOM'd): at `--target-gpu-memory-utilization 0.85` the TARGET engine reserves
+~67GiB of an 80GB A100, and a turn-0 prefill of a ~124k-token SCBench context
+needs multi-GiB transient activation buffers (3.31GiB per SiluAndMul output
+alone) on top of that. The failing process held 70GiB allocated with 6GiB
+reserved-but-unallocated — headroom exhausted plus allocator fragmentation.
+This is a target-side margin that the oracle row did not create but does
+expose; `expandable_segments:True` addresses the fragmentation half and the
+lower utilization the headroom half. If it still OOMs, lower
+`--target-max-num-batched-tokens` (at the cost of skipping the longest
+conversations — watch `num_skipped_too_large`).
+
+Placement is now checked and printed before either engine allocates: the
+scorer must not land on the target's own GPU (two 8B engines do not fit on
+one card), and the log line names the model, device, utilization, and
+`CUDA_VISIBLE_DEVICES` for both engines — a CUDA OOM traceback cannot, since
+every engine calls its own device "GPU 0".
 
 `scbench_kv` is where the SPARSE degradation actually lives, so for a first
 read: `--exp ORACLE-k20 --scbench-config scbench_kv --max-conversations 20`
@@ -375,7 +393,7 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 85/85 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 86/86 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |

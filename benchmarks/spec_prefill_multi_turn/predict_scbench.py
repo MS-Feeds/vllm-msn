@@ -1866,13 +1866,74 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             scorer_gpu_memory_utilization = args.speculator_gpu_memory_utilization
             scorer_device_arg = args.speculator_device
             scorer_max_num_batched_tokens_arg = args.speculator_max_num_batched_tokens
+        speculator_device = torch.device(scorer_device_arg or "cuda:1")
+
+        # Pre-flight the GPU placement, out loud, BEFORE either engine
+        # allocates -- a real failure this catches, not a defensive guess.
+        # The first ORACLE-k20 run on real hardware died with
+        # `torch.OutOfMemoryError: Tried to allocate 3.31 GiB. GPU 0 ... 2.63
+        # GiB is free ... this process has 76.61 GiB in use` from inside an
+        # activation kernel, tens of minutes into the run. That failure mode
+        # is invisible in the traceback (every engine calls its own device
+        # "GPU 0", because `SpecPrefillProposer` places the scorer by
+        # rewriting CUDA_VISIBLE_DEVICES for the child process -- so the
+        # message cannot tell you WHICH engine or WHICH physical card),
+        # which is exactly why it's worth a loud check here instead.
+        #
+        # The target engine takes the FIRST visible device (this driver never
+        # passes it a placement -- see the `LLM(**llm_kwargs)` call above and
+        # `SpecPrefillProposer`'s docstring on why placement is a
+        # CUDA_VISIBLE_DEVICES concern in this fork, not an `LLM()` kwarg),
+        # so scorer index 0 means "same card as the target". Sharing is
+        # survivable for the 1B speculator (SPARSE rows: ~2GB of weights)
+        # and simply is not for an 8B scorer facing an 8B target: two
+        # ~16GB weight sets plus two long-context KV pools plus scoring's
+        # own multi-GB transients do not fit in 80GB.
+        scorer_device_index = speculator_device.index
+        device_count = torch.cuda.device_count()
         print(
             f"[predict_scbench] scoring engine: {scorer_model} on "
-            f"{scorer_device_arg or 'cuda:1'} "
-            f"(gpu_memory_utilization={scorer_gpu_memory_utilization})"
+            f"{speculator_device} "
+            f"(gpu_memory_utilization={scorer_gpu_memory_utilization}); "
+            f"target engine on the first visible device "
+            f"(gpu_memory_utilization={args.target_gpu_memory_utilization}); "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
+            f"torch.cuda.device_count()={device_count}"
         )
-
-        speculator_device = torch.device(scorer_device_arg or "cuda:1")
+        # `device_count == 0` means no CUDA at all in THIS process -- true
+        # for a CPU-only dry run of this wiring, and not something to
+        # diagnose here (the engines themselves fail with a clearer message
+        # than any guess this could make).
+        if device_count and scorer_device_index is not None and scorer_device_index >= device_count:
+            raise RuntimeError(
+                f"{exp_id}: scorer device {speculator_device} does not exist "
+                f"-- torch.cuda.device_count() is {device_count} "
+                f"(CUDA_VISIBLE_DEVICES="
+                f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}). Note that "
+                f"SpecPrefillProposer places the scorer by SETTING "
+                f"CUDA_VISIBLE_DEVICES to this index for the child engine "
+                f"process, so the index is interpreted against the devices "
+                f"THIS process can already see, not against physical GPU "
+                f"ids -- on a job allocated e.g. CUDA_VISIBLE_DEVICES=2,3, "
+                f"'cuda:1' means the second of those two."
+            )
+        if scorer_device_index == 0 and mode == "oracle":
+            raise RuntimeError(
+                f"{exp_id}: the oracle scorer ({scorer_model}) would land on "
+                f"the same GPU as the target engine (device 0). Two 8B "
+                f"engines plus two long-context KV pools plus scoring's own "
+                f"multi-GB transients do not fit on one 80GB card -- this "
+                f"OOMs mid-run, inside an activation kernel, after the run "
+                f"has already been paid for. Give the scorer its own GPU "
+                f"with --oracle-scorer-device (the SPARSE rows' 1B "
+                f"speculator gets cuda:1 by default and the oracle inherits "
+                f"that), or, if only one GPU is available, drop BOTH "
+                f"--target-gpu-memory-utilization and "
+                f"--oracle-scorer-gpu-memory-utilization far enough that "
+                f"the two pools plus ~10GB of scoring headroom fit inside "
+                f"it -- which at SCBench's context lengths likely means "
+                f"lowering --target-max-num-batched-tokens too."
+            )
         gran_kwargs = GRANULARITIES[granularity]
         spec_config = SpecConfig(
             keep_strategy="percentage",

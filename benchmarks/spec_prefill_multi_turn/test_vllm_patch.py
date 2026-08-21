@@ -2157,7 +2157,7 @@ def test_oracle_rows_pair_one_to_one_with_a_sparse_row():
     )
 
 
-def _run_experiment_with_stubs(exp_id):
+def _run_experiment_with_stubs(exp_id, **arg_overrides):
     """Drives `predict_scbench.run_experiment` for one row with every heavy
     dependency stubbed out (no vLLM, no GPU, no checkpoints, no dataset),
     and reports what it *tried* to construct: the target engine's kwargs,
@@ -2248,6 +2248,9 @@ def _run_experiment_with_stubs(exp_id):
         oracle_scorer_max_num_batched_tokens=None,
         max_tokens=64, reps=1, peak_tflops=None,
     )
+    for k, v in arg_overrides.items():
+        assert hasattr(args, k), f"unknown arg override {k!r}"
+        setattr(args, k, v)
 
     try:
         ps.run_experiment(exp_id, EXPERIMENTS[exp_id], args)
@@ -2318,6 +2321,38 @@ def test_oracle_row_scores_with_the_target_checkpoint_on_the_sparse_loop():
         f"ORACLE and its SPARSE partner differ in more than the scorer "
         f"checkpoint and its memory budget: {sorted(differing)}"
     )
+
+
+def test_oracle_scorer_sharing_the_targets_gpu_fails_before_the_run_starts():
+    """The first real ORACLE-k20 run died with a CUDA OOM inside an
+    activation kernel, tens of minutes in, holding 76.6GiB -- more than
+    either engine's own configured budget, i.e. two 8B engines on one card.
+    That traceback cannot name the culprit: `SpecPrefillProposer` places the
+    scorer by rewriting CUDA_VISIBLE_DEVICES for the child process, so every
+    engine calls its own device "GPU 0" regardless of which physical card it
+    holds.
+
+    So the placement is checked up front instead, and the check has to
+    RAISE rather than warn: a warning at minute 0 of an hours-long sweep is
+    read after the OOM, not before it."""
+    try:
+        _run_experiment_with_stubs("ORACLE-k20", oracle_scorer_device="cuda:0")
+    except RuntimeError as e:
+        assert "same GPU as the target" in str(e)
+        assert "--oracle-scorer-device" in str(e), (
+            "the error must name the flag that fixes it"
+        )
+    else:
+        raise AssertionError(
+            "an oracle scorer placed on device 0 (the target's own device) "
+            "must fail before either engine allocates, not OOM mid-run"
+        )
+
+    # The 1B speculator sharing the target's GPU is a different question --
+    # ~2GB of weights, which is why the SPARSE rows have always been free to
+    # do it -- so the guard must not fire for them.
+    sparse = _run_experiment_with_stubs("SPARSE-k20-g32", speculator_device="cuda:0")
+    assert sparse["loop"] == "sparse"
 
 
 def _run_all():
