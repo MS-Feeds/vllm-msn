@@ -1760,13 +1760,60 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     if native_max_model_len is not None:
         max_model_len = min(max_model_len, int(native_max_model_len))
 
+    # `max_num_batched_tokens` does THREE jobs in this driver and they are
+    # not the same number. Two of them stay tied to
+    # --target-max-num-batched-tokens: the context ceiling (`max_model_len`
+    # above) and the "is this conversation servable at all" skip threshold
+    # (the run_* loops' pre-flight checks). The third -- how many tokens the
+    # engine puts through ONE forward pass -- is what actually sizes the
+    # transient activation buffers, and it is what
+    # --target-prefill-chunk-tokens separates out.
+    #
+    # A real failure this fixes, not a tidy-up: the first ORACLE-k20 run
+    # OOM'd twice, once per engine, both times prefilling `scbench_kv-0`'s
+    # 124,009-token turn 0 in a SINGLE batch. At Llama-3.1-8B's
+    # intermediate_size of 14336, one SiluAndMul output for that batch is
+    # 3.31GiB in bf16, and several such buffers are live at once -- tens of
+    # GiB of transients that no `gpu_memory_utilization` setting reserves,
+    # because vLLM sizes the KV pool from a PROFILED activation peak that a
+    # 124k-token batch exceeds. Capping this at e.g. 32768 cuts the peak
+    # ~4x with no effect on results: chunked prefill is already on
+    # (`enable_chunked_prefill=True`, passed explicitly below rather than
+    # relying on the v1 default), and both workers are already correct
+    # across prefill chunks -- `sparse_target_runner.py` leaves every step
+    # with `num_computed < num_prompt` at full unrestricted attention, and
+    # `speculator_worker.py::end_capture` filters captured queries by SHAPE
+    # (exactly-1-token entries) precisely so any number of leading prefill
+    # chunks is harmless.
+    #
+    # Default None == the previous behavior exactly (one batch as large as
+    # the context budget), so no already-measured row silently changes its
+    # batching, and therefore its timings, underneath the published sweep.
+    target_engine_batch_tokens = (
+        args.target_prefill_chunk_tokens or target_max_num_batched_tokens
+    )
+    if target_engine_batch_tokens > target_max_num_batched_tokens:
+        raise ValueError(
+            f"--target-prefill-chunk-tokens ({target_engine_batch_tokens}) "
+            f"exceeds --target-max-num-batched-tokens "
+            f"({target_max_num_batched_tokens}) -- the chunk is a per-step "
+            f"slice of that budget, never larger than it."
+        )
+    if target_engine_batch_tokens != target_max_num_batched_tokens:
+        print(
+            f"[predict_scbench] target engine: prefill chunked at "
+            f"{target_engine_batch_tokens} tokens/step "
+            f"(context ceiling stays {target_max_num_batched_tokens})"
+        )
+
     llm_kwargs = dict(
         model=args.target_model,
         trust_remote_code=True,
         enforce_eager=True,
         disable_log_stats=False,
         gpu_memory_utilization=args.target_gpu_memory_utilization,
-        max_num_batched_tokens=target_max_num_batched_tokens,
+        max_num_batched_tokens=target_engine_batch_tokens,
+        enable_chunked_prefill=True,
         max_model_len=max_model_len,
     )
     if mode in ("sparse", "oracle"):
@@ -1988,11 +2035,37 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             else speculator_max_num_batched_tokens + 1 + LOOK_AHEAD_CNT,
         )
 
+        # Same three-jobs-one-number split as the target's above, and the
+        # same real OOM behind it -- the scorer's own dumped batch was
+        # `scbench_kv-0::turn0`, 124,009 prompt tokens, max_tokens=9 (1 +
+        # look_ahead_cnt, i.e. unmistakably `proposer.py`'s scoring request
+        # rather than the target's session). The scorer needs this MORE than
+        # the target does at the oracle's settings: it prefills the whole
+        # candidate pool every turn, and for ORACLE-k* it does so with 8B
+        # weights on a smaller memory budget than the target's.
+        scorer_engine_batch_tokens = (
+            args.scorer_prefill_chunk_tokens or speculator_max_num_batched_tokens
+        )
+        if scorer_engine_batch_tokens > speculator_max_num_batched_tokens:
+            raise ValueError(
+                f"--scorer-prefill-chunk-tokens ({scorer_engine_batch_tokens}) "
+                f"exceeds the scorer's context budget "
+                f"({speculator_max_num_batched_tokens}) -- the chunk is a "
+                f"per-step slice of that budget, never larger than it."
+            )
+        if scorer_engine_batch_tokens != speculator_max_num_batched_tokens:
+            print(
+                f"[predict_scbench] scoring engine: prefill chunked at "
+                f"{scorer_engine_batch_tokens} tokens/step "
+                f"(context ceiling stays {speculator_max_num_batched_tokens})"
+            )
+
         proposer = SpecPrefillProposer(
             speculator_model_path=scorer_model,
             device=speculator_device,
             gpu_memory_utilization=scorer_gpu_memory_utilization,
-            max_num_batched_tokens=speculator_max_num_batched_tokens,
+            max_num_batched_tokens=scorer_engine_batch_tokens,
+            enable_chunked_prefill=True,
             max_model_len=speculator_max_model_len,
         )
 
@@ -2202,6 +2275,28 @@ def main() -> None:
     parser.add_argument("--speculator-device", default=None)
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.2)
+    parser.add_argument(
+        "--target-prefill-chunk-tokens", type=int, default=None,
+        help="Tokens per forward pass for the TARGET engine (vLLM's "
+             "max_num_batched_tokens), separate from "
+             "--target-max-num-batched-tokens, which stays the context "
+             "ceiling and the conversation-skip threshold. Lower this "
+             "(e.g. 32768) when a long context OOMs during PREFILL rather "
+             "than at engine startup: transient activation buffers scale "
+             "with the per-step batch, not with the context, and vLLM's "
+             "gpu_memory_utilization does not reserve for a batch bigger "
+             "than the one it profiled. Default: no chunking beyond the "
+             "context budget (previous behavior -- leave it alone to keep "
+             "already-measured rows comparable).",
+    )
+    parser.add_argument(
+        "--scorer-prefill-chunk-tokens", type=int, default=None,
+        help="Same as --target-prefill-chunk-tokens, for the SCORING engine "
+             "(the 1B speculator on SPARSE-k*-g* rows, the 8B target "
+             "checkpoint on ORACLE-k* rows). The scorer prefills the whole "
+             "candidate pool every turn, so this is the one that matters "
+             "first for an oracle run.",
+    )
     parser.add_argument(
         "--oracle-scorer-model", default=None,
         help="Checkpoint the ORACLE-k* rows score with. Default: "

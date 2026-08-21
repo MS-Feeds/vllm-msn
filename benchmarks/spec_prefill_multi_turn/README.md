@@ -137,20 +137,32 @@ reserve. Too high a value OOMs during scoring, not during generation. The
 Run it with:
 
 ```bash
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python predict_scbench.py --exp oracle --target-gpu-memory-utilization 0.75
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python predict_scbench.py --exp oracle --target-prefill-chunk-tokens 32768 --scorer-prefill-chunk-tokens 32768
 ```
 
-**Why those two extras** (learned from the first real ORACLE-k20 run, which
-OOM'd): at `--target-gpu-memory-utilization 0.85` the TARGET engine reserves
-~67GiB of an 80GB A100, and a turn-0 prefill of a ~124k-token SCBench context
-needs multi-GiB transient activation buffers (3.31GiB per SiluAndMul output
-alone) on top of that. The failing process held 70GiB allocated with 6GiB
-reserved-but-unallocated — headroom exhausted plus allocator fragmentation.
-This is a target-side margin that the oracle row did not create but does
-expose; `expandable_segments:True` addresses the fragmentation half and the
-lower utilization the headroom half. If it still OOMs, lower
-`--target-max-num-batched-tokens` (at the cost of skipping the longest
-conversations — watch `num_skipped_too_large`).
+**Why the chunk flags** (learned from the first real ORACLE-k20 run, which
+OOM'd on *both* engines): SCBench's longest contexts are ~124k tokens, and
+with `max_num_batched_tokens` at the context ceiling the whole thing goes
+through one forward pass. At Llama-3.1-8B's `intermediate_size` of 14336, a
+single SiluAndMul output for that batch is **3.31GiB** in bf16, with several
+such buffers live at once — tens of GiB of transients that no
+`gpu_memory_utilization` reserves, because vLLM sizes the KV pool from a
+*profiled* activation peak that a 124k-token batch blows past. Both crashes
+were on that exact prefill (the second one's dumped batch:
+`scbench_kv-0::turn0`, `prompt_token_ids_len=124009`, `max_tokens=9` — the
+scorer's request).
+
+`--target-prefill-chunk-tokens` / `--scorer-prefill-chunk-tokens` set the
+engines' per-step batch size **without** moving `--*-max-num-batched-tokens`,
+which stays the context ceiling *and* the conversation-skip threshold —
+lowering that instead would silently skip the longest conversations rather
+than serve them (watch `num_skipped_too_large`). Chunking costs nothing in
+accuracy: `sparse_target_runner.py` leaves every step with
+`num_computed < num_prompt` at full unrestricted attention, and
+`speculator_worker.py::end_capture` filters captured queries by shape
+(exactly-1-token entries) precisely so any number of leading prefill chunks
+is harmless. Both flags default to off, so no already-measured row changes
+its batching underneath the published sweep.
 
 Placement is now checked and printed before either engine allocates: the
 scorer must not land on the target's own GPU (two 8B engines do not fit on

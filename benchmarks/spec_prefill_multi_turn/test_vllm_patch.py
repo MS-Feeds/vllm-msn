@@ -2243,6 +2243,8 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         speculator_gpu_memory_utilization=0.2,
         target_max_num_batched_tokens=131072,
         speculator_max_num_batched_tokens=131072,
+        target_prefill_chunk_tokens=None,
+        scorer_prefill_chunk_tokens=None,
         oracle_scorer_model=None, oracle_scorer_device=None,
         oracle_scorer_gpu_memory_utilization=0.6,
         oracle_scorer_max_num_batched_tokens=None,
@@ -2306,6 +2308,27 @@ def test_oracle_row_scores_with_the_target_checkpoint_on_the_sparse_loop():
     assert oracle["proposer_kwargs"]["speculator_model_path"] == "/ckpt/Llama-3.1-8B-Instruct"
     assert oracle["proposer_kwargs"]["gpu_memory_utilization"] == 0.6
     assert oracle["loop"] == "sparse"
+
+    # Per-step batch size defaults to the context budget (previous
+    # behavior), and both engines run with chunked prefill available so
+    # --*-prefill-chunk-tokens is a working knob rather than a silently
+    # ignored one.
+    assert oracle["llm_kwargs"]["max_num_batched_tokens"] == 131072
+    assert oracle["llm_kwargs"]["enable_chunked_prefill"] is True
+    assert oracle["proposer_kwargs"]["max_num_batched_tokens"] == 131072
+    assert oracle["proposer_kwargs"]["enable_chunked_prefill"] is True
+
+    # ...and the chunk knob reaches the engines without moving the context
+    # ceiling with it -- the whole point of separating them, since the
+    # ceiling is also the conversation-skip threshold.
+    chunked = _run_experiment_with_stubs(
+        "ORACLE-k20", target_prefill_chunk_tokens=32768,
+        scorer_prefill_chunk_tokens=32768,
+    )
+    assert chunked["llm_kwargs"]["max_num_batched_tokens"] == 32768
+    assert chunked["llm_kwargs"]["max_model_len"] == oracle["llm_kwargs"]["max_model_len"]
+    assert chunked["proposer_kwargs"]["max_num_batched_tokens"] == 32768
+    assert chunked["proposer_kwargs"]["max_model_len"] == oracle["proposer_kwargs"]["max_model_len"]
 
     # ...and the SPARSE partner row differs in exactly the one field the
     # comparison is supposed to isolate.
