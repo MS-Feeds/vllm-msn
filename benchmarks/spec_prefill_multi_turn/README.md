@@ -39,6 +39,14 @@ history-retention setting first.
 - `grade_scbench.py` — scores predictions against `prep_scbench.py`'s
   samples, with per-SCBench-config metrics ported from the official
   `microsoft/MInference/scbench/eval_utils.py`.
+- `compare_ceiling.py` — compares several predictions files on the turns
+  they ALL cover, with a cluster-bootstrap CI over conversations. The tool
+  for reading an `ORACLE-k*` run against the `SPARSE` row it bounds; grading
+  each separately against the full samples file would compare different
+  conversation sets.
+- `ACCURACY_IMPROVEMENTS.md` — the candidate accuracy improvements drawn
+  from the two papers and from this pipeline's own code, gated on the
+  oracle result and ranked by effort.
 - `flops_model.py` / `validate_flops_model.py` — analytic FLOP model for
   the combined speculator + target system (pure Python, no GPU needed) and
   its GPU-node validation harness.
@@ -410,14 +418,10 @@ eval_utils.py`.
    this list is speculative until the two gaps above are measured, because
    they decide whether accuracy work belongs in the scorer or in the
    selection/gather mechanism.
-2. Then, guided by that split, the candidate improvements drawn from the two
-   papers: de-max the (layer, head) score aggregation and/or restrict which
-   layers vote; retrieval-head filtering; block-neighborhood dilation at g16
-   (the sweep's own monotonic g64 > g32 > g16 ordering says recall and
-   contiguity bind harder than selection precision); nucleus/mass-based keep
-   budgets instead of fixed top-k; a recency window and cross-turn sticky
-   selection; per-layer selection instead of one block set shared by all 32
-   layers; mid-turn re-selection during decode.
+2. Then, guided by that split, the candidates in
+   **[ACCURACY_IMPROVEMENTS.md](ACCURACY_IMPROVEMENTS.md)** — scoring-signal
+   changes if the estimator is what's losing points, allocation/mechanism
+   changes if it isn't. That document's Step 0 is the decision rule.
 3. Per-`turn_idx` score breakdowns for the existing sweep — the aggregate
    tables hide whether degradation compounds across turns, which is the
    multi-turn thesis itself.
@@ -459,5 +463,7 @@ eval_utils.py`.
 | `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
 | `predict_scbench.py` | Runs the M000/ORACLE-k\*/SPARSE-k\*-g\* matrix, writes a per-turn predictions JSONL per experiment |
 | `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
+| `compare_ceiling.py` | Compares predictions files on their common turns, with a cluster-bootstrap CI — for reading ORACLE-k\* against its SPARSE partner |
+| `ACCURACY_IMPROVEMENTS.md` | Candidate accuracy improvements, gated on the oracle result and ranked by effort |
 | `datasets/` | SCBench prep output (gitignored) |
 | `results/` | Output directory (gitignored, empty in this checkout) |
