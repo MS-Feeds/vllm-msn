@@ -141,16 +141,33 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python predict_scbench.py --exp
 ```
 
 **Why the chunk flags** (learned from the first real ORACLE-k20 run, which
-OOM'd on *both* engines): SCBench's longest contexts are ~124k tokens, and
-with `max_num_batched_tokens` at the context ceiling the whole thing goes
-through one forward pass. At Llama-3.1-8B's `intermediate_size` of 14336, a
-single SiluAndMul output for that batch is **3.31GiB** in bf16, with several
-such buffers live at once — tens of GiB of transients that no
-`gpu_memory_utilization` reserves, because vLLM sizes the KV pool from a
-*profiled* activation peak that a 124k-token batch blows past. Both crashes
-were on that exact prefill (the second one's dumped batch:
-`scbench_kv-0::turn0`, `prompt_token_ids_len=124009`, `max_tokens=9` — the
-scorer's request).
+OOM'd on the **scorer** — dumped batch `scbench_kv-0::turn0`,
+`prompt_token_ids_len=124009`, `max_tokens=9`, i.e. `proposer.py`'s scoring
+request, not the target's `::sparse-session`): SCBench's longest contexts are
+~124k tokens, and with `max_num_batched_tokens` at the context ceiling the
+whole thing goes through one forward pass. At Llama-3.1-8B's
+`intermediate_size` of 14336, a single SiluAndMul output for that batch is
+**3.31GiB** in bf16, with several such buffers live at once — tens of GiB of
+transients that no `gpu_memory_utilization` reserves, because vLLM sizes the
+KV pool from a *profiled* activation peak that a 124k-token batch blows past.
+
+**Why no SPARSE run ever hit it**, on the same conversation: swapping the
+scorer moves both terms the wrong way at once.
+
+| Scorer | per-SiluAndMul buffer @124k | KV | budget @util | card left free |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B (SPARSE) | 1.89 GiB | 32 KiB/tok | 15.9 GiB @0.2 | **~63 GiB** |
+| Llama-3.1-8B (ORACLE) | 3.31 GiB | 128 KiB/tok | 47.5 GiB @0.6 | **~32 GiB** |
+
+~3.5x less margin for a workload needing ~1.75x more, under
+`enforce_eager=True` (no compilation, so no fusion to shrink the live set).
+The 1B had so much slack that the single-batch 124k prefill was never visible
+as a problem. The scorer also runs *first* — `compute_pruned_turn` precedes
+the turn's `add_request` — so on turn 0 of the first conversation it prefills
+124k tokens before the target does anything, which is why an oracle run dies
+there rather than anywhere downstream. The target itself is not known to be
+marginal: it survived the entire published SPARSE sweep at 0.85 with the same
+token stream.
 
 `--target-prefill-chunk-tokens` / `--scorer-prefill-chunk-tokens` set the
 engines' per-step batch size **without** moving `--*-max-num-batched-tokens`,

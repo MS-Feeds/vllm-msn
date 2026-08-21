@@ -1769,15 +1769,19 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     # transient activation buffers, and it is what
     # --target-prefill-chunk-tokens separates out.
     #
-    # A real failure this fixes, not a tidy-up: the first ORACLE-k20 run
-    # OOM'd twice, once per engine, both times prefilling `scbench_kv-0`'s
-    # 124,009-token turn 0 in a SINGLE batch. At Llama-3.1-8B's
-    # intermediate_size of 14336, one SiluAndMul output for that batch is
-    # 3.31GiB in bf16, and several such buffers are live at once -- tens of
-    # GiB of transients that no `gpu_memory_utilization` setting reserves,
-    # because vLLM sizes the KV pool from a PROFILED activation peak that a
-    # 124k-token batch exceeds. Capping this at e.g. 32768 cuts the peak
-    # ~4x with no effect on results: chunked prefill is already on
+    # The failure that motivated this was on the SCORER, not here (see the
+    # scorer's own block below) -- but the cliff is the same shape on both
+    # engines and this side is the one with no headroom to spare, so the
+    # knob exists on both. `scbench_kv-0`'s turn 0 is 124,009 tokens, and at
+    # Llama-3.1-8B's intermediate_size of 14336 one SiluAndMul output for a
+    # batch that size is 3.31GiB in bf16, with several such buffers live at
+    # once -- tens of GiB of transients that no `gpu_memory_utilization`
+    # setting reserves, because vLLM sizes the KV pool from a PROFILED
+    # activation peak that a 124k-token batch exceeds. The target has
+    # survived this at `--target-gpu-memory-utilization 0.85` across the
+    # whole published SPARSE sweep, so it is NOT known to be marginal --
+    # capping this is available, not required. Capping at e.g. 32768 cuts
+    # the peak ~4x with no effect on results: chunked prefill is already on
     # (`enable_chunked_prefill=True`, passed explicitly below rather than
     # relying on the v1 default), and both workers are already correct
     # across prefill chunks -- `sparse_target_runner.py` leaves every step
@@ -2035,14 +2039,33 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             else speculator_max_num_batched_tokens + 1 + LOOK_AHEAD_CNT,
         )
 
-        # Same three-jobs-one-number split as the target's above, and the
-        # same real OOM behind it -- the scorer's own dumped batch was
+        # Same three-jobs-one-number split as the target's above, and THIS
+        # is the side the real OOM was on: the dumped batch was
         # `scbench_kv-0::turn0`, 124,009 prompt tokens, max_tokens=9 (1 +
         # look_ahead_cnt, i.e. unmistakably `proposer.py`'s scoring request
-        # rather than the target's session). The scorer needs this MORE than
-        # the target does at the oracle's settings: it prefills the whole
-        # candidate pool every turn, and for ORACLE-k* it does so with 8B
-        # weights on a smaller memory budget than the target's.
+        # rather than the target's `::sparse-session`).
+        #
+        # Why ORACLE-k* hits this when no SPARSE-k*-g* run ever did, even on
+        # the same conversation -- the scorer swap moves BOTH terms the
+        # wrong way at once:
+        #
+        #   Llama-3.2-1B scorer (SPARSE): intermediate_size 8192 -> 1.89GiB
+        #     per SiluAndMul output at 124k tokens; util 0.2 = 15.9GiB
+        #     budget, leaving ~63GiB of the card free for transients.
+        #   Llama-3.1-8B scorer (ORACLE): intermediate_size 14336 -> 3.31GiB
+        #     per buffer (1.75x more), KV 128KiB/token vs 32; util 0.6 =
+        #     47.5GiB budget, leaving only ~32GiB free (2x less).
+        #
+        # ~3.5x less margin for a workload needing ~1.75x more, under
+        # `enforce_eager=True` (no compilation, so no fusion to shrink the
+        # live set). The 1B had so much slack that the single-batch 124k
+        # prefill was never visible as a problem; the 8B has none.
+        #
+        # The scorer is also FIRST: `compute_pruned_turn` runs before the
+        # turn's `add_request`, so on turn 0 of the first conversation the
+        # scorer's 124k prefill happens before the target has done anything
+        # at all -- which is why an oracle run dies here rather than
+        # anywhere downstream.
         scorer_engine_batch_tokens = (
             args.scorer_prefill_chunk_tokens or speculator_max_num_batched_tokens
         )
