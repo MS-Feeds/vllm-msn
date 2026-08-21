@@ -121,6 +121,7 @@ from vllm.v1.worker.gpu_worker import Worker
 
 from .kv_cache_utils import (
     gather_keys_for_slots,
+    is_decode_query_slice,
     read_layer_keys,
     stack_decode_only_steps,
 )
@@ -266,9 +267,14 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         max_tokens).
 
         Since `begin_capture` now runs before the request even exists (see
-        that method's docstring), every one of this request's forward
-        calls gets captured, INCLUDING the bootstrap prefill's own -- which
-        must be excluded here, not by timing. The bootstrap's own capture
+        that method's docstring), every one of this request's forward calls
+        REACHES the capture hook, INCLUDING the bootstrap prefill's own --
+        which must be excluded by shape, not by timing. As of the
+        capture-time skip in `_capture_queries_by_request` (added to stop
+        prefill queries pinning tens of GiB -- see that method's docstring)
+        prefill entries no longer arrive here at all; the filter below is
+        kept as the second line of defense, and as the statement of the
+        rule both places implement. The bootstrap's own capture
         is NOT reliably "just the first entry": if the new-suffix being
         prefilled this turn is long enough to need more than one scheduler
         step (chunked prefill), there could be several leading multi-token
@@ -312,6 +318,50 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         return result
 
     def _capture_queries_by_request(self, layer_idx: int, q: torch.Tensor) -> None:
+        """Appends this forward call's per-request query slice to the
+        capture buffer -- DECODE steps only.
+
+        ## Why the `end - start != 1` skip is load-bearing, in GiB
+
+        `end_capture` has always thrown prefill entries away by shape (keep
+        only entries covering exactly 1 token -- see its docstring for why
+        that rule is the robust one). Doing it only THERE meant every
+        prefill token's query stayed resident until the turn's scoring
+        pass: `q[start:end]` is a VIEW, so retaining it pins the whole
+        forward's query tensor, per layer, for every prefill (or prefill-
+        chunk) call.
+
+        That is `num_prefill_tokens x hidden_size x 2 bytes x num_layers`
+        of memory doing nothing but waiting to be discarded. A real OOM
+        this fixes, not a theoretical one -- on `scbench_kv-0`'s 124,009-
+        token turn 0:
+
+          Llama-3.2-1B speculator: 16 x 0.47GiB =  7.6GiB retained
+          Llama-3.1-8B scorer:     32 x 0.95GiB = 30.3GiB retained
+
+        The 1B's 7.6GiB was invisible for the whole SPARSE sweep, absorbed
+        by the ~63GiB the card had free at `--speculator-gpu-memory-
+        utilization 0.2`. The 8B ORACLE scorer's 30.3GiB was not: 15GiB
+        weights + ~30GiB KV pool + 30.3GiB of prefill queries = the 78.00
+        GiB `torch.cuda.memory_allocated()` reported at the OOM, on a
+        79.25GiB card. Note this is INVARIANT to prefill chunk size --
+        chunking the prefill splits the same total across more, smaller
+        views -- which is why capping `max_num_batched_tokens` alone did
+        not fix it (it did shrink the per-step activation transient, from
+        a 3.31GiB failed allocation to 896MiB, just not this).
+
+        Skipping at capture time is exactly equivalent to `end_capture`'s
+        existing shape filter -- same rule, same predicate, applied before
+        the memory is pinned rather than after. That filter stays where it
+        is as defense in depth; this one is what makes it free.
+
+        The decode slice is `.clone()`d rather than kept as a view, so what
+        stays resident is bounded by the captured token itself (1 x
+        hidden_size, a few KiB) and not by whatever else shared that
+        step's batch -- cheap insurance against a future scheduler that
+        batches this request's decode alongside another request's prefill
+        chunk, which would otherwise pin that chunk's whole tensor through
+        a 1-token view."""
         if not self._capturing_request_ids:
             return
         num_reqs = self.input_batch.num_reqs
@@ -322,9 +372,14 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
                 continue
             start = int(query_start_loc_np[req_idx])
             end = int(query_start_loc_np[req_idx + 1])
-            if end <= start:
+            if not is_decode_query_slice(start, end):
+                # Prefill or prefill-continuation chunk (or an empty slice):
+                # never scored, so never retained. See this method's
+                # docstring for the memory this saves, and
+                # `kv_cache_utils.is_decode_query_slice` for why the
+                # predicate lives over there.
                 continue
-            self._query_buffer[req_id][layer_idx].append(q[start:end])
+            self._query_buffer[req_id][layer_idx].append(q[start:end].clone())
 
     def _prepare_inputs(self, scheduler_output, *args, **kwargs):
         # *args/**kwargs passthrough -- see model_runner.py's identical

@@ -194,6 +194,32 @@ def tensor_from_wire(d: dict) -> torch.Tensor:
     return flat.reshape(d["shape"])
 
 
+def is_decode_query_slice(start: int, end: int) -> bool:
+    """Whether a forward call's `[start, end)` query slice for one request
+    is a DECODE step (exactly 1 new token) and therefore worth capturing.
+
+    The same rule `stack_decode_only_steps` below applies AFTER the fact
+    (`step.shape[0] == 1`), expressed so `speculator_worker.py`'s capture
+    hook can apply it BEFORE retaining anything -- and lives here, beside
+    that function, for the same reason it does: `speculator_worker.py`
+    imports vLLM at module level and so can't be imported without vLLM's
+    full runtime, while this is a two-integer predicate that should be
+    unit-testable on CPU.
+
+    Applying it at capture time is what makes the after-the-fact filter
+    free. A captured slice is a VIEW into the whole forward call's query
+    tensor, so retaining one prefill slice pins that entire tensor, per
+    layer, until the turn's scoring pass runs -- 30.3GiB for Llama-3.1-8B
+    over a 124k-token context (32 layers x 0.95GiB), which is what OOM'd
+    the first real ORACLE-k20 run. See `speculator_worker.py`'s
+    `_capture_queries_by_request` docstring for the full accounting.
+
+    `end <= start` (an empty slice -- a request present in the batch with
+    no scheduled tokens) is not a decode step either, and returns False.
+    """
+    return end - start == 1
+
+
 def stack_decode_only_steps(
     steps: List[torch.Tensor], hidden_dim_fallback: int
 ) -> torch.Tensor:

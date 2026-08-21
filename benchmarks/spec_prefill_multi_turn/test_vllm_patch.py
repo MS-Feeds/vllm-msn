@@ -62,6 +62,7 @@ from vllm_patch.kv_cache_utils import (
     compute_sparse_gather_view,
     compute_sparse_gather_view_incremental,
     gather_keys_for_slots,
+    is_decode_query_slice,
     stack_decode_only_steps,
     tensor_from_wire,
     tensor_to_wire,
@@ -344,6 +345,61 @@ def test_tensor_wire_roundtrip_empty_tensor():
     restored = tensor_from_wire(tensor_to_wire(original))
     assert restored.shape == original.shape
     assert restored.dtype == original.dtype
+
+
+def test_capture_time_and_after_the_fact_decode_filters_agree():
+    """`is_decode_query_slice` (applied in the capture hook, before a slice
+    is retained) and `stack_decode_only_steps` (applied at end_capture,
+    after) implement the SAME rule -- "a decode step is exactly 1 token".
+    They have to: if the capture-time predicate were stricter, real decode
+    steps would silently vanish from the scoring pass and every keep-rate
+    row would be scored on fewer lookahead steps than it reported; if it
+    were looser, the prefill queries it exists to drop would still be
+    pinned.
+
+    That second half is the 30.3GiB one. A captured slice is a view into
+    the whole forward call's query tensor, so one retained prefill slice
+    pins that tensor per layer until scoring runs -- 32 layers x 0.95GiB
+    for Llama-3.1-8B over a 124k-token context, which OOM'd the first real
+    ORACLE-k20 run at 78.00GiB allocated on a 79.25GiB card. The 1B
+    speculator's equivalent 7.6GiB had been absorbed by the headroom at
+    --speculator-gpu-memory-utilization 0.2 for the whole SPARSE sweep,
+    which is why no earlier run ever surfaced it."""
+    HD = 8
+    # (start, end) pairs a real batch can hand the hook: a full prefill, a
+    # chunked-prefill continuation, a decode step, and an empty slice for a
+    # request scheduled with no tokens this step.
+    cases = [(0, 124009), (0, 32768), (5, 6), (0, 1), (7, 7)]
+    for start, end in cases:
+        captured = is_decode_query_slice(start, end)
+        # What end_capture would decide about the same slice, by shape.
+        survives_stacking = (end - start) == 1
+        assert captured == survives_stacking, (
+            f"slice [{start}, {end}) -- capture-time filter says "
+            f"{captured}, end_capture's shape filter says {survives_stacking}"
+        )
+
+    assert is_decode_query_slice(5, 6) is True
+    assert is_decode_query_slice(0, 32768) is False
+    # Empty slice is not a decode step (and must not be retained either).
+    assert is_decode_query_slice(7, 7) is False
+
+    # End to end: feed only what the hook would now retain, and confirm
+    # end_capture still produces the same [1, num_decode_steps, H*D] stack
+    # it produced back when it had to filter prefill entries out itself.
+    prefill_then_decodes = [
+        torch.randn(32768, HD), torch.randn(32768, HD),  # dropped at capture
+        torch.randn(1, HD), torch.randn(1, HD), torch.randn(1, HD),
+    ]
+    retained = [
+        t for t in prefill_then_decodes
+        if is_decode_query_slice(0, t.shape[0])
+    ]
+    assert len(retained) == 3
+    assert torch.equal(
+        stack_decode_only_steps(retained, HD),
+        stack_decode_only_steps(prefill_then_decodes, HD),
+    )
 
 
 def test_stack_decode_only_steps_drops_single_bootstrap_entry():
