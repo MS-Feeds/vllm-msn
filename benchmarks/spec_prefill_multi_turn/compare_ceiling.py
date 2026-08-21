@@ -115,6 +115,13 @@ def main() -> None:
     parser.add_argument("--bootstrap", type=int, default=2000,
                         help="Cluster-bootstrap iterations (0 to skip).")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--by-conversation", action="store_true",
+                        help="Per-conversation score for every row, sorted by "
+                             "context length -- for checking whether a subset "
+                             "is unrepresentative along the length axis "
+                             "(long-context conversations are where the "
+                             "baseline itself starts failing, leaving nothing "
+                             "for sparsification to lose).")
     parser.add_argument("--per-turn", action="store_true",
                         help="Also break every row down by turn_idx -- the "
                              "multi-turn-specific signal (does degradation "
@@ -125,7 +132,9 @@ def main() -> None:
         parser.error("give at least two predictions files to compare")
 
     samples_by_key = {}
+    context_chars: dict[str, int] = {}
     for sample in _read_jsonl(args.samples):
+        context_chars[sample["id"]] = len(sample.get("context", ""))
         for turn_idx, turn in enumerate(sample["turns"]):
             samples_by_key[(sample["id"], turn_idx)] = (sample["config"], turn["answer"])
 
@@ -200,11 +209,62 @@ def main() -> None:
                 cells.append(f"  {100.0 * sum(vals) / len(vals):6.1f}" if vals else "     n/a")
             print(path.stem.replace("_predictions", "").ljust(name_width) + "".join(cells))
 
+    # Is the comparison set representative of what each row covered?
+    #
+    # This is not a formality. A row restricted to a subset can score wildly
+    # differently from its own published full-run number, and when it does,
+    # every difference measured on that subset is being measured somewhere
+    # the reference row does not behave the way the headline table says it
+    # does. The failure mode it catches: a comparison set where the baseline
+    # has little headroom left compresses every row into each other, and the
+    # resulting "small gaps" say nothing about the thing under test.
+    interesting = [
+        (path, scored) for path, scored in scored_by_file.items()
+        if len(scored) > len(common)
+    ]
+    if interesting:
+        print("\nis this comparison set representative?")
+        print(f"  {'row'.ljust(name_width)}  {'in set':>8}  {'outside':>8}  {'delta':>8}")
+        for path, scored in interesting:
+            inside = [sc for k, sc in scored.items() if k in common]
+            outside = [sc for k, sc in scored.items() if k not in common]
+            if not outside:
+                continue
+            mean_in = 100.0 * sum(inside) / len(inside)
+            mean_out = 100.0 * sum(outside) / len(outside)
+            label = path.stem.replace("_predictions", "").ljust(name_width)
+            print(f"  {label}  {mean_in:8.1f}  {mean_out:8.1f}  {mean_in - mean_out:+8.1f}")
+        print(
+            "  A large negative delta means the shared conversations are the "
+            "HARDER ones.\n  Gaps measured there are gaps measured where the "
+            "baseline itself is weak."
+        )
+
+    if args.by_conversation:
+        print("\nper conversation (sorted by context length):")
+        cids = sorted(conversations, key=lambda c: context_chars.get(c, 0), reverse=True)
+        header = "  " + "conversation".ljust(22) + f"{'ctx chars':>11}" + "".join(
+            f"  {p.stem.replace('_predictions', '')[:12]:>12}" for p, *_ in rows
+        )
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for cid in cids:
+            cells = []
+            for path, *_ in rows:
+                vals = [
+                    sc for k, sc in scored_by_file[path].items()
+                    if k[0] == cid and k in common
+                ]
+                cells.append(f"  {100.0 * sum(vals) / len(vals):12.1f}" if vals else f"  {'n/a':>12}")
+            print(f"  {cid[:22].ljust(22)}{context_chars.get(cid, 0):>11}" + "".join(cells))
+
     if len(rows) >= 3:
         print(
             "\nreading the two gaps (see ACCURACY_IMPROVEMENTS.md's Step 0): "
             "oracle-minus-sparse is the estimator's cost, "
-            "M000-minus-oracle is the mechanism's."
+            "M000-minus-oracle is the mechanism's. Both are only readable if "
+            "the reference row has headroom on this set -- check the "
+            "representativeness table above first."
         )
     if args.bootstrap:
         print(
