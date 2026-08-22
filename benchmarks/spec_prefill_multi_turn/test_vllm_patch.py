@@ -74,8 +74,10 @@ from vllm_patch.pruning_registry import PruneRecord
 from vllm_patch.scoring import (
     aggregate_attention_score,
     chunk_select_from_smoothed_attention,
+    aggregate_attention_score,
     compute_attention_score,
     score_and_select_indices,
+    scoring_layer_indices,
 )
 from vllm_patch.pruner import _positions_from_kept_indices
 from predict_scbench import (
@@ -2432,6 +2434,115 @@ def test_oracle_scorer_sharing_the_targets_gpu_fails_before_the_run_starts():
     # do it -- so the guard must not fire for them.
     sparse = _run_experiment_with_stubs("SPARSE-k20-g32", speculator_device="cuda:0")
     assert sparse["loop"] == "sparse"
+
+
+def test_scoring_layer_indices_selects_late_layers_and_never_empties():
+    """The layer-restriction policy, as integers. Every named selection drops
+    EARLY layers -- layers 0-1 are positional/sink-dominated, and under the
+    default `max` aggregation one peaked early head can set the whole
+    importance vector by itself (ACCURACY_IMPROVEMENTS.md §1.2)."""
+    assert scoring_layer_indices(32, None) == list(range(32))
+    assert scoring_layer_indices(32, "skip_first2") == list(range(2, 32))
+    assert scoring_layer_indices(32, "second_half") == list(range(16, 32))
+    assert scoring_layer_indices(32, "last_quarter") == list(range(24, 32))
+    # The 1B speculator has 16 layers, the 8B oracle scorer 32 -- the same
+    # selection name must mean "the same fraction of the model" on both,
+    # or a variant's result would not transfer between the two scorers.
+    assert scoring_layer_indices(16, "second_half") == list(range(8, 16))
+    assert scoring_layer_indices(16, "last_quarter") == list(range(12, 16))
+
+    # Never empty: an empty selection would mean averaging over zero layers,
+    # which is a silent NaN score vector rather than an error.
+    for num_layers in (1, 2, 3, 4):
+        for selection in (None, "skip_first2", "second_half", "last_quarter"):
+            got = scoring_layer_indices(num_layers, selection)
+            assert got, f"{selection!r} emptied the layer set at {num_layers} layers"
+            assert max(got) == num_layers - 1
+            assert min(got) >= 0
+
+    try:
+        scoring_layer_indices(32, "no_such_selection")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown score_layers must raise, not silently pass through")
+
+
+def test_default_scoring_config_is_bit_identical_to_the_reference():
+    """The scoring variants are only safe to add if leaving them unset
+    reproduces the reference implementation EXACTLY -- every published row
+    (M000's partners, the 12-cell SPARSE grid, ORACLE-k20) was measured with
+    `max` over all layers, and those numbers are the baseline the variants
+    are judged against. A default that drifted would silently invalidate the
+    comparison rather than fail loudly."""
+    torch.manual_seed(0)
+    LAYERS, HEADS, LOOKAHEAD, CTX = 6, 4, 3, 64
+    attn = [torch.randn(LAYERS, HEADS, LOOKAHEAD, CTX)]
+
+    default_cfg = SpecConfig(keep_strategy="percentage", pool_kernel_size=13)
+    assert default_cfg.score_aggregation == "max"
+    assert default_cfg.score_layers is None
+
+    # The reference pipeline, inlined: softmax -> pool -> max over
+    # (layer, head) -> mean over lookahead.
+    ref = torch.nn.functional.softmax(attn[0], dim=-1, dtype=torch.float32).to(attn[0].dtype)
+    ref = ref.flatten(0, 1)
+    ref = torch.nn.functional.avg_pool1d(ref, kernel_size=13, padding=6, stride=1)
+    ref = ref.max(0)[0].mean(0)
+
+    got = aggregate_attention_score(attn, default_cfg)[0]
+    assert torch.equal(got, ref), "default scoring drifted from the reference pipeline"
+
+
+def test_scoring_variants_change_the_selection_without_changing_its_shape():
+    """Each variant must produce a real, different ranking -- a config knob
+    that silently does nothing is worse than no knob, because a null result
+    from it would be read as "this idea doesn't help" rather than "this idea
+    was never tested". Shape and finiteness are checked alongside, since
+    everything downstream (chunk selection, the block gather) assumes one
+    finite score per prompt token."""
+    torch.manual_seed(0)
+    LAYERS, HEADS, LOOKAHEAD, CTX = 8, 4, 3, 128
+    attn = [torch.randn(LAYERS, HEADS, LOOKAHEAD, CTX)]
+
+    scores = {}
+    for aggregation in ("max", "mean", "zmean"):
+        for layers in (None, "skip_first2", "second_half", "last_quarter"):
+            cfg = SpecConfig(
+                keep_strategy="percentage", pool_kernel_size=13,
+                score_aggregation=aggregation, score_layers=layers,
+            )
+            out = aggregate_attention_score(attn, cfg)[0]
+            assert out.shape == (CTX,), f"{aggregation}/{layers} changed the score shape"
+            assert torch.isfinite(out).all(), f"{aggregation}/{layers} produced non-finite scores"
+            scores[(aggregation, layers)] = out
+
+    # Every configuration ranks the context differently from the reference.
+    reference = scores[("max", None)]
+    ref_order = torch.argsort(reference, descending=True)
+    for key, out in scores.items():
+        if key == ("max", None):
+            continue
+        order = torch.argsort(out, descending=True)
+        assert not torch.equal(order, ref_order), (
+            f"variant {key} produced the reference ranking -- it is not "
+            f"actually varying anything"
+        )
+
+
+def test_zmean_survives_a_constant_attention_head():
+    """`zmean` divides by each head's standard deviation across the context.
+    A head whose pooled distribution is genuinely flat has zero variance --
+    a real case for a sink-dominated head after average pooling, not a
+    hypothetical -- and without the epsilon that one head turns the entire
+    score vector into NaN, silently, for the whole turn."""
+    LAYERS, HEADS, LOOKAHEAD, CTX = 2, 2, 1, 32
+    attn = torch.randn(LAYERS, HEADS, LOOKAHEAD, CTX)
+    attn[0, 0] = 5.0  # one perfectly flat head
+
+    cfg = SpecConfig(keep_strategy="percentage", pool_kernel_size=13, score_aggregation="zmean")
+    out = aggregate_attention_score([attn], cfg)[0]
+    assert torch.isfinite(out).all(), "a constant head produced NaN/inf scores under zmean"
 
 
 def _run_all():

@@ -469,6 +469,8 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         full_sequence_len: int,
         pool_kernel_size: Optional[int],
         keep_kwargs: dict,
+        score_aggregation: str = "max",
+        score_layers: Optional[str] = None,
     ):
         """Combines `end_capture` + `retrieve_keys` + the scoring/selection
         pipeline (`scoring.score_and_select_indices`) into ONE in-process
@@ -524,10 +526,18 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         key_buffer_per_layer = self.retrieve_keys(
             conversation_salt, list(range(full_sequence_len))
         )
+        # `score_aggregation`/`score_layers` have to be passed in rather than
+        # read from a config here: scoring runs inside the speculator's OWN
+        # worker process, which never sees the driver's `SpecConfig` (see
+        # this class's module docstring on the process split). They are
+        # defaulted to the reference behavior so an older caller that doesn't
+        # pass them scores exactly as before.
         spec_config = SpecConfig(
             keep_strategy="percentage",
             keep_kwargs=keep_kwargs,
             pool_kernel_size=pool_kernel_size,
+            score_aggregation=score_aggregation,
+            score_layers=score_layers,
         )
         kept_local_indices = score_and_select_indices(
             query_buffer, key_buffer_per_layer, actual_look_ahead_cnt, spec_config
@@ -615,13 +625,19 @@ class SpeculatorWorker(Worker):
         full_sequence_len: int,
         pool_kernel_size: Optional[int],
         keep_kwargs: dict,
+        score_aggregation: str = "max",
+        score_layers: Optional[str] = None,
     ):
         """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
         end_capture_and_score`'s docstring for the full reasoning (in-
         process K retrieval + scoring, only the small resulting index list
-        crosses `collective_rpc`)."""
+        crosses `collective_rpc`).
+
+        `score_aggregation`/`score_layers` default to the reference
+        behavior, so this stays callable with the old 5-argument signature."""
         return self.model_runner.end_capture_and_score(
-            request_id, conversation_salt, full_sequence_len, pool_kernel_size, keep_kwargs
+            request_id, conversation_salt, full_sequence_len, pool_kernel_size,
+            keep_kwargs, score_aggregation, score_layers,
         )
 
     def discard_conversation(self, conversation_salt: str) -> None:

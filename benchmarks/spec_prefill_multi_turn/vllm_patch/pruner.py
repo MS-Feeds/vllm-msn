@@ -209,6 +209,12 @@ def compute_pruned_turn(
         pool_kernel_size=spec_config.pool_kernel_size,
         keep_kwargs=spec_config.keep_kwargs,
         ignore_eos=spec_config.ignore_eos,
+        # Scoring variants (ACCURACY_IMPROVEMENTS.md §1) -- threaded from the
+        # driver's SpecConfig because the speculator's worker process has no
+        # access to it, same reason `keep_kwargs`/`pool_kernel_size` are
+        # passed rather than read.
+        score_aggregation=spec_config.score_aggregation,
+        score_layers=spec_config.score_layers,
     )
 
     pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(

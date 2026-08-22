@@ -216,10 +216,23 @@ one card), and the log line names the model, device, utilization, and
 `CUDA_VISIBLE_DEVICES` for both engines — a CUDA OOM traceback cannot, since
 every engine calls its own device "GPU 0".
 
-`scbench_kv` is where the SPARSE degradation actually lives, so for a first
-read: `--exp ORACLE-k20 --scbench-config scbench_kv --max-conversations 20`
-against the matching `SPARSE-k20-g32` slice is the cheapest run that answers
-the attribution question at the grid's worst-case corner.
+`scbench_kv` is where the SPARSE degradation actually lives, so that is the
+config to run first.
+
+> **`--max-conversations N` is a biased sample, not a cheap one.** It takes
+> the first N rows in file order ([predict_scbench.py:347](predict_scbench.py:347)),
+> and `scbench_kv`'s file order is ordered by difficulty. Measured, not
+> theorized: M000 scores **57.0** on the first 20 conversations and **87.75**
+> on the other 80, against its 81.60 full-set figure. Every gap shrinks with
+> it — M000 − SPARSE-k20-g32 is 25.0 points on the full set and 5.0 points on
+> that prefix, because a baseline that has already lost the points has none
+> left for sparsification to take. A 20-conversation ceiling run is therefore
+> not a cheap preview of the full one; it is a different, unreadable
+> measurement. Run the full config, or add a seeded random sample.
+>
+> (Conversation ids are HF row ids and step by 5 — `kv-0, kv-5, … kv-95` is
+> the first 20 conversations, not a stride across 100. Easy to misread as a
+> spread sample; it isn't one.)
 
 ---
 
@@ -254,6 +267,30 @@ matched turns).
 | SPARSE-k80-g16 | 78.6 | −3.0 | −3.7% |
 | SPARSE-k80-g32 | 79.2 | −2.4 | −2.9% |
 | SPARSE-k80-g64 | 80.8 | −0.8 | −1.0% |
+
+### ORACLE-k20: the ceiling, and what the 25-point gap is made of
+
+Run over the same 100 conversations / 500 turns as every number above.
+
+| Row | Score | vs. M000 |
+|---|---:|---:|
+| M000 | 81.6 | — |
+| **ORACLE-k20** | **73.6** | **−8.0** |
+| SPARSE-k20-g32 | 56.6 | −25.0 |
+
+| Term | Points | Share |
+|---|---:|---:|
+| **Estimator** — the 1B speculator's estimation error (`ORACLE` − `SPARSE`) | **17.0** | **68%** |
+| **Mechanism** — block-granular sparse decode with a perfect-as-this-method-allows estimator (`M000` − `ORACLE`) | 8.0 | 32% |
+
+**Roughly 2:1 in favour of the scorer being the problem.** Since the scoring
+pass is ~0.007% of a turn's FLOPs, those 17 points are the cheapest available.
+Per-turn, neither gap compounds with `turn_idx` (mechanism 9/8/8/12/3,
+estimator 23/14/18/9/21) — degradation is a per-turn selection problem
+repeated five times, not an accumulating one. Turn 0 is the worst turn for
+every row including M000 (70.0, vs 86.0 at turn 4) and is where sparsification
+costs most (−32, of which 23 is the estimator). See
+[ACCURACY_IMPROVEMENTS.md](ACCURACY_IMPROVEMENTS.md) for what this selects.
 
 **Clean, monotonic dose-response**: score rises with both keep rate and KV
 granularity, exactly as expected if sparsification is genuinely degrading
@@ -463,6 +500,7 @@ eval_utils.py`.
 | `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
 | `predict_scbench.py` | Runs the M000/ORACLE-k\*/SPARSE-k\*-g\* matrix, writes a per-turn predictions JSONL per experiment |
 | `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
+| `SPARSE-k20-g32-*` rows | Scoring-variant sweep (`--exp score`) — `score_aggregation`/`score_layers`, targeting the 17-point estimator gap the oracle measured |
 | `compare_ceiling.py` | Compares predictions files on their common turns, with a cluster-bootstrap CI — for reading ORACLE-k\* against its SPARSE partner |
 | `ACCURACY_IMPROVEMENTS.md` | Candidate accuracy improvements, gated on the oracle result and ranked by effort |
 | `datasets/` | SCBench prep output (gitignored) |

@@ -5,35 +5,82 @@ reference papers (SpecPrefill, arXiv:2502.02789; SCBench, arXiv:2412.10319)
 and from what this pipeline's own code and graded sweep actually do. Every
 item names the specific place it would change.
 
-**Read this document gated on the ORACLE-k\* result.** Most of what follows is
-speculative until the ceiling rows say which half of the pipeline is losing
-the points, and the two halves have disjoint fixes. See "Step 0" below.
+**The gate has been run.** `ORACLE-k20` over all 100 `scbench_kv`
+conversations says the 1B speculator's estimation error is **68% of the loss**
+and the sparse-decode mechanism itself is the other **32%**. §1 is therefore
+the priority and §2/§3 are real but secondary. Full numbers and what they rule
+out in "Step 0" below.
 
 ---
 
-## Step 0: the gate (run this before anything else)
+## Step 0: the gate — RESOLVED
 
 `ORACLE-k{N}` is `SPARSE-k{N}-g32` with the target checkpoint scoring instead
 of the 1B speculator — see README's "ORACLE-k\*: what it is and what it
-bounds". It splits the unexplained `scbench_kv` degradation in two:
+bounds". Run over all 100 `scbench_kv` conversations (500 turns, the same set
+behind every published number in the README):
 
-| Gap | Reading | Where the work goes |
-|---|---|---|
-| `ORACLE-k{N}` − `SPARSE-k{N}-g32` | the 1B speculator's estimation error | §1 Scoring signal |
-| `M000` − `ORACLE-k{N}` | what block-granular sparse decode costs with a perfect-as-this-method-allows estimator | §2 Allocation, §3 Mechanism |
+| Row | Score | vs. M000 |
+|---|---:|---:|
+| M000 | 81.6 | — |
+| **ORACLE-k20** | **73.6** | **−8.0** |
+| SPARSE-k20-g32 | 56.6 | −25.0 |
 
-Decision rule:
+The 25.0-point degradation splits:
 
-- **Oracle recovers most of M000** → the mechanism is fine, the estimator is
-  the problem. Go to §1, and §2's per-region/nucleus items.
-- **Oracle is also far below M000** → better scoring cannot save this. Go to
-  §3 and the structural items in §2 (per-layer selection, dilation).
-- **Both gaps are large** → both, but §3 first: a better estimator feeding a
-  lossy mechanism still loses.
+| Term | Points | Share | Section |
+|---|---:|---:|---|
+| **Estimator** (`ORACLE` − `SPARSE`) — the 1B's estimation error | **17.0** | **68%** | **§1 Scoring signal** |
+| **Mechanism** (`M000` − `ORACLE`) — what block-granular sparse decode costs with the estimator held as good as this method allows | 8.0 | 32% | §2 Allocation, §3 Mechanism |
+
+**Verdict: the scorer is the dominant term, by roughly 2:1.** Given §1's items
+cost essentially nothing at runtime (the scoring pass is ~0.007% of a turn),
+that is the cheapest 17 points in the project. The mechanism's 8 points are
+real and worth §2/§3 afterwards — they are not zero, and they bound whatever
+§1 can achieve.
+
+### What the per-turn breakdown rules out
+
+| Deficit vs. M000 | turn 0 | turn 1 | turn 2 | turn 3 | turn 4 |
+|---|---:|---:|---:|---:|---:|
+| M000 (absolute) | 70.0 | 81.0 | 84.0 | 87.0 | 86.0 |
+| mechanism (M000 − ORACLE) | 9 | 8 | 8 | 12 | 3 |
+| estimator (ORACLE − SPARSE) | 23 | 14 | 18 | 9 | 21 |
+
+- **Degradation does not compound across turns.** Both gaps are flat-to-
+  shrinking in `turn_idx`; nothing accumulates. This is a real negative result
+  for §3.3 (self-generated-history compounding) — **deprioritized on
+  evidence**, not deferred for cost. It also means the multi-turn setting is
+  not adding a failure mode on top of the single-turn one here; it is the
+  same per-turn selection problem, five times.
+- **Turn 0 is the worst turn for every row**, M000 included (70.0 vs 86.0 at
+  turn 4 — the documented turn-0 dip), and it is where sparsification hurts
+  most (−32). 23 of those 32 points are the estimator. So §1's improvements
+  should show up first and largest at turn 0, which makes turn 0 the cheapest
+  place to measure whether a scoring change worked.
+
+Read gaps by `compare_ceiling.py`'s **paired** CI column, not by whether the
+marginal CIs overlap — every row answers the same conversations, so the
+conversation-difficulty variance that dominates each marginal interval
+cancels out of the difference. Here the marginal intervals for M000
+[76.4, 86.4] and ORACLE-k20 [68.2, 78.6] overlap while the paired 8-point
+difference is solid.
 
 Compare on an identical conversation subset (`compare_ceiling.py`), not
 against the published full-sweep numbers — a 20-conversation oracle against a
 100-conversation SPARSE row is not a comparison.
+
+**Read the agreement table before the means.** Two rows can have nearly equal
+means while disagreeing about almost every individual conversation, if one
+wins some and loses others and the errors cancel. On a near-binary metric like
+`in_match` that is the *expected* shape of a selection method that scrambles
+which conversations succeed rather than uniformly losing points — and the
+means alone report it as "no difference", which is the opposite of what it
+means. First observed on the 20-conversation ORACLE-k20 run: means 54.0
+(oracle) vs 52.0 (sparse), a 2-point gap readable as "the estimator buys
+nothing", while the oracle agreed with M000 on 14/20 conversations (mean
+|diff| 11.0) and sparse on 5/20 (mean |diff| 33.0). The estimator mattered
+enormously; its errors simply cancelled at that keep rate.
 
 ---
 
@@ -48,13 +95,40 @@ Current pipeline ([scoring.py:103](vllm_patch/scoring.py:103)): softmax →
 `avg_pool1d(kernel=13)` → **max over (layer, head)** → mean over 8 lookahead
 steps.
 
-1. **Drop `max` over (layer, head).** Max is winner-take-all: one peaked
-   early-layer positional head sets the entire importance vector. Try
-   mean-over-heads of softmax mass, a top-q quantile, or per-head z-scoring
-   before combining so no single head dominates the scale.
-2. **Restrict which layers vote.** Layers 0–1 are near-universally
-   positional/sink-dominated and carry little retrieval signal. Score from
-   mid/late layers only. One-line change; plausibly the largest cheap win.
+1. **Drop `max` over (layer, head).** ✅ **Built.** Max is winner-take-all:
+   one peaked early-layer positional head sets the entire importance vector.
+   `SpecConfig.score_aggregation` ∈ `{max, mean, zmean}` — `mean` is total
+   attention mass, `zmean` z-scores each head across the context first so
+   heads contribute shape rather than magnitude.
+2. **Restrict which layers vote.** ✅ **Built.** Layers 0–1 are
+   near-universally positional/sink-dominated and carry little retrieval
+   signal. `SpecConfig.score_layers` ∈ `{None, skip_first2, second_half,
+   last_quarter}`.
+
+> **Running 1 and 2.** Six rows at the `k20-g32` probe point — the grid's
+> worst corner, where the 17-point estimator gap has the most room to show
+> above noise:
+>
+> ```bash
+> python predict_scbench.py --exp score --scbench-config scbench_kv
+> ```
+>
+> `SPARSE-k20-g32-{aggmean, aggzmean, lyrskip2, lyr2h, lyr4q, aggmean-lyr2h}`,
+> compared against the existing `SPARSE-k20-g32` (56.6) and the `ORACLE-k20`
+> ceiling (73.6) with `compare_ceiling.py`. Defaults are unchanged and
+> bit-identical to the reference implementation (locked by a test), so every
+> published row keeps its meaning; the variant is opt-in per row.
+>
+> **Iterate on gold-answer survival first**, not on graded sweeps — it needs
+> only the speculator (no target engine, no generation, no grading), so a
+> variant is judged in minutes:
+>
+> ```bash
+> python diagnose_gold_survival.py --predictions-file results/SPARSE-k20-g32_predictions.jsonl --keep-percentage 0.2 --score-aggregation mean --score-layers second_half
+> ```
+>
+> Turn 0 is the cheapest place to look: it is where sparsification costs most
+> (−32) and where the estimator owns the largest share of it (23 of 32).
 3. **Retrieval-head filtering.** Only a small head subset does copy/retrieval.
    Identify them offline on the speculator with a needle probe and score using
    only those. The strongest version of items 1–2, and aimed squarely at
@@ -157,8 +231,10 @@ not the binding constraint; recall and locality are.**
 
 ## Shortlist
 
-Ranked by expected value per unit of effort, assuming the oracle gate has been
-read first.
+Ranked by expected value per unit of effort, **given the resolved gate**: the
+estimator owns 17.0 of the 25.0 points, so §1 leads. Items 1 and 5 attack that
+68% directly; items 2-4 attack the mechanism's 8 points and are what remains
+once §1 is exhausted.
 
 | # | Change | Effort | Risk | Section |
 |---|---|---|---|---|

@@ -236,6 +236,38 @@ GRANULARITIES = {
 # Revisit if granularity turns out to matter for the oracle ceiling too.
 ORACLE_GRANULARITY = "32"
 
+# Scoring variants (ACCURACY_IMPROVEMENTS.md §1), swept at ONE probe point.
+#
+# ORACLE-k20 measured the speculator's estimation error at 17.0 of the
+# 25.0-point `scbench_kv` degradation -- 68%, vs 8.0 for the sparse-decode
+# mechanism -- so this is where the cheap points are: the scoring pass is
+# ~0.007% of a turn's FLOPs, meaning every variant below costs the same to
+# run as the row it is compared against.
+#
+# The probe point is `k20-g32`: the worst corner of the grid, where the
+# estimator gap is largest and a real improvement has the most room to show
+# up above the noise. Promote winners to the other keep rates rather than
+# crossing the whole grid with every variant up front -- 6 variants x 12
+# SPARSE cells would be 72 runs to answer a question 6 runs can answer.
+#
+# `None` for `score_layers` and `"max"` for `score_aggregation` are the
+# reference behavior; the baseline for this sweep is the EXISTING
+# `SPARSE-k20-g32` row (56.6), which is exactly that configuration, so it is
+# deliberately not duplicated here.
+SCORE_VARIANTS = {
+    "aggmean": ("mean", None),
+    "aggzmean": ("zmean", None),
+    "lyrskip2": ("max", "skip_first2"),
+    "lyr2h": ("max", "second_half"),
+    "lyr4q": ("max", "last_quarter"),
+    # The natural combination: if de-maxing and dropping early layers both
+    # help, they plausibly help for the same reason (one peaked early head
+    # dominating), so the pair could be redundant rather than additive --
+    # which is worth one run to find out.
+    "aggmean-lyr2h": ("mean", "second_half"),
+}
+SCORE_VARIANT_PROBE = (0.2, "32")
+
 
 def _build_experiments() -> dict:
     experiments = {
@@ -293,6 +325,18 @@ def _build_experiments() -> dict:
                 "mode": "sparse", "keep_mode": "keep",
                 "keep_percentage": rate, "granularity": gran_name,
             }
+    # Scoring variants at the probe point -- see SCORE_VARIANTS.
+    probe_rate, probe_gran = SCORE_VARIANT_PROBE
+    for suffix, (aggregation, layers) in SCORE_VARIANTS.items():
+        exp_id = f"SPARSE-k{int(probe_rate * 100)}-g{probe_gran}-{suffix}"
+        experiments[exp_id] = {
+            "label": f"Sparse attention (persistent cache) keep={int(probe_rate * 100)}% "
+                     f"granularity={probe_gran} score_aggregation={aggregation} "
+                     f"score_layers={layers}",
+            "mode": "sparse", "keep_mode": "keep",
+            "keep_percentage": probe_rate, "granularity": probe_gran,
+            "score_aggregation": aggregation, "score_layers": layers,
+        }
     return experiments
 
 
@@ -1986,13 +2030,25 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 f"lowering --target-max-num-batched-tokens too."
             )
         gran_kwargs = GRANULARITIES[granularity]
+        # Rows that predate the scoring sweep carry neither key and get the
+        # reference behavior, so they stay byte-identical to their published
+        # numbers -- the variant is opt-in per row, never a global default
+        # change (see SCORE_VARIANTS).
         spec_config = SpecConfig(
             keep_strategy="percentage",
             keep_kwargs={**gran_kwargs, "percentage": keep_percentage},
             look_ahead_cnt=LOOK_AHEAD_CNT,
             pool_kernel_size=POOL_KERNEL_SIZE,
             keep_mode=keep_mode,
+            score_aggregation=exp_cfg.get("score_aggregation", "max"),
+            score_layers=exp_cfg.get("score_layers"),
         )
+        if exp_cfg.get("score_aggregation", "max") != "max" or exp_cfg.get("score_layers"):
+            print(
+                f"[predict_scbench] scoring variant: "
+                f"score_aggregation={spec_config.score_aggregation!r} "
+                f"score_layers={spec_config.score_layers!r}"
+            )
 
         # Same clamp-to-native-ceiling reasoning as the target above --
         # independently derived (not assumed identical to the target's, even
@@ -2279,7 +2335,8 @@ def main() -> None:
              "rows, the persistent-cache + sparse-attention architecture), "
              "'oracle' (all ORACLE-k* rows -- the same sparse architecture "
              "scored by the TARGET checkpoint instead of the 1B speculator, "
-             "i.e. the accuracy ceiling for the SPARSE rows), or 'all' "
+             "i.e. the accuracy ceiling for the SPARSE rows), 'score' (the "
+             "scoring-variant sweep at the k20-g32 probe point), or 'all' "
              "(every defined experiment).",
     )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
@@ -2434,6 +2491,13 @@ def main() -> None:
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "sparse"]
     elif exp_arg == "oracle":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "oracle"]
+    elif exp_arg == "score":
+        # The scoring-variant sweep only -- NOT the plain SPARSE-k20-g32 row
+        # it is compared against, which is already run and published.
+        exp_ids = [
+            eid for eid, cfg in EXPERIMENTS.items()
+            if cfg.get("score_aggregation", "max") != "max" or cfg.get("score_layers")
+        ]
     elif exp_arg == "all":
         exp_ids = list(EXPERIMENTS.keys())
     else:

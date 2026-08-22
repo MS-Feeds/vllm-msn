@@ -281,6 +281,8 @@ class SpecPrefillProposer:
         pool_kernel_size: Optional[int],
         keep_kwargs: dict,
         ignore_eos: bool = False,
+        score_aggregation: str = "max",
+        score_layers: Optional[str] = None,
     ) -> Tuple[Optional[List[int]], int, int]:
         """Same driving/submission as `run_turn` (via the shared
         `_submit_and_drive_turn` helper), but retrieves K and runs the
@@ -293,6 +295,15 @@ class SpecPrefillProposer:
         calls; `run_turn` itself is unchanged and still used directly by
         `validate_proposer.py`, which wants the raw Q buffer to validate
         the capture mechanism in isolation from scoring.
+
+        `score_aggregation`/`score_layers` select the scoring variant (see
+        `SpecConfig`'s fields and ACCURACY_IMPROVEMENTS.md §1); they default
+        to the reference behavior, so a caller that doesn't pass them scores
+        exactly as every already-published row did. They have to travel as
+        arguments rather than being read from a config on the far side: the
+        speculator's worker runs in its own process and never sees the
+        driver's `SpecConfig`, the same reason `keep_kwargs`/
+        `pool_kernel_size` are passed.
 
         Returns `(kept_local_indices, actual_look_ahead_cnt,
         num_cached_tokens)` -- `kept_local_indices` is `None` if
@@ -315,6 +326,8 @@ class SpecPrefillProposer:
                 len(full_sequence_token_ids),
                 pool_kernel_size,
                 keep_kwargs,
+                score_aggregation,
+                score_layers,
             ),
         )[0]
         num_kept = len(kept_local_indices) if kept_local_indices is not None else None

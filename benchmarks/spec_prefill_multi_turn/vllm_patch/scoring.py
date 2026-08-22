@@ -21,7 +21,7 @@ restoration, request merging, target forward) are out of scope for this pass
 """
 
 import math
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -96,19 +96,84 @@ def compute_attention_score(
     ]
 
 
+def scoring_layer_indices(num_layers: int, score_layers: Optional[str]) -> List[int]:
+    """Which layer indices get a vote in `aggregate_attention_score`.
+
+    Pure integer arithmetic, no tensors, so the layer-restriction policy is
+    unit-testable without a model -- and so the "does this selection do what
+    its name says" question is answered in one place rather than inside a
+    tensor pipeline.
+
+    `None` means every layer (the reference implementation's behavior and the
+    default). Every named selection drops EARLY layers and keeps late ones:
+    layers 0-1 are near-universally positional/sink-dominated, and under the
+    default `max` aggregation a single peaked early head can set the entire
+    importance vector by itself. See ACCURACY_IMPROVEMENTS.md §1.2.
+
+    Always returns at least one layer -- a selection that would empty the
+    list on a very shallow model falls back to the last layer rather than
+    producing a NaN score vector further down.
+    """
+    if score_layers is None:
+        return list(range(num_layers))
+    if score_layers == "skip_first2":
+        start = 2
+    elif score_layers == "second_half":
+        start = num_layers // 2
+    elif score_layers == "last_quarter":
+        start = (3 * num_layers) // 4
+    else:
+        raise ValueError(f"unknown score_layers: {score_layers!r}")
+    start = min(start, max(num_layers - 1, 0))
+    return list(range(start, num_layers))
+
+
+def _collapse_layer_head(attn: torch.Tensor, score_aggregation: str) -> torch.Tensor:
+    """Collapse a [layer*head, look_ahead_cnt, context_len] tensor down the
+    (layer, head) axis, per `score_aggregation`. See `SpecConfig`'s field
+    docstring for what each mode is for.
+
+    `zmean` normalizes each (layer, head)'s distribution over the CONTEXT
+    axis before averaging, so heads contribute their *shape* rather than
+    their magnitude. The epsilon guards a head whose pooled distribution is
+    genuinely flat (zero variance across the context), which is a real case
+    for a sink-dominated head after average pooling, not a hypothetical --
+    without it that head alone turns the whole score vector into NaN.
+    """
+    if score_aggregation == "max":
+        return attn.max(0)[0]
+    if score_aggregation == "mean":
+        return attn.mean(0)
+    if score_aggregation == "zmean":
+        mean = attn.mean(dim=-1, keepdim=True)
+        std = attn.std(dim=-1, keepdim=True)
+        return ((attn - mean) / (std + 1e-6)).mean(0)
+    raise ValueError(f"unknown score_aggregation: {score_aggregation!r}")
+
+
 def aggregate_attention_score(
     attn_scores: List[torch.Tensor],
     spec_config: SpecConfig,
 ) -> List[torch.Tensor]:
     """Algorithm line 14: A <- aggregate_attention_score(A).
 
-    softmax -> optional smoothing pool -> max over (layer, head) -> mean over
+    softmax -> optional smoothing pool -> collapse (layer, head) -> mean over
     lookahead steps, producing one importance score per prompt token.
+
+    The collapse step is `max` by default -- the reference implementation's
+    behavior, so an unconfigured run reproduces every already-published row
+    exactly -- and `spec_config.score_aggregation` /
+    `spec_config.score_layers` select the alternatives (`mean`, `zmean`, and
+    late-layer-only voting). Those exist because ORACLE-k20 attributed 17.0
+    of `scbench_kv`'s 25.0-point degradation to the speculator's estimation
+    error, against 8.0 for the sparse-decode mechanism, while this whole
+    function costs ~0.007% of a turn's FLOPs. See ACCURACY_IMPROVEMENTS.md.
 
     Args:
         attn_scores: per-sample [num_layer, num_head, look_ahead_cnt, context_len]
             tensors, as returned by compute_attention_score.
-        spec_config: supplies `pool_kernel_size`.
+        spec_config: supplies `pool_kernel_size`, `score_aggregation`,
+            `score_layers`.
 
     Returns:
         Per-sample 1D [context_len] token-importance tensors.
@@ -121,7 +186,16 @@ def aggregate_attention_score(
             original_dtype
         )
 
-        # Flatten (layer, head) into one axis so pooling/max apply uniformly.
+        # Layer restriction happens BEFORE the flatten below -- dim 0 is the
+        # layer axis only until (layer, head) are folded together.
+        layer_indices = scoring_layer_indices(
+            attn.shape[0], spec_config.score_layers
+        )
+        if len(layer_indices) != attn.shape[0]:
+            attn = attn[layer_indices]
+
+        # Flatten (layer, head) into one axis so pooling/collapse apply
+        # uniformly.
         attn = attn.flatten(0, 1)
 
         kernel_size = spec_config.pool_kernel_size
@@ -133,7 +207,7 @@ def aggregate_attention_score(
                 stride=1,
             )
 
-        attn = attn.max(0)[0]  # max over (layer, head)
+        attn = _collapse_layer_head(attn, spec_config.score_aggregation)
         attn = attn.mean(0)  # mean over lookahead steps
 
         token_importance.append(attn)

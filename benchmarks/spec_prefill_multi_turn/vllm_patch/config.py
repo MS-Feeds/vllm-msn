@@ -33,6 +33,15 @@ from typing import Any, Dict, Optional
 import yaml
 
 
+# Enumerated rather than free-form (no "layers 3,7,11-19" mini-language, no
+# arbitrary callables): every value here has to survive a `collective_rpc`
+# hop into the speculator's own process and end up in a CSV column, and a
+# closed set keeps both of those honest. Extend the set when a variant earns
+# a row in the experiment matrix.
+SCORE_AGGREGATIONS = frozenset({"max", "mean", "zmean"})
+SCORE_LAYER_SELECTIONS = frozenset({None, "skip_first2", "second_half", "last_quarter"})
+
+
 @dataclass
 class SpecConfig:
     keep_strategy: Optional[str]
@@ -46,6 +55,31 @@ class SpecConfig:
     # protocol's own stated priority ("Keep old history or discard (FIRST:
     # KEEP)").
     keep_mode: str = "keep"
+    # How per-(layer, head) attention is collapsed into ONE importance score
+    # per prompt token, and which layers get a vote. Both exist because
+    # ORACLE-k20 measured the 1B speculator's estimation error at 17.0 of the
+    # 25.0-point `scbench_kv` degradation -- 68%, against the sparse-decode
+    # mechanism's 8.0 -- while the scoring pass costs ~0.007% of a turn's
+    # FLOPs. See ACCURACY_IMPROVEMENTS.md's Step 0 and §1.
+    #
+    # `score_aggregation`:
+    #   "max"   -- max over (layer, head). The reference implementation's
+    #              behavior and the DEFAULT, so an unconfigured run is
+    #              byte-identical to every already-published row.
+    #   "mean"  -- mean over (layer, head): total attention mass rather than
+    #              the single most peaked head's opinion.
+    #   "zmean" -- z-score each (layer, head)'s distribution across the
+    #              context first, then mean. Removes per-head scale
+    #              differences, so a head with a naturally peaked
+    #              distribution cannot outvote the rest by magnitude alone.
+    #
+    # `score_layers` (None == all layers, the default):
+    #   "skip_first2" -- drop layers 0-1, which are near-universally
+    #                    positional/sink-dominated.
+    #   "second_half" -- layers >= L//2.
+    #   "last_quarter"-- layers >= 3L//4.
+    score_aggregation: str = "max"
+    score_layers: Optional[str] = None
 
     @classmethod
     def from_path(cls, config_path: Optional[str] = None):
@@ -76,6 +110,14 @@ class SpecConfig:
         assert self.keep_strategy in ["percentage"]
         assert self.keep_mode in ["keep", "discard"], (
             f"keep_mode must be 'keep' or 'discard', got {self.keep_mode!r}"
+        )
+        assert self.score_aggregation in SCORE_AGGREGATIONS, (
+            f"score_aggregation must be one of {sorted(SCORE_AGGREGATIONS)}, "
+            f"got {self.score_aggregation!r}"
+        )
+        assert self.score_layers in SCORE_LAYER_SELECTIONS, (
+            f"score_layers must be one of {sorted(x for x in SCORE_LAYER_SELECTIONS if x)} "
+            f"or None, got {self.score_layers!r}"
         )
 
 

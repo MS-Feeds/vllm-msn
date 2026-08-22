@@ -78,6 +78,46 @@ def load_scored(
     return scored
 
 
+def paired_delta_ci(
+    row: dict[str, list[float]],
+    ref: dict[str, list[float]],
+    iterations: int,
+    seed: int,
+) -> tuple[float, float]:
+    """95% CI for (row - reference), resampling whole CONVERSATIONS and
+    recomputing BOTH means on the same resample.
+
+    This, not the overlap of two marginal CIs, is the statistic that says
+    whether a gap is real. Every row here answered the SAME conversations,
+    so the comparison is paired and the conversation-difficulty variance
+    that dominates each row's own interval cancels out of the difference.
+    Judging a paired difference by whether two marginal intervals overlap
+    is a well-known way to call a real effect insignificant -- and it
+    would have done exactly that here: at 100 conversations the first full
+    ORACLE-k20 result had M000 [76.4, 86.4] and ORACLE-k20 [68.2, 78.6],
+    which overlap, while the paired difference is a solid 8 points.
+    """
+    rng = random.Random(seed)
+    conversation_ids = [c for c in row if c in ref]
+    deltas = []
+    for _ in range(iterations):
+        picked = [rng.choice(conversation_ids) for _ in conversation_ids]
+        row_turns = [s for cid in picked for s in row[cid]]
+        ref_turns = [s for cid in picked for s in ref[cid]]
+        if row_turns and ref_turns:
+            deltas.append(
+                100.0 * sum(row_turns) / len(row_turns)
+                - 100.0 * sum(ref_turns) / len(ref_turns)
+            )
+    deltas.sort()
+    if not deltas:
+        return (float("nan"), float("nan"))
+    return (
+        deltas[int(0.025 * (len(deltas) - 1))],
+        deltas[int(0.975 * (len(deltas) - 1))],
+    )
+
+
 def cluster_bootstrap_ci(
     per_conversation: dict[str, list[float]], iterations: int, seed: int
 ) -> tuple[float, float]:
@@ -186,14 +226,37 @@ def main() -> None:
         rows.append((path, mean, ci, by_conversation))
 
     ref_mean = rows[0][1]
+    ref_by_conversation = rows[0][3]
     name_width = max(len(p.stem.replace("_predictions", "")) for p, *_ in rows)
-    print(f"{'row'.ljust(name_width)}  {'score':>7}  {'95% CI':>16}  {'vs. ' + reference.stem.replace('_predictions', ''):>14}")
-    print("-" * (name_width + 45))
-    for path, mean, (lo, hi), _ in rows:
+    ref_label = reference.stem.replace("_predictions", "")
+    print(f"{'row'.ljust(name_width)}  {'score':>7}  {'95% CI':>16}  "
+          f"{'vs. ' + ref_label:>10}  {'paired 95% CI of the delta':>28}")
+    print("-" * (name_width + 70))
+    for path, mean, (lo, hi), by_conversation in rows:
         label = path.stem.replace("_predictions", "").ljust(name_width)
-        delta = "" if path == reference else f"{mean - ref_mean:+.1f}"
         ci_str = f"[{lo:.1f}, {hi:.1f}]" if lo == lo else "n/a"
-        print(f"{label}  {mean:7.1f}  {ci_str:>16}  {delta:>14}")
+        if path == reference:
+            delta, delta_ci = "", ""
+        else:
+            delta = f"{mean - ref_mean:+.1f}"
+            if args.bootstrap:
+                dlo, dhi = paired_delta_ci(
+                    by_conversation, ref_by_conversation, args.bootstrap, args.seed
+                )
+                # A delta whose paired interval excludes 0 is a real
+                # difference, regardless of whether the two marginal CIs
+                # to its left happen to overlap -- see paired_delta_ci.
+                excludes_zero = "" if dlo <= 0.0 <= dhi else "  *"
+                delta_ci = f"[{dlo:+.1f}, {dhi:+.1f}]{excludes_zero}"
+            else:
+                delta_ci = "n/a"
+        print(f"{label}  {mean:7.1f}  {ci_str:>16}  {delta:>10}  {delta_ci:>28}")
+    if args.bootstrap and len(rows) > 1:
+        print("  * paired interval excludes 0 -- a real difference. Judge gaps "
+              "by THIS column,\n    not by whether the marginal CIs overlap: "
+              "every row answered the same\n    conversations, so the "
+              "difficulty variance that dominates each marginal\n    interval "
+              "cancels out of the paired difference.")
 
     if args.per_turn:
         print("\nby turn_idx:")
@@ -208,6 +271,44 @@ def main() -> None:
                 vals = [s for (c, ti), s in scored.items() if ti == t and (c, ti) in common]
                 cells.append(f"  {100.0 * sum(vals) / len(vals):6.1f}" if vals else "     n/a")
             print(path.stem.replace("_predictions", "").ljust(name_width) + "".join(cells))
+
+    # Agreement with the reference, turn by turn -- NOT just the means.
+    #
+    # Two rows can have nearly equal means and still disagree about almost
+    # every individual turn, if one of them wins some and loses others and
+    # the errors cancel. On a near-binary metric like `in_match` that is not
+    # a corner case, it is the expected shape of a selection method that
+    # scrambles WHICH turns succeed rather than uniformly losing some. The
+    # means alone would report that as "no difference", which is the
+    # opposite of what it means: a row that tracks the baseline turn for
+    # turn is behaving like the baseline, and a row with the same mean and
+    # no agreement is not.
+    #
+    # Real example this exists for: a 20-conversation ORACLE-k20 vs
+    # SPARSE-k20-g32 comparison whose means were 54.0 and 52.0 -- 2 points
+    # apart, readable as "the estimator buys nothing" -- while ORACLE agreed
+    # with M000 on 14/20 conversations (mean |diff| 11.0) and SPARSE on 5/20
+    # (mean |diff| 33.0). The estimator mattered enormously; its errors
+    # simply happened to cancel in the mean at that keep rate.
+    if len(rows) >= 2:
+        ref_scored = scored_by_file[reference]
+        print(f"\nagreement with {reference.stem.replace('_predictions', '')}, "
+              f"turn by turn (not just in the mean):")
+        print(f"  {'row'.ljust(name_width)}  {'mean |diff|':>12}  {'turns equal':>12}")
+        for path, *_ in rows:
+            if path == reference:
+                continue
+            scored = scored_by_file[path]
+            diffs = [abs(scored[k] - ref_scored[k]) for k in common]
+            equal = sum(1 for k in common if scored[k] == ref_scored[k])
+            print(f"  {path.stem.replace('_predictions', '').ljust(name_width)}  "
+                  f"{100.0 * sum(diffs) / len(diffs):12.1f}  "
+                  f"{f'{equal}/{len(common)}':>12}")
+        print(
+            "  Rows with similar means but LOW agreement are not equivalent -- "
+            "they are\n  disagreeing in both directions and cancelling. Read "
+            "this before the means."
+        )
 
     # Is the comparison set representative of what each row covered?
     #

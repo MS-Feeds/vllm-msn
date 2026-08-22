@@ -108,6 +108,11 @@ def _group_consecutive_runs(positions: List[int]) -> List[tuple]:
 
 
 def main() -> None:
+    # Imported here rather than with the other deferred imports below: these
+    # feed argparse `choices`, which is built before any of that runs.
+    # Cheap -- `vllm_patch.config` pulls in neither vLLM nor torch.
+    from vllm_patch.config import SCORE_AGGREGATIONS, SCORE_LAYER_SELECTIONS
+
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -121,6 +126,18 @@ def main() -> None:
     parser.add_argument("--keep-percentage", type=float, required=True)
     parser.add_argument("--granularity", default="32", choices=["token", "16", "32", "64"])
     parser.add_argument("--keep-mode", default="keep", choices=["keep", "discard"])
+    # The fast inner loop for ACCURACY_IMPROVEMENTS.md §1: gold-answer
+    # survival is what `in_match` is downstream of, and measuring it needs
+    # only the SPECULATOR (no target engine, no generation, no grading), so
+    # a scoring variant can be judged in minutes instead of a full run.
+    # Defaults reproduce the reference scoring exactly.
+    parser.add_argument("--score-aggregation", default="max",
+                        choices=sorted(SCORE_AGGREGATIONS),
+                        help="How per-(layer, head) attention collapses into one "
+                             "score per token -- see SpecConfig.")
+    parser.add_argument("--score-layers", default=None,
+                        choices=[x for x in sorted(SCORE_LAYER_SELECTIONS, key=str) if x],
+                        help="Restrict which layers vote (default: all).")
     parser.add_argument("--config", default="scbench_kv",
                         help="Restrict to one SCBench config (answers must be exact strings "
                              "for the survival check to mean anything -- retrieval configs "
@@ -174,7 +191,13 @@ def main() -> None:
         look_ahead_cnt=LOOK_AHEAD_CNT,
         pool_kernel_size=POOL_KERNEL_SIZE,
         keep_mode=args.keep_mode,
+        score_aggregation=args.score_aggregation,
+        score_layers=args.score_layers,
     )
+    if args.score_aggregation != "max" or args.score_layers:
+        print(f"[diagnose_gold_survival] scoring variant: "
+              f"score_aggregation={args.score_aggregation!r} "
+              f"score_layers={args.score_layers!r}")
 
     native_len = AutoConfig.from_pretrained(
         speculator_model, trust_remote_code=True).max_position_embeddings
