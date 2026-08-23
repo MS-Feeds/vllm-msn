@@ -133,6 +133,17 @@ def main() -> None:
                         help="Per-step batch size for the speculator (see "
                              "predict_scbench.py's flag of the same name). Lower it "
                              "(e.g. 32768) if a long context OOMs during prefill.")
+    parser.add_argument("--fixed-heads-from", type=Path, default=None,
+                        help="A --head-mass-out JSON from a PREVIOUS run. Evaluates "
+                             "survival under the global top-N head sets from that "
+                             "file -- heads chosen WITHOUT seeing this turn's gold, "
+                             "i.e. the honest section 1.3 number rather than the "
+                             "ceiling. Run once without it to produce the file, then "
+                             "again with it (ideally over a different "
+                             "--max-conversations slice, so the fixed set is scored "
+                             "out-of-sample).")
+    parser.add_argument("--fixed-head-budgets", default="1,2,4,8,16,32",
+                        help="Head-set sizes to evaluate from --fixed-heads-from.")
     parser.add_argument("--head-mass-out", type=Path, default=None,
                         help="Optional JSON dump of the accumulated per-head gold "
                              "mass -- the input a real §1.3 head list would be built "
@@ -213,9 +224,28 @@ def main() -> None:
     turns_measured = 0
     turns_skipped_no_gold = 0
     accumulated_mass: List[float] = []
-    per_turn_top_sets: List[set] = []
+    fixed_survived: dict = {}
+
+    fixed_head_sets = None
+    if args.fixed_heads_from:
+        prior = json.loads(args.fixed_heads_from.read_text(encoding="utf-8"))
+        ranking = prior["global_rank_desc"]
+        fixed_head_sets = [
+            [f"global top-{n}", ranking[:n]]
+            for n in (int(x) for x in args.fixed_head_budgets.split(",") if x.strip())
+            if n <= len(ranking)
+        ]
+        print(f"[diagnose_retrieval_heads] evaluating {len(fixed_head_sets)} fixed "
+              f"head set(s) from {args.fixed_heads_from}")
     num_heads = None
-    STABILITY_N = 16  # the set size the stability numbers are reported at
+    # Stability is reported at SEVERAL set sizes, not one. Reporting only
+    # top-16 is actively misleading when the ceiling peaks at top-1: if a
+    # couple of heads are stable and ranks 3-16 are noise, top-16 Jaccard
+    # lands near 0.2 and reads as "no stable heads" when the opposite is
+    # true. The budget where the ceiling peaks is the budget whose stability
+    # decides anything.
+    STABILITY_NS = [1, 2, 4, 8, 16]
+    per_turn_top_sets_by_n = {n: [] for n in STABILITY_NS}
 
     for conv in conversations:
         conv_id = str(conv["id"])
@@ -246,6 +276,7 @@ def main() -> None:
                     keep_kwargs=spec_config.keep_kwargs,
                     gold_positions=gold_positions,
                     top_n_list=top_n_list,
+                    fixed_head_sets=fixed_head_sets,
                     ignore_eos=spec_config.ignore_eos,
                 )
 
@@ -261,7 +292,10 @@ def main() -> None:
                 for i, m in enumerate(mass):
                     accumulated_mass[i] += m
                 ranked = sorted(range(len(mass)), key=lambda i: mass[i], reverse=True)
-                per_turn_top_sets.append(set(ranked[:STABILITY_N]))
+                for n in STABILITY_NS:
+                    per_turn_top_sets_by_n[n].append(set(ranked[:n]))
+                for label, ok in (diagnostics.get("fixed_survived") or {}).items():
+                    fixed_survived[label] = fixed_survived.get(label, 0) + int(ok)
 
             # Advance the ledger with the ACTUAL run's output, so turn N+1
             # sees the same history the graded run did.
@@ -292,25 +326,40 @@ def main() -> None:
         pct = 100.0 * oracle_survived[n] / turns_measured
         print(f"{n:>12} {pct:13.1f}% {pct - base_pct:+17.1f}")
 
+    # Fixed head sets, if a previous run's ranking was supplied: the honest
+    # §1.3 number. Printed FIRST because it settles what the ceiling and the
+    # stability numbers can only bracket.
+    if fixed_survived:
+        print("\n=== fixed global head sets (chosen without this turn's gold) ===")
+        print(f"{'head set':>16} {'gold survived':>14} {'vs. all-head max':>18}")
+        for label in sorted(fixed_survived, key=lambda l: int(l.split("-")[-1])):
+            pct = 100.0 * fixed_survived[label] / turns_measured
+            print(f"{label:>16} {pct:13.1f}% {pct - base_pct:+17.1f}")
+        print("\nThis is what §1.3 would actually deliver. The ceiling above "
+              "is what it could\ndeliver with per-input clairvoyance; the gap "
+              "between them is the cost of\nhaving to choose the heads in advance.")
+
     # Head stability: can a FIXED head list exist at all?
     global_rank = sorted(range(len(accumulated_mass)),
                          key=lambda i: accumulated_mass[i], reverse=True)
-    global_top = set(global_rank[:STABILITY_N])
-    overlaps = [jaccard(s, global_top) for s in per_turn_top_sets]
-    pairwise = [
-        jaccard(per_turn_top_sets[i], per_turn_top_sets[i + 1])
-        for i in range(len(per_turn_top_sets) - 1)
-    ]
-    print(f"\n=== head stability (top-{STABILITY_N} sets) ===")
-    print(f"mean Jaccard, per-turn set vs. GLOBAL set : {statistics.mean(overlaps):.2f}")
-    if pairwise:
-        print(f"mean Jaccard, consecutive turns           : {statistics.mean(pairwise):.2f}")
-    print(f"heads ever in a per-turn top-{STABILITY_N}            : "
-          f"{len(set().union(*per_turn_top_sets))} of {num_heads}")
-    print("\nA fixed head list is only possible if these overlaps are high. Low "
-          "overlap means\nthe useful heads are chosen per input, which is not what "
-          "a retrieval head is,\nand §1.3 cannot be built as a static set no matter "
-          "how high the ceiling above is.")
+    print("\n=== head stability ===")
+    print(f"{'set size':>9} {'vs. global':>11} {'consecutive':>13} {'distinct heads used':>21}")
+    for n in STABILITY_NS:
+        sets_n = per_turn_top_sets_by_n[n]
+        if not sets_n:
+            continue
+        global_top = set(global_rank[:n])
+        overlaps = [jaccard(s, global_top) for s in sets_n]
+        pairwise = [jaccard(sets_n[i], sets_n[i + 1]) for i in range(len(sets_n) - 1)]
+        distinct = len(set().union(*sets_n))
+        pair_str = f"{statistics.mean(pairwise):.2f}" if pairwise else "n/a"
+        print(f"{n:>9} {statistics.mean(overlaps):11.2f} {pair_str:>13} "
+              f"{f'{distinct} of {num_heads}':>21}")
+    print("\nRead the row whose set size matches where the CEILING peaks -- "
+          "that is the budget\n§1.3 would actually use. High overlap there "
+          "means a fixed head list can exist; low\noverlap at every size means "
+          "the useful heads are chosen per input, which is not\nwhat a retrieval "
+          "head is, and §1.3 cannot be built as a static set.")
 
     if args.head_mass_out:
         args.head_mass_out.parent.mkdir(parents=True, exist_ok=True)

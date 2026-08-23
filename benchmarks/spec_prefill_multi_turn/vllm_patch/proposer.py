@@ -349,6 +349,7 @@ class SpecPrefillProposer:
         keep_kwargs: dict,
         gold_positions: List[int],
         top_n_list: List[int],
+        fixed_head_sets: Optional[List] = None,
         ignore_eos: bool = False,
     ):
         """Drives one turn exactly as `run_turn_and_score` does, then asks
@@ -370,6 +371,7 @@ class SpecPrefillProposer:
                 keep_kwargs,
                 gold_positions,
                 top_n_list,
+                fixed_head_sets,
             ),
         )[0]
 

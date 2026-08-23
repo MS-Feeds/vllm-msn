@@ -553,6 +553,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         keep_kwargs: dict,
         gold_positions: list,
         top_n_list: list,
+        fixed_head_sets: list = None,
     ):
         """The §1.3 gate (ACCURACY_IMPROVEMENTS.md): how much would
         retrieval-head filtering buy, AT MOST?
@@ -578,6 +579,16 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
           `baseline_survived` gold kept under the reference all-head `max`.
           `oracle_survived`  gold kept under `max` restricted to the top-N
                              heads BY GOLD MASS, per N in `top_n_list`.
+          `fixed_survived`   gold kept under each `(label, head_indices)` in
+                             `fixed_head_sets` -- a head list chosen WITHOUT
+                             seeing this turn's gold, i.e. the honest §1.3
+                             number rather than the ceiling. This is what
+                             settles a split verdict where the ceiling is
+                             high but the per-turn head sets look unstable:
+                             low top-16 overlap is also what you would see
+                             if a couple of heads are stable and the ranks
+                             below them are noise, and only a fixed set's
+                             actual survival can tell those apart.
 
         Survival is "every gold token position kept", matching
         `diagnose_gold_survival.py`'s text-containment check in strictness:
@@ -649,10 +660,20 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
                 continue
             oracle_survived[n] = bool(_survived(order[:n]))
 
+        fixed_survived = {}
+        for label, head_indices in (fixed_head_sets or []):
+            rows = torch.tensor(
+                [int(h) for h in head_indices if 0 <= int(h) < attn.shape[0]],
+                device=attn.device, dtype=torch.long,
+            )
+            if rows.numel():
+                fixed_survived[str(label)] = bool(_survived(rows))
+
         return {
             "gold_mass": gold_mass.float().cpu().tolist(),
             "baseline_survived": bool(_survived(None)),
             "oracle_survived": oracle_survived,
+            "fixed_survived": fixed_survived,
             "num_heads": int(attn.shape[0]),
         }
 
@@ -761,12 +782,13 @@ class SpeculatorWorker(Worker):
         keep_kwargs: dict,
         gold_positions: list,
         top_n_list: list,
+        fixed_head_sets: list = None,
     ):
         """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
         end_capture_and_head_diagnostics`'s docstring."""
         return self.model_runner.end_capture_and_head_diagnostics(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
-            keep_kwargs, gold_positions, top_n_list,
+            keep_kwargs, gold_positions, top_n_list, fixed_head_sets,
         )
 
     def discard_conversation(self, conversation_salt: str) -> None:
