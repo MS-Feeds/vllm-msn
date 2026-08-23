@@ -283,6 +283,7 @@ class SpecPrefillProposer:
         ignore_eos: bool = False,
         score_aggregation: str = "max",
         score_layers: Optional[str] = None,
+        score_head_set: Optional[List[int]] = None,
     ) -> Tuple[Optional[List[int]], int, int]:
         """Same driving/submission as `run_turn` (via the shared
         `_submit_and_drive_turn` helper), but retrieves K and runs the
@@ -328,6 +329,7 @@ class SpecPrefillProposer:
                 keep_kwargs,
                 score_aggregation,
                 score_layers,
+                score_head_set,
             ),
         )[0]
         num_kept = len(kept_local_indices) if kept_local_indices is not None else None

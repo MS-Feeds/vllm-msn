@@ -237,10 +237,41 @@ way around it.
 >
 > Turn 0 is the cheapest place to look: it is where sparsification costs most
 > (−32) and where the estimator owns the largest share of it (23 of 32).
-3. **Retrieval-head filtering.** Only a small head subset does copy/retrieval.
-   Identify them offline on the speculator with a needle probe and score using
-   only those. The strongest version of items 1–2, and aimed squarely at
-   `scbench_kv`'s failure mode.
+3. **Retrieval-head filtering.** ✅ **Gate passed, built, awaiting a graded
+   run.** `SpecConfig.score_head_set`; rows `SPARSE-k20-g32-heads{1,2,4}`.
+
+   `diagnose_retrieval_heads.py` measured it before it was built. Ranked on
+   conversations 1–20, scored **fully out-of-sample** on 21–40:
+
+   | Head set | Gold survived | vs. all-head `max` |
+   |---|---:|---:|
+   | all 512 (`max`, the reference) | 54.0% | — |
+   | **fixed global top-2** | **82.0%** | **+28.0** |
+   | fixed global top-4 | 78.0% | +24.0 |
+   | fixed global top-16 | 67.0% | +13.0 |
+   | *clairvoyant top-2 (ceiling)* | *84.0%* | *+30.0* |
+
+   A **fixed 2-head mask captures 93% of what per-input clairvoyance could
+   achieve**, and the heads are genuinely stable — top-2 Jaccard 0.71 against
+   the global ranking, 0.63 between consecutive turns, and only **20 distinct
+   heads across 100 turns** out of 512. Stability peaks at exactly the budget
+   where the ceiling peaks.
+
+   **A methodological note worth keeping.** The first run of this gate
+   reported top-16 stability alone (Jaccard 0.26) and read as "the useful
+   heads are chosen per input, §1.3 is dead". That was an artifact of
+   measuring at the wrong budget: 2 stable heads plus 14 slots of noise
+   produce exactly that number. Reporting stability at the budget where the
+   ceiling peaks reversed the verdict. A stability metric has to be evaluated
+   at the set size the method would actually use.
+
+   Expected value, stated before the run so it can be wrong: at the ~80%
+   survival-to-score conversion measured earlier, +28 survival maps to
+   roughly +20 `in_match`, which would put `SPARSE-k20-g32` near the
+   **ORACLE-k20 ceiling of 73.6** — i.e. most of the 17-point estimator gap,
+   recovered by a 2-head mask that costs nothing. That extrapolation crosses
+   two conversation slices and assumes the conversion rate holds; it is a
+   reason to run the experiment, not a result.
 4. **Mask sinks before pooling.** Position 0 and delimiters absorb enormous
    softmax mass and skew both the pooled scores and the chunk means around
    them. Zero them in the score and force-keep them separately — wrapper spans

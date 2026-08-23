@@ -215,6 +215,7 @@ def compute_pruned_turn(
         # passed rather than read.
         score_aggregation=spec_config.score_aggregation,
         score_layers=spec_config.score_layers,
+        score_head_set=spec_config.score_head_set,
     )
 
     pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(

@@ -173,7 +173,7 @@ def aggregate_attention_score(
         attn_scores: per-sample [num_layer, num_head, look_ahead_cnt, context_len]
             tensors, as returned by compute_attention_score.
         spec_config: supplies `pool_kernel_size`, `score_aggregation`,
-            `score_layers`.
+            `score_layers`, `score_head_set`.
 
     Returns:
         Per-sample 1D [context_len] token-importance tensors.
@@ -197,6 +197,23 @@ def aggregate_attention_score(
         # Flatten (layer, head) into one axis so pooling/collapse apply
         # uniformly.
         attn = attn.flatten(0, 1)
+
+        # Retrieval-head filtering, applied here rather than after pooling:
+        # `avg_pool1d` is independent per row, so masking first is
+        # numerically identical and pools 2 rows instead of 512.
+        if spec_config.score_head_set is not None:
+            head_rows = torch.tensor(
+                [h for h in spec_config.score_head_set if h < attn.shape[0]],
+                dtype=torch.long, device=attn.device,
+            )
+            if head_rows.numel() == 0:
+                raise ValueError(
+                    f"score_head_set {spec_config.score_head_set} selects no head "
+                    f"that exists -- this model's flattened layer*head axis is "
+                    f"only {attn.shape[0]} wide. A head list built for a "
+                    f"different checkpoint cannot be reused as-is."
+                )
+            attn = attn[head_rows]
 
         kernel_size = spec_config.pool_kernel_size
         if kernel_size:

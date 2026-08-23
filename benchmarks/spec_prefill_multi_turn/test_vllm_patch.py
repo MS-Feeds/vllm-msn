@@ -2610,6 +2610,89 @@ def test_jaccard_bounds_head_set_stability():
     assert jaccard(set(), set()) == 0.0
 
 
+def test_score_head_set_masks_exactly_the_named_heads():
+    """§1.3's whole mechanism: only the listed heads vote. Verified by
+    equivalence rather than by inspection -- scoring with `score_head_set=S`
+    must equal scoring an attention tensor that only ever contained S's rows.
+    If the indices were interpreted against the wrong axis (layer instead of
+    layer*head is the easy mistake, since the tensor is [L, H, ...] until it
+    is flattened), this fails; eyeballing the output would not."""
+    torch.manual_seed(0)
+    LAYERS, HEADS, LOOKAHEAD, CTX = 4, 3, 2, 48
+    attn = torch.randn(LAYERS, HEADS, LOOKAHEAD, CTX)
+
+    # Heads are indexed into the FLATTENED layer*head axis: layer l, head h
+    # is index l * HEADS + h.
+    chosen = [0 * HEADS + 1, 2 * HEADS + 0, 3 * HEADS + 2]
+
+    masked_cfg = SpecConfig(keep_strategy="percentage", pool_kernel_size=13,
+                            score_head_set=chosen)
+    got = aggregate_attention_score([attn], masked_cfg)[0]
+
+    # The same computation with a tensor that physically contains only those
+    # rows, reshaped as a 3-layer/1-head model so the reference path sees
+    # exactly the chosen distributions and nothing else.
+    only_chosen = attn.reshape(LAYERS * HEADS, LOOKAHEAD, CTX)[chosen]
+    equivalent = only_chosen.reshape(len(chosen), 1, LOOKAHEAD, CTX)
+    ref_cfg = SpecConfig(keep_strategy="percentage", pool_kernel_size=13)
+    expected = aggregate_attention_score([equivalent], ref_cfg)[0]
+
+    assert torch.equal(got, expected), (
+        "score_head_set did not select the heads its indices name"
+    )
+
+    # And it genuinely differs from letting every head vote -- a mask that
+    # changed nothing would make a null §1.3 result unfalsifiable.
+    all_heads = aggregate_attention_score([attn], ref_cfg)[0]
+    assert not torch.equal(got, all_heads)
+
+
+def test_score_head_set_rejects_configs_that_would_silently_mislead():
+    """Three ways a head set can be wrong while still running to completion
+    and writing a plausible-looking score. All three have to raise.
+
+    The last one is the subtle one: `score_layers` removes layers from the
+    very axis `score_head_set`'s indices are counted along, so combining them
+    silently reinterprets every index as a different head."""
+    # Empty list -- would score with no heads and produce NaN importance.
+    try:
+        SpecConfig(keep_strategy="percentage", score_head_set=[])
+    except AssertionError as e:
+        assert "empty" in str(e)
+    else:
+        raise AssertionError("an empty score_head_set must raise")
+
+    # Duplicates -- would vote twice under `mean`, reweighting the aggregate.
+    try:
+        SpecConfig(keep_strategy="percentage", score_head_set=[3, 3, 7])
+    except AssertionError as e:
+        assert "duplicate" in str(e)
+    else:
+        raise AssertionError("a duplicated head must raise")
+
+    # Combined with score_layers -- indices would point at different heads.
+    try:
+        SpecConfig(keep_strategy="percentage", score_head_set=[3],
+                   score_layers="second_half")
+    except AssertionError as e:
+        assert "score_layers" in str(e)
+    else:
+        raise AssertionError("score_head_set + score_layers must raise")
+
+    # A head list from a bigger checkpoint selects nothing here, which must
+    # be an error rather than a silent all-head fallback: head indices do not
+    # transfer between models.
+    attn = torch.randn(2, 2, 1, 16)  # 4 heads total
+    cfg = SpecConfig(keep_strategy="percentage", pool_kernel_size=13,
+                     score_head_set=[500, 501])
+    try:
+        aggregate_attention_score([attn], cfg)
+    except ValueError as e:
+        assert "different checkpoint" in str(e)
+    else:
+        raise AssertionError("an out-of-range head list must raise, not silently pass")
+
+
 def _run_all():
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     failures = []

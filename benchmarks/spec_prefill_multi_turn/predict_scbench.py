@@ -268,6 +268,22 @@ SCORE_VARIANTS = {
 }
 SCORE_VARIANT_PROBE = (0.2, "32")
 
+# Retrieval-head filtering (ACCURACY_IMPROVEMENTS.md §1.3). The head budgets
+# to try, at the same k20-g32 probe point.
+#
+# The head LIST itself is not baked in here -- it is a property of a
+# checkpoint, measured by `diagnose_retrieval_heads.py`, and it belongs with
+# the measurement rather than in this table. `--head-set-from` resolves these
+# sizes against that script's `--head-mass-out` JSON at run time, and the
+# resolved provenance goes into the CSV `label` so a row can be traced back
+# to the ranking it used. Baking a literal list in would make the matrix
+# silently wrong the moment the speculator checkpoint changed.
+#
+# 1, 2, 4 because that is where both the ceiling and the head STABILITY peak:
+# out-of-sample, a fixed top-2 mask lifted gold survival 54.0% -> 82.0%
+# (+28.0, 93% of the clairvoyant ceiling) while top-16 gave only +13.0.
+HEAD_SET_SIZES = [1, 2, 4]
+
 
 def _build_experiments() -> dict:
     experiments = {
@@ -336,6 +352,20 @@ def _build_experiments() -> dict:
             "mode": "sparse", "keep_mode": "keep",
             "keep_percentage": probe_rate, "granularity": probe_gran,
             "score_aggregation": aggregation, "score_layers": layers,
+        }
+    # Retrieval-head rows -- see HEAD_SET_SIZES. `head_set_size` is carried
+    # instead of a head list; `run_experiment` resolves it against
+    # --head-set-from and fails loudly if that flag is missing, rather than
+    # silently falling back to all-head scoring and producing a row that
+    # looks like a §1.3 result but is not one.
+    for size in HEAD_SET_SIZES:
+        exp_id = f"SPARSE-k{int(probe_rate * 100)}-g{probe_gran}-heads{size}"
+        experiments[exp_id] = {
+            "label": f"Sparse attention (persistent cache) keep={int(probe_rate * 100)}% "
+                     f"granularity={probe_gran} retrieval-head filtering top-{size}",
+            "mode": "sparse", "keep_mode": "keep",
+            "keep_percentage": probe_rate, "granularity": probe_gran,
+            "head_set_size": size,
         }
     return experiments
 
@@ -2034,6 +2064,41 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # reference behavior, so they stay byte-identical to their published
         # numbers -- the variant is opt-in per row, never a global default
         # change (see SCORE_VARIANTS).
+        # Resolve a retrieval-head row's head list from the ranking file.
+        # Deliberately fatal when the flag is missing: scoring with every
+        # head would still complete and still write a plausible number under
+        # a `-heads2` experiment id, which is exactly the kind of row that
+        # gets read as a §1.3 result years later.
+        head_set = None
+        head_set_size = exp_cfg.get("head_set_size")
+        if head_set_size:
+            if not args.head_set_from:
+                raise ValueError(
+                    f"{exp_id} needs --head-set-from <head_mass.json> (produced by "
+                    f"diagnose_retrieval_heads.py --head-mass-out). Without it "
+                    f"there is no head list to filter to."
+                )
+            ranking_doc = json.loads(Path(args.head_set_from).read_text(encoding="utf-8"))
+            ranking = ranking_doc["global_rank_desc"]
+            if len(ranking) < head_set_size:
+                raise ValueError(
+                    f"{args.head_set_from} ranks only {len(ranking)} heads, "
+                    f"fewer than the {head_set_size} {exp_id} asks for"
+                )
+            head_set = ranking[:head_set_size]
+            ranked_on = ranking_doc.get("speculator_model", "?")
+            print(
+                f"[predict_scbench] retrieval-head filtering: top-{head_set_size} "
+                f"heads {head_set} from {args.head_set_from} (ranked on {ranked_on})"
+            )
+            if Path(ranked_on).name != Path(scorer_model).name:
+                print(
+                    f"[predict_scbench] WARNING: that ranking was measured on "
+                    f"{ranked_on!r}, but this row scores with {scorer_model!r}. "
+                    f"Head indices are checkpoint-specific -- they do not "
+                    f"transfer between models."
+                )
+
         spec_config = SpecConfig(
             keep_strategy="percentage",
             keep_kwargs={**gran_kwargs, "percentage": keep_percentage},
@@ -2042,6 +2107,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             keep_mode=keep_mode,
             score_aggregation=exp_cfg.get("score_aggregation", "max"),
             score_layers=exp_cfg.get("score_layers"),
+            score_head_set=head_set,
         )
         if exp_cfg.get("score_aggregation", "max") != "max" or exp_cfg.get("score_layers"):
             print(
@@ -2211,7 +2277,11 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 # Appended rather than given a column so already-written
                 # all_runs.csv files stay append-compatible.
                 "label": (
-                    f"{label} [scorer={Path(scorer_model).name}]"
+                    f"{label} [scorer={Path(scorer_model).name}"
+                    + (f" heads={spec_config.score_head_set}"
+                       if spec_config is not None and spec_config.score_head_set
+                       else "")
+                    + "]"
                     if scorer_model else label
                 ),
                 "mode": mode, "keep_mode": keep_mode,
@@ -2348,8 +2418,9 @@ def main() -> None:
              "'oracle' (all ORACLE-k* rows -- the same sparse architecture "
              "scored by the TARGET checkpoint instead of the 1B speculator, "
              "i.e. the accuracy ceiling for the SPARSE rows), 'score' (the "
-             "scoring-variant sweep at the k20-g32 probe point), or 'all' "
-             "(every defined experiment).",
+             "scoring-variant sweep at the k20-g32 probe point), 'heads' "
+             "(the retrieval-head-filtering rows, which need "
+             "--head-set-from), or 'all' (every defined experiment).",
     )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
     parser.add_argument(
@@ -2388,6 +2459,14 @@ def main() -> None:
              "checkpoint on ORACLE-k* rows). The scorer prefills the whole "
              "candidate pool every turn, so this is the one that matters "
              "first for an oracle run.",
+    )
+    parser.add_argument(
+        "--head-set-from", default=None,
+        help="Path to a diagnose_retrieval_heads.py --head-mass-out JSON. "
+             "Required by the SPARSE-*-heads<N> rows, which take their head "
+             "list from its `global_rank_desc`. Head indices are specific to "
+             "the checkpoint they were ranked on; a mismatch against the "
+             "scoring model is warned about, not silently accepted.",
     )
     parser.add_argument(
         "--oracle-scorer-model", default=None,
@@ -2503,6 +2582,8 @@ def main() -> None:
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "sparse"]
     elif exp_arg == "oracle":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "oracle"]
+    elif exp_arg == "heads":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg.get("head_set_size")]
     elif exp_arg == "score":
         # The scoring-variant sweep only -- NOT the plain SPARSE-k20-g32 row
         # it is compared against, which is already run and published.

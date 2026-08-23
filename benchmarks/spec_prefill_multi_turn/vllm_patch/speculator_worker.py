@@ -471,6 +471,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         keep_kwargs: dict,
         score_aggregation: str = "max",
         score_layers: Optional[str] = None,
+        score_head_set: Optional[list] = None,
     ):
         """Combines `end_capture` + `retrieve_keys` + the scoring/selection
         pipeline (`scoring.score_and_select_indices`) into ONE in-process
@@ -538,6 +539,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             pool_kernel_size=pool_kernel_size,
             score_aggregation=score_aggregation,
             score_layers=score_layers,
+            score_head_set=score_head_set,
         )
         kept_local_indices = score_and_select_indices(
             query_buffer, key_buffer_per_layer, actual_look_ahead_cnt, spec_config
@@ -760,6 +762,7 @@ class SpeculatorWorker(Worker):
         keep_kwargs: dict,
         score_aggregation: str = "max",
         score_layers: Optional[str] = None,
+        score_head_set: Optional[list] = None,
     ):
         """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
         end_capture_and_score`'s docstring for the full reasoning (in-
@@ -770,7 +773,7 @@ class SpeculatorWorker(Worker):
         behavior, so this stays callable with the old 5-argument signature."""
         return self.model_runner.end_capture_and_score(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
-            keep_kwargs, score_aggregation, score_layers,
+            keep_kwargs, score_aggregation, score_layers, score_head_set,
         )
 
     def end_capture_and_head_diagnostics(

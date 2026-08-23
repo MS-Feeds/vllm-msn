@@ -80,6 +80,22 @@ class SpecConfig:
     #   "last_quarter"-- layers >= 3L//4.
     score_aggregation: str = "max"
     score_layers: Optional[str] = None
+    # Retrieval-head filtering (ACCURACY_IMPROVEMENTS.md §1.3): explicit
+    # (layer, head) indices into the FLATTENED layer*head axis -- head
+    # `l * num_heads + h` -- that alone get a vote. `None` == every head,
+    # the reference behavior.
+    #
+    # Measured, not assumed: `diagnose_retrieval_heads.py` found that a
+    # FIXED 2-head mask, ranked on one set of conversations and scored
+    # out-of-sample on another, lifts gold-answer survival from 54.0% to
+    # 82.0% (+28.0), capturing 93% of what per-input clairvoyant head
+    # selection could achieve. The heads are stable (top-2 Jaccard 0.71
+    # against the global ranking; 20 distinct heads across 100 turns), which
+    # is what makes a static list viable at all.
+    #
+    # Indices are into the full, unrestricted layer*head space, so this is
+    # mutually exclusive with `score_layers` -- see __post_init__.
+    score_head_set: Optional[list] = None
 
     @classmethod
     def from_path(cls, config_path: Optional[str] = None):
@@ -119,6 +135,30 @@ class SpecConfig:
             f"score_layers must be one of {sorted(x for x in SCORE_LAYER_SELECTIONS if x)} "
             f"or None, got {self.score_layers!r}"
         )
+        if self.score_head_set is not None:
+            self.score_head_set = [int(h) for h in self.score_head_set]
+            assert self.score_head_set, (
+                "score_head_set is an empty list -- that would score with no "
+                "heads at all and produce a NaN importance vector. Pass None "
+                "for 'every head'."
+            )
+            assert len(set(self.score_head_set)) == len(self.score_head_set), (
+                f"score_head_set contains duplicates: {self.score_head_set}. A "
+                f"duplicated head would vote twice under `mean`, silently "
+                f"reweighting the aggregation."
+            )
+            assert min(self.score_head_set) >= 0, (
+                f"score_head_set has a negative index: {self.score_head_set}"
+            )
+            # Both restrict which heads vote, but `score_head_set`'s indices
+            # are into the FULL layer*head axis while `score_layers` removes
+            # layers from it -- combining them would silently reinterpret
+            # every index as pointing at a different head.
+            assert self.score_layers is None, (
+                f"score_head_set and score_layers cannot be combined "
+                f"(got score_layers={self.score_layers!r}): head indices are "
+                f"into the full layer*head axis, which score_layers changes."
+            )
 
 
 _SPEC_CONFIG: Optional[SpecConfig] = None
