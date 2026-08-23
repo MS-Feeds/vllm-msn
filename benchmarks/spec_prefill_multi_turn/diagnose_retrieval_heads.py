@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""The §1.3 gate: measures the UPPER BOUND on retrieval-head filtering
+before anyone builds it (ACCURACY_IMPROVEMENTS.md §1.3).
+
+## What this answers, and why it comes first
+
+The §1.1/§1.2 sweep found that `max` over (layer, head) beats `mean` by 12.4
+points and `zmean` by 17.2 -- i.e. the useful signal is concentrated in a few
+heads, and averaging lets the ~500 uninformative ones outvote them. That is
+the retrieval-head hypothesis, measured accidentally. The obvious follow-up is
+to identify the retrieval heads explicitly and aggregate only within them.
+
+That build is multi-day work (offline needle-probe identification, a head-set
+config surface, a graded sweep). This script answers, in one speculator-only
+pass, whether it could possibly pay -- by selecting heads USING THE GOLD
+ANSWER'S OWN POSITION. That is cheating, so whatever it reports is a ceiling
+no honest head-identification method can exceed:
+
+- ceiling near the all-head baseline  -> the 1B does not localize the needle
+  at all, no head selection can help, §1.3 is dead for the cost of one run.
+- ceiling far above it                -> the information IS present and being
+  drowned out; §1.3 is a readout fix and worth building.
+
+Same "measure the ceiling before optimizing toward it" move as the ORACLE-k*
+row, which has already killed two multi-day ideas cheaply.
+
+## The second question, which is just as decisive
+
+A high ceiling is necessary but not sufficient. Retrieval heads are supposed
+to be a FIXED property of a checkpoint -- if the heads that matter are
+different heads on every conversation, then no static head list can capture
+them and §1.3 dies anyway, ceiling or no ceiling. So this also reports how
+stable the per-turn oracle head sets are against each other and against a
+single global ranking. Both answers come from the same pass.
+
+## Scope
+
+Speculator only -- no target engine, no decode loop, no grading. Reuses
+`compute_pruned_turn`'s exact submission path via
+`SpecPrefillProposer.run_turn_and_head_diagnostics`, so the captured queries
+are byte-identical to what a real scoring turn would produce.
+
+Retrieval configs only (`scbench_kv` by default): the gold answer has to be
+an exact string present in the context for "which positions are the gold
+span" to be a well-posed question at all.
+
+Usage:
+    python3 diagnose_retrieval_heads.py \\
+        --predictions-file results/SPARSE-k20-g32_predictions.jsonl \\
+        --keep-percentage 0.2 --granularity 32 --max-conversations 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import statistics
+import sys
+from collections import defaultdict
+from pathlib import Path
+from typing import List
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
+
+DEFAULT_TOP_N = [1, 2, 4, 8, 16, 32, 64, 128]
+
+
+def gold_token_positions(tok, context: str, gold: str) -> List[int]:
+    """Ledger positions of the gold answer's tokens inside the context.
+
+    Located by CHARACTER offset and mapped through the tokenizer's own
+    `offset_mapping`, not by searching for the gold's standalone token ids in
+    the context's ids. The latter is the obvious approach and is wrong: a
+    string tokenizes differently in isolation than it does mid-context
+    (leading-space merges, digit grouping), so the subsequence often is not
+    there to find, and when it is, it can be found in the wrong place.
+
+    The offsets come from the SAME single `tok(context)` call that produces
+    the ids the ledger's context region is built from, so the indices line up
+    exactly with the positions the attention scores are indexed by -- no
+    re-tokenization seam to drift across.
+
+    Returns `[]` if the gold string does not appear verbatim in the context,
+    which is a legitimate outcome for a non-retrieval config rather than an
+    error (the caller skips those turns).
+    """
+    where = context.find(gold)
+    if where < 0:
+        return []
+    encoded = tok(context, add_special_tokens=False, return_offsets_mapping=True)
+    end = where + len(gold)
+    return [
+        i for i, (start, stop) in enumerate(encoded["offset_mapping"])
+        if stop > where and start < end
+    ]
+
+
+def jaccard(a: set, b: set) -> float:
+    union = a | b
+    return len(a & b) / len(union) if union else 0.0
+
+
+def main() -> None:
+    from vllm_patch.config import SCORE_AGGREGATIONS  # noqa: F401  (parity check)
+
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--samples", type=Path,
+                        default=Path(__file__).parent / "datasets" / "scbench_samples.jsonl")
+    parser.add_argument("--predictions-file", type=Path, required=True,
+                        help="A completed run's predictions, used ONLY to replay the "
+                             "same self-generated history this diagnostic's turns "
+                             "were produced under -- same reason "
+                             "diagnose_gold_survival.py needs one.")
+    parser.add_argument("--keep-percentage", type=float, required=True)
+    parser.add_argument("--granularity", default="32", choices=["token", "16", "32", "64"])
+    parser.add_argument("--config", default="scbench_kv",
+                        help="Retrieval configs only -- the gold answer must appear "
+                             "verbatim in the context.")
+    parser.add_argument("--max-conversations", type=int, default=20)
+    parser.add_argument("--top-n", default=",".join(str(n) for n in DEFAULT_TOP_N),
+                        help="Comma-separated head-budget sizes to evaluate the "
+                             "cheating selection at.")
+    parser.add_argument("--speculator-model", default=None)
+    parser.add_argument("--speculator-device", default="cuda:1")
+    parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.3)
+    parser.add_argument("--speculator-max-num-batched-tokens", type=int, default=131072)
+    parser.add_argument("--scorer-prefill-chunk-tokens", type=int, default=None,
+                        help="Per-step batch size for the speculator (see "
+                             "predict_scbench.py's flag of the same name). Lower it "
+                             "(e.g. 32768) if a long context OOMs during prefill.")
+    parser.add_argument("--head-mass-out", type=Path, default=None,
+                        help="Optional JSON dump of the accumulated per-head gold "
+                             "mass -- the input a real §1.3 head list would be built "
+                             "from, if the gate says build it.")
+    args = parser.parse_args()
+
+    top_n_list = [int(x) for x in args.top_n.split(",") if x.strip()]
+
+    from transformers import AutoConfig, AutoTokenizer
+
+    from predict_scbench import GRANULARITIES, LOOK_AHEAD_CNT, POOL_KERNEL_SIZE, render_turn_query
+    from vllm_patch.config import SpecConfig
+    from vllm_patch.conversation_state import ConversationState
+    from vllm_patch.proposer import SpecPrefillProposer
+
+    speculator_model = args.speculator_model or os.environ.get("LLAMA32_1B_MODEL_PATH")
+    if not speculator_model:
+        parser.error("--speculator-model or $LLAMA32_1B_MODEL_PATH is required")
+
+    samples = {}
+    with open(args.samples, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                row = json.loads(line)
+                if row.get("config") == args.config:
+                    samples[str(row["id"])] = row
+
+    prior_outputs: dict = defaultdict(dict)
+    with open(args.predictions_file, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                row = json.loads(line)
+                prior_outputs[str(row["conversation_id"])][row["turn_idx"]] = row["pred"]
+
+    conversations = [
+        samples[cid] for cid in samples if cid in prior_outputs
+    ][: args.max_conversations]
+    if not conversations:
+        parser.error(f"no {args.config!r} conversations present in both "
+                     f"{args.samples} and {args.predictions_file}")
+
+    tok = AutoTokenizer.from_pretrained(speculator_model, trust_remote_code=True)
+    spec_config = SpecConfig(
+        keep_strategy="percentage",
+        keep_kwargs={**GRANULARITIES[args.granularity], "percentage": args.keep_percentage},
+        look_ahead_cnt=LOOK_AHEAD_CNT,
+        pool_kernel_size=POOL_KERNEL_SIZE,
+        # KEEP only, hardcoded: this script drives `begin_turn`/`complete_turn`
+        # itself (it needs the raw sequence, not `compute_pruned_turn`'s
+        # selection) and passes `[]` as the kept-history pairs, which DISCARD
+        # mode would read as "last turn kept nothing" and silently shrink the
+        # candidate pool to nothing. The SPARSE architecture is keep-only
+        # anyway -- it never evicts, so DISCARD has no meaning there.
+        keep_mode="keep",
+    )
+
+    native_len = AutoConfig.from_pretrained(
+        speculator_model, trust_remote_code=True).max_position_embeddings
+    max_batched = args.speculator_max_num_batched_tokens
+    if native_len is not None and max_batched > native_len:
+        max_batched = int(native_len)
+    max_model_len = min(max_batched + 1 + LOOK_AHEAD_CNT,
+                        int(native_len) if native_len is not None else max_batched + 1 + LOOK_AHEAD_CNT)
+
+    import torch
+
+    proposer = SpecPrefillProposer(
+        speculator_model_path=speculator_model,
+        device=torch.device(args.speculator_device),
+        gpu_memory_utilization=args.speculator_gpu_memory_utilization,
+        max_num_batched_tokens=args.scorer_prefill_chunk_tokens or max_batched,
+        enable_chunked_prefill=True,
+        max_model_len=max_model_len,
+    )
+
+    baseline_survived = 0
+    oracle_survived = {n: 0 for n in top_n_list}
+    turns_measured = 0
+    turns_skipped_no_gold = 0
+    accumulated_mass: List[float] = []
+    per_turn_top_sets: List[set] = []
+    num_heads = None
+    STABILITY_N = 16  # the set size the stability numbers are reported at
+
+    for conv in conversations:
+        conv_id = str(conv["id"])
+        outputs = prior_outputs[conv_id]
+        context = conv["context"]
+        context_ids = tok.encode(context, add_special_tokens=False)
+        state = ConversationState(conv["id"], context_ids, "keep")
+
+        for turn_idx, turn in enumerate(conv["turns"]):
+            if turn_idx > 0 and (turn_idx - 1) not in outputs:
+                break  # cannot replay history past a turn the run never produced
+            query_ids = render_turn_query(tok, turn_idx, turn)
+            gold_positions = gold_token_positions(tok, context, str(turn["answer"]))
+
+            candidate_pool, force_keep_query = state.begin_turn(query_ids)
+            full_ids = [tid for tid, _ in candidate_pool + force_keep_query]
+
+            if not gold_positions:
+                turns_skipped_no_gold += 1
+                diagnostics = None
+            else:
+                diagnostics = proposer.run_turn_and_head_diagnostics(
+                    conversation_salt=conv_id,
+                    turn_idx=turn_idx,
+                    full_sequence_token_ids=full_ids,
+                    look_ahead_cnt=spec_config.look_ahead_cnt,
+                    pool_kernel_size=spec_config.pool_kernel_size,
+                    keep_kwargs=spec_config.keep_kwargs,
+                    gold_positions=gold_positions,
+                    top_n_list=top_n_list,
+                    ignore_eos=spec_config.ignore_eos,
+                )
+
+            if diagnostics is not None:
+                turns_measured += 1
+                num_heads = diagnostics["num_heads"]
+                baseline_survived += int(diagnostics["baseline_survived"])
+                for n, ok in diagnostics["oracle_survived"].items():
+                    oracle_survived[int(n)] = oracle_survived.get(int(n), 0) + int(ok)
+                mass = diagnostics["gold_mass"]
+                if not accumulated_mass:
+                    accumulated_mass = [0.0] * len(mass)
+                for i, m in enumerate(mass):
+                    accumulated_mass[i] += m
+                ranked = sorted(range(len(mass)), key=lambda i: mass[i], reverse=True)
+                per_turn_top_sets.append(set(ranked[:STABILITY_N]))
+
+            # Advance the ledger with the ACTUAL run's output, so turn N+1
+            # sees the same history the graded run did.
+            output_ids = (
+                tok.encode(f" {outputs[turn_idx]}", add_special_tokens=False)
+                if turn_idx in outputs else []
+            )
+            state.complete_turn([], output_ids)
+
+        proposer.discard_conversation(conv_id)
+        print(f"[diagnose_retrieval_heads] {conv_id} done", flush=True)
+
+    if not turns_measured:
+        print("no turns measured -- every turn's gold answer was absent from its "
+              "context, or no lookahead step was ever captured")
+        return
+
+    print(f"\n=== retrieval-head ceiling (keep={args.keep_percentage}, "
+          f"g{args.granularity}, {args.config}, {turns_measured} turns, "
+          f"{num_heads} heads) ===")
+    if turns_skipped_no_gold:
+        print(f"({turns_skipped_no_gold} turns skipped: gold answer not verbatim "
+              f"in the context)")
+    base_pct = 100.0 * baseline_survived / turns_measured
+    print(f"\n{'head budget':>12} {'gold survived':>14} {'vs. all-head max':>18}")
+    print(f"{'all (max)':>12} {base_pct:13.1f}% {'—':>18}")
+    for n in sorted(oracle_survived):
+        pct = 100.0 * oracle_survived[n] / turns_measured
+        print(f"{n:>12} {pct:13.1f}% {pct - base_pct:+17.1f}")
+
+    # Head stability: can a FIXED head list exist at all?
+    global_rank = sorted(range(len(accumulated_mass)),
+                         key=lambda i: accumulated_mass[i], reverse=True)
+    global_top = set(global_rank[:STABILITY_N])
+    overlaps = [jaccard(s, global_top) for s in per_turn_top_sets]
+    pairwise = [
+        jaccard(per_turn_top_sets[i], per_turn_top_sets[i + 1])
+        for i in range(len(per_turn_top_sets) - 1)
+    ]
+    print(f"\n=== head stability (top-{STABILITY_N} sets) ===")
+    print(f"mean Jaccard, per-turn set vs. GLOBAL set : {statistics.mean(overlaps):.2f}")
+    if pairwise:
+        print(f"mean Jaccard, consecutive turns           : {statistics.mean(pairwise):.2f}")
+    print(f"heads ever in a per-turn top-{STABILITY_N}            : "
+          f"{len(set().union(*per_turn_top_sets))} of {num_heads}")
+    print("\nA fixed head list is only possible if these overlaps are high. Low "
+          "overlap means\nthe useful heads are chosen per input, which is not what "
+          "a retrieval head is,\nand §1.3 cannot be built as a static set no matter "
+          "how high the ceiling above is.")
+
+    if args.head_mass_out:
+        args.head_mass_out.parent.mkdir(parents=True, exist_ok=True)
+        args.head_mass_out.write_text(json.dumps({
+            "speculator_model": speculator_model,
+            "config": args.config,
+            "turns_measured": turns_measured,
+            "num_heads": num_heads,
+            "mean_gold_mass_per_head": [m / turns_measured for m in accumulated_mass],
+            "global_rank_desc": global_rank,
+        }, indent=2), encoding="utf-8")
+        print(f"\n[diagnose_retrieval_heads] wrote per-head gold mass -> "
+              f"{args.head_mass_out}")
+
+
+if __name__ == "__main__":
+    main()

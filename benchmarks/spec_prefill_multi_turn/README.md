@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  87/87 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  93/93 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -484,13 +484,14 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 87/87 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 93/93 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |
 | `validate_sparse_attention.py` | GPU-node validation: decode-step block-gather sparse attention (needle-in-haystack) |
 | `diagnose_turn_index_gap.py` | Diagnoses the turn-0 accuracy dip: rendering-mismatch vs. truncation hypotheses |
 | `diagnose_gold_survival.py` | Diagnoses the turn-0 accuracy dip: does the gold answer survive selection? |
+| `diagnose_retrieval_heads.py` | The §1.3 gate: upper bound on retrieval-head filtering (heads picked using the gold position — cheating, so it is a ceiling), plus whether those heads are stable enough for a fixed head set to exist |
 | `diagnose_speculator_selection.py` | Decodes the speculator's actual selected text, to isolate selection-side vs. target-side bugs |
 | `diagnose_target_gather_metadata.py` | Checks target-side gathered block count against an independently computed expectation |
 | `diagnose_h1_metadata.py` | Dumps attention-metadata length fields to catch stale-field bugs (found `max_seq_len` staleness) |

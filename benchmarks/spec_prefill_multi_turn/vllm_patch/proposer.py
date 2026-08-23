@@ -339,6 +339,40 @@ class SpecPrefillProposer:
         )
         return kept_local_indices, actual_look_ahead_cnt, num_cached_tokens
 
+    def run_turn_and_head_diagnostics(
+        self,
+        conversation_salt: str,
+        turn_idx: int,
+        full_sequence_token_ids: List[int],
+        look_ahead_cnt: int,
+        pool_kernel_size: Optional[int],
+        keep_kwargs: dict,
+        gold_positions: List[int],
+        top_n_list: List[int],
+        ignore_eos: bool = False,
+    ):
+        """Drives one turn exactly as `run_turn_and_score` does, then asks
+        the worker for the §1.3 retrieval-head gate instead of a selection --
+        see `speculator_worker.py::end_capture_and_head_diagnostics`. Shares
+        `_submit_and_drive_turn`, so the capture/lookahead conditions are
+        identical to a real scoring turn; only what is computed from the
+        captured Q differs."""
+        request_id, _num_cached, _t_start = self._submit_and_drive_turn(
+            conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
+        )
+        return self.llm_engine.collective_rpc(
+            "end_capture_and_head_diagnostics",
+            args=(
+                request_id,
+                conversation_salt,
+                len(full_sequence_token_ids),
+                pool_kernel_size,
+                keep_kwargs,
+                gold_positions,
+                top_n_list,
+            ),
+        )[0]
+
     def _submit_and_drive_turn(
         self,
         conversation_salt: str,

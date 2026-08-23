@@ -150,16 +150,68 @@ The oracle differs from SPARSE in two ways at once — whose attention, and
 whose lookahead tokens. Post-hoc collapse choices are now eliminated, so the
 next discriminator should separate those two:
 
-- **Scorer capacity (§1.6) — cheapest, run it first.** `--oracle-scorer-model`
-  already exists; point it at a mid-size checkpoint (e.g. Llama-3.2-3B) and
-  see whether the 17 points come back as a smooth function of scorer size. If
-  3B recovers most of it, the answer is "use a slightly bigger draft" and the
-  question becomes a FLOPs trade rather than a scoring-math one. If 3B lands
-  near the 1B, the gap is something specific to the target's own attention and
-  §1.3/§1.5 are where to look.
+- **Scorer capacity (§1.6).** ❌ **Answered — works, and is the wrong
+  currency.** See "The capacity probe" below.
 - **Retrieval-head filtering (§1.3)** — now the best-motivated scoring change,
-  per the reading above.
-- **Lookahead source (§1.5)** — the other axis the oracle changed.
+  per the reading above, and one of only two left that cost no capacity.
+  **Gated before building**: `diagnose_retrieval_heads.py` measures the
+  ceiling by picking heads with the gold answer's own position (cheating), so
+  no honest identification method can beat what it reports, and it separately
+  reports whether the winning heads are the *same* heads across turns — a
+  retrieval head set is static by definition, so unstable heads kill §1.3
+  regardless of the ceiling.
+
+  ```bash
+  python diagnose_retrieval_heads.py --predictions-file results/SPARSE-k20-g32_predictions.jsonl --keep-percentage 0.2 --max-conversations 20 --head-mass-out results/head_mass.json
+  ```
+
+  Read it as: ceiling near the all-head baseline (currently ~70% survival) →
+  the 1B does not localize the needle, §1.3 is dead for one run's cost.
+  Ceiling far above it *and* stable heads → it is a readout problem, build it,
+  and `--head-mass-out` is already the head list to build from.
+- **Lookahead source (§1.5)** — the other axis the oracle changed, and the
+  other capacity-free one.
+
+### The capacity probe: smooth, and economically backwards
+
+Scoring the same `SPARSE-k20-g32` configuration with progressively larger
+checkpoints, all 100 `scbench_kv` conversations:
+
+| Scorer | Params | Score | vs. 1B | paired 95% CI |
+|---|---:|---:|---:|---|
+| Llama-3.2-1B (the speculator) | 1.24B | 56.6 | — | — |
+| Llama-3.2-3B | 3.21B | 65.0 | +8.4 | [+2.4, +14.2] * |
+| Llama-3.1-8B (= the target, ORACLE-k20) | 8.03B | 73.6 | +17.0 | [+10.2, +23.4] * |
+
+**Log-linear in scorer size, with no plateau anywhere:**
+
+    score ≈ 56.6 + 9.1 · ln(params / 1.24B)      (+6.3 points per doubling)
+
+The fit through the two endpoints predicts **65.3** for 3B against an actual
+**65.0** — a 0.3-point residual on an interpolated point. 1B→3B buys +8.4 and
+3B→8B buys +8.6: the returns do not diminish, so there is no cheap
+"just-big-enough" draft model hiding between the sizes. The estimator gap
+closes smoothly and only fully when the scorer *is* the target.
+
+**Why that settles it against capacity as the fix.** SPARSE already costs
+**+21% FLOPs and +36% latency** against the dense M000 baseline it is supposed
+to beat (its case rests on memory bandwidth, not arithmetic — see README's
+FLOP sections). The speculator's incremental cost is ~180 TFLOP/turn of
+SPARSE's ~1038; a 3B scorer is ~2.6x that, pushing the total to roughly 154%
+of M000's FLOPs to buy +8.4 points while still sitting **16.6 below** the
+baseline that is also ~3x faster. Scaling to the 8B scorer means running an
+8B model twice per turn, which is not an acceleration method. Read the actual
+cost off `all_runs.csv` (`seconds_per_turn_excl_turn0_mean`,
+`total_tflops_per_turn_mean`) rather than this projection — the 3B run
+recorded its own.
+
+So capacity is a real lever on accuracy and a dominated one on the
+accuracy-per-FLOP frontier this project exists to move. **What is left in §1
+is the capacity-free items only: §1.3 (which heads) and §1.5 (which
+queries).** If neither moves the number, the honest conclusion is that a
+~1B draft cannot estimate an 8B model's retrieval attention well enough for
+aggressive keep rates, and the project's result is that bound rather than a
+way around it.
 
 > **Running 1 and 2.** Six rows at the `k20-g32` probe point — the grid's
 > worst corner, where the 17-point estimator gap has the most room to show
@@ -295,11 +347,12 @@ once §1 is exhausted.
 | # | Change | Effort | Risk | Section |
 |---|---|---|---|---|
 | ~~1~~ | ~~De-max the (layer, head) aggregation; restrict voting layers~~ — **falsified, see §1** | — | — | §1.1–1.2 |
-| 1 | Scorer-capacity probe (`--oracle-scorer-model` at 3B) | ~1 run | low | §1.6 |
+| ~~1~~ | ~~Scorer-capacity probe~~ — **answered: log-linear, economically dominated** | — | — | §1.6 |
+| 1 | Retrieval-head filtering (capacity-free) | ~2 days | medium | §1.3 |
 | 2 | Block-neighborhood dilation at g16 | ~half day | low | §2.1 |
 | 3 | Nucleus (mass-based) keep budget | ~half day | low | §2.2 |
 | 4 | Recency window + sticky cross-turn union | ~1 day | low | §2.3–2.4 |
-| 5 | Retrieval-head filtering | ~2 days | medium | §1.3 |
+| 5 | Lookahead-query source (capacity-free) | ~1 day | low | §1.5 |
 | 6 | Mid-turn re-selection | ~3 days | medium | §3.1 |
 | 7 | Per-layer selection | ~1 week | high | §2.6 |
 

@@ -544,6 +544,118 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         )
         return kept_local_indices, actual_look_ahead_cnt
 
+    def end_capture_and_head_diagnostics(
+        self,
+        request_id: str,
+        conversation_salt: str,
+        full_sequence_len: int,
+        pool_kernel_size,
+        keep_kwargs: dict,
+        gold_positions: list,
+        top_n_list: list,
+    ):
+        """The §1.3 gate (ACCURACY_IMPROVEMENTS.md): how much would
+        retrieval-head filtering buy, AT MOST?
+
+        Selects heads using the gold answer's own position -- i.e. cheating --
+        so whatever survival this reports is an UPPER BOUND on any honest
+        head-identification method. The point is to kill or justify a
+        multi-day build with a half-day measurement, the same way ORACLE-k20
+        did for the scoring sweep.
+
+        Runs entirely in this process for the same reason
+        `end_capture_and_score` does, only more so: the per-head importance
+        tensor it needs is `[num_layers*num_heads, look_ahead, context_len]`
+        -- ~1GB for the 1B speculator at a 124k context -- and only a handful
+        of scalars per turn ever need to come back.
+
+        Returns a dict (or None if no lookahead step was captured):
+          `gold_mass`        per-(layer, head) share of that head's own
+                             attention mass landing on the gold span. The
+                             raw material for "are the useful heads the SAME
+                             heads across turns", which the driver answers;
+                             a fixed head set cannot work if they are not.
+          `baseline_survived` gold kept under the reference all-head `max`.
+          `oracle_survived`  gold kept under `max` restricted to the top-N
+                             heads BY GOLD MASS, per N in `top_n_list`.
+
+        Survival is "every gold token position kept", matching
+        `diagnose_gold_survival.py`'s text-containment check in strictness:
+        a partially-kept answer is not retrievable either.
+        """
+        import torch
+
+        from .config import SpecConfig
+        from .scoring import (
+            chunk_select_from_smoothed_attention,
+            compute_attention_score,
+        )
+
+        query_buffer = self.end_capture(request_id)
+        actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
+        if actual_look_ahead_cnt == 0 or not gold_positions:
+            return None
+
+        key_buffer_per_layer = self.retrieve_keys(
+            conversation_salt, list(range(full_sequence_len))
+        )
+        attn = compute_attention_score(
+            query_buffer, [[k] for k in key_buffer_per_layer], [actual_look_ahead_cnt]
+        )[0]
+
+        # Same pipeline as `aggregate_attention_score`, stopped one step
+        # early: the (layer, head) axis is kept instead of collapsed, which
+        # is the whole point.
+        original_dtype = attn.dtype
+        attn = torch.nn.functional.softmax(attn, dim=-1, dtype=torch.float32).to(
+            original_dtype
+        )
+        attn = attn.flatten(0, 1)
+        if pool_kernel_size:
+            attn = torch.nn.functional.avg_pool1d(
+                attn, kernel_size=pool_kernel_size,
+                padding=pool_kernel_size // 2, stride=1,
+            )
+
+        gold_idx = torch.tensor(
+            sorted(set(gold_positions)), device=attn.device, dtype=torch.long
+        )
+        per_head = attn.mean(1)  # [LH, ctx] -- mean over lookahead, for ranking
+        gold_mass = (
+            per_head.index_select(-1, gold_idx).sum(-1)
+            / per_head.sum(-1).clamp_min(1e-9)
+        )
+
+        spec_config = SpecConfig(
+            keep_strategy="percentage",
+            keep_kwargs=keep_kwargs,
+            pool_kernel_size=pool_kernel_size,
+        )
+        gold_set = set(int(p) for p in gold_idx.tolist())
+
+        def _survived(head_rows) -> bool:
+            # `head_rows is None` == every head, and is NOT expressed as an
+            # arange index: indexing would copy the whole ~1GB tensor to
+            # reproduce it.
+            collapsed = (attn if head_rows is None else attn[head_rows]).max(0)[0].mean(0)
+            kept = chunk_select_from_smoothed_attention([collapsed], spec_config)[0]
+            return gold_set.issubset(set(kept.tolist()))
+
+        order = torch.argsort(gold_mass, descending=True)
+        oracle_survived = {}
+        for n in top_n_list:
+            n = int(n)
+            if n <= 0 or n > attn.shape[0]:
+                continue
+            oracle_survived[n] = bool(_survived(order[:n]))
+
+        return {
+            "gold_mass": gold_mass.float().cpu().tolist(),
+            "baseline_survived": bool(_survived(None)),
+            "oracle_survived": oracle_survived,
+            "num_heads": int(attn.shape[0]),
+        }
+
     def discard_conversation(self, conversation_salt: str) -> None:
         """Drop this conversation's accumulated slot history -- call once
         the whole conversation (not just one turn) is done, to avoid
@@ -638,6 +750,23 @@ class SpeculatorWorker(Worker):
         return self.model_runner.end_capture_and_score(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
             keep_kwargs, score_aggregation, score_layers,
+        )
+
+    def end_capture_and_head_diagnostics(
+        self,
+        request_id: str,
+        conversation_salt: str,
+        full_sequence_len: int,
+        pool_kernel_size,
+        keep_kwargs: dict,
+        gold_positions: list,
+        top_n_list: list,
+    ):
+        """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
+        end_capture_and_head_diagnostics`'s docstring."""
+        return self.model_runner.end_capture_and_head_diagnostics(
+            request_id, conversation_salt, full_sequence_len, pool_kernel_size,
+            keep_kwargs, gold_positions, top_n_list,
         )
 
     def discard_conversation(self, conversation_salt: str) -> None:

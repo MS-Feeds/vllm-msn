@@ -2545,6 +2545,71 @@ def test_zmean_survives_a_constant_attention_head():
     assert torch.isfinite(out).all(), "a constant head produced NaN/inf scores under zmean"
 
 
+def test_gold_token_positions_maps_char_spans_to_token_indices():
+    """The §1.3 gate ranks heads by how much attention they put on the gold
+    span, so a wrong span silently corrupts every number it reports -- and
+    wrongly, not obviously: the run still completes and still prints a
+    plausible ceiling.
+
+    The rule under test is the overlap condition. A token counts if it
+    overlaps the gold's character range AT ALL (partial overlap included --
+    tokenizers merge across a boundary, and half a gold token is still gold),
+    and tokens merely ADJACENT to the range do not count.
+
+    A stub tokenizer stands in for a real one deliberately: what is being
+    tested is this function's index arithmetic over an offset mapping, not
+    any tokenizer's behavior, and the CPU suite has no model weights.
+    """
+    from diagnose_retrieval_heads import gold_token_positions
+
+    class _StubTok:
+        """Splits on spaces, reporting real character offsets."""
+        def __init__(self, text):
+            self.spans = []
+            pos = 0
+            for word in text.split(" "):
+                self.spans.append((pos, pos + len(word)))
+                pos += len(word) + 1
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            return {"offset_mapping": self.spans}
+
+    context = "alpha beta gamma delta epsilon"
+    #          0-4   6-9  11-15 17-21 23-29
+    tok = _StubTok(context)
+
+    # Exact single-token match.
+    assert gold_token_positions(tok, context, "gamma") == [2]
+    # Multi-token span.
+    assert gold_token_positions(tok, context, "beta gamma") == [1, 2]
+    # Partial overlap at both ends still counts the touched tokens, and the
+    # untouched neighbours are excluded.
+    assert gold_token_positions(tok, context, "ta gam") == [1, 2]
+    # First and last tokens are reachable (no fencepost at either end).
+    assert gold_token_positions(tok, context, "alpha") == [0]
+    assert gold_token_positions(tok, context, "epsilon") == [4]
+    # Absent gold is an empty result, not an exception and not a bogus span --
+    # a legitimate outcome for a non-retrieval config, which the caller skips.
+    assert gold_token_positions(tok, context, "not-in-context") == []
+
+
+def test_jaccard_bounds_head_set_stability():
+    """Head stability is the gate's second, independently fatal question: a
+    high ceiling is worthless if the useful heads differ per input, because
+    a retrieval head set is by definition static. Jaccard is how that is
+    reported, so its degenerate cases have to be right -- identical sets must
+    read 1.0 and disjoint sets 0.0, or the conclusion inverts."""
+    from diagnose_retrieval_heads import jaccard
+
+    assert jaccard({1, 2, 3}, {1, 2, 3}) == 1.0
+    assert jaccard({1, 2, 3}, {4, 5, 6}) == 0.0
+    assert jaccard({1, 2}, {2, 3}) == 1 / 3
+    # Two empty sets share nothing to be stable ABOUT -- 0.0, not a
+    # divide-by-zero and not a spurious 1.0 that would read as perfect
+    # stability.
+    assert jaccard(set(), set()) == 0.0
+
+
 def _run_all():
     tests = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     failures = []

@@ -2202,7 +2202,19 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             turn_times_excl_first = [t for idx, t in stats["turn_elapsed"] if idx > 0]
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "exp_id": exp_id, "label": label, "mode": mode, "keep_mode": keep_mode,
+                "exp_id": exp_id,
+                # Scorer identity goes in `label`, not a new column: two runs
+                # of the SAME exp_id can differ only by --oracle-scorer-model
+                # (an 8B ceiling vs a 3B capacity probe, ACCURACY_IMPROVEMENTS
+                # .md §1.6), and nothing else written here would tell them
+                # apart afterwards -- `label` comes from the static matrix.
+                # Appended rather than given a column so already-written
+                # all_runs.csv files stay append-compatible.
+                "label": (
+                    f"{label} [scorer={Path(scorer_model).name}]"
+                    if scorer_model else label
+                ),
+                "mode": mode, "keep_mode": keep_mode,
                 "keep_percentage": keep_percentage, "kv_granularity": granularity,
                 "chunk_size": GRANULARITIES.get(granularity, {}).get("chunk_size") if granularity else None,
                 "look_ahead_cnt": LOOK_AHEAD_CNT if mode != "baseline" else None,
