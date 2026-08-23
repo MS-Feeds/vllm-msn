@@ -51,6 +51,21 @@ first; verify `*.safetensors` actually landed, not just tokenizer/config
 files). If you already downloaded these for `../spec_prefill_llama/`, reuse
 the same snapshot paths in this pipeline's `.env_exports.sh`.
 
+**Optional third checkpoint**: `meta-llama/Llama-3.2-3B-Instruct`
+(`LLAMA32_3B_MODEL_PATH`), gated the same way. Not needed for any row of the
+experiment matrix — it is only the mid-size scorer for
+`ACCURACY_IMPROVEMENTS.md` §1.6's capacity probe, run via
+`--oracle-scorer-model`. Skip it unless you are running that probe. Download
+it the same way as the other two, then fill in the real snapshot hash:
+
+```bash
+hf download meta-llama/Llama-3.2-3B-Instruct --exclude "original/*"
+```
+
+```bash
+ls -la /scratch/hf_cache/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/*/
+```
+
 ## 3. SCBench dataset
 
 `datasets/prep_scbench.py` fetches `microsoft/SCBench`'s 3 MVP configs

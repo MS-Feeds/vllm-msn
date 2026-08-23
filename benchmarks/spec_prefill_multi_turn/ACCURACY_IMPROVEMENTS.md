@@ -95,15 +95,71 @@ Current pipeline ([scoring.py:103](vllm_patch/scoring.py:103)): softmax →
 `avg_pool1d(kernel=13)` → **max over (layer, head)** → mean over 8 lookahead
 steps.
 
-1. **Drop `max` over (layer, head).** ✅ **Built.** Max is winner-take-all:
-   one peaked early-layer positional head sets the entire importance vector.
-   `SpecConfig.score_aggregation` ∈ `{max, mean, zmean}` — `mean` is total
-   attention mass, `zmean` z-scores each head across the context first so
-   heads contribute shape rather than magnitude.
-2. **Restrict which layers vote.** ✅ **Built.** Layers 0–1 are
-   near-universally positional/sink-dominated and carry little retrieval
-   signal. `SpecConfig.score_layers` ∈ `{None, skip_first2, second_half,
-   last_quarter}`.
+1. **Drop `max` over (layer, head).** ❌ **FALSIFIED — and backwards.**
+2. **Restrict which layers vote.** ❌ **Null.**
+
+### The §1.1/§1.2 sweep: what it actually found
+
+Six variants, all 100 `scbench_kv` conversations, against the
+`SPARSE-k20-g32` baseline (56.6). `*` = paired 95% CI excludes 0.
+
+| Variant | Score | Δ | paired 95% CI | |
+|---|---:|---:|---|---|
+| `lyr2h` (layers ≥ L/2) | 58.2 | **+1.6** | [−2.2, +5.2] | ns |
+| `lyrskip2` (drop layers 0–1) | 56.2 | −0.4 | [−3.0, +2.4] | ns |
+| `aggmean-lyr2h` | 52.6 | −4.0 | [−8.2, −0.4] | * |
+| `lyr4q` (layers ≥ 3L/4) | 48.4 | −8.2 | [−12.6, −3.8] | * |
+| `aggmean` | 44.2 | −12.4 | [−17.0, −8.4] | * |
+| `aggzmean` | 39.4 | −17.2 | [−22.0, −12.6] | * |
+
+**`max` was right, and the hypothesis behind replacing it was wrong.** Every
+step away from winner-take-all made things worse, monotonically with how far
+it went: `mean` −12.4, `zmean` (which additionally equalizes every head's
+scale) −17.2. This is not a null result, it is a large effect in the opposite
+direction, well outside anything six-way multiple testing could manufacture.
+
+The retrospective reading, which is a *better* model of the problem than the
+one that motivated the sweep: for needle retrieval the signal **is** a single
+peaked head. Llama-3.2-1B has 16 × 32 = 512 (layer, head) distributions, of
+which a handful know where the needle is; averaging lets the ~500 that don't
+outvote them, and z-scoring guarantees it by removing exactly the magnitude
+advantage that made the informed heads distinguishable. `max` is a crude,
+free, implicit retrieval-head selector — which is why §1.3 (explicit
+retrieval-head filtering) is now the *better-motivated* item in this section,
+not a redundant one: it is the principled version of what `max` does by
+accident, and the right form is "restrict to known retrieval heads, then
+aggregate within that set".
+
+Layer restriction is null in both directions for the same reason. Early
+layers rarely win the `max`, so dropping them barely perturbs anything
+(`lyrskip2` agrees with the baseline on 464/500 turns, mean |diff| 7.2 —
+the smallest change of all six). Dropping *late* layers removes real signal:
+`lyr4q` keeps only 4 of 16 and loses 8.2 points. `lyr2h`'s +1.6 is the best
+point estimate in the sweep and is not significant; even if real it is 9% of
+the 17-point estimator gap, so it is not the answer either way.
+
+**What this does not change:** the 17-point estimator gap is still there and
+`ORACLE-k20` still proves it is achievable. What the sweep rules out is that
+it is reachable by changing how the 1B's attention is *collapsed*. The
+remaining candidates are about what is collapsed, not how: §1.3 (which heads),
+§1.5 (which queries), §1.6 (which model) — see "After the sweep" below.
+
+### After the sweep: the live hypotheses
+
+The oracle differs from SPARSE in two ways at once — whose attention, and
+whose lookahead tokens. Post-hoc collapse choices are now eliminated, so the
+next discriminator should separate those two:
+
+- **Scorer capacity (§1.6) — cheapest, run it first.** `--oracle-scorer-model`
+  already exists; point it at a mid-size checkpoint (e.g. Llama-3.2-3B) and
+  see whether the 17 points come back as a smooth function of scorer size. If
+  3B recovers most of it, the answer is "use a slightly bigger draft" and the
+  question becomes a FLOPs trade rather than a scoring-math one. If 3B lands
+  near the 1B, the gap is something specific to the target's own attention and
+  §1.3/§1.5 are where to look.
+- **Retrieval-head filtering (§1.3)** — now the best-motivated scoring change,
+  per the reading above.
+- **Lookahead source (§1.5)** — the other axis the oracle changed.
 
 > **Running 1 and 2.** Six rows at the `k20-g32` probe point — the grid's
 > worst corner, where the 17-point estimator gap has the most room to show
@@ -238,7 +294,8 @@ once §1 is exhausted.
 
 | # | Change | Effort | Risk | Section |
 |---|---|---|---|---|
-| 1 | De-max the (layer, head) aggregation; restrict voting layers | ~1 hour | low | §1.1–1.2 |
+| ~~1~~ | ~~De-max the (layer, head) aggregation; restrict voting layers~~ — **falsified, see §1** | — | — | §1.1–1.2 |
+| 1 | Scorer-capacity probe (`--oracle-scorer-model` at 3B) | ~1 run | low | §1.6 |
 | 2 | Block-neighborhood dilation at g16 | ~half day | low | §2.1 |
 | 3 | Nucleus (mass-based) keep budget | ~half day | low | §2.2 |
 | 4 | Recency window + sticky cross-turn union | ~1 day | low | §2.3–2.4 |

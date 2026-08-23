@@ -27,3 +27,21 @@ export LLAMA31_8B_MODEL_PATH=/scratch/hf_cache/models--meta-llama--Llama-3.1-8B-
 # Speculator model (Llama-3.2-1B-Instruct). Same "fill in once downloaded"
 # caveat as above (also gated on Hugging Face).
 export LLAMA32_1B_MODEL_PATH=/scratch/hf_cache/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6
+
+# Mid-size scorer (Llama-3.2-3B-Instruct) -- NOT part of the published
+# experiment matrix. It exists for the scorer-capacity probe in
+# ACCURACY_IMPROVEMENTS.md §1.6: ORACLE-k20 (the 8B scoring its own
+# attention) recovers 17.0 of the 25.0-point scbench_kv degradation, and the
+# §1.1/§1.2 sweep ruled out reaching that by changing how the 1B's attention
+# is aggregated. Scoring with 3B instead answers whether the gap is a smooth
+# function of scorer capacity -- i.e. whether the fix is "use a bigger draft
+# model" (a FLOPs trade, priceable with flops_model.py) rather than better
+# scoring math.
+#
+#   python3 predict_scbench.py --exp ORACLE-k20 --scbench-config scbench_kv --oracle-scorer-model $LLAMA32_3B_MODEL_PATH --scorer-prefill-chunk-tokens 32768
+#
+# Same gated-repo + "fill in the real snapshot hash once downloaded" caveat
+# as the two above -- the hash below is a PLACEHOLDER, not this node's real
+# path. Find it with:
+#   ls -la /scratch/hf_cache/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/*/
+export LLAMA32_3B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95
