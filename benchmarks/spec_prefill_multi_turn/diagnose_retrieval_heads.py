@@ -122,6 +122,15 @@ def main() -> None:
                         help="Retrieval configs only -- the gold answer must appear "
                              "verbatim in the context.")
     parser.add_argument("--max-conversations", type=int, default=20)
+    parser.add_argument("--skip-conversations", type=int, default=0,
+                        help="Skip the first N conversations. Exists for ONE reason: "
+                             "a head set ranked on conversations 1..N and then scored "
+                             "on conversations 1..M is scored partly on the turns it "
+                             "was fitted to, and 2 heads chosen from 512 can memorize "
+                             "a little even at that ratio. Rank with "
+                             "--max-conversations N, then score with "
+                             "--skip-conversations N for a clean out-of-sample "
+                             "number.")
     parser.add_argument("--top-n", default=",".join(str(n) for n in DEFAULT_TOP_N),
                         help="Comma-separated head-budget sizes to evaluate the "
                              "cheating selection at.")
@@ -180,7 +189,7 @@ def main() -> None:
 
     conversations = [
         samples[cid] for cid in samples if cid in prior_outputs
-    ][: args.max_conversations]
+    ][args.skip_conversations: args.skip_conversations + args.max_conversations]
     if not conversations:
         parser.error(f"no {args.config!r} conversations present in both "
                      f"{args.samples} and {args.predictions_file}")
@@ -313,9 +322,14 @@ def main() -> None:
               "context, or no lookahead step was ever captured")
         return
 
+    slice_note = (
+        f", conversations {args.skip_conversations + 1}.."
+        f"{args.skip_conversations + len(conversations)}"
+        if args.skip_conversations else ""
+    )
     print(f"\n=== retrieval-head ceiling (keep={args.keep_percentage}, "
           f"g{args.granularity}, {args.config}, {turns_measured} turns, "
-          f"{num_heads} heads) ===")
+          f"{num_heads} heads{slice_note}) ===")
     if turns_skipped_no_gold:
         print(f"({turns_skipped_no_gold} turns skipped: gold answer not verbatim "
               f"in the context)")
