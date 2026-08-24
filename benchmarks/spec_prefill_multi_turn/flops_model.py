@@ -74,7 +74,7 @@ than the entire rest of the prefill.
 """
 
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -292,6 +292,49 @@ def target_prefill_flops(cfg: ModelFlopConfig, prompt_len: int, num_cached: int)
         + cfg.attn_prefill_flops(n_new, min(num_cached, prompt_len))
         + (cfg.lm_head_flops if n_new > 0 else 0)
     )
+
+
+def target_sparse_prefill_flops(
+    cfg: ModelFlopConfig, prefill_steps: Sequence[Tuple[int, int]]
+) -> int:
+    """Target prefill for one turn, MEASURED per chunk instead of derived
+    from `(prompt_len, num_cached)`.
+
+    Used only by the sparse pipeline's opt-in sparse-prefill scope, where
+    `target_prefill_flops`' analytic model no longer applies: that function
+    assumes every new token attends every cached token, which is exactly
+    the assumption the gather breaks. The replacement input comes from
+    `vllm_patch/sparse_target_runner.py::pop_prefill_steps` -- one
+    `(num_query_tokens, attended_len)` pair per prefill chunk, with
+    `attended_len` the block-PADDED length the kernel was actually handed
+    (a chunk the gather declined to restrict reports its full length, so
+    dense chunks are charged densely and turn 0 comes out identical to the
+    analytic model modulo prefix-cache bookkeeping).
+
+    Each chunk's causal key-visit count is
+    `attn_prefill_flops(n_q, attended_len - n_q)`: the chunk's own `n_q`
+    tokens sit at the tail of the gathered view by construction (see
+    `kv_cache_utils.compute_prefill_gather_view`'s "Why the tail must be
+    contiguous"), so they see `attended_len - n_q` keys of history plus the
+    usual causal triangle among themselves.
+
+    One `lm_head` row is charged for the turn, not per chunk -- same
+    convention as `target_prefill_flops`: only the final chunk produces
+    logits, and only the one sampled token's row.
+    """
+    total = 0
+    charged_any = False
+    for num_query_tokens, attended_len in prefill_steps:
+        if num_query_tokens <= 0:
+            continue
+        charged_any = True
+        total += num_query_tokens * cfg.linear_flops_per_token
+        total += cfg.attn_prefill_flops(
+            num_query_tokens, max(attended_len - num_query_tokens, 0)
+        )
+    if charged_any:
+        total += cfg.lm_head_flops
+    return total
 
 
 def target_decode_flops(cfg: ModelFlopConfig, attended_lens: Sequence[int]) -> int:

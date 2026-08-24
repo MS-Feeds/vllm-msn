@@ -86,19 +86,45 @@ from typing import Dict, List, Optional, Tuple
 
 _registry: Dict[str, List[int]] = {}
 _generations: Dict[str, int] = {}
+_prefill_turn_starts: Dict[str, Optional[int]] = {}
 _next_generation = 0
 _lock = threading.Lock()
 
 
-def register(request_id: str, selected_positions: List[int]) -> None:
+def register(
+    request_id: str,
+    selected_positions: List[int],
+    prefill_turn_start: Optional[int] = None,
+) -> None:
     """`selected_positions` -- absolute conversation-ledger positions
     (== local positions in the target's own persistent session, per module
     docstring), sorted or not (callers should sort for determinism, but
     this module doesn't require it -- `sparse_target_runner.py`'s gather
-    doesn't care about input order, it just goes into a block-index set)."""
+    doesn't care about input order, it just goes into a block-index set).
+
+    `prefill_turn_start` selects the SCOPE of the sparsity, and its default
+    is load-bearing:
+
+    - `None` (default) -- decode-only, the originally-shipped behavior and
+      the one every published `SPARSE-k*`/`ORACLE-k*` row was measured
+      under. This turn's own prompt tokens prefill against the full,
+      unrestricted resident cache.
+    - an `int` -- additionally restrict this turn's PREFILL. The value is
+      the absolute position where this turn's own new tokens begin (the
+      session's resident length just before the delta was submitted), which
+      `sparse_target_runner.py` needs and cannot derive for itself: it sees
+      only `num_computed` (already past the turn start on every chunk after
+      the first) and `num_prompt` (the END of the delta, not its start).
+
+    Keeping this a per-registration fact rather than a process-wide mode is
+    deliberate -- the worker never has to be told which experiment it is
+    running, and a driver that simply never passes it gets byte-identical
+    behavior to before this parameter existed.
+    """
     global _next_generation
     with _lock:
         _registry[request_id] = list(selected_positions)
+        _prefill_turn_starts[request_id] = prefill_turn_start
         _generations[request_id] = _next_generation
         _next_generation += 1
 
@@ -111,24 +137,39 @@ def get(request_id: str) -> Optional[List[int]]:
         return _registry.get(request_id)
 
 
-def get_with_generation(request_id: str) -> Optional[Tuple[int, List[int]]]:
-    """Returns (generation, selected_positions) as one atomic snapshot, or
-    None if there's no active selection -- see module docstring's
-    "Generation counter" section for why this must be one call, not
-    `get()` plus a separate generation lookup. Callers that only need the
-    positions (e.g. tests, or anything not doing per-turn caching) should
-    keep using plain `get()`."""
+def get_with_generation(
+    request_id: str,
+) -> Optional[Tuple[int, List[int], Optional[int]]]:
+    """Returns (generation, selected_positions, prefill_turn_start) as one
+    atomic snapshot, or None if there's no active selection -- see module
+    docstring's "Generation counter" section for why this must be one call,
+    not `get()` plus separate lookups. Callers that only need the positions
+    (e.g. tests, or anything not doing per-turn caching) should keep using
+    plain `get()`.
+
+    `prefill_turn_start` rides in this same snapshot rather than in an
+    accessor of its own for exactly the reason the generation does: it is
+    part of what a single `register()` call established, and reading it
+    separately would let a concurrent registration split one turn's
+    selection from another turn's turn-start -- the same class of bug the
+    generation counter was introduced to close, just narrower.
+    """
     with _lock:
         positions = _registry.get(request_id)
         if positions is None:
             return None
-        return _generations[request_id], positions
+        return (
+            _generations[request_id],
+            positions,
+            _prefill_turn_starts.get(request_id),
+        )
 
 
 def discard(request_id: str) -> None:
     with _lock:
         _registry.pop(request_id, None)
         _generations.pop(request_id, None)
+        _prefill_turn_starts.pop(request_id, None)
 
 
 def clear() -> None:
@@ -136,3 +177,4 @@ def clear() -> None:
     with _lock:
         _registry.clear()
         _generations.clear()
+        _prefill_turn_starts.clear()

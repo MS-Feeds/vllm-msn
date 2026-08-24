@@ -11,13 +11,47 @@ than turn 1's, consistent with genuine cross-turn KV persistence).
 Every token's KV entry is computed once and never discarded (the target
 session's own persistent cache, via the resumable-request mechanism); this
 runner restricts which of those already-resident entries actually
-participate in attention during DECODE steps only, per a selection the
-speculator (unchanged, `proposer.py`/`speculator_worker.py`) recomputes
-fresh every turn -- see `sparse_selection_registry.py`'s module docstring
-for why no position-translation layer is needed between the speculator's
-selection and this runner's own consumption of it (both track the same
-absolute, gapless conversation-ledger numbering, unlike the OTHER
-pipeline's physically-pruned, gap-containing prompts).
+participate in attention, per a selection the speculator (unchanged,
+`proposer.py`/`speculator_worker.py`) recomputes fresh every turn -- see
+`sparse_selection_registry.py`'s module docstring for why no
+position-translation layer is needed between the speculator's selection and
+this runner's own consumption of it (both track the same absolute, gapless
+conversation-ledger numbering, unlike the OTHER pipeline's
+physically-pruned, gap-containing prompts).
+
+## Two scopes: decode-only (default) and prefill+decode (opt-in)
+
+Which STEPS get restricted is decided per registration, by whether the
+driver passes a `prefill_turn_start` (see `sparse_selection_registry.
+register`):
+
+- **Decode-only** (`prefill_turn_start=None`, the default): only decode
+  steps are gathered. Each turn's own new query tokens prefill against the
+  full, unrestricted resident cache. This is the originally-shipped
+  behavior and what every published `SPARSE-k*`/`ORACLE-k*` row was
+  measured under, so it is what a driver that says nothing still gets.
+- **Prefill + decode** (`prefill_turn_start=<this turn's start position>`):
+  the turn's own prompt tokens additionally attend only to the selected
+  blocks of the pre-existing history, plus a contiguous force-kept tail
+  covering the turn's own tokens so far. See
+  `kv_cache_utils.compute_prefill_gather_view` for the mechanism and, in
+  particular, for the causal-mask invariant that makes a multi-token query
+  chunk legal against a compacted K/V view at all -- the reason this was
+  scoped out of the first pass rather than merely deferred.
+
+Turn 0 is dense under BOTH scopes, and not by special-casing: its
+`turn_start` is 0, so the force-kept tail spans everything and the gather
+degenerates to a no-op. That is the required answer, not a convenience --
+turn 0's prefill is where the context's KV is computed for the first time,
+and computing it under a restricted view would poison the persistent cache
+that every later turn's selection reads from.
+
+What does NOT change under either scope: `slot_mapping` is never patched,
+so every token's KV is still WRITTEN in full, at its true physical slot.
+The selection only ever masks reads. That is what keeps a token dropped at
+turn 2 genuinely re-selectable at turn 5, which is the whole premise of
+KEEP mode and the one thing the physically-pruned sibling pipeline cannot
+do.
 
 ## Why `_build_attention_metadata`, not `_prepare_inputs`
 
@@ -56,7 +90,13 @@ within the batched query tensor -- for a single decode step (always exactly
 1 new query token per request under this pipeline's own established
 one-in-flight-request scope, same convention `proposer.py`/`predict_
 scbench.py` already use elsewhere), this is unaffected by how much of the
-KEY/VALUE side (`block_table`/`seq_lens`) gets gathered.
+KEY/VALUE side (`block_table`/`seq_lens`) gets gathered. It stays unpatched
+under the prefill scope too, and for the same reason: it is a QUERY-side
+description, and gathering changes only the K/V side. What the multi-token
+query chunk DOES require of the gather is that the chunk's own tokens land
+at the tail of the compacted view, so bottom-right causal alignment still
+picks out the right keys -- enforced by `compute_prefill_gather_view`'s
+contiguous force-kept tail, documented there.
 
 `max_seq_len`, by contrast, DOES need patching, and originally wasn't --
 a real bug caught via `diagnose_h1_metadata.py` against real hardware,
@@ -422,27 +462,35 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             # get_with_generation(), not get() -- one atomic snapshot of
-            # (generation, positions) under a single lock, not two separate
-            # calls. See sparse_selection_registry.py's "Generation counter"
-            # section: reading these separately could race against a
-            # concurrent register() the same way the id()-based cache this
-            # replaced already did, just narrower.
+            # (generation, positions, prefill_turn_start) under a single
+            # lock, not three separate calls. See sparse_selection_
+            # registry.py's "Generation counter" section: reading these
+            # separately could race against a concurrent register() the
+            # same way the id()-based cache this replaced already did, just
+            # narrower.
             registered = sparse_selection_registry.get_with_generation(req_id)
             if registered is None:
                 continue  # no active selection for this request -- leave untouched
-            selection_generation, selected_positions = registered
+            selection_generation, selected_positions, prefill_turn_start = registered
 
             num_computed = int(num_computed_tokens_cpu[req_idx])
             num_prompt = int(num_prompt_tokens_cpu[req_idx])
-            if num_computed < num_prompt:
-                # Still prefilling this turn's own new query tokens --
-                # deliberately left at full, unrestricted attention (see
-                # module docstring's "Force-keep" section and the approved
-                # plan's decode-only scope decision). Only decode steps
-                # (num_computed >= num_prompt) get gathered. This guard is
-                # the ONE place `num_computed` is the right quantity to
-                # compare against -- everything below needs `step_seq_len`
-                # instead, see the next comment.
+            # `num_computed < num_prompt` is this file's canonical
+            # prefill/decode boundary (the same one every other probe in
+            # this directory uses). This is the ONE place `num_computed` is
+            # the right quantity to compare against -- everything below
+            # needs `step_seq_len` instead, see the comment further down.
+            is_prefill = num_computed < num_prompt
+            if is_prefill and prefill_turn_start is None:
+                # Decode-only scope: the default, and what every published
+                # SPARSE-k*/ORACLE-k* row was measured under. This turn's
+                # own new query tokens prefill at full, unrestricted
+                # attention over the whole resident cache. A driver opts
+                # into sparse prefill by passing `prefill_turn_start` to
+                # `register_sparse_selection`; see that method and
+                # `sparse_selection_registry.register`'s docstring for why
+                # the scope rides on the registration rather than on a
+                # process-wide mode flag.
                 continue
 
             # The step's TOTAL sequence length -- NOT `num_computed`. See
@@ -457,6 +505,11 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # drift from what the kernel would otherwise have been told.
             step_seq_len = self._step_seq_len(req_idx)
 
+            if is_prefill and not self._prefill_gather_applies(
+                prefill_turn_start, num_computed, step_seq_len
+            ):
+                continue
+
             t_override_start = time.time()
             # Read once per request, not once inside _compute_gathered_view
             # AND again below for block_table_width -- same "an arbitrary
@@ -464,6 +517,45 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # before, just consolidated to one lookup.
             any_layer_metadata = next(iter(attn_metadata.values()))
             full_block_table_row = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD)[req_idx]
+
+            if is_prefill:
+                # Prefill and decode need genuinely different views, not the
+                # same one with a different length plugged in -- see
+                # `kv_cache_utils.PrefillGatherView`'s docstring for why
+                # `BaseGatherView`'s `num_prompt`-centred stable/boundary
+                # split is not merely suboptimal but WRONG here (it would
+                # classify not-yet-written blocks as stable). The two share
+                # `_get_base_block_indices`'s cache underneath, since the
+                # selection's block-index set is the same set either way.
+                prefill_view = self._get_prefill_base_view(
+                    req_id, selected_positions, block_size, full_block_table_row,
+                    prefill_turn_start, selection_generation,
+                )
+                gathered = self._compute_prefill_gathered_view(
+                    base_view=prefill_view,
+                    full_block_table_row=full_block_table_row,
+                    block_size=block_size,
+                    seq_len=step_seq_len,
+                )
+                # Same "record before the early-out" reasoning as the decode
+                # accumulator below: a `None` gather is a DENSE chunk, not a
+                # free one, and must be charged at its full length or the
+                # measured prefill FLOPs understate what the GPU did.
+                self._accumulate_prefill_step(
+                    req_id,
+                    step_seq_len - num_computed,
+                    step_seq_len if gathered is None else gathered[1],
+                )
+                if gathered is None:
+                    continue
+                gathered_block_table_row, gathered_seq_len = gathered
+                any_patched = True
+                self._apply_gathered_view(
+                    attn_metadata, any_layer_metadata, req_idx,
+                    gathered_block_table_row, gathered_seq_len,
+                )
+                self._accumulate_override_timing(req_id, time.time() - t_override_start)
+                continue
 
             base_view = self._get_base_gather_view(
                 req_id, selected_positions, block_size, full_block_table_row, num_prompt,
@@ -495,36 +587,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 continue
             gathered_block_table_row, gathered_seq_len = gathered
             any_patched = True
-
-            # Pad to the full block-table row width ONCE here, not inside
-            # the per-layer loop below -- real hardware timing showed
-            # `_patch_layer_metadata`'s per-layer cost (previously 2 writes:
-            # gathered-row + zero-pad) adding up across every layer (32 for
-            # Llama-3.1-8B) on EVERY decode step, under enforce_eager=True
-            # (no CUDA-graph batching to amortize the per-op dispatch cost)
-            # -- a real, measured 0.5-1s/turn overhead vs. baseline, not
-            # theoretical. block_table's column width is already assumed
-            # uniform across layers elsewhere, so building the padded row
-            # once here and writing it whole into each layer's own tensor
-            # is safe under the same assumption, and cuts the hot per-layer
-            # loop from 2 GPU ops to 1.
-            block_table_width = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD).shape[1]
-            num_gathered = gathered_block_table_row.shape[0]
-            if block_table_width > num_gathered:
-                padded_block_table_row = torch.zeros(
-                    block_table_width,
-                    dtype=gathered_block_table_row.dtype,
-                    device=gathered_block_table_row.device,
-                )
-                padded_block_table_row[:num_gathered] = gathered_block_table_row
-            else:
-                padded_block_table_row = gathered_block_table_row
-
-            for layer_name, layer_metadata in attn_metadata.items():
-                self._patch_layer_metadata(
-                    layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
-                )
-
+            self._apply_gathered_view(
+                attn_metadata, any_layer_metadata, req_idx,
+                gathered_block_table_row, gathered_seq_len,
+            )
             self._accumulate_override_timing(req_id, time.time() - t_override_start)
 
         if any_patched:
@@ -572,6 +638,196 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             if hasattr(any_layer_metadata, _SCHEDULER_METADATA_FIELD):
                 for layer_metadata in attn_metadata.values():
                     setattr(layer_metadata, _SCHEDULER_METADATA_FIELD, None)
+
+    def _apply_gathered_view(
+        self, attn_metadata, any_layer_metadata, req_idx: int,
+        gathered_block_table_row, gathered_seq_len: int,
+    ) -> None:
+        """Write one request's gathered `(block_table_row, seq_len)` into
+        every layer's metadata. Shared verbatim by the prefill and decode
+        branches of `_apply_sparse_attention_overrides` -- the two differ
+        entirely in HOW the view is computed and not at all in how it is
+        installed, and factoring this out is what keeps that true (a second
+        copy would be the obvious place for the two paths to drift on, say,
+        the padding convention).
+
+        Pads to the full block-table row width ONCE here, not inside the
+        per-layer loop -- real hardware timing showed
+        `_patch_layer_metadata`'s per-layer cost (previously 2 writes:
+        gathered-row + zero-pad) adding up across every layer (32 for
+        Llama-3.1-8B) on EVERY decode step, under `enforce_eager=True` (no
+        CUDA-graph batching to amortize the per-op dispatch cost) -- a
+        real, measured 0.5-1s/turn overhead vs. baseline, not theoretical.
+        `block_table`'s column width is already assumed uniform across
+        layers elsewhere, so building the padded row once and writing it
+        whole into each layer's own tensor is safe under the same
+        assumption, and cuts the hot per-layer loop from 2 GPU ops to 1.
+        """
+        block_table_width = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD).shape[1]
+        num_gathered = gathered_block_table_row.shape[0]
+        if block_table_width > num_gathered:
+            padded_block_table_row = torch.zeros(
+                block_table_width,
+                dtype=gathered_block_table_row.dtype,
+                device=gathered_block_table_row.device,
+            )
+            padded_block_table_row[:num_gathered] = gathered_block_table_row
+        else:
+            padded_block_table_row = gathered_block_table_row
+
+        for layer_metadata in attn_metadata.values():
+            self._patch_layer_metadata(
+                layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
+            )
+
+    @staticmethod
+    def _prefill_gather_applies(
+        prefill_turn_start: int, num_computed: int, seq_len: int
+    ) -> bool:
+        """Whether a prefill chunk may legally be gathered at all.
+
+        Two bail-outs, both leaving the chunk fully dense (which is always
+        a correct answer -- just a more expensive one):
+
+        1. `num_computed < prefill_turn_start`: the engine is (re)computing
+           tokens from BEFORE this turn began. That happens if a session
+           resumption misses the prefix cache and earlier history has to be
+           recomputed. Those tokens' KV is being written for the first
+           time, and writing it under a restricted view would poison the
+           persistent cache every later turn's selection reads from -- the
+           same reason turn 0 must stay dense (see
+           `kv_cache_utils.compute_prefill_gather_view`'s docstring). The
+           tail-contiguity invariant would not hold for them either.
+        2. `seq_len <= prefill_turn_start`: nothing of this turn is in the
+           chunk yet, so there is no tail to force-keep and the causal
+           alignment argument has nothing to stand on.
+
+        Neither is expected in the steady state; both are cheap to check
+        and silently wrong to skip.
+        """
+        if num_computed < prefill_turn_start:
+            return False
+        if seq_len <= prefill_turn_start:
+            return False
+        return True
+
+    def _prefill_base_view_cache(self) -> Dict[str, tuple]:
+        # Same lazy-init / generation-keyed-invalidation reasoning as
+        # _base_gather_view_cache above, for the prefill counterpart. A
+        # turn has far fewer prefill chunks than decode steps, so this
+        # matters less than the decode caches do -- but the cached quantity
+        # is O(len(selection)) to build (a filter + sort + tensor gather
+        # over tens of thousands of positions at SCBench scale) and the
+        # chunk count is not bounded by anything this module controls, so
+        # rebuilding it per chunk would be the same mistake the decode path
+        # already had to have fixed.
+        if not hasattr(self, "_sparse_prefill_base_view_cache"):
+            self._sparse_prefill_base_view_cache: Dict[str, tuple] = {}
+        return self._sparse_prefill_base_view_cache
+
+    def _get_prefill_base_view(
+        self,
+        req_id: str,
+        selected_positions: List[int],
+        block_size: int,
+        full_block_table_row,
+        prefill_turn_start: int,
+        selection_generation: int,
+    ):
+        """Caches `kv_cache_utils.compute_prefill_base_view`'s result per
+        request, invalidated by the same `selection_generation` signal the
+        decode caches use (see `sparse_selection_registry.py`'s "Generation
+        counter" section for why not `id()`).
+
+        Safe to key on the generation alone, without also keying on
+        `prefill_turn_start` or the block-table row's contents: the
+        turn-start is registered in the SAME `register()` call the
+        generation comes from, so it cannot change without the generation
+        changing, and every block this caches is strictly below
+        `first_tail_block` -- fully written before this turn started, and
+        never rewritten by it.
+        """
+        from .kv_cache_utils import compute_prefill_base_view
+
+        cache = self._prefill_base_view_cache()
+        cached = cache.get(req_id)
+        if cached is not None and cached[0] == selection_generation:
+            return cached[1]
+        base_block_indices = self._get_base_block_indices(
+            req_id, selected_positions, block_size, selection_generation
+        )
+        prefill_view = compute_prefill_base_view(
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            base_block_indices=base_block_indices,
+            turn_start=prefill_turn_start,
+        )
+        cache[req_id] = (selection_generation, prefill_view)
+        return prefill_view
+
+    def _compute_prefill_gathered_view(
+        self,
+        base_view,
+        full_block_table_row,
+        block_size: int,
+        seq_len: int,
+    ) -> Optional[tuple]:
+        """Thin wrapper delegating to `kv_cache_utils.compute_prefill_
+        gather_view` -- factored out for the same reason
+        `_compute_gathered_view` is: so the block-selection arithmetic (and
+        in particular the causal-mask invariant documented on that
+        function) is unit-testable without a live `GPUModelRunner`."""
+        from .kv_cache_utils import compute_prefill_gather_view
+
+        return compute_prefill_gather_view(
+            base_view=base_view,
+            full_block_table_row=full_block_table_row,
+            block_size=block_size,
+            seq_len=seq_len,
+        )
+
+    def _prefill_steps_accum(self) -> Dict[str, List[Tuple[int, int]]]:
+        # Same lazily-initialized, req_id-keyed, pop-and-reset shape as
+        # _attended_lens_accum above. Kept SEPARATE from it rather than
+        # folded in: `pop_attended_lens` feeds `flops_model.target_decode_
+        # flops`, which charges one linear+lm_head row per entry, and a
+        # prefill chunk is neither one token nor one sampled row. Mixing
+        # them would silently inflate the decode column by whatever the
+        # prefill chunks happened to be.
+        if not hasattr(self, "_sparse_prefill_steps_accum"):
+            self._sparse_prefill_steps_accum: Dict[str, List[Tuple[int, int]]] = {}
+        return self._sparse_prefill_steps_accum
+
+    def _accumulate_prefill_step(
+        self, req_id: str, num_query_tokens: int, attended_len: int
+    ) -> None:
+        self._prefill_steps_accum().setdefault(req_id, []).append(
+            (int(num_query_tokens), int(attended_len))
+        )
+
+    def pop_prefill_steps(self, request_id: str) -> List[Tuple[int, int]]:
+        """Returns this turn's `(num_query_tokens, attended_len)` per
+        PREFILL chunk for `request_id` (one entry per chunk, in order),
+        then resets it. The prefill counterpart of `pop_attended_lens`, and
+        the FLOP driver for `flops_model.py::target_sparse_prefill_flops`.
+
+        Empty unless the driver opted into sparse prefill by registering a
+        `prefill_turn_start` -- under the default decode-only scope this
+        method never sees a chunk, and the driver's own analytic
+        `target_prefill_flops` remains the right model (nothing is
+        restricted, so nothing needs measuring).
+
+        `attended_len` is block-PADDED, exactly as `pop_attended_lens`
+        documents for decode: it is what the kernel was told to read, not a
+        token-exact ideal. `num_query_tokens` is the chunk's own scheduled
+        token count (`seq_len - num_computed`), which is what makes the
+        pair enough to reconstruct a chunk's causal key-visit count --
+        `attn_prefill_flops(n_q, attended_len - n_q)`, valid because the
+        gather's tail invariant puts this chunk's own tokens at the end of
+        the gathered view (see `kv_cache_utils.compute_prefill_gather_
+        view`'s "Why the tail must be contiguous").
+        """
+        return self._prefill_steps_accum().pop(request_id, [])
 
     def _override_timing_accum(self) -> Dict[str, tuple]:
         # Lazily-initialized, same reasoning as _base_block_indices_cache
@@ -644,10 +900,13 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         block_size)` must hold step for step.
 
         Prefill steps are absent by construction -- `_apply_sparse_
-        attention_overrides` `continue`s on `num_computed < num_prompt`
-        before ever reaching the gather, so this only ever sees genuine
-        decode steps (the same prefill/decode boundary every other probe in
-        this directory uses).
+        attention_overrides` branches on `num_computed < num_prompt` before
+        reaching this accumulator, so this only ever sees genuine decode
+        steps (the same prefill/decode boundary every other probe in this
+        directory uses). Under the opt-in prefill scope those chunks are
+        recorded by `pop_prefill_steps` instead, deliberately kept separate
+        so `target_decode_flops` is never handed a multi-token chunk to
+        charge as a single decode row.
 
         Costs one list append per decode step and no GPU sync -- negligible
         next to the per-layer metadata patching already in that loop, so
@@ -785,14 +1044,28 @@ class SparseTargetWorker(Worker):
         super().init_device()
         self.model_runner = SparseTargetGPUModelRunner(self.vllm_config, self.device)
 
-    def register_sparse_selection(self, request_id: str, selected_positions: List[int]) -> None:
+    def register_sparse_selection(
+        self,
+        request_id: str,
+        selected_positions: List[int],
+        prefill_turn_start: Optional[int] = None,
+    ) -> None:
         """RPC-callable via `llm_engine.collective_rpc("register_sparse_selection",
         args=(request_id, selected_positions))` -- called by the driver
         BEFORE that turn's query update is submitted (see
         `sparse_selection_registry.py`'s module docstring for why this
         ordering, mirroring `pruner.py`'s identical "register before
-        add_request" fix, is load-bearing here too)."""
-        sparse_selection_registry.register(request_id, selected_positions)
+        add_request" fix, is load-bearing here too).
+
+        `prefill_turn_start` is optional and defaults to the original
+        decode-only scope; pass this turn's own start position to
+        additionally restrict its PREFILL. See
+        `sparse_selection_registry.register`'s docstring for the full
+        contract, and `kv_cache_utils.compute_prefill_gather_view`'s for
+        what the restriction actually does."""
+        sparse_selection_registry.register(
+            request_id, selected_positions, prefill_turn_start
+        )
 
     def discard_sparse_selection(self, request_id: str) -> None:
         sparse_selection_registry.discard(request_id)
@@ -806,3 +1079,8 @@ class SparseTargetWorker(Worker):
         """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
         pop_attended_lens`'s docstring for what this measures and why."""
         return self.model_runner.pop_attended_lens(request_id)
+
+    def pop_prefill_steps(self, request_id: str) -> List[Tuple[int, int]]:
+        """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
+        pop_prefill_steps`'s docstring for what this measures and why."""
+        return self.model_runner.pop_prefill_steps(request_id)

@@ -362,20 +362,39 @@ adopted instead) lives in the approved plan this section summarizes.
    than turn 1's, confirming genuine reuse, not recomputation;
    `num_cached_tokens` was checked and found NOT meaningful for session
    continuations, a scheduler-internal gating detail, not a bug).
-2. **Decode-only sparse attention via block-table gathering**: the target
-   runner (`vllm_patch/sparse_target_runner.py`) overrides
+2. **Sparse attention via block-table gathering**: the target runner
+   (`vllm_patch/sparse_target_runner.py`) overrides
    `_build_attention_metadata()` to substitute a gathered
    `(block_table, seq_lens)` view -- reusing the STOCK, unmodified
    attention kernel underneath, the same technique
    `make_local_attention_virtual_batches()` already uses for chunked-local
-   attention. Correct for single-token decode steps only (RoPE is baked
-   into K at write time, so gathered vectors carry correct rotation
-   regardless of where they land in the shrunk view); each turn's own new
-   query tokens always prefill with full, unrestricted attention over the
-   whole resident cache. Verified on real hardware via a needle-in-a-
-   haystack behavioral test (`validate_sparse_attention.py`, all 3 steps
-   passed: full-attention baseline finds the needle, excluding its block
-   loses it, re-including a different partial selection recovers it).
+   attention. RoPE needs no adjustment either way (it is baked into K at
+   write time, so gathered vectors carry correct rotation regardless of
+   where they land in the shrunk view). Verified on real hardware via a
+   needle-in-a-haystack behavioral test (`validate_sparse_attention.py`,
+   all 3 steps passed: full-attention baseline finds the needle, excluding
+   its block loses it, re-including a different partial selection recovers
+   it).
+
+   **Scope was originally decode-only, and is now a per-run choice.** The
+   first pass restricted decode steps only -- each turn's own new query
+   tokens prefilled with full, unrestricted attention over the whole
+   resident cache -- because a single-token decode step needs nothing said
+   about the ORDER of the compacted view, while a multi-token prefill
+   chunk does: FlashAttention aligns its causal mask bottom-right, so the
+   chunk's own tokens must be the final entries of the gathered view or
+   every query in it silently reads the wrong keys. `--sparse-prefill`
+   opts into the prefill scope, satisfying that invariant by force-keeping
+   a CONTIGUOUS tail from the turn's start position onward (see
+   `vllm_patch/kv_cache_utils.py::compute_prefill_gather_view`). Turn 0
+   stays dense under both scopes -- restricting the prefill that first
+   computes the context's KV would poison the persistent cache every later
+   turn's selection reads from. Decode-only remains the DEFAULT: every
+   published `SPARSE-k*`/`ORACLE-k*` row was measured under it, and the
+   two scopes measure structurally different things (under
+   `--sparse-prefill` the prefill stage joins the shrinking side, so
+   whether the decode saving alone can pay for the speculator is no longer
+   the question the row answers).
 3. **Block-level granularity only** (`16`/`32`/`64`) -- `token`-level
    sparse selection would need a genuine custom kernel (DeepSeek's sparse
    MLA path is architecturally similar but MQA/MLA-specific, not portable

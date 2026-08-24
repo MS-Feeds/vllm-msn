@@ -146,6 +146,7 @@ from flops_model import (
     speculator_turn_flops,
     target_decode_flops,
     target_prefill_flops,
+    target_sparse_prefill_flops,
 )
 
 sys.path.insert(0, str(Path(__file__).parent))  # for `vllm_patch` imports
@@ -1378,6 +1379,7 @@ def run_sparse_attention(
     keep_mode,
     speculator_max_num_batched_tokens,
     target_max_num_batched_tokens,
+    sparse_prefill: bool = False,
 ) -> tuple[list[dict], dict]:
     """SPARSE-k*-g* **and ORACLE-k***: persistent full-KV-cache target
     session, scorer-selected sparse attention over it during decode (see
@@ -1421,6 +1423,30 @@ def run_sparse_attention(
        `LedgerToTargetPositionMap`'s bookkeeping. Golden answers are only
        used for grading (`grade_scbench.py` reads the dataset directly),
        never fed into this driver's own state.
+
+    **`sparse_prefill` (default False) chooses the SCOPE of the sparsity**,
+    and is the one knob that changes what this row actually measures:
+
+    - `False` -- decode-only. Each turn's own new tokens prefill against
+      the full resident cache; only decode attention is restricted. Every
+      published `SPARSE-k*`/`ORACLE-k*` row was produced this way, which is
+      why it stays the default rather than the better-sounding option.
+    - `True` -- this turn's prefill is additionally restricted to the
+      selected blocks of prior history (plus a contiguous force-kept tail
+      covering the turn's own tokens). Passed through to the worker as
+      `register_sparse_selection`'s `prefill_turn_start`, using the
+      `target_resident_len` this loop already tracks. Turn 0 is dense
+      regardless -- `turn_start == 0` makes the gather degenerate, which is
+      required, not incidental: turn 0's prefill is where the context's KV
+      is computed for the first time, and computing it under a restricted
+      view would poison the persistent cache every later turn reads from
+      (see `vllm_patch/kv_cache_utils.py::compute_prefill_gather_view`).
+
+    Under `sparse_prefill=True` the turn's `target_prefill` FLOPs come from
+    `target_sparse_prefill_flops` over per-chunk measurements popped from
+    the worker, not from the analytic `target_prefill_flops` -- the
+    analytic model assumes every new token attends every cached token,
+    which is precisely the assumption the prefill gather breaks.
 
     A `LedgerToTargetPositionMap` per conversation translates
     `conversation_state`'s pure-content ledger positions into the target
@@ -1615,9 +1641,20 @@ def run_sparse_attention(
                 set(position_map.translate(p) for p in result.kept_positions)
                 | set(position_map.wrapper_target_positions())
             )
+            # `target_resident_len` is exactly the absolute position at
+            # which this turn's delta begins -- the same quantity the FLOP
+            # call below already uses as `num_cached`, reused here rather
+            # than re-derived so the two can't disagree about where the
+            # turn starts. Passed as None under the default decode-only
+            # scope, which is what makes that path byte-identical to before
+            # this option existed (see `register_sparse_selection`).
             llm.llm_engine.collective_rpc(
                 "register_sparse_selection",
-                args=(target_request_id, translated_positions),
+                args=(
+                    target_request_id,
+                    translated_positions,
+                    target_resident_len if sparse_prefill else None,
+                ),
             )
 
             # Shared with `run_baseline` so M000 and SPARSE submit the same
@@ -1677,21 +1714,35 @@ def run_sparse_attention(
             attended_lens = llm.llm_engine.collective_rpc(
                 "pop_attended_lens", args=(target_request_id,),
             )[0]
-            # attended_lens is recorded on a strict SUPERSET of the steps
-            # override timing is: it's appended before the `gathered is
-            # None` early-out (dense-fallback steps are real attention
-            # work), while the timing accumulator only fires on steps that
+            # Per-prefill-chunk (num_query_tokens, attended_len), the
+            # prefill counterpart of attended_lens. Always popped, not
+            # gated on `sparse_prefill`: under the decode-only scope the
+            # worker never records a chunk, so this comes back empty and
+            # the analytic prefill model below stays in charge. Popping
+            # unconditionally means a stale accumulator can never survive
+            # into a later turn if the scope is ever toggled mid-run.
+            # See sparse_target_runner.py::pop_prefill_steps.
+            prefill_steps = llm.llm_engine.collective_rpc(
+                "pop_prefill_steps", args=(target_request_id,),
+            )[0]
+            # attended_lens (+ prefill_steps, when the prefill scope is on)
+            # is recorded on a strict SUPERSET of the steps override timing
+            # is: both are appended before the `gathered is None`
+            # early-out (dense-fallback steps are real attention work),
+            # while the timing accumulator only fires on steps that
             # actually patched metadata. So `>=` is the invariant, not
             # equality -- at keep_rate=1.0 every step is a dense fallback
             # and override_steps is legitimately 0 while attended_lens is
-            # full. Fewer attended samples than patched steps, on the other
-            # hand, means the accumulator is missing steps it should have
-            # seen, and the decode FLOPs below are under-counted.
-            if len(attended_lens) < override_steps:
+            # full. Fewer measured steps than patched steps, on the other
+            # hand, means an accumulator is missing steps it should have
+            # seen, and the FLOPs below are under-counted.
+            num_measured_steps = len(attended_lens) + len(prefill_steps)
+            if num_measured_steps < override_steps:
                 progress.write(
                     f"[predict_scbench] WARNING {conv['id']!r} turn "
-                    f"{turn_idx}: attended-length samples ({len(attended_lens)}) "
-                    f"< metadata-patch steps ({override_steps}) -- decode "
+                    f"{turn_idx}: measured steps ({num_measured_steps} = "
+                    f"{len(attended_lens)} decode + {len(prefill_steps)} "
+                    f"prefill) < metadata-patch steps ({override_steps}) -- "
                     f"FLOPs for this turn are under-counted."
                 )
             llm.llm_engine.collective_rpc(
@@ -1735,24 +1786,37 @@ def run_sparse_attention(
 
                 # The structural asymmetry this row exists to expose: the
                 # speculator is paid for IN FULL (same cost as the
-                # SpecPrefill row), the target's PREFILL is fully dense
-                # (the gather is decode-only -- sparse_target_runner.py
-                # `continue`s while num_computed < num_prompt), and only
+                # SpecPrefill row), and -- under the default decode-only
+                # scope -- the target's PREFILL is fully dense while only
                 # decode attention shrinks. Reading these three stages
                 # against each other is what tells you whether the decode
-                # saving can ever pay for the speculator at a given
-                # context length.
+                # saving can ever pay for the speculator at a given context
+                # length; under `--sparse-prefill` the prefill stage joins
+                # the shrinking side and the arithmetic changes completely,
+                # which is exactly why the two scopes must stay
+                # distinguishable in the output rather than silently
+                # sharing a row name.
                 bd = speculator_turn_flops(
                     spec_flop_cfg,
                     pool_len=result.orig_len,
                     num_cached=result.num_cached_tokens,
                     look_ahead=result.actual_look_ahead_cnt,
                 )
-                bd.target_prefill = target_prefill_flops(
-                    target_flop_cfg,
-                    prompt_len=target_resident_len + len(delta_ids),
-                    num_cached=target_resident_len,
-                )
+                if prefill_steps:
+                    # Measured per chunk, for the same reason the decode
+                    # column is measured per step: once the gather fires,
+                    # what the kernel read is decided by how the selection
+                    # lands on block boundaries, and no token-count formula
+                    # driver-side can reconstruct it.
+                    bd.target_prefill = target_sparse_prefill_flops(
+                        target_flop_cfg, prefill_steps
+                    )
+                else:
+                    bd.target_prefill = target_prefill_flops(
+                        target_flop_cfg,
+                        prompt_len=target_resident_len + len(delta_ids),
+                        num_cached=target_resident_len,
+                    )
                 # Measured per step, not derived -- these are the
                 # block-padded lengths the kernel was actually handed.
                 bd.target_decode = target_decode_flops(target_flop_cfg, attended_lens)
@@ -1763,6 +1827,12 @@ def run_sparse_attention(
                     spec_look_ahead=result.actual_look_ahead_cnt,
                     target_resident_len=target_resident_len,
                     target_delta_len=len(delta_ids),
+                    sparse_prefill=sparse_prefill,
+                    prefill_chunks=len(prefill_steps),
+                    prefill_attended_len_mean=(
+                        sum(a for _, a in prefill_steps) / len(prefill_steps)
+                        if prefill_steps else 0
+                    ),
                     decode_steps=len(attended_lens),
                     decode_attended_len_mean=(
                         sum(attended_lens) / len(attended_lens) if attended_lens else 0
@@ -2241,6 +2311,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 predictions, stats = run_sparse_attention(
                     llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
+                    sparse_prefill=args.sparse_prefill,
                 )
             else:
                 predictions, stats = run_specprefill(
@@ -2309,6 +2380,17 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             # show -- exclude it, per turn_idx, for every conversation (not
             # just the first one processed).
             turn_times_excl_first = [t for idx, t in stats["turn_elapsed"] if idx > 0]
+            # Same "append to label, don't add a column" convention the
+            # scorer identity below already follows, for the same reason:
+            # a `--sparse-prefill` run and a default run share an exp_id
+            # but measure structurally different things (prefill dense vs.
+            # gathered), and nothing else written here would tell them
+            # apart afterwards. Empty for every non-sparse mode, so no
+            # existing row's label changes.
+            scope_tag = (
+                " [prefill=sparse]"
+                if args.sparse_prefill and mode in ("sparse", "oracle") else ""
+            )
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "exp_id": exp_id,
@@ -2326,7 +2408,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                        else "")
                     + "]"
                     if scorer_model else label
-                ),
+                ) + scope_tag,
                 "mode": mode, "keep_mode": keep_mode,
                 "keep_percentage": keep_percentage, "kv_granularity": granularity,
                 "chunk_size": GRANULARITIES.get(granularity, {}).get("chunk_size") if granularity else None,
@@ -2575,6 +2657,20 @@ def main() -> None:
              "determines whether a huge SCBench conversation's turn can be "
              "SCORED at all, before any pruning shrinks what the target "
              "sees.",
+    )
+    parser.add_argument(
+        "--sparse-prefill", action="store_true",
+        help="SPARSE/ORACLE rows only: also restrict each turn's PREFILL to "
+             "the speculator's selected blocks, instead of the default "
+             "decode-only scope. Off by default because every published "
+             "SPARSE-k*/ORACLE-k* row was measured under decode-only, and a "
+             "silent change of scope would make old and new rows "
+             "incomparable while looking identical in the CSV -- rows from "
+             "this mode carry a `[prefill=sparse]` tag in `label`, and each "
+             "turn's JSONL `flop_inputs` records it too. "
+             "Turn 0 stays dense either way (its prefill is where the "
+             "context's KV is first computed; see vllm_patch/"
+             "kv_cache_utils.py::compute_prefill_gather_view).",
     )
     parser.add_argument("--max-tokens", type=int, default=64,
                          help="Generation cap per turn.")

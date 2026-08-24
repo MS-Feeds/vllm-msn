@@ -573,6 +573,179 @@ def compute_sparse_gather_view_incremental(
     return gathered_block_table_row, gathered_seq_len
 
 
+@dataclass
+class PrefillGatherView:
+    """Per-turn precomputation for `compute_prefill_gather_view` -- the
+    PREFILL counterpart of `BaseGatherView`, and deliberately a separate
+    type rather than a reuse of it.
+
+    `BaseGatherView` splits the selection around
+    `boundary_block = num_prompt // block_size`, which for a decode step is
+    the block currently receiving generated tokens. During a PREFILL chunk
+    that same quantity points past the end of the chunk entirely
+    (`num_prompt` is the cumulative prompt length INCLUDING the whole
+    delta, while `seq_len` has only reached this chunk's end), so its
+    stable/boundary/overflow partition is meaningless here: `stable_blocks`
+    would happily include blocks that are not yet written, and the
+    per-step range check would fire on `boundary_block` itself. Hence a
+    separate view whose split point is the TURN START, not `num_prompt`.
+
+    Built ONCE per turn by `compute_prefill_base_view` and reused across
+    every prefill chunk of that turn (`sparse_target_runner.py` caches it
+    on the same `selection_generation` signal the decode views use)."""
+
+    first_tail_block: int  # turn_start // block_size -- the first block spanned by THIS turn's own new tokens
+    historical_blocks: List[int]  # sorted, all strictly < first_tail_block -- selected, already fully written, occupancy fixed
+    historical_rows: torch.Tensor  # full_block_table_row[historical_blocks], gathered ONCE
+    historical_seq_len: int  # len(historical_blocks) * block_size -- every one is fully occupied by construction
+
+
+def compute_prefill_base_view(
+    full_block_table_row: torch.Tensor,
+    block_size: int,
+    base_block_indices: Set[int],
+    turn_start: int,
+) -> PrefillGatherView:
+    """Per-turn half of `compute_prefill_gather_view`'s work.
+
+    `turn_start` is the absolute position at which THIS turn's own new
+    tokens begin -- i.e. the target session's resident length just before
+    the turn's delta was submitted, supplied by the driver at registration
+    time (`sparse_selection_registry.register`'s `prefill_turn_start`).
+    The runner cannot derive it: it sees only `num_computed` (which has
+    already advanced past `turn_start` on every chunk after the first) and
+    `num_prompt` (which is the END of the delta, not its start).
+
+    Selection blocks at or above `first_tail_block` are dropped here rather
+    than kept: they cover this turn's own delta positions, which
+    `compute_prefill_gather_view` force-includes wholesale anyway (see its
+    docstring's "Why the tail must be contiguous"). Dropping them is what
+    makes the remaining `historical_blocks` provably safe to gather and
+    cache -- every one is strictly below
+    `first_tail_block <= (seq_len - 1) // block_size`, hence fully written
+    and fully occupied, for every chunk of this turn.
+    """
+    first_tail_block = turn_start // block_size
+    historical_blocks = sorted(b for b in base_block_indices if b < first_tail_block)
+
+    if historical_blocks:
+        historical_block_tensor = torch.tensor(
+            historical_blocks, dtype=torch.int64, device=full_block_table_row.device
+        )
+        historical_rows = full_block_table_row[historical_block_tensor].clone()
+    else:
+        historical_rows = full_block_table_row[:0].clone()
+
+    return PrefillGatherView(
+        first_tail_block=first_tail_block,
+        historical_blocks=historical_blocks,
+        historical_rows=historical_rows,
+        historical_seq_len=len(historical_blocks) * block_size,
+    )
+
+
+def compute_prefill_gather_view(
+    base_view: PrefillGatherView,
+    full_block_table_row: torch.Tensor,
+    block_size: int,
+    seq_len: int,
+) -> Optional[Tuple[torch.Tensor, int]]:
+    """Restrict a PREFILL chunk's K/V side to the speculator's selection.
+
+    Same contract/return value as `compute_sparse_gather_view_incremental`
+    -- `(gathered_block_table_row, gathered_seq_len)`, or `None` for the
+    degenerate "selection already covers every resident block" case that
+    the caller should leave dense.
+
+    Args:
+        base_view: this turn's cached `PrefillGatherView`.
+        full_block_table_row: this request's real block-table row.
+        block_size: KV block size.
+        seq_len: this chunk's TOTAL sequence length (`num_computed_tokens +
+            num_scheduled_tokens`), exactly the same contract as
+            `compute_sparse_gather_view`'s parameter of the same name.
+
+    ## Why the tail must be contiguous (the causal-mask invariant)
+
+    Every block from `first_tail_block` through the last written block is
+    force-included, unconditionally and CONTIGUOUSLY -- not just the ones
+    the selection happens to name. That is not over-caution, it is what
+    makes the gathered view legal input to a causal kernel at all.
+
+    FlashAttention masks a chunk of `n_q` query tokens against `L` keys
+    bottom-right-aligned: query `i` may attend key indices
+    `[0, L - n_q + i]`. The gathered view is a COMPACTED renumbering of the
+    real K/V stream, so that arithmetic is only correct if the chunk's own
+    `n_q` tokens are the final `n_q` entries of the view, in order. They
+    are, given a contiguous tail: this chunk occupies real positions
+    `[seq_len - n_q, seq_len)`, the tail covers real positions
+    `[first_tail_block * block_size, seq_len)` with no holes, and
+    `first_tail_block * block_size <= turn_start <= seq_len - n_q`. Punch
+    one hole in that tail -- by honoring the selection inside it -- and
+    every query in the chunk silently attends the wrong keys.
+
+    The same contiguity is what keeps this turn's earlier prefill chunks
+    visible to its later ones, which they must be: a query token that
+    cannot see the first half of its own question is not a cheaper
+    computation, it is a different one.
+
+    RoPE needs no adjustment here for the same reason it needs none on the
+    decode path (`sparse_target_runner.py`'s module docstring): rotation is
+    baked into K at write time, and the query's own position comes from
+    `self.positions`, which this mechanism never touches.
+
+    ## Turn 0 degenerates to dense, by construction
+
+    At turn 0 `turn_start == 0`, so `first_tail_block == 0` and the tail is
+    every block that exists -- `total_selected == num_full_blocks_present`
+    and this returns `None`. That is the correct answer rather than a
+    special case worth writing: turn 0's prefill is where the context's KV
+    is COMPUTED for the first time, and computing it under a restricted
+    view would poison the persistent cache that every later turn's
+    selection reads from.
+    """
+    if seq_len <= 0:
+        return None
+
+    num_full_blocks_present = -(-seq_len // block_size)  # ceil div
+    if base_view.first_tail_block >= num_full_blocks_present:
+        raise ValueError(
+            f"prefill turn-start block {base_view.first_tail_block} is at or "
+            f"beyond the number of blocks actually allocated so far "
+            f"({num_full_blocks_present}, for seq_len={seq_len} tokens at "
+            f"block_size={block_size}) -- the registered prefill_turn_start "
+            f"must lie inside this request's own already-submitted stream. A "
+            f"turn_start past it means the driver's resident-length tracking "
+            f"has drifted from the engine's, and gathering on it would read "
+            f"unwritten (or another request's) physical blocks."
+        )
+
+    tail_blocks = list(range(base_view.first_tail_block, num_full_blocks_present))
+    total_selected = len(base_view.historical_blocks) + len(tail_blocks)
+    if total_selected == num_full_blocks_present:
+        # Degenerate: the selection plus the force-kept tail already span
+        # every resident block (turn 0 always lands here -- see docstring).
+        return None
+
+    tail_block_tensor = torch.tensor(
+        tail_blocks, dtype=torch.int64, device=full_block_table_row.device
+    )
+    tail_rows = full_block_table_row[tail_block_tensor].clone()
+    gathered_block_table_row = torch.cat([base_view.historical_rows, tail_rows])
+
+    # The tail is contiguous and ends at the last written block, so exactly
+    # one gathered block (the final one) can be partially occupied.
+    last_real_block_index = (seq_len - 1) // block_size
+    last_real_block_occupancy = seq_len - last_real_block_index * block_size
+    gathered_seq_len = (
+        base_view.historical_seq_len
+        + (len(tail_blocks) - 1) * block_size
+        + last_real_block_occupancy
+    )
+
+    return gathered_block_table_row, gathered_seq_len
+
+
 def retrieve_keys_per_sample(
     attn_layer,
     block_size: int,

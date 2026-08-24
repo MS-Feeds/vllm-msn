@@ -59,6 +59,8 @@ from vllm_patch.kv_cache_utils import (
     _find_kv_split_dim,
     block_indices_from_positions,
     compute_base_gather_view,
+    compute_prefill_base_view,
+    compute_prefill_gather_view,
     compute_sparse_gather_view,
     compute_sparse_gather_view_incremental,
     gather_keys_for_slots,
@@ -96,6 +98,7 @@ from flops_model import (
     speculator_turn_flops,
     target_decode_flops,
     target_prefill_flops,
+    target_sparse_prefill_flops,
 )
 
 
@@ -1182,10 +1185,14 @@ def test_apply_overrides_result_lets_the_kernel_reach_the_decoding_token():
 
 def test_apply_overrides_leaves_prefill_steps_untouched():
     """`num_computed_tokens < num_prompt_tokens` means this turn's own
-    query is still being prefilled -- deliberately full attention. The
-    guard must key on `num_computed_tokens`, NOT on the step seq_len,
-    which is larger and would misclassify the last prefill chunk as a
-    decode step."""
+    query is still being prefilled. Under the DEFAULT (decode-only) scope
+    that is deliberately full attention -- and the guard must key on
+    `num_computed_tokens`, NOT on the step seq_len, which is larger and
+    would misclassify the last prefill chunk as a decode step.
+
+    The opt-in prefill scope is covered separately below; this test pins
+    the default, which is what every published SPARSE row was measured
+    under and must not change silently."""
     runner_module = _load_sparse_target_runner()
     block_size, num_prompt = 16, 160
     runner, attn_metadata = _make_fake_runner(
@@ -1336,6 +1343,358 @@ def test_apply_overrides_per_turn_cache_invalidates_on_a_new_selection():
     assert 1006 in first and 1006 not in second
 
 
+# ---------------------------------------------------------------------------
+# Sparse PREFILL (opt-in scope) -- kv_cache_utils level
+# ---------------------------------------------------------------------------
+#
+# The decode gather only ever has one query token, so "which keys are
+# visible" is the whole story. A prefill chunk has many, and the ORDER of
+# the compacted view becomes load-bearing: FlashAttention aligns a causal
+# mask bottom-right, so query `i` of `n_q` reads keys `[0, L - n_q + i]`.
+# That is only the right answer if the chunk's own tokens are the final
+# `n_q` entries of the gathered view, in order. These tests check that
+# invariant directly, by decoding the gathered view back into real
+# positions with `_kernel_visible_positions` -- not by comparing block
+# counts, which is exactly the check that was blind to the seq_lens bug on
+# the decode side.
+
+
+def _prefill_gather(block_table_row, block_size, selection, turn_start, seq_len):
+    """Build the per-turn view and run one chunk through it, the same two
+    calls `sparse_target_runner.py` makes."""
+    base_view = compute_prefill_base_view(
+        full_block_table_row=block_table_row,
+        block_size=block_size,
+        base_block_indices=block_indices_from_positions(selection, block_size),
+        turn_start=turn_start,
+    )
+    return compute_prefill_gather_view(
+        base_view=base_view,
+        full_block_table_row=block_table_row,
+        block_size=block_size,
+        seq_len=seq_len,
+    )
+
+
+def test_prefill_gather_keeps_selected_history_and_drops_the_rest():
+    block_size, turn_start, seq_len = 16, 160, 200
+    row = torch.arange(1000, 1000 + 20, dtype=torch.int64)
+    # History blocks 0,1,5,9 selected; 2,3,4,6,7,8 not.
+    selection = [b * block_size for b in (0, 1, 5, 9)]
+
+    gathered_row, gathered_seq_len = _prefill_gather(
+        row, block_size, selection, turn_start, seq_len
+    )
+
+    # 4 selected history blocks + the contiguous tail 10,11,12.
+    assert gathered_row.tolist() == [1000, 1001, 1005, 1009, 1010, 1011, 1012]
+    # 6 full blocks + block 12's 8 real tokens (200 - 192).
+    assert gathered_seq_len == 6 * block_size + 8
+
+    visible = _kernel_visible_positions(gathered_row, gathered_seq_len, row, block_size)
+    assert not any(pos // block_size in (2, 3, 4, 6, 7, 8) for pos in visible)
+    assert max(visible) == seq_len - 1
+
+
+def test_prefill_gather_puts_this_chunks_own_tokens_at_the_tail_of_the_view():
+    """**The causal-mask invariant, checked directly.** Bottom-right
+    alignment means the last `n_q` entries of the gathered view must be
+    exactly this chunk's own `n_q` positions, in ascending order. If they
+    are not, every query in the chunk attends the wrong keys -- silently,
+    with no crash and no shape error to catch it."""
+    block_size, turn_start = 16, 160
+    num_computed, seq_len = 176, 200
+    n_q = seq_len - num_computed
+    row = torch.arange(1000, 1000 + 20, dtype=torch.int64)
+    selection = [b * block_size for b in (0, 1, 5, 9)]
+
+    gathered_row, gathered_seq_len = _prefill_gather(
+        row, block_size, selection, turn_start, seq_len
+    )
+    visible = _kernel_visible_positions(gathered_row, gathered_seq_len, row, block_size)
+
+    assert visible[-n_q:] == list(range(seq_len - n_q, seq_len)), (
+        f"the last {n_q} gathered entries are {visible[-n_q:]}, expected "
+        f"{list(range(seq_len - n_q, seq_len))} -- bottom-right causal "
+        f"alignment reads exactly these, so anything else means every query "
+        f"in this chunk attends the wrong keys"
+    )
+
+
+def test_prefill_gather_tail_ignores_holes_the_selection_leaves_inside_it():
+    """The force-kept tail is CONTIGUOUS, not "whatever the selection
+    happens to name at or above the turn start". A selection that covers
+    block 11 but not block 10 must still yield 10,11,12 -- punching a hole
+    in the tail would break the alignment the previous test pins."""
+    block_size, turn_start, seq_len = 16, 160, 200
+    row = torch.arange(1000, 1000 + 20, dtype=torch.int64)
+    # Block 11 named, blocks 10 and 12 not -- all three must appear anyway.
+    selection = [0 * block_size, 11 * block_size]
+
+    gathered_row, _ = _prefill_gather(row, block_size, selection, turn_start, seq_len)
+
+    assert gathered_row.tolist() == [1000, 1010, 1011, 1012]
+
+
+def test_prefill_gather_turn_zero_degenerates_to_dense():
+    """Turn 0's prefill is where the context's KV is COMPUTED for the first
+    time. Restricting it would poison the persistent cache every later
+    turn's selection reads from, so `turn_start == 0` must produce a no-op
+    -- and does, without a special case: the tail spans everything."""
+    block_size, seq_len = 16, 200
+    row = torch.arange(1000, 1000 + 20, dtype=torch.int64)
+    selection = [0, 16, 32]  # aggressively small, and irrelevant here
+
+    assert _prefill_gather(row, block_size, selection, 0, seq_len) is None
+
+
+def test_prefill_gather_keeps_earlier_chunks_of_the_same_turn_visible():
+    """Chunked prefill: a later chunk must still see the turn's earlier
+    chunks. They are below `num_computed` but at or above `turn_start`, so
+    only the contiguous tail rule covers them -- the selection cannot, it
+    was registered before any of this turn's blocks existed as history."""
+    block_size, turn_start = 16, 160
+    row = torch.arange(1000, 1000 + 24, dtype=torch.int64)
+    selection = [0 * block_size]
+
+    # Chunk 1 ends at 192; chunk 2 ends at 240.
+    _, seq_len_1 = _prefill_gather(row, block_size, selection, turn_start, 192)
+    gathered_2, seq_len_2 = _prefill_gather(row, block_size, selection, turn_start, 240)
+    visible_2 = _kernel_visible_positions(gathered_2, seq_len_2, row, block_size)
+
+    # Everything from turn_start onward is visible in chunk 2, including
+    # the positions chunk 1 computed.
+    assert set(range(turn_start, 240)).issubset(set(visible_2))
+    assert seq_len_1 == block_size + (192 - turn_start)
+
+
+def test_prefill_gather_accounts_for_a_partially_filled_last_block():
+    """Same class of bug as the decode path's confirmed off-by-one: the
+    last gathered block is generally NOT full, and reporting it as full
+    lets the kernel read uninitialized slots past the real occupancy."""
+    block_size, turn_start = 16, 160
+    row = torch.arange(1000, 1000 + 20, dtype=torch.int64)
+    selection = [0 * block_size, 1 * block_size]
+
+    for seq_len, expected_tail_tokens in ((193, 33), (200, 40), (208, 48)):
+        _, gathered_seq_len = _prefill_gather(
+            row, block_size, selection, turn_start, seq_len
+        )
+        # 2 selected history blocks + the real token count from turn_start on.
+        assert gathered_seq_len == 2 * block_size + expected_tail_tokens, seq_len
+        assert expected_tail_tokens == seq_len - turn_start
+
+
+def test_prefill_gather_raises_on_a_turn_start_past_what_is_allocated():
+    """A `turn_start` beyond the request's own written stream means the
+    driver's resident-length tracking has drifted from the engine's.
+    Gathering on it would read unwritten (or another request's) blocks, so
+    it must fail loudly rather than silently -- same discipline as the
+    decode path's out-of-range check."""
+    block_size = 16
+    row = torch.arange(1000, 1000 + 20, dtype=torch.int64)
+    try:
+        _prefill_gather(row, block_size, [0], turn_start=400, seq_len=200)
+        raise AssertionError("expected ValueError for an out-of-range turn_start")
+    except ValueError as e:
+        assert "prefill turn-start block" in str(e), e
+
+
+# ---------------------------------------------------------------------------
+# Sparse PREFILL -- runner level
+# ---------------------------------------------------------------------------
+
+
+def _make_prefill_runner(runner_module, block_size=16, num_computed=176,
+                         num_prompt=240, step_seq_len=200):
+    return _make_fake_runner(
+        runner_module, block_size,
+        req_ids=["r0"],
+        num_computed_tokens=[num_computed],
+        num_prompt_tokens=[num_prompt],   # delta not finished -> a prefill chunk
+        step_seq_lens=[step_seq_len],
+    )
+
+
+def test_apply_overrides_gathers_prefill_when_a_turn_start_is_registered():
+    """The opt-in scope end to end through the runner: same chunk the
+    default leaves untouched, now restricted."""
+    runner_module = _load_sparse_target_runner()
+    block_size, turn_start = 16, 160
+    runner, attn_metadata = _make_prefill_runner(runner_module, block_size)
+    original_row = attn_metadata["layer.0"].block_table[0].clone()
+    selection = [b * block_size for b in (0, 1, 5, 9)]
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register("r0", selection, turn_start)
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    for name, layer in attn_metadata.items():
+        assert layer.block_table[0, :7].tolist() == [
+            1000, 1001, 1005, 1009, 1010, 1011, 1012
+        ], name
+        assert layer.block_table[0, 7:].abs().sum().item() == 0, name
+        assert int(layer.seq_lens[0]) == 6 * block_size + 8, name
+        # The two fields the decode path had confirmed bugs in must be
+        # fixed up on this path too -- a stale max_seq_len or AOT schedule
+        # sized for the pre-gather span is just as wrong here.
+        assert layer.max_seq_len == 6 * block_size + 8, name
+        assert layer.scheduler_metadata is None, name
+
+    visible = _kernel_visible_positions(
+        attn_metadata["layer.0"].block_table[0],
+        int(attn_metadata["layer.0"].seq_lens[0]),
+        original_row, block_size,
+    )
+    n_q = 200 - 176
+    assert visible[-n_q:] == list(range(200 - n_q, 200))
+
+
+def test_apply_overrides_records_prefill_chunks_separately_from_decode_steps():
+    """`pop_prefill_steps` and `pop_attended_lens` feed different FLOP
+    functions -- one charges a multi-token chunk, the other charges one
+    decode row per entry. A prefill chunk landing in the decode
+    accumulator would silently inflate the decode column."""
+    runner_module = _load_sparse_target_runner()
+    block_size, turn_start = 16, 160
+    runner, attn_metadata = _make_prefill_runner(runner_module, block_size)
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register(
+            "r0", [b * block_size for b in (0, 1, 5, 9)], turn_start
+        )
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    assert runner.pop_attended_lens("r0") == []
+    assert runner.pop_prefill_steps("r0") == [(200 - 176, 6 * block_size + 8)]
+    # Popping resets, same contract as the decode accumulator.
+    assert runner.pop_prefill_steps("r0") == []
+
+
+def test_apply_overrides_charges_a_dense_prefill_chunk_at_its_full_length():
+    """A chunk the gather declined to restrict (turn 0, or a selection
+    already spanning everything) is a DENSE chunk, not a free one. Same
+    reasoning as the decode accumulator's `gathered is None` handling: skip
+    it and the measured prefill FLOPs understate what the GPU did."""
+    runner_module = _load_sparse_target_runner()
+    block_size = 16
+    runner, attn_metadata = _make_prefill_runner(runner_module, block_size)
+    before = attn_metadata["layer.0"].block_table.clone()
+
+    sparse_selection_registry.clear()
+    try:
+        # turn_start=0 -> degenerate, nothing patched.
+        sparse_selection_registry.register("r0", [0, 16, 32], 0)
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    assert torch.equal(attn_metadata["layer.0"].block_table, before)
+    assert runner.pop_prefill_steps("r0") == [(200 - 176, 200)]
+
+
+def test_apply_overrides_leaves_prefill_dense_while_recomputing_older_tokens():
+    """`num_computed < turn_start` means the engine is (re)computing tokens
+    from BEFORE this turn -- a session resumption that missed the prefix
+    cache. Their KV is being written for the first time, so restricting
+    them would poison the cache, and the tail-contiguity invariant does not
+    hold for them either. Dense is the only safe answer."""
+    runner_module = _load_sparse_target_runner()
+    block_size = 16
+    runner, attn_metadata = _make_prefill_runner(
+        runner_module, block_size, num_computed=64, step_seq_len=96,
+    )
+    before = {name: (layer.block_table.clone(), layer.seq_lens.clone())
+              for name, layer in attn_metadata.items()}
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register("r0", [0, 16, 32], 160)
+        runner._apply_sparse_attention_overrides(attn_metadata)
+    finally:
+        sparse_selection_registry.clear()
+
+    for name, layer in attn_metadata.items():
+        old_bt, old_sl = before[name]
+        assert torch.equal(layer.block_table, old_bt), name
+        assert torch.equal(layer.seq_lens, old_sl), name
+    assert runner.pop_prefill_steps("r0") == []
+
+
+def test_prefill_base_view_cache_invalidates_on_the_generation_counter():
+    """Same cache-invalidation contract (and the same `id()`-collision bug
+    it must not reintroduce) as the decode path's two caches."""
+    runner_module = _load_sparse_target_runner()
+    block_size, turn_start = 16, 160
+    runner, attn_metadata = _make_prefill_runner(runner_module, block_size)
+
+    sparse_selection_registry.clear()
+    try:
+        sparse_selection_registry.register("r0", [0 * block_size], turn_start)
+        runner._apply_sparse_attention_overrides(attn_metadata)
+        first = attn_metadata["layer.0"].block_table[0, :4].tolist()
+
+        runner2, attn_metadata_2 = _make_prefill_runner(runner_module, block_size)
+        runner2._sparse_prefill_base_view_cache = runner._prefill_base_view_cache()
+        runner2._sparse_base_block_indices_cache = runner._base_block_indices_cache()
+        sparse_selection_registry.register("r0", [5 * block_size], turn_start)
+        runner2._apply_sparse_attention_overrides(attn_metadata_2)
+        second = attn_metadata_2["layer.0"].block_table[0, :4].tolist()
+    finally:
+        sparse_selection_registry.clear()
+
+    assert first == [1000, 1010, 1011, 1012]
+    assert second == [1005, 1010, 1011, 1012], (
+        f"got {second} -- a stale cached view means the second turn is "
+        f"attending the FIRST turn's selection"
+    )
+
+
+def test_target_sparse_prefill_flops_matches_the_analytic_model_when_dense():
+    """The measured model must reduce to the analytic one on a chunk that
+    was not actually restricted -- otherwise a `--sparse-prefill` run's
+    turn 0 (always dense) would not be comparable to a default run's."""
+    cfg = _llama31_8b_flop_cfg()
+    n_cached, n_new = 4096, 512
+
+    measured = target_sparse_prefill_flops(cfg, [(n_new, n_cached + n_new)])
+    analytic = target_prefill_flops(
+        cfg, prompt_len=n_cached + n_new, num_cached=n_cached
+    )
+    assert measured == analytic
+
+
+def test_target_sparse_prefill_flops_charges_one_lm_head_row_per_turn():
+    """Not one per chunk -- only the final chunk produces logits, and only
+    for the one sampled token. Same convention as `target_prefill_flops`."""
+    cfg = _llama31_8b_flop_cfg()
+    chunks = [(256, 4096), (256, 4352)]
+
+    total = target_sparse_prefill_flops(cfg, chunks)
+    without_lm_head = sum(
+        n * cfg.linear_flops_per_token + cfg.attn_prefill_flops(n, a - n)
+        for n, a in chunks
+    )
+    assert total == without_lm_head + cfg.lm_head_flops
+    assert target_sparse_prefill_flops(cfg, []) == 0
+
+
+def test_target_sparse_prefill_flops_is_cheaper_when_the_gather_bites():
+    """The whole point of the scope: a restricted chunk must cost strictly
+    less than the same chunk read densely."""
+    cfg = _llama31_8b_flop_cfg()
+    n_new = 512
+    dense = target_sparse_prefill_flops(cfg, [(n_new, 8192 + n_new)])
+    sparse = target_sparse_prefill_flops(cfg, [(n_new, 2048 + n_new)])
+    assert sparse < dense
+
+
 def test_sparse_selection_registry_lifecycle():
     sparse_selection_registry.clear()
     try:
@@ -1375,12 +1734,14 @@ def test_sparse_selection_registry_generation_counter():
         assert sparse_selection_registry.get_with_generation("req-1") is None
 
         sparse_selection_registry.register("req-1", [0, 4, 8])
-        gen1, positions1 = sparse_selection_registry.get_with_generation("req-1")
+        gen1, positions1, turn_start1 = sparse_selection_registry.get_with_generation("req-1")
         assert positions1 == [0, 4, 8]
+        assert turn_start1 is None, "decode-only scope is the default"
 
         sparse_selection_registry.register("req-1", [12, 16])
-        gen2, positions2 = sparse_selection_registry.get_with_generation("req-1")
+        gen2, positions2, turn_start2 = sparse_selection_registry.get_with_generation("req-1")
         assert positions2 == [12, 16]
+        assert turn_start2 is None
         assert gen2 != gen1, "generation must change across registrations"
 
         # A second request_id's own generation sequence is independent --
@@ -1388,7 +1749,7 @@ def test_sparse_selection_registry_generation_counter():
         # must never cause two DIFFERENT requests' current generations to
         # collide either.
         sparse_selection_registry.register("req-2", [1, 2])
-        gen_req2, _ = sparse_selection_registry.get_with_generation("req-2")
+        gen_req2, _, _ = sparse_selection_registry.get_with_generation("req-2")
         assert gen_req2 not in (gen1, gen2)
 
         sparse_selection_registry.discard("req-1")
@@ -2307,6 +2668,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         oracle_scorer_gpu_memory_utilization=0.6,
         oracle_scorer_max_num_batched_tokens=None,
         max_tokens=64, reps=1, peak_tflops=None,
+        sparse_prefill=False,
         output_suffix="", head_set_from=None,
     )
     for k, v in arg_overrides.items():

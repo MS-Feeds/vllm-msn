@@ -69,13 +69,31 @@ HeadKV) and head-level (rather than token-level) selection.
 **SPARSE-k\*-g\*** (persistent cache + sparse attention): the target
 retains its full conversation KV cache persistently across every turn —
 nothing is ever discarded — via resumable-session KV persistence, and a
-decode-only block-table gather restricts attention to a subset of that
-already-resident cache. What's compressed is decode-time attention compute,
-not the KV cache itself. KV granularity is `16`/`32`/`64` (block-gather is
-block-granular). History mode is self-generated (future turns are built
-from the model's own actual output — the resumable-session mechanism has
-no hook to substitute golden reference text). `keep_mode` is `keep` only
-(nothing is ever evicted, so DISCARD's reason for existing doesn't apply).
+block-table gather restricts attention to a subset of that already-resident
+cache. What's compressed is attention compute, not the KV cache itself. KV
+granularity is `16`/`32`/`64` (block-gather is block-granular). History
+mode is self-generated (future turns are built from the model's own actual
+output — the resumable-session mechanism has no hook to substitute golden
+reference text). `keep_mode` is `keep` only (nothing is ever evicted, so
+DISCARD's reason for existing doesn't apply).
+
+The gather's **scope** is a run-level choice, and it changes what the row
+measures:
+
+| scope | flag | turn N's prefill | turn N's decode |
+| --- | --- | --- | --- |
+| decode-only (default) | — | dense over the full resident cache | restricted |
+| prefill + decode | `--sparse-prefill` | restricted to selected blocks + a contiguous tail covering the turn's own tokens | restricted |
+
+Every published `SPARSE-k*`/`ORACLE-k*` row was measured under decode-only,
+which is why it stays the default; `--sparse-prefill` rows are tagged
+`[prefill=sparse]` in the `label` column so the two never get compared by
+accident. Turn 0 is dense under both — its prefill is where the context's
+KV is computed for the first time, and computing it under a restricted view
+would poison the persistent cache every later turn's selection reads from.
+Under `--sparse-prefill` the `target_prefill` FLOPs are measured per prefill
+chunk rather than derived analytically, since the analytic model assumes
+every new token attends every cached token.
 
 ---
 
