@@ -16,6 +16,11 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 
+# None until the first CUDA call establishes whether the container extension
+# supports the newer padding-aware schema.
+_uses_legacy_topk_softmax_abi: bool | None = None
+
+
 def _get_padding_mask(num_tokens: int) -> torch.Tensor | None:
     if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
         is_padding = get_forward_context().is_padding
@@ -30,7 +35,20 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
+    global _uses_legacy_topk_softmax_abi
+
     is_padding = _get_padding_mask(topk_indices.shape[0])
+    if _uses_legacy_topk_softmax_abi is True and is_padding is None:
+        torch.ops._moe_C.topk_softmax(
+            topk_weights,
+            topk_indices,
+            token_expert_indices,
+            gating_output,
+            renormalize,
+            None,
+        )
+        return topk_weights, topk_indices
+
     try:
         ops.topk_softmax(
             topk_weights,
@@ -40,6 +58,7 @@ def vllm_topk_softmax(
             renormalize,
             is_padding=is_padding,
         )
+        _uses_legacy_topk_softmax_abi = False
     except RuntimeError as error:
         if is_padding is not None or "expected at most 6 argument" not in str(error):
             raise
@@ -54,6 +73,7 @@ def vllm_topk_softmax(
             renormalize,
             None,
         )
+        _uses_legacy_topk_softmax_abi = True
 
     return topk_weights, topk_indices
 
