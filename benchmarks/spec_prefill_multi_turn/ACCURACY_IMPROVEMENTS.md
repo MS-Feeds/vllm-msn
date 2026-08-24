@@ -265,13 +265,41 @@ way around it.
    ceiling peaks reversed the verdict. A stability metric has to be evaluated
    at the set size the method would actually use.
 
-   Expected value, stated before the run so it can be wrong: at the ~80%
-   survival-to-score conversion measured earlier, +28 survival maps to
-   roughly +20 `in_match`, which would put `SPARSE-k20-g32` near the
-   **ORACLE-k20 ceiling of 73.6** — i.e. most of the 17-point estimator gap,
-   recovered by a 2-head mask that costs nothing. That extrapolation crosses
-   two conversation slices and assumes the conversion rate holds; it is a
-   reason to run the experiment, not a result.
+   **Graded result** (all 100 `scbench_kv` conversations, paired CIs):
+
+   | Row | Score | Δ vs. baseline | Share of the 17.0-point estimator gap |
+   |---|---:|---:|---:|
+   | `SPARSE-k20-g32` (all heads) | 56.6 | — | — |
+   | `-heads1` | 61.8 | +5.2 (ns) | 31% |
+   | `-heads2` | 64.4 | +7.8 * | 46% |
+   | **`-heads4`** | **65.2** | **+8.6 \*** | **51%** |
+   | *ORACLE-k20, 3B scorer* | *65.0* | *+8.4* | *49%* |
+   | *ORACLE-k20, 8B scorer (the ceiling)* | *73.6* | *+17.0* | *100%* |
+
+   **A free 4-head mask on the 1B matches a 3B scorer** (65.2 vs 65.0) — the
+   same accuracy the capacity probe bought for ~2.6x the speculator's FLOPs,
+   for a mask that makes scoring marginally *cheaper*. This is the first
+   change in §1 that both works and is economically sensible, and it closes
+   **51% of the estimator gap**.
+
+   After it, the two remaining gaps are equal: **8.4 points** of estimator
+   error still unrecovered, **8.0 points** of mechanism (M000 − the 8B
+   oracle). The next marginal point is equally available from §1 or §2.
+
+   ### Calibration: gold survival overstates score gains ~2.5x on the margin
+
+   Predicted before the run, from the gate's +28.0 survival at an ~80%
+   average survival-to-score conversion: **+20**. Actual: **+8.6** — the
+   prediction was 2.3x too optimistic, and the error is systematic rather
+   than noise.
+
+   The marginal conversion rate is ~31%, not the ~80% average, and in
+   hindsight that is forced: the turns a better head set newly rescues are
+   *by construction* the ones the old selection already failed on, so they
+   are the harder turns, where the gold surviving is less often sufficient.
+   Any survival-based projection should be discounted accordingly. The fast
+   loop remains valid for **ranking** variants — it ranked these three
+   correctly — but its magnitudes must not be read as score deltas.
 4. **Mask sinks before pooling.** Position 0 and delimiters absorb enormous
    softmax mass and skew both the pooled scores and the chunk means around
    them. Zero them in the score and force-keep them separately — wrapper spans

@@ -2307,6 +2307,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         oracle_scorer_gpu_memory_utilization=0.6,
         oracle_scorer_max_num_batched_tokens=None,
         max_tokens=64, reps=1, peak_tflops=None,
+        output_suffix="", head_set_from=None,
     )
     for k, v in arg_overrides.items():
         assert hasattr(args, k), f"unknown arg override {k!r}"

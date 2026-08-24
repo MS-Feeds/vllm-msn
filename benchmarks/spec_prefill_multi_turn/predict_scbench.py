@@ -2248,7 +2248,34 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             num_conversations_processed = len({p["conversation_id"] for p in predictions})
 
             if rep == args.reps:
-                pred_path = OUT_DIR / f"{exp_id}_predictions.jsonl"
+                # Predictions are named by exp_id alone, so the SAME row run
+                # against a different --scbench-config overwrites the earlier
+                # config's file with no warning. That has already cost one
+                # measurement in this project (an 8B ORACLE-k20 file replaced
+                # by a 3B re-run of the same row), so check rather than trust:
+                # if a file is already there and its rows belong to a
+                # different config than this run produced, refuse.
+                pred_path = OUT_DIR / f"{exp_id}{args.output_suffix}_predictions.jsonl"
+                if pred_path.exists() and predictions:
+                    existing_configs = set()
+                    try:
+                        with open(pred_path, encoding="utf-8") as f:
+                            for line in f:
+                                if line.strip():
+                                    existing_configs.add(json.loads(line).get("config"))
+                    except (OSError, json.JSONDecodeError):
+                        existing_configs = set()
+                    new_configs = {row.get("config") for row in predictions}
+                    if existing_configs and not (existing_configs & new_configs):
+                        raise FileExistsError(
+                            f"{pred_path} already holds predictions for "
+                            f"{sorted(c for c in existing_configs if c)}, but this "
+                            f"run produced {sorted(c for c in new_configs if c)}. "
+                            f"Writing would destroy the earlier measurement. Pass "
+                            f"--output-suffix (e.g. --output-suffix "
+                            f"-{sorted(new_configs)[0]}) to keep both, or move the "
+                            f"existing file first."
+                        )
                 with open(pred_path, "w", encoding="utf-8") as f:
                     for row in predictions:
                         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -2459,6 +2486,14 @@ def main() -> None:
              "checkpoint on ORACLE-k* rows). The scorer prefills the whole "
              "candidate pool every turn, so this is the one that matters "
              "first for an oracle run.",
+    )
+    parser.add_argument(
+        "--output-suffix", default="",
+        help="Appended to the predictions filename before "
+             "'_predictions.jsonl'. Use it when running the SAME experiment id "
+             "against a different --scbench-config, which would otherwise "
+             "overwrite the earlier config's predictions (that overwrite is "
+             "refused outright, but this is how you keep both).",
     )
     parser.add_argument(
         "--head-set-from", default=None,
