@@ -283,6 +283,10 @@ SCORE_VARIANT_PROBE = (0.2, "32")
 # out-of-sample, a fixed top-2 mask lifted gold survival 54.0% -> 82.0%
 # (+28.0, 93% of the clairvoyant ceiling) while top-16 gave only +13.0.
 HEAD_SET_SIZES = [1, 2, 4]
+# Keep rates the head rows are generated at. 0.2 is the original probe point
+# (measured: +8.6 for top-4); 0.4 and 0.6 exist to test whether that gain
+# survives a looser budget or was specific to the starved corner.
+HEAD_SET_RATES = [0.2, 0.4, 0.6]
 
 
 def _build_experiments() -> dict:
@@ -353,20 +357,31 @@ def _build_experiments() -> dict:
             "keep_percentage": probe_rate, "granularity": probe_gran,
             "score_aggregation": aggregation, "score_layers": layers,
         }
-    # Retrieval-head rows -- see HEAD_SET_SIZES. `head_set_size` is carried
-    # instead of a head list; `run_experiment` resolves it against
-    # --head-set-from and fails loudly if that flag is missing, rather than
-    # silently falling back to all-head scoring and producing a row that
-    # looks like a §1.3 result but is not one.
-    for size in HEAD_SET_SIZES:
-        exp_id = f"SPARSE-k{int(probe_rate * 100)}-g{probe_gran}-heads{size}"
-        experiments[exp_id] = {
-            "label": f"Sparse attention (persistent cache) keep={int(probe_rate * 100)}% "
-                     f"granularity={probe_gran} retrieval-head filtering top-{size}",
-            "mode": "sparse", "keep_mode": "keep",
-            "keep_percentage": probe_rate, "granularity": probe_gran,
-            "head_set_size": size,
-        }
+    # Retrieval-head rows -- see HEAD_SET_SIZES/HEAD_SET_RATES.
+    # `head_set_size` is carried instead of a head list; `run_experiment`
+    # resolves it against --head-set-from and fails loudly if that flag is
+    # missing, rather than silently falling back to all-head scoring and
+    # producing a row that looks like a §1.3 result but is not one.
+    #
+    # Generated across keep rates, not just the k20 probe point, so the
+    # measured +8.6 at k20 can be checked for whether it HOLDS as the budget
+    # loosens. It should shrink by construction -- the whole gap it eats into
+    # shrinks (M000 - SPARSE-g32 is 25.0 at k20, 16.2 at k40, 8.8 at k60) --
+    # so the question is whether the gain shrinks proportionally (head
+    # filtering is a general improvement) or faster (it was only rescuing the
+    # most starved regime, which would make it a k20 curiosity rather than a
+    # method). The k20 ids are byte-identical to what the single-rate loop
+    # produced, so already-run rows keep their names and their results.
+    for rate in HEAD_SET_RATES:
+        for size in HEAD_SET_SIZES:
+            exp_id = f"SPARSE-k{int(rate * 100)}-g{probe_gran}-heads{size}"
+            experiments[exp_id] = {
+                "label": f"Sparse attention (persistent cache) keep={int(rate * 100)}% "
+                         f"granularity={probe_gran} retrieval-head filtering top-{size}",
+                "mode": "sparse", "keep_mode": "keep",
+                "keep_percentage": rate, "granularity": probe_gran,
+                "head_set_size": size,
+            }
     return experiments
 
 
@@ -2272,9 +2287,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                             f"{sorted(c for c in existing_configs if c)}, but this "
                             f"run produced {sorted(c for c in new_configs if c)}. "
                             f"Writing would destroy the earlier measurement. Pass "
-                            f"--output-suffix (e.g. --output-suffix "
-                            f"-{sorted(new_configs)[0]}) to keep both, or move the "
-                            f"existing file first."
+                            f"--output-suffix to keep both, or move the existing "
+                            f"file first. Note the '=' form: a suffix starting "
+                            f"with '-' is read as another flag otherwise, e.g. "
+                            f"--output-suffix=-{sorted(c for c in new_configs if c)[0]}"
                         )
                 with open(pred_path, "w", encoding="utf-8") as f:
                     for row in predictions:
@@ -2493,7 +2509,9 @@ def main() -> None:
              "'_predictions.jsonl'. Use it when running the SAME experiment id "
              "against a different --scbench-config, which would otherwise "
              "overwrite the earlier config's predictions (that overwrite is "
-             "refused outright, but this is how you keep both).",
+             "refused outright, but this is how you keep both). A suffix that "
+             "starts with '-' must use the '=' form -- --output-suffix=-qaeng "
+             "-- since argparse otherwise reads the value as another flag.",
     )
     parser.add_argument(
         "--head-set-from", default=None,

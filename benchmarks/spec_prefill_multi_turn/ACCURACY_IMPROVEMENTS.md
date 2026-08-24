@@ -286,6 +286,67 @@ way around it.
    error still unrecovered, **8.0 points** of mechanism (M000 − the 8B
    oracle). The next marginal point is equally available from §1 or §2.
 
+   ### Transfer to `scbench_qa_eng`: inconclusive by construction
+
+   Same kv-derived head list (top-2, top-4), scored on all 23 `scbench_qa_eng`
+   conversations (117 turns) against the M000/SPARSE-k20-g32 baseline pair,
+   paired CIs:
+
+   | Row | Score | Δ vs. M000 | paired 95% CI |
+   |---|---:|---:|---|
+   | M000 | 27.3 | — | — |
+   | SPARSE-k20-g32 (all heads) | 26.2 | −1.0 | [−3.7, +1.4] ns |
+   | SPARSE-k20-g32-heads4 | 28.8 | +1.5 | [−0.9, +3.9] ns |
+   | SPARSE-k20-g32-heads2 | 28.3 | +1.0 | [−0.2, +2.3] ns |
+
+   Nothing reaches significance in either direction, exactly as the config's
+   own headroom predicted: the entire baseline-to-sparse gap on this config
+   is ~1 point (README's `scbench_qa_eng` table), so there was never enough
+   room for a scoring change to show up against, whatever its true effect.
+   **This run cannot tell "the heads don't transfer" from "there was nothing
+   to transfer."** It is not evidence against §1.3 generalizing.
+
+   A real transfer test needs a config with retrieval headroom AND verbatim
+   needles the gate can rank against directly — `scbench_summary_with_needles`
+   or `scbench_vt` (both valid `prep_scbench.py` configs, not yet downloaded).
+   That would answer two questions at once: whether the kv heads help there,
+   and whether task-specific-ranked heads are the SAME heads (a property of
+   the checkpoint, as the retrieval-head literature claims, rather than of
+   the task) or different ones.
+
+   ### Transfer to `scbench_summary`: same inconclusive shape, as expected
+
+   All 70 `scbench_summary` conversations (350 turns), same kv-derived heads:
+
+   | Row | Score | Δ vs. M000 | paired 95% CI |
+   |---|---:|---:|---|
+   | M000 | 36.0 | — | — |
+   | SPARSE-k20-g32 (all heads) | 35.9 | −0.1 | [−0.9, +0.6] ns |
+   | SPARSE-k20-g32-heads4 | 36.1 | +0.1 | [−0.7, +0.8] ns |
+   | SPARSE-k20-g32-heads2 | 36.0 | −0.0 | [−0.8, +0.7] ns |
+
+   Predicted before running, from the README's already-published finding that
+   `scbench_summary` is flat across the ENTIRE keep-rate/granularity grid
+   (every SPARSE config within ~1% of M000): if there is no headroom for
+   sparsification itself to cost anything on this config, there is no
+   headroom for a scoring improvement to recover either. That is what
+   happened — every row lands within 0.2 points of M000's 36.0, at n=70 (a
+   larger, better-powered sample than qa_eng's n=23), and still nothing
+   clears zero.
+
+   **This confirms the README's two live explanations for `scbench_summary`
+   being flat are still both live**, and adds a third: (a) global-summary
+   quality doesn't depend on which tokens are selected, as long as each
+   selected block carries the source's "gist"; (b) `rouge_l_f1`'s LCS-based
+   scoring is insensitive enough to hide a real, smaller degradation; (c) —
+   new — if the retrieval-head mechanism itself doesn't apply to a
+   non-retrieval task the way it does to `scbench_kv`, "which heads vote"
+   would not be expected to matter here regardless of (a) or (b). This run
+   cannot distinguish the three. **`scbench_summary` is not further
+   informative for §1.3** without first resolving which of (a)/(b)/(c) is
+   operating, which the summary config alone cannot do — see §4.3's
+   non-LCS-metric suggestion, still open.
+
    ### Calibration: gold survival overstates score gains ~2.5x on the margin
 
    Predicted before the run, from the gate's +28.0 survival at an ~80%
