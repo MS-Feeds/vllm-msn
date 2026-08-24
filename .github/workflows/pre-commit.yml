@@ -17,7 +17,7 @@ permissions:
 jobs:
   pre-run-check:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, vllm-runners]
     steps:
     - name: Check PR label and author merge count
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -28,7 +28,8 @@ jobs:
             pull_number: context.payload.pull_request.number,
           });
 
-          const hasReadyLabel = pr.labels.some(l => l.name === 'ready');
+          const readyLabels = ['ready', 'ready-run-all-tests'];
+          const hasReadyLabel = pr.labels.some(l => readyLabels.includes(l.name));
           const hasVerifiedLabel = pr.labels.some(l => l.name === 'verified');
           const trustedAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
           const isTrustedAuthor = trustedAssociations.has(pr.author_association);
@@ -42,13 +43,13 @@ jobs:
           if (hasReadyLabel || hasVerifiedLabel || mergedCount >= 4 || isTrustedAuthor) {
             core.info(`Check passed: verified label=${hasVerifiedLabel}, ready label=${hasReadyLabel}, trusted author=${isTrustedAuthor}, 4+ merged PRs=${mergedCount >= 4}`);
           } else {
-            core.setFailed(`PR must have the 'verified' or 'ready' (which also triggers tests) label, be opened by an OWNER/MEMBER/COLLABORATOR, or the author must have at least 4 merged PRs (found ${mergedCount}).`);
+            core.setFailed(`PR must have the 'verified', 'ready', or 'ready-run-all-tests' label to run pre-commit, be opened by an OWNER/MEMBER/COLLABORATOR, or the author must have at least 4 merged PRs (found ${mergedCount}).`);
           }
 
   pre-commit:
     needs: pre-run-check
     if: always() && (needs.pre-run-check.result == 'success' || needs.pre-run-check.result == 'skipped')
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, vllm-runners]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -57,6 +58,7 @@ jobs:
     - run: echo "::add-matcher::.github/workflows/matchers/actionlint.json"
     - run: echo "::add-matcher::.github/workflows/matchers/markdownlint.json"
     - run: echo "::add-matcher::.github/workflows/matchers/mypy.json"
+    - run: echo "::add-matcher::.github/workflows/matchers/shellcheck.json"
     - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
       with:
         extra_args: --all-files --hook-stage manual
