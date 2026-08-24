@@ -39,7 +39,7 @@ def test_supported_mm_limits_match_available_towers(
     expected: dict[str, None],
 ):
     class TestContext:
-        def get_hf_config(self) -> SimpleNamespace:
+        def get_hf_config(self, _config_cls: type[object]) -> SimpleNamespace:
             return SimpleNamespace(
                 vision_config=vision_config,
                 audio_config=audio_config,
