@@ -245,10 +245,13 @@ class Gemma4ProcessingInfo(BaseProcessingInfo):
         super().validate_num_items(modality, num_items)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        limits: dict[str, int | None] = {"image": None}
-        if self.get_hf_config().audio_config is not None:
+        config = self.get_hf_config()
+        limits: dict[str, int | None] = {}
+        if config.vision_config is not None:
+            limits["image"] = None
+            limits["video"] = None
+        if config.audio_config is not None:
             limits["audio"] = None
-        limits["video"] = None
         return limits
 
     def get_mm_max_tokens_per_item(
