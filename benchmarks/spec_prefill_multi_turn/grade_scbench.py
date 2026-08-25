@@ -200,6 +200,30 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
     prediction is always scored (0.0 counts as a real, if bad, score, same
     as any other turn) -- there's no "unparseable" concept here, since
     these are continuous similarity metrics, not a discrete letter-match.
+
+    ## Why turn 0 gets its own aggregates
+
+    `overall_excl_turn0`/`by_config_excl_turn0` (and their `*_turn0`
+    counterparts) exist because turn 0 is not a sample of the same
+    population as the turns after it, on either axis this benchmark
+    measures:
+
+    - **Cost**: turn 0 is each conversation's cold full-context prefill.
+      On the SPARSE pipeline it is ~99.7% of a run's target-prefill FLOPs,
+      so any per-turn mean that includes it is a measurement of turn 0
+      with a rounding error attached. `predict_scbench.py` already draws
+      exactly this line on the timing side, for the same reason -- see
+      `seconds_per_turn_excl_turn0_mean`.
+    - **Behavior**: turn 0 answers from a context nothing has been dropped
+      from yet, and under the sparse pipeline's opt-in prefill scope it is
+      *required* to be byte-identical between scopes (its prefill is dense
+      either way). That makes `overall_turn0` a free control when
+      comparing two runs: it must not move, and if it does, the difference
+      is a bug rather than a result.
+
+    Mixing the two into one number hides both effects. All the pre-existing
+    keys are unchanged, so nothing that reads `overall`/`by_config`/
+    `by_turn_idx` needs to know these exist.
     """
     pred_by_key: dict[tuple[str, int], str] = {}
     for p in predictions:
@@ -214,6 +238,11 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
     scores_by_turn_idx: dict[int, list[float]] = {}
     scores_by_config_and_turn: dict[tuple[str, int], list[float]] = {}
     overall: list[float] = []
+    # Turn 0 vs. the rest, kept separate throughout -- see docstring.
+    overall_excl_turn0: list[float] = []
+    overall_turn0: list[float] = []
+    scores_by_config_excl_turn0: dict[str, list[float]] = {}
+    scores_by_config_turn0: dict[str, list[float]] = {}
     per_turn: list[dict] = []
 
     for sample in samples:
@@ -262,6 +291,12 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
             scores_by_config.setdefault(config, []).append(score)
             scores_by_turn_idx.setdefault(turn_idx, []).append(score)
             scores_by_config_and_turn.setdefault((config, turn_idx), []).append(score)
+            if turn_idx == 0:
+                overall_turn0.append(score)
+                scores_by_config_turn0.setdefault(config, []).append(score)
+            else:
+                overall_excl_turn0.append(score)
+                scores_by_config_excl_turn0.setdefault(config, []).append(score)
             per_turn.append(
                 {
                     "conversation_id": conversation_id,
@@ -279,7 +314,15 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
 
     return {
         "overall": _avg(overall),
+        "overall_excl_turn0": _avg(overall_excl_turn0),
+        "overall_turn0": _avg(overall_turn0),
         "by_config": {k: _avg(v) for k, v in sorted(scores_by_config.items())},
+        "by_config_excl_turn0": {
+            k: _avg(v) for k, v in sorted(scores_by_config_excl_turn0.items())
+        },
+        "by_config_turn0": {
+            k: _avg(v) for k, v in sorted(scores_by_config_turn0.items())
+        },
         "by_turn_idx": {k: _avg(v) for k, v in sorted(scores_by_turn_idx.items())},
         "by_config_and_turn_idx": {
             f"{cfg}/turn{idx}": _avg(v)
@@ -288,6 +331,8 @@ def grade(samples: list[dict], predictions: list[dict]) -> dict:
         "counts": {
             "total_turns": total_turns,
             "matched": matched,
+            "matched_turn0": len(overall_turn0),
+            "matched_excl_turn0": len(overall_excl_turn0),
             "missing": missing,
             "no_metric_assigned": no_metric,
         },
@@ -307,6 +352,12 @@ def write_per_turn_csv(result: dict, path: Path) -> None:
 
 
 def render_summary_table(result: dict) -> str:
+    """Headline numbers plus a per-config table split three ways: all
+    turns, steady state (turns 1+), and turn 0 alone. See `grade`'s
+    docstring for why that split is the meaningful one rather than a
+    convenience -- briefly, turn 0 is the cold full-context prefill and
+    dominates cost, while being the one turn a sparse pipeline's own
+    prefill scope is required not to change."""
     lines = []
     counts = result["counts"]
     lines.append(
@@ -315,11 +366,23 @@ def render_summary_table(result: dict) -> str:
         f"{counts['missing']} missing/skipped, {counts['no_metric_assigned']} with no "
         f"metric assigned, both excluded from this %)"
     )
+    lines.append(
+        f"**Turns 1+ (steady state): {result['overall_excl_turn0']:.2f}** "
+        f"({counts['matched_excl_turn0']} turns) &nbsp;&nbsp; "
+        f"**Turn 0 only: {result['overall_turn0']:.2f}** "
+        f"({counts['matched_turn0']} turns)"
+    )
     lines.append("")
-    lines.append("| Config | Score |")
-    lines.append("|---|---:|")
+    lines.append("| Config | All turns | Turns 1+ | Turn 0 |")
+    lines.append("|---|---:|---:|---:|")
     for key, score in result["by_config"].items():
-        lines.append(f"| {key} | {score:.2f} |")
+        steady = result["by_config_excl_turn0"].get(key)
+        first = result["by_config_turn0"].get(key)
+        lines.append(
+            f"| {key} | {score:.2f} | "
+            f"{'-' if steady is None else format(steady, '.2f')} | "
+            f"{'-' if first is None else format(first, '.2f')} |"
+        )
     lines.append("")
     lines.append("| Turn index | Score |")
     lines.append("|---|---:|")
@@ -372,17 +435,29 @@ def run_batch(samples_path: Path, results_dir: Path) -> None:
         row = {
             "exp_id": exp_id,
             "overall": round(result["overall"], 4),
+            "overall_excl_turn0": round(result["overall_excl_turn0"], 4),
+            "overall_turn0": round(result["overall_turn0"], 4),
             "total_turns": counts["total_turns"],
             "matched": counts["matched"],
+            "matched_excl_turn0": counts["matched_excl_turn0"],
+            "matched_turn0": counts["matched_turn0"],
             "missing": counts["missing"],
             "no_metric_assigned": counts["no_metric_assigned"],
         }
         row.update({k: round(v, 4) for k, v in result["by_config"].items()})
+        # Suffixed rather than given their own fixed columns, so the
+        # per-config set stays data-driven (configs vary by run) and the
+        # two variants of each config sort next to each other.
+        row.update({f"{k}/turns1+": round(v, 4)
+                    for k, v in result["by_config_excl_turn0"].items()})
         summary_rows.append(row)
         print(f"[grade_scbench] {exp_id}: overall={result['overall']:.2f} "
+              f"(turns 1+: {result['overall_excl_turn0']:.2f}) "
               f"({counts['matched']}/{counts['total_turns']} turns matched) -> {out_path}")
 
-    fixed_cols = ["exp_id", "overall", "total_turns", "matched", "missing", "no_metric_assigned"]
+    fixed_cols = ["exp_id", "overall", "overall_excl_turn0", "overall_turn0",
+                  "total_turns", "matched", "matched_excl_turn0", "matched_turn0",
+                  "missing", "no_metric_assigned"]
     config_cols = sorted({k for row in summary_rows for k in row if k not in fixed_cols})
     fieldnames = fixed_cols + config_cols
 
