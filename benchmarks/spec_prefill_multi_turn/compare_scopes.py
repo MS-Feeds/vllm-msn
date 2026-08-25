@@ -45,6 +45,17 @@ harmless -- 21 tokens against 88k moved the measured prefill reduction by
 ~0.02% against an ~11.6% effect -- but it grows, so read it rather than
 assume it.
 
+## Everything is split by SCBench config
+
+Accuracy and FLOPs alike, with a pooled `ALL` row alongside. Pooling
+across configs is a blend rather than a summary here: the three configs
+differ substantially in context length, so a mixed steady-state FLOP mean
+lands between them and describes none of them (measured: ~4.36 TF/turn on
+`scbench_kv` alone vs ~3.7 pooled). On the accuracy side the split matters
+even more -- `scbench_kv`'s exact-substring retrieval is the only one of
+the three that responds to how much context was dropped at all, so a
+pooled score dilutes the one real signal with two flat ones.
+
 Usage:
     python3 compare_scopes.py \\
         --exp SPARSE-k80-g32,SPARSE-k60-g32,SPARSE-k40-g32,SPARSE-k20-g32 \\
@@ -137,6 +148,15 @@ class RunPair:
         )
         self.only_a = sorted(set(self.scored[0]) - set(self.scored[1]))
         self.only_b = sorted(set(self.scored[1]) - set(self.scored[0]))
+        # Predictions files written before the FLOP model was wired into
+        # `predict_scbench.py` carry only {conversation_id, turn_idx,
+        # config, pred} -- no `flops` key at all. That is a real and
+        # reachable case (the published SPARSE-k*-g32 sweep is exactly
+        # this), and it must be reported rather than silently treated as
+        # zero FLOPs, which would make every reduction read as -100%.
+        self.has_flops = [
+            any("flops" in r for r in run) for run in preds
+        ]
 
     def keys(self, *, turn0: bool):
         return [k for k in self.common if (k[1] == 0) == turn0]
@@ -150,9 +170,21 @@ class RunPair:
             if config is None or self.scored[run][k]["config"] == config
         )
 
-    def flop(self, run: int, stage: str, *, turn0: bool) -> float:
+    def flop(self, run: int, stage: str, *, turn0: bool,
+             config: str | None = None) -> float:
+        """`config=None` means every config pooled. Pooling is a blend, not
+        a summary: SCBench's three configs have very different context
+        lengths, so a mixed steady-state mean sits between them and matches
+        none of them. Both views are rendered for that reason."""
         return _mean(
             _stage(self.flops[run][k], stage) for k in self.keys(turn0=turn0)
+            if config is None or self.scored[run][k]["config"] == config
+        )
+
+    def n(self, *, turn0: bool, config: str | None = None) -> int:
+        return sum(
+            1 for k in self.keys(turn0=turn0)
+            if config is None or self.scored[0][k]["config"] == config
         )
 
     def turn0_identical(self) -> tuple[int, int]:
@@ -177,6 +209,8 @@ class RunPair:
 
 
 def render(pairs, a_label, b_label, reference=None):
+    flop_capable = [p for p in pairs if all(p.has_flops)]
+    flop_missing = [p for p in pairs if not all(p.has_flops)]
     out = []
     w = 78
 
@@ -218,51 +252,90 @@ def render(pairs, a_label, b_label, reference=None):
     out.append("")
     out.append("## Accuracy, turn 0 (control -- should not move)")
     out.append("")
-    out.append(f"{'exp_id':<20} {'n':>5} {'A':>8} {'B':>8} {'delta':>8}")
+    out.append(f"{'exp_id':<20} {'config':<18} {'n':>5} {'A':>8} {'B':>8} {'delta':>8}")
     for p in pairs:
+        for cfg in p.configs():
+            n = p.n(turn0=True, config=cfg)
+            if not n:
+                continue
+            sa = p.score(0, turn0=True, config=cfg)
+            sb = p.score(1, turn0=True, config=cfg)
+            out.append(f"{p.exp_id:<20} {cfg:<18} {n:>5} "
+                       f"{sa:>8.2f} {sb:>8.2f} {sb - sa:>+8.2f}")
         sa, sb = p.score(0, turn0=True), p.score(1, turn0=True)
-        out.append(f"{p.exp_id:<20} {len(p.keys(turn0=True)):>5} "
+        out.append(f"{'':<20} {'ALL':<18} {p.n(turn0=True):>5} "
                    f"{sa:>8.2f} {sb:>8.2f} {sb - sa:>+8.2f}")
 
     # -- flops --------------------------------------------------------------
+    if flop_missing:
+        out.append("")
+        out.append("## FLOPs -- UNAVAILABLE for some rows")
+        out.append("")
+        for p in flop_missing:
+            which = [lbl for lbl, ok in zip((a_label, b_label), p.has_flops) if not ok]
+            out.append(f"  {p.exp_id}: no `flops` field in {', '.join(which)}")
+        out.append("")
+        out.append("  Those predictions predate the FLOP model being written into")
+        out.append("  the JSONL. Accuracy above is still valid -- it only needs `pred`.")
+        out.append("  For the FLOP side, re-run that arm, or derive the counterfactual")
+        out.append("  from the other arm's own flop_inputs (decode-only prefill is a")
+        out.append("  pure function of target_resident_len + target_delta_len).")
+
+    if not flop_capable:
+        return "\n".join(out)
+
     out.append("")
     out.append("## FLOPs per turn, steady state (TFLOP, turn 0 excluded)")
     out.append("")
-    out.append(f"{'exp_id':<20} {'run':<16} {'spec':>8} {'prefill':>9} "
-               f"{'decode':>8} {'total':>9} {'vs A':>8}")
-    for p in pairs:
-        ta = p.flop(0, "total", turn0=False)
-        for run, label in ((0, a_label), (1, b_label)):
-            t = p.flop(run, "total", turn0=False)
-            rel = "" if run == 0 else f"{100 * (t / ta - 1):>+7.2f}%"
-            out.append(f"{p.exp_id if run == 0 else '':<20} {label:<16} "
-                       f"{p.flop(run, 'spec', turn0=False):>8.3f} "
-                       f"{p.flop(run, 'target_prefill', turn0=False):>9.3f} "
-                       f"{p.flop(run, 'target_decode', turn0=False):>8.3f} "
-                       f"{t:>9.3f} {rel:>8}")
-        pa, pb = (p.flop(r, "target_prefill", turn0=False) for r in (0, 1))
-        out.append(f"{'':<20} {'-> prefill':<16} {'':>8} "
-                   f"{100 * (pb / pa - 1):>+8.1f}%")
+    header = (f"{'exp_id':<20} {'config':<18} {'run':<16} {'spec':>7} "
+              f"{'prefill':>8} {'decode':>7} {'total':>8} {'prefill':>9} {'total':>8}")
+    out.append(header)
+    out.append(f"{'':<20} {'':<18} {'':<16} {'':>7} {'':>8} {'':>7} {'':>8} "
+               f"{'B vs A':>9} {'B vs A':>8}")
+    for p in flop_capable:
+        for cfg in list(p.configs()) + [None]:
+            if p.n(turn0=False, config=cfg) == 0:
+                continue
+            f = lambda r, st: p.flop(r, st, turn0=False, config=cfg)  # noqa: E731
+            pa, pb = f(0, "target_prefill"), f(1, "target_prefill")
+            ta, tb = f(0, "total"), f(1, "total")
+            for run, label in ((0, a_label), (1, b_label)):
+                first = run == 0
+                rel_p = "" if first else f"{100 * (pb / pa - 1):>+8.1f}%"
+                rel_t = "" if first else f"{100 * (tb / ta - 1):>+7.2f}%"
+                out.append(
+                    f"{(p.exp_id if first and cfg == p.configs()[0] else ''):<20} "
+                    f"{(cfg or 'ALL') if first else '':<18} {label:<16} "
+                    f"{f(run, 'spec'):>7.3f} {f(run, 'target_prefill'):>8.3f} "
+                    f"{f(run, 'target_decode'):>7.3f} {f(run, 'total'):>8.3f} "
+                    f"{rel_p:>9} {rel_t:>8}")
     if reference is not None:
         out.append("")
-        out.append(f"{reference.exp_id:<20} {'reference':<16} "
-                   f"{reference.flop(0, 'spec', turn0=False):>8.3f} "
-                   f"{reference.flop(0, 'target_prefill', turn0=False):>9.3f} "
-                   f"{reference.flop(0, 'target_decode', turn0=False):>8.3f} "
-                   f"{reference.flop(0, 'total', turn0=False):>9.3f}")
+        for cfg in list(reference.configs()) + [None]:
+            if reference.n(turn0=False, config=cfg) == 0:
+                continue
+            g = lambda st: reference.flop(0, st, turn0=False, config=cfg)  # noqa: E731
+            out.append(f"{reference.exp_id:<20} {(cfg or 'ALL'):<18} {'reference':<16} "
+                       f"{g('spec'):>7.3f} {g('target_prefill'):>8.3f} "
+                       f"{g('target_decode'):>7.3f} {g('total'):>8.3f}")
 
     # -- turn 0 cost --------------------------------------------------------
     out.append("")
     out.append("## Turn 0 cost, for scale (TFLOP/turn)")
     out.append("")
-    out.append(f"{'exp_id':<20} {'turn0 total':>13} {'steady total':>14} "
-               f"{'turn0 share of run':>20}")
-    for p in pairs:
-        t0 = p.flop(1, "total", turn0=True)
-        st = p.flop(1, "total", turn0=False)
-        n0, ns = len(p.keys(turn0=True)), len(p.keys(turn0=False))
-        share = 100 * (t0 * n0) / (t0 * n0 + st * ns) if (n0 or ns) else float("nan")
-        out.append(f"{p.exp_id:<20} {t0:>13.1f} {st:>14.3f} {share:>19.2f}%")
+    out.append(f"{'exp_id':<20} {'config':<18} {'turn0 total':>13} "
+               f"{'steady total':>14} {'turn0 share of run':>20}")
+    for p in flop_capable:
+        for cfg in list(p.configs()) + [None]:
+            n0 = p.n(turn0=True, config=cfg)
+            ns = p.n(turn0=False, config=cfg)
+            if not (n0 or ns):
+                continue
+            t0 = p.flop(1, "total", turn0=True, config=cfg)
+            st = p.flop(1, "total", turn0=False, config=cfg)
+            share = 100 * (t0 * n0) / (t0 * n0 + st * ns)
+            out.append(f"{(p.exp_id if cfg == p.configs()[0] else ''):<20} "
+                       f"{(cfg or 'ALL'):<18} {t0:>13.1f} {st:>14.3f} {share:>19.2f}%")
     out.append("")
     out.append("  A steady-state saving is a fraction of the right-hand column,")
     out.append("  not of the run. Read both before calling a scope a win.")
