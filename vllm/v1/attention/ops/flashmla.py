@@ -84,16 +84,21 @@ def _raise_flashmla_unavailable(*_args, **_kwargs):
 
 
 if _is_flashmla_available()[0]:
-    from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
-        FlashMLASchedMeta,
-        flash_attn_varlen_func,
-        flash_attn_varlen_kvpacked_func,
-        flash_attn_varlen_qkvpacked_func,
-        flash_mla_sparse_fwd,
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
-else:
+    try:
+        from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
+            FlashMLASchedMeta,
+            flash_attn_varlen_func,
+            flash_attn_varlen_kvpacked_func,
+            flash_attn_varlen_qkvpacked_func,
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+    except ImportError:
+        _flashmla_C_AVAILABLE = False
+        _flashmla_extension_C_AVAILABLE = False
+
+if not _is_flashmla_available()[0]:
 
     class FlashMLASchedMeta:  # type: ignore[no-redef]
         pass
