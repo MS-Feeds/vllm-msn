@@ -37,19 +37,6 @@ def vllm_topk_softmax(
 ) -> tuple[torch.Tensor, ...]:
     global _uses_legacy_topk_softmax_abi
 
-    # Gemma4 does not enable padding skipping. Once the legacy ABI is known,
-    # avoid recomputing an always-empty padding mask for every MoE layer.
-    if _uses_legacy_topk_softmax_abi is True and not envs.VLLM_MOE_SKIP_PADDING:
-        torch.ops._moe_C.topk_softmax(
-            topk_weights,
-            topk_indices,
-            token_expert_indices,
-            gating_output,
-            renormalize,
-            None,
-        )
-        return topk_weights, topk_indices
-
     is_padding = _get_padding_mask(topk_indices.shape[0])
     if _uses_legacy_topk_softmax_abi is True and is_padding is None:
         torch.ops._moe_C.topk_softmax(
