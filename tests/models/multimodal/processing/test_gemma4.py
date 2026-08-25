@@ -2,14 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import pytest
 import torch
 from PIL import Image as PILImage
 
+from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.gemma4_mm import (
     Gemma4ForConditionalGeneration,
     Gemma4ImagePixelInputs,
+    Gemma4ProcessingInfo,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
@@ -20,6 +23,31 @@ from ...utils import build_model_context
 
 # TODO: to be updated to "google/gemma-4-e2b-it" once the models are available
 GEMMA4_MODEL_ID = "google/gemma-4-E2B-it"
+
+
+@pytest.mark.parametrize(
+    ("vision_config", "audio_config", "expected"),
+    [
+        (object(), None, {"image": None, "video": None}),
+        (None, object(), {"audio": None}),
+        (None, None, {}),
+    ],
+)
+def test_supported_mm_limits_match_available_towers(
+    vision_config: object | None,
+    audio_config: object | None,
+    expected: dict[str, None],
+):
+    class TestContext:
+        def get_hf_config(self, _config_cls: type[object]) -> SimpleNamespace:
+            return SimpleNamespace(
+                vision_config=vision_config,
+                audio_config=audio_config,
+            )
+
+    info = Gemma4ProcessingInfo(TestContext())  # type: ignore[arg-type]
+
+    assert info.get_supported_mm_limits() == expected
 
 
 def test_gemma4_image_schema_accepts_variable_patch_counts():
@@ -222,7 +250,7 @@ def test_limit_mm_per_prompt(
     mm_data = {"image": images}
 
     # Expect ValueError when exceeding limit
-    with pytest.raises(ValueError, match="At most 1 image"):
+    with pytest.raises(VLLMValidationError, match="At most 1 image"):
         processor(
             prompt,
             mm_items=processor.info.parse_mm_data(mm_data),

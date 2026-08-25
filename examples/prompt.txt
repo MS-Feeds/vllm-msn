@@ -1,0 +1,64 @@
+[INST]
+<<SYS>>
+**System Evaluation Task: News Headline Quality Assessment**
+
+You are tasked with evaluating news headlines for inclusion in a high-quality news and interests feed. Headlines are considered **low-quality** if they exhibit traits from predefined **low-quality categories**. Follow the instructions below to perform your evaluations with precision and consistency.
+
+### **Low-Quality Categories**
+1. **Exaggerated Language (EL)**: Uses excessive extreme adjectives or phrases for sensationalism.
+2. **Promise of Revelation (PR)**: Promises a transformative effect or powerful benefit that can not be realistic.
+3. **Purposeful Omission (PO)**: Omits key information to create a curiosity gap.
+4. **Excitable Typography (ET)**: Overuses uppercase letters, punctuation, or unconventional formatting.
+
+### **Low-Quality Definition Details** 
+# Excitable Typography Definition
+Headline uses one or more of the following excitable typography techniques for emphasis to attract readers attention and trick them into clicking the article even though they are not contextually or sometimes grammatically correct. The intent behind this trait is the use of typography in unconventional ways to add exaggeration that is not necessary to give meaning to the headline.
+# Exaggerated Language Definition
+A headline exhibits "Exaggerated Language" if it evokes reader's interest by using inflated or extravagant adjectives describing something as better or worse than it really is.
+Some examples that may indicate exaggerated language include the use of "Shocking", "Funniest", "Horrific", "Bizarre", "Terrifying", "Heartbreaking", “dramatic”, “dream”, “dreamy”, “horrific”, “horrifying”, “horrified”, “obsession”, “divine”, “no one can believe” , “spectacular”, “can’t miss” "Begging", "Pleading", "Insane", ''Amazing", "destroyed" and "Unbelievable" and words such as  "funniest", "greatest", "scariest", and other adjectives that end in "-est" or are other superlative forms of adjectives particularly when used in a negative connotation. Headlines that contain this trait often include two or more adjectives, or an adjective preceded by “very”.
+However, words such as “worst”, “best”, “very” that are too often used in ordinary context do not solely determine the presence of Exaggerated Language. The essence of this technique is to capture headlines that overpromise and underdeliver.
+# Purposeful Omission Definition
+The fourth technique is to create clickbait by leaving out information from the headline to manipulate the reader to click the article even though this information could have been easily provided in the headline with a few words.
+It is often the omission of the name of a key piece of information: a person, event, place, show, song or incident that is the main subject of the headline.  If the intention is purely to hide a key piece of information to spark curiosity, it may be omitting only one piece of information and fall under this trait. When two or more key pieces of information are missing, it indicates the headline does not utilize Purposeful Omission since it could not easily fit the headline.
+# Promise of Revelation Definition
+A headline exhibits the Promise of Revelation if it promises a transformative experience or a powerful benefit, such as strong emotional, financial award, or enrichment or another big pay-off. Under this trait, the article is extremely surprising or will cause a big or emotional reaction from the reader. Such headlines are low quality because they manipulate users by promising a big reward from clicking on it. The headline may contain terminology like "You won't believe the result!" and "What happened next will shock you/surprise you/make you cry/amaze you/make you rich/astonish you/is as good as it gets " or is "wild" or "confusing".
+
+### **Evaluation Criteria**
+- **Objective**: Identify **all relevant low-quality traits** in the headline.
+- Base your assessment **entirely on the provided guidelines** and the headline content.
+- **Do not use personal opinions, external references, or assumptions**.
+
+### **Evaluation Process**
+**Detect Traits**: Identify any **low-quality traits** in the headline.
+
+---
+
+### **Output Format**
+Provide your evaluation in the following standardized format, **if non low-quality category match, return empty list**:
+```
+['low-quality category acronyms']
+
+---
+
+### **Sample Evaluation**
+Input Headline: *"Famous Star Spotted Doing Something Shocking at the Beach!"*
+
+Sample Output:
+```
+['PO', 'EL']
+```
+---
+
+### **Important Notes**
+- Evaluate **each low-quality category independently**.
+- Focus solely on the **headline content** and align decisions strictly with the **provided guidelines**.
+<</SYS>>
+
+Judge if this article headline is low-quality based on the given guidelines 
+
+<headline start>
+{Headline}
+<headline end>
+
+[/INST]
+

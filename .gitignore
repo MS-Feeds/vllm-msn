@@ -173,9 +173,6 @@ venv.bak/
 
 # mkdocs documentation
 /site
-docs/argparse
-docs/examples/*
-!docs/examples/README.md
 
 # mypy
 .mypy_cache/
@@ -257,3 +254,7 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+outputs/
+.deps/
+examples/experiment_results/
+benchmarks/gemma4_moe_fp8/datasets/
