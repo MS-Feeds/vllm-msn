@@ -69,12 +69,29 @@ if HAS_TRITON:
                 HAS_TRITON = False
     except ImportError:
         # This can occur if Triton is partially installed or triton.backends
-        # is missing.
-        logger.warning(
-            "Triton is installed, but `triton.backends` could not be imported. "
-            "Disabling Triton."
-        )
-        HAS_TRITON = False
+        # is missing. The AML image ships a legacy Triton whose core JIT still
+        # works even though the newer backend-plugin API is unavailable.
+        try:
+            import triton as _triton_check
+
+            if callable(getattr(_triton_check, "jit", None)):
+                logger.warning(
+                    "Triton is installed and triton.jit is callable, but "
+                    "`triton.backends` could not be imported. Keeping Triton "
+                    "enabled for legacy JIT kernels."
+                )
+            else:
+                logger.warning(
+                    "Triton is installed, but `triton.backends` could not be "
+                    "imported and triton.jit is not callable. Disabling Triton."
+                )
+                HAS_TRITON = False
+        except Exception:
+            logger.warning(
+                "Triton is installed, but `triton.backends` could not be "
+                "imported. Disabling Triton."
+            )
+            HAS_TRITON = False
     except Exception as e:
         # Catch any other unexpected errors during the check.
         logger.warning(
