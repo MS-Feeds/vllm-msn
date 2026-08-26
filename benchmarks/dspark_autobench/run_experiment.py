@@ -53,6 +53,19 @@ def build_llm_kwargs(config: dict) -> dict:
     return kwargs
 
 
+def truncate_prompts(
+    tokenizer, prompts: list[str], max_model_len: int, max_tokens: int
+) -> list[dict[str, list[int]]]:
+    max_prompt_tokens = max_model_len - max_tokens
+    if max_prompt_tokens <= 0:
+        raise ValueError("max_model_len must exceed max_tokens")
+    prompt_token_ids = []
+    for prompt in prompts:
+        token_ids = [int(token_id) for token_id in tokenizer.encode(prompt)]
+        prompt_token_ids.append({"prompt_token_ids": token_ids[-max_prompt_tokens:]})
+    return prompt_token_ids
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -70,7 +83,7 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, trust_remote_code=True, local_files_only=True
     )
-    prompts = [
+    rendered_prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             add_generation_prompt=True,
@@ -78,6 +91,10 @@ def main() -> int:
         )
         for prompt in load_prompts(args.prompts)
     ]
+    max_tokens = config.get("max_tokens", 1024)
+    prompts = truncate_prompts(
+        tokenizer, rendered_prompts, config["max_model_len"], max_tokens
+    )
 
     print(f"DSpark runner model: {model_path}", flush=True)
     print(f"DSpark runner prompts: {len(prompts)}", flush=True)
@@ -86,7 +103,7 @@ def main() -> int:
     totals = []
     for repetition in range(1, args.reps + 1):
         sampling = SamplingParams(
-            temperature=0.7, top_p=0.95, max_tokens=8192, seed=repetition
+            temperature=0.7, top_p=0.95, max_tokens=max_tokens, seed=repetition
         )
         start = time.time()
         outputs = llm.generate(prompts, sampling, use_tqdm=True)
