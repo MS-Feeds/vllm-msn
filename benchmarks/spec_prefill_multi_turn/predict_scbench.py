@@ -185,7 +185,16 @@ CSV_PATH = OUT_DIR / "all_runs.csv"
 DEFAULT_SAMPLES = Path(__file__).parent / "datasets" / "scbench_samples.jsonl"
 
 CSV_FIELDS = [
-    "ts", "exp_id", "label", "mode", "keep_mode",
+    # `scbench_config` is not derivable from anything else in the row: the
+    # same exp_id run against two different --scbench-config values
+    # produces rows identical in exp_id/mode/keep_percentage/kv_granularity
+    # and distinguishable only by `ts` and the conversation counts. Unlike
+    # the scorer identity and the prefill scope -- both appended to `label`
+    # specifically to keep already-written all_runs.csv files
+    # append-compatible -- this one is a real grouping key that analysis
+    # needs to filter and join on, so it gets a column and a one-time
+    # migration of the existing file rather than a tag.
+    "ts", "exp_id", "label", "mode", "scbench_config", "keep_mode",
     "keep_percentage", "kv_granularity", "chunk_size",
     "look_ahead_cnt", "pool_kernel_size",
     "target_gpu_memory_utilization", "speculator_gpu_memory_utilization",
@@ -2409,7 +2418,20 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     + "]"
                     if scorer_model else label
                 ) + scope_tag,
-                "mode": mode, "keep_mode": keep_mode,
+                "mode": mode,
+                # Read off the predictions this run actually produced, not
+                # echoed from `--scbench-config`: an unrestricted run leaves
+                # the flag unset but really did run all three, and a
+                # restricted run can still come back with fewer configs than
+                # asked for if every conversation of one was skipped for
+                # length. The column should say what was measured, not what
+                # was requested. Falls back to the flag only when nothing
+                # was produced at all.
+                "scbench_config": (
+                    "+".join(sorted({p["config"] for p in predictions}))
+                    or (args.scbench_config or "")
+                ),
+                "keep_mode": keep_mode,
                 "keep_percentage": keep_percentage, "kv_granularity": granularity,
                 "chunk_size": GRANULARITIES.get(granularity, {}).get("chunk_size") if granularity else None,
                 "look_ahead_cnt": LOOK_AHEAD_CNT if mode != "baseline" else None,
