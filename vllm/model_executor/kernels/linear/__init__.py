@@ -381,6 +381,21 @@ def _resolve_backend_kernels(
     return filtered
 
 
+def _prioritize_fp8_marlin(
+    kernels: list[type], compute_capability: int | None
+) -> list[type]:
+    if (
+        MarlinFP8ScaledMMLinearKernel not in kernels
+        or compute_capability is None
+        or compute_capability >= 89
+    ):
+        return kernels
+    return [
+        MarlinFP8ScaledMMLinearKernel,
+        *(k for k in kernels if k is not MarlinFP8ScaledMMLinearKernel),
+    ]
+
+
 # in priority/performance order (when available)
 _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]] = {
     PlatformEnum.CPU: [ZentorchInt8ScaledMMLinearKernel, CPUInt8ScaledMMLinearKernel],
@@ -396,14 +411,12 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
 # in priority/performance order (when available)
 _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] = {
     PlatformEnum.CUDA: [
-        # A100 (SM80) lacks native FP8 Tensor Cores; Marlin provides the
-        # compatible weight-only FP8 path before CUTLASS is considered.
-        MarlinFP8ScaledMMLinearKernel,
         FlashInferFP8ScaledMMLinearKernel,
         CutlassFP8ScaledMMLinearKernel,
         B12xTensorFP8ScaledMMLinearKernel,
         PerTensorTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
+        MarlinFP8ScaledMMLinearKernel,
         HummingFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
@@ -647,6 +660,15 @@ def choose_scaled_mm_linear_kernel(
         )
 
     platform_kernels = possible_kernels.get(current_platform._enum, [])
+
+    if current_platform.is_cuda():
+        capability = compute_capability
+        if capability is None:
+            device_capability = current_platform.get_device_capability()
+            capability = (
+                device_capability.to_int() if device_capability is not None else None
+            )
+        platform_kernels = _prioritize_fp8_marlin(platform_kernels, capability)
 
     # Apply --linear-backend filtering when set.
     platform_kernels = _resolve_backend_kernels(platform_kernels, "scaled-mm")
