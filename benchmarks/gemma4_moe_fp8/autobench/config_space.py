@@ -121,13 +121,20 @@ def config_to_llm_kwargs(cfg: dict, scenario_cfg: dict) -> dict:
     kwargs = {
         "trust_remote_code": True,
         "max_model_len": cfg.get("max_model_len", 24576),
-        "max_num_seqs": cfg.get("max_num_seqs", 128),
-        "max_num_batched_tokens": cfg.get("max_num_batched_tokens",
-                                          scenario_cfg.get("max_num_batched_tokens", 16384)),
         "gpu_memory_utilization": cfg.get("gpu_memory_utilization", 0.95),
         "enforce_eager": cfg.get("enforce_eager", False),
         "seed": 0,
     }
+    if cfg.get("performance_mode") != "throughput":
+        kwargs["max_num_seqs"] = cfg.get("max_num_seqs", 128)
+        kwargs["max_num_batched_tokens"] = cfg.get(
+            "max_num_batched_tokens",
+            scenario_cfg.get("max_num_batched_tokens", 16384),
+        )
+    else:
+        for key in ("max_num_seqs", "max_num_batched_tokens"):
+            if key in cfg:
+                kwargs[key] = cfg[key]
     if cfg.get("quantization"):
         kwargs["quantization"] = cfg["quantization"]
     if cfg.get("kv_cache_dtype", "auto") != "auto":
@@ -147,6 +154,10 @@ def config_to_llm_kwargs(cfg: dict, scenario_cfg: dict) -> dict:
         kwargs["async_scheduling"] = cfg["async_scheduling"]
     if cfg.get("attention_backend"):
         kwargs["attention_backend"] = cfg["attention_backend"]
+    if cfg.get("optimization_level"):
+        kwargs["optimization_level"] = cfg["optimization_level"]
+    if cfg.get("performance_mode"):
+        kwargs["performance_mode"] = cfg["performance_mode"]
     if cfg.get("hf_overrides"):
         kwargs["hf_overrides"] = cfg["hf_overrides"]
     if cfg.get("kv_cache_dtype_skip_layers"):
