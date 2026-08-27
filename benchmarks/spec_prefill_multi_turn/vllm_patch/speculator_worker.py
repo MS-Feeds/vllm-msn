@@ -125,6 +125,7 @@ from .kv_cache_utils import (
     read_layer_keys,
     stack_decode_only_steps,
 )
+from .model_truncation import _install_truncated_layer_weight_filter
 
 
 def _conversation_salt_from_request_id(request_id: str) -> Optional[str]:
@@ -711,6 +712,15 @@ class SpeculatorWorker(Worker):
         self.model_runner = SpeculatorGPUModelRunner(self.vllm_config, self.device)
 
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        # Before super(), not after: this is what lets a scorer engine built
+        # with `hf_overrides={"num_hidden_layers": n}` load only the first n
+        # layers of a deeper checkpoint, and the weights are read inside the
+        # super() call. Installed here rather than at module import because
+        # it patches a vLLM class, and this module is also imported by the
+        # DRIVER process (for the `worker_cls` dotted path); the patch only
+        # ever needs to exist in the worker that actually loads a model.
+        # No-op for an untruncated checkpoint -- see the function's docstring.
+        _install_truncated_layer_weight_filter()
         super().load_model(load_dummy_weights=load_dummy_weights)
         self.model_runner.install_query_capture_hooks()
 

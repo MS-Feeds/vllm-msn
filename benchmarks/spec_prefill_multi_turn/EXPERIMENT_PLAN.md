@@ -794,12 +794,15 @@ implemented this pass.
 | M-k20-g{token,16,32,64} | Keep 20% | 20% | token/16/32/64 | keep |
 | ORACLE-k{80,60,40,20} | Oracle upper bound (SPARSE architecture, target checkpoint as scorer) | 80/60/40/20% | 32 (representative, pairs with SPARSE-k\*-g32) | keep |
 | SPARSE-k{80,60,40,20}-g{16,32,64} | Persistent cache + sparse attention (see that section above) | 80/60/40/20% | 16/32/64 (no `token` -- block-gather is block-granular only) | keep (only) |
+| EARLY-k20-g32-L{1..8} | Scorer = the target's own first n layers, `r = n/32` (see below) | 20% | 32 | keep |
+| EARLY-k{60,80}-g32-L{2,4} | Same, at the keep rates a cheap `r` unlocks | 60/80% | 32 | keep |
 
 `predict_scbench.py --list` prints this matrix (generated programmatically,
 not hand-enumerated -- see that script's `_build_experiments`). Use
 `--exp specprefill` for all M-k*-g* rows, `--exp sparse` for all
-SPARSE-k*-g* rows, `--exp oracle` for the 4 ORACLE-k* ceiling rows, or
-`--exp all` for everything.
+SPARSE-k*-g* rows, `--exp oracle` for the 4 ORACLE-k* ceiling rows,
+`--exp early` for the 12 EARLY-k*-g32-L<n> rows, or `--exp all` for
+everything.
 
 Metrics captured per turn: per-config metric (`grade_scbench.py` --
 `in_match` for `scbench_kv`, `qa_f1_score` for `scbench_qa_eng`, ROUGE-L for
@@ -833,6 +836,68 @@ real wall clock," not "how fast is the model's decode loop in isolation."
 `DISCARD` mode and the `ORACLE` rows' full granularity cross are natural
 next steps once `M000`/`M-k*-g*` are validated and run — not part of this
 pass's default sweep.
+
+
+### EARLY-k\*-g32-L\<n>: the target's own first *n* layers as the scorer
+
+`EARLY-k{K}-g32-L{n}` is `SPARSE-k{K}-g32` with the 1B speculator replaced by
+the **target checkpoint truncated to its first n layers** — the same engine,
+the same driving loop, the same block-gather, built as
+`LLM(model=<target>, hf_overrides={"num_hidden_layers": n})`.
+
+It exists because the scorer/target cost ratio then needs no measurement:
+
+> `A = 32 · 4 · 32 · 128`, `B = n · 4 · 32 · 128`, so **`r = n/32` exactly.**
+
+and `SPECULATION_ECONOMICS.md`'s win condition `(d + o)(1 - r - k) > 12r`
+turns entirely on `r`. At today's `r = 1/4` the useful keep rate can never
+exceed 75%, while `k80` is the only rate clearing a 5% accuracy drop on
+`scbench_kv` — the structural bind that section describes. At `n = 2`,
+`r = 1/16` and both `k60` and `k80` clear the ceiling.
+
+| n | r | max useful keep | fixed overhead `12r` |
+|---:|---:|---:|---:|
+| 1 | 1/32 | 96.9% | 0.375 |
+| 2 | 1/16 | 93.8% | 0.75 |
+| 4 | 1/8 | 87.5% | 1.5 |
+| 8 | 1/4 | 75.0% | 3.0 |
+
+**Why the sweep is 1..8.** `n = 8` reproduces the 1B speculator's `r`
+exactly, so `EARLY-k20-g32-L8` vs. `SPARSE-k20-g32` is a controlled,
+equal-cost head-to-head — and past n=8 the family is strictly worse than the
+status quo on the axis it exists to improve. `ORACLE-k{K}` is this family's
+own `n = 32` end point.
+
+**Rows.** `n = 1..8` at the `k20-g32` probe point (the corner where the
+estimator gap is largest, so scorers are distinguishable above the noise —
+at `k80` almost nothing is pruned and every `n` looks alike), plus
+`EARLY-k{60,80}-g32-L{2,4}` for the economics question that `k20` cannot
+answer. `--exp early` selects all 12; `--scbench-config` and `--chunk-size`
+work exactly as they do for every other family.
+
+**Run the gate first.** `diagnose_retrieval_heads.py --layer-prefix-budgets
+1,2,3,4,5,6,7,8,16,32 --speculator-model <target>` measures gold-answer
+survival for **every n in one speculator-only pass**, no target engine and no
+grading — a layer prefix is just the first `n · num_heads` rows of the
+flattened `layer*head` axis the §1.3 fixed-head-set machinery already takes.
+Same "measure the ceiling before building toward it" move as `ORACLE-k20`.
+
+**Two things to read the results against.**
+
+1. The gate is an *upper bound*, not a prediction of the EARLY rows. Its
+   lookahead tokens still come from the full 32-layer forward pass, so it
+   isolates *"is early-layer attention informative"* from *"can a truncated
+   model produce usable lookahead queries."*
+2. A truncated scorer decodes lookahead through the target's final norm and
+   `lm_head`, trained for layer-32 outputs — an untuned early-exit head. Those
+   tokens degrade as `n` shrinks. That is a real property of the proposal, not
+   a bug, but it means a poor EARLY row has two possible causes and the gate is
+   what separates them.
+
+**Cost caveat.** These rows run the scorer as a *separate engine*, so they
+still pay its own prefill (turn 0's measured +21% penalty). A fused
+implementation — reading the attention out of the target's own first n layers
+mid-prefill — removes that entirely. The grid measures the pessimistic bound.
 
 ---
 
@@ -912,7 +977,7 @@ memory-footprint variable that estimate didn't have to account for.
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) -- see "Persistent KV cache + sparse attention" section |
 | `validate_sparse_attention.py` | GPU-node validation: decode-step block-gather sparse attention (needle-in-haystack) -- see "Persistent KV cache + sparse attention" section |
 | `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
-| `predict_scbench.py` | Runs the M000/M-k*-g*/ORACLE-k*/SPARSE-k*-g* matrix, writes a per-turn predictions JSONL per experiment |
+| `predict_scbench.py` | Runs the M000/M-k*-g*/ORACLE-k*/SPARSE-k*-g*/EARLY-k*-g32-L<n> matrix, writes a per-turn predictions JSONL per experiment |
 | `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
 | `datasets/` | SCBench prep output (gitignored) |
 | `results/` | Output directory (gitignored) |

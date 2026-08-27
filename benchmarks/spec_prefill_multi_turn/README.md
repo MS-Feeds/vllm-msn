@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  95/95 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  116/116 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -107,6 +107,8 @@ Confirmed MVP scope: 3 SCBench configs (`scbench_qa_eng`/`scbench_kv`/
 | M000 | Baseline (no pruning) | 100% | — | — |
 | ORACLE-k{80,60,40,20} | Oracle upper bound (target checkpoint scores instead of the speculator) | 80/60/40/20% | 32 (pairs with SPARSE-k\*-g32) | keep |
 | SPARSE-k{80,60,40,20}-g{16,32,64} | Persistent cache + sparse attention | 80/60/40/20% | 16/32/64 | keep (only) |
+| EARLY-k20-g32-L{1..8} | Scorer = the target's own first n layers (`r = n/32`) | 20% | 32 | keep |
+| EARLY-k{60,80}-g32-L{2,4} | Same, at the keep rates a cheap `r` unlocks | 60/80% | 32 | keep |
 
 Shared SpecPrefill hyperparameters (matches `../spec_prefill_llama/`'s
 single-turn matrix): BF16, look-ahead count **8**, `pool_kernel_size`
@@ -253,6 +255,68 @@ config to run first.
 > spread sample; it isn't one.)
 
 ---
+
+
+### EARLY-k\*-g32-L\<n>: the target's own first *n* layers as the scorer
+
+`EARLY-k{K}-g32-L{n}` is `SPARSE-k{K}-g32` with the 1B speculator replaced by
+the **target checkpoint truncated to its first n layers** — the same engine,
+the same driving loop, the same block-gather, built as
+`LLM(model=<target>, hf_overrides={"num_hidden_layers": n})`.
+
+It exists because the scorer/target cost ratio then needs no measurement:
+
+> `A = 32 · 4 · 32 · 128`, `B = n · 4 · 32 · 128`, so **`r = n/32` exactly.**
+
+and `SPECULATION_ECONOMICS.md`'s win condition `(d + o)(1 - r - k) > 12r`
+turns entirely on `r`. At today's `r = 1/4` the useful keep rate can never
+exceed 75%, while `k80` is the only rate clearing a 5% accuracy drop on
+`scbench_kv` — the structural bind that section describes. At `n = 2`,
+`r = 1/16` and both `k60` and `k80` clear the ceiling.
+
+| n | r | max useful keep | fixed overhead `12r` |
+|---:|---:|---:|---:|
+| 1 | 1/32 | 96.9% | 0.375 |
+| 2 | 1/16 | 93.8% | 0.75 |
+| 4 | 1/8 | 87.5% | 1.5 |
+| 8 | 1/4 | 75.0% | 3.0 |
+
+**Why the sweep is 1..8.** `n = 8` reproduces the 1B speculator's `r`
+exactly, so `EARLY-k20-g32-L8` vs. `SPARSE-k20-g32` is a controlled,
+equal-cost head-to-head — and past n=8 the family is strictly worse than the
+status quo on the axis it exists to improve. `ORACLE-k{K}` is this family's
+own `n = 32` end point.
+
+**Rows.** `n = 1..8` at the `k20-g32` probe point (the corner where the
+estimator gap is largest, so scorers are distinguishable above the noise —
+at `k80` almost nothing is pruned and every `n` looks alike), plus
+`EARLY-k{60,80}-g32-L{2,4}` for the economics question that `k20` cannot
+answer. `--exp early` selects all 12; `--scbench-config` and `--chunk-size`
+work exactly as they do for every other family.
+
+**Run the gate first.** `diagnose_retrieval_heads.py --layer-prefix-budgets
+1,2,3,4,5,6,7,8,16,32 --speculator-model <target>` measures gold-answer
+survival for **every n in one speculator-only pass**, no target engine and no
+grading — a layer prefix is just the first `n · num_heads` rows of the
+flattened `layer*head` axis the §1.3 fixed-head-set machinery already takes.
+Same "measure the ceiling before building toward it" move as `ORACLE-k20`.
+
+**Two things to read the results against.**
+
+1. The gate is an *upper bound*, not a prediction of the EARLY rows. Its
+   lookahead tokens still come from the full 32-layer forward pass, so it
+   isolates *"is early-layer attention informative"* from *"can a truncated
+   model produce usable lookahead queries."*
+2. A truncated scorer decodes lookahead through the target's final norm and
+   `lm_head`, trained for layer-32 outputs — an untuned early-exit head. Those
+   tokens degrade as `n` shrinks. That is a real property of the proposal, not
+   a bug, but it means a poor EARLY row has two possible causes and the gate is
+   what separates them.
+
+**Cost caveat.** These rows run the scorer as a *separate engine*, so they
+still pay its own prefill (turn 0's measured +21% penalty). A fused
+implementation — reading the attention out of the target's own first n layers
+mid-prefill — removes that entirely. The grid measures the pessimistic bound.
 
 ## Results: full SCBench graded sweep (M000 + all 12 SPARSE-k\*-g\* configs)
 
@@ -502,14 +566,14 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 95/95 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 116/116 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |
 | `validate_sparse_attention.py` | GPU-node validation: decode-step block-gather sparse attention (needle-in-haystack) |
 | `diagnose_turn_index_gap.py` | Diagnoses the turn-0 accuracy dip: rendering-mismatch vs. truncation hypotheses |
 | `diagnose_gold_survival.py` | Diagnoses the turn-0 accuracy dip: does the gold answer survive selection? |
-| `diagnose_retrieval_heads.py` | The §1.3 gate: upper bound on retrieval-head filtering (heads picked using the gold position — cheating, so it is a ceiling), plus whether those heads are stable enough for a fixed head set to exist |
+| `diagnose_retrieval_heads.py` | The §1.3 gate: upper bound on retrieval-head filtering (heads picked using the gold position — cheating, so it is a ceiling), plus whether those heads are stable enough for a fixed head set to exist. `--layer-prefix-budgets` reuses the same fixed-head-set machinery as the cheap gate for the `EARLY-k*-g32-L<n>` family: gold survival when only the first n layers vote, every n in one pass |
 | `diagnose_speculator_selection.py` | Decodes the speculator's actual selected text, to isolate selection-side vs. target-side bugs |
 | `diagnose_target_gather_metadata.py` | Checks target-side gathered block count against an independently computed expectation |
 | `diagnose_h1_metadata.py` | Dumps attention-metadata length fields to catch stale-field bugs (found `max_seq_len` staleness) |
@@ -517,7 +581,7 @@ eval_utils.py`.
 | `flops_model.py` | Analytic FLOP model (pure Python, no GPU needed) |
 | `validate_flops_model.py` | GPU-node validation of the FLOP model against real profiler output |
 | `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
-| `predict_scbench.py` | Runs the M000/ORACLE-k\*/SPARSE-k\*-g\* matrix, writes a per-turn predictions JSONL per experiment |
+| `predict_scbench.py` | Runs the M000/ORACLE-k\*/SPARSE-k\*-g\*/EARLY-k\*-g32-L\<n> matrix, writes a per-turn predictions JSONL per experiment |
 | `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
 | `SPARSE-k20-g32-*` rows | Scoring-variant sweep (`--exp score`) — `score_aggregation`/`score_layers`, targeting the 17-point estimator gap the oracle measured |
 | `compare_ceiling.py` | Compares predictions files on their common turns, with a cluster-bootstrap CI — for reading ORACLE-k\* against its SPARSE partner |

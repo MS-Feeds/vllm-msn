@@ -299,6 +299,69 @@ HEAD_SET_SIZES = [1, 2, 4]
 HEAD_SET_RATES = [0.2, 0.4, 0.6]
 
 
+# Which modes build a SCORER engine at all, and which run the persistent-cache
+# + sparse-attention architecture. Named rather than repeated as literal
+# tuples at each site: adding the `early` family below would otherwise mean
+# finding all seven `mode in (...)` membership tests by hand and silently
+# producing a half-wired mode if one were missed.
+SCORING_MODES = ("specprefill", "sparse", "oracle", "early")
+SPARSE_ARCH_MODES = ("sparse", "oracle", "early")
+
+# The target's own first N layers as the speculator (SPECULATION_ECONOMICS.md's
+# third escape from the keep-rate bind). The scorer is the TARGET checkpoint
+# loaded with `hf_overrides={"num_hidden_layers": n}` -- see
+# `vllm_patch/speculator_worker.py::_install_truncated_layer_weight_filter`
+# for the one non-obvious mechanism this needs, and `mode == "early"`'s branch
+# in `run_experiment` for how the scorer engine is built.
+#
+# WHY 1..8 AND NOT FURTHER. The economics model's whole verdict turns on `r`,
+# the scorer's per-token cost as a fraction of the target's. For the first n
+# layers of the target that ratio is exact and needs no measurement:
+#
+#     A = 32 layers x 4 x 32 heads x 128 head_dim   (target)
+#     B =  n layers x 4 x 32 heads x 128 head_dim   ->  r = n/32
+#
+# and the win condition `(d + o)(1 - r - k) > 12r` then reads:
+#
+#     n   r      max useful keep (1-r)   fixed overhead (12r)
+#     1   1/32   96.9%                   0.375
+#     2   1/16   93.8%                   0.75
+#     4   1/8    87.5%                   1.5
+#     8   1/4    75.0%                   3.0
+#
+# n=8 is EXACTLY the Llama-3.2-1B speculator's own r, so `EARLY-k20-g32-L8`
+# vs. the published `SPARSE-k20-g32` is a controlled, equal-cost head-to-head,
+# and anything past n=8 is strictly worse than the status quo on the very axis
+# this family exists to improve. That makes 8 the ceiling, not a guess.
+#
+# KNOWN LIMITATION, so a reader does not mis-attribute a result. A truncated
+# scorer decodes its lookahead tokens by running layer-n's hidden states
+# through the TARGET's final norm and `lm_head`, which were trained for
+# layer-32 outputs -- an untuned early-exit head (logit-lens decoding). Those
+# tokens will be degraded, more so at small n. That is a real property of the
+# proposal rather than a bug, but it means a poor row here has TWO possible
+# causes: early-layer attention not carrying the retrieval signal, or the
+# truncated model not producing usable lookahead queries. Those are separated
+# by `diagnose_retrieval_heads.py --layer-prefix-budgets`, whose lookahead
+# comes from the FULL model and which therefore reports the attention-quality
+# half alone (and is a cheap gate to run BEFORE this grid).
+EARLY_LAYER_BUDGETS = [1, 2, 3, 4, 5, 6, 7, 8]
+# k20-g32, the same probe point the scoring/head sweeps use and for the same
+# reason: it is the corner where the estimator gap is largest (ORACLE-k20 put
+# 17.0 of `scbench_kv`'s 25.0-point drop on estimation error), so differences
+# between scorers show above the noise. At k80 almost nothing is pruned and
+# every n would look alike.
+EARLY_PROBE = (0.2, "32")
+# ...but k20 is NOT where this family pays off. The point of a small r is that
+# it raises the useful-keep ceiling, so the rates worth confirming are the
+# gentle ones the 1B scorer can never reach (k80 is the only rate clearing a
+# 5% accuracy drop on `scbench_kv`, and at r=1/4 it can never pay for itself).
+# Generated at two representative budgets; run the one the k20 probe promotes
+# rather than both.
+EARLY_FOLLOWUP_RATES = [0.6, 0.8]
+EARLY_FOLLOWUP_BUDGETS = [2, 4]
+
+
 def _build_experiments() -> dict:
     experiments = {
         "M000": {
@@ -392,6 +455,31 @@ def _build_experiments() -> dict:
                 "keep_percentage": rate, "granularity": probe_gran,
                 "head_set_size": size,
             }
+    # Target's-own-early-layers rows -- see EARLY_LAYER_BUDGETS above for the
+    # r = n/32 derivation that fixes the range at 1..8, and for the
+    # lookahead-degradation caveat these rows have to be read against.
+    #
+    # `mode` is "early", NOT "oracle", even though the scorer engine is built
+    # from the same checkpoint by the same code: an ORACLE row is the ACCURACY
+    # CEILING (the target estimating its own attention with everything it has)
+    # and an EARLY row is a cheap approximation of it. A CSV row labelled
+    # `oracle` that is not the ceiling is exactly the kind of row that gets
+    # read back years later as one.
+    early_rate, early_gran = EARLY_PROBE
+    early_cells = [(early_rate, n) for n in EARLY_LAYER_BUDGETS]
+    early_cells += [
+        (rate, n) for rate in EARLY_FOLLOWUP_RATES for n in EARLY_FOLLOWUP_BUDGETS
+    ]
+    for rate, num_layers in early_cells:
+        exp_id = f"EARLY-k{int(rate * 100)}-g{early_gran}-L{num_layers}"
+        experiments[exp_id] = {
+            "label": f"Sparse attention (persistent cache) keep={int(rate * 100)}% "
+                     f"granularity={early_gran} scorer=target's first "
+                     f"{num_layers} layer(s) (r={num_layers}/32)",
+            "mode": "early", "keep_mode": "keep",
+            "keep_percentage": rate, "granularity": early_gran,
+            "scorer_num_layers": num_layers,
+        }
     return experiments
 
 
@@ -1988,7 +2076,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         enable_chunked_prefill=True,
         max_model_len=max_model_len,
     )
-    if mode in ("sparse", "oracle"):
+    if mode in SPARSE_ARCH_MODES:
         # SparseTargetWorker, not SpecPrefillWorker -- this path never
         # physically shrinks the prompt (no RoPE-position-override
         # machinery needed at all, see sparse_target_runner.py's module
@@ -2040,13 +2128,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     speculator_max_num_batched_tokens = None
     scorer_model = None
     scorer_gpu_memory_utilization = None
-    if mode in ("specprefill", "sparse", "oracle"):
-        # Same scorer construction for all three -- the scoring job (run the
-        # sequence, decode `look_ahead_cnt` lookahead tokens, score their
-        # attention over the context, chunk-select the top k%) is identical
-        # regardless of WHICH checkpoint does it and of how the TARGET
-        # consumes the resulting selection (see run_sparse_attention's own
-        # docstring).
+    if mode in SCORING_MODES:
+        # Same scorer construction for every scoring mode -- the scoring
+        # job (run the sequence, decode `look_ahead_cnt` lookahead tokens,
+        # score their attention over the context, chunk-select the top k%)
+        # is identical regardless of WHICH checkpoint does it, how DEEP a
+        # slice of it runs, and of how the TARGET consumes the resulting
+        # selection (see run_sparse_attention's own docstring).
         import torch
         from vllm_patch.proposer import SpecPrefillProposer
 
@@ -2071,9 +2159,22 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # resumable-session mechanism). A separate engine has neither
         # problem, and reuses the speculator path's already-validated
         # machinery unchanged.
-        if mode == "oracle":
+        scorer_num_layers = exp_cfg.get("scorer_num_layers")
+        if mode in ("oracle", "early"):
+            # EARLY-* scores with the SAME checkpoint the oracle does, just
+            # truncated to its first `scorer_num_layers` layers (see
+            # EARLY_LAYER_BUDGETS) -- so it inherits the oracle's model,
+            # device and context-budget flags rather than growing parallel
+            # copies of each. Only the memory fraction differs, because
+            # --oracle-scorer-gpu-memory-utilization's own help text derives
+            # 0.6 from a FULL 8B's ~16GB of weights and 128 KiB/token of KV,
+            # and neither number describes an n-layer truncation.
             scorer_model = args.oracle_scorer_model or args.target_model
-            scorer_gpu_memory_utilization = args.oracle_scorer_gpu_memory_utilization
+            scorer_gpu_memory_utilization = (
+                args.early_scorer_gpu_memory_utilization
+                if mode == "early"
+                else args.oracle_scorer_gpu_memory_utilization
+            )
             scorer_device_arg = args.oracle_scorer_device or args.speculator_device
             scorer_max_num_batched_tokens_arg = (
                 args.oracle_scorer_max_num_batched_tokens
@@ -2111,8 +2212,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         scorer_device_index = speculator_device.index
         device_count = torch.cuda.device_count()
         print(
-            f"[predict_scbench] scoring engine: {scorer_model} on "
-            f"{speculator_device} "
+            f"[predict_scbench] scoring engine: {scorer_model}"
+            + (f" TRUNCATED to its first {scorer_num_layers} layer(s)"
+               if scorer_num_layers else "")
+            + f" on {speculator_device} "
             f"(gpu_memory_utilization={scorer_gpu_memory_utilization}); "
             f"target engine on the first visible device "
             f"(gpu_memory_utilization={args.target_gpu_memory_utilization}); "
@@ -2136,6 +2239,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 f"ids -- on a job allocated e.g. CUDA_VISIBLE_DEVICES=2,3, "
                 f"'cuda:1' means the second of those two."
             )
+        # Oracle only, deliberately NOT extended to mode == "early": this
+        # guard's reasoning is arithmetic about two FULL 8B weight sets, and
+        # that arithmetic is simply false for a truncated scorer (~2.1 +
+        # 0.44n GB of weights at 4096*n bytes/token of KV, i.e. ~3GB and
+        # ~8 KiB/token at n=2). Sharing device 0 is plausible there, so
+        # refusing it would block a legitimate single-GPU EARLY run with a
+        # message that does not describe the situation.
         if scorer_device_index == 0 and mode == "oracle":
             raise RuntimeError(
                 f"{exp_id}: the oracle scorer ({scorer_model}) would land on "
@@ -2299,6 +2409,18 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 f"(context ceiling stays {speculator_max_num_batched_tokens})"
             )
 
+        # `hf_overrides` is how an EARLY-* row becomes "the target's own first
+        # n layers": vLLM resolves the checkpoint's config with
+        # num_hidden_layers replaced, so the engine builds n decoder layers,
+        # sizes its KV pool for n, and -- because `_speculator_flop_config`
+        # reads the ENGINE's resolved hf_config rather than the checkpoint on
+        # disk -- every spec_* FLOP column comes out at n/32 of the oracle's
+        # with no change to flops_model.py at all. The surplus layers'
+        # weights would otherwise crash the load; see
+        # `speculator_worker.py::_install_truncated_layer_weight_filter`.
+        proposer_kwargs = {}
+        if scorer_num_layers:
+            proposer_kwargs["hf_overrides"] = {"num_hidden_layers": scorer_num_layers}
         proposer = SpecPrefillProposer(
             speculator_model_path=scorer_model,
             device=speculator_device,
@@ -2306,6 +2428,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             max_num_batched_tokens=scorer_engine_batch_tokens,
             enable_chunked_prefill=True,
             max_model_len=speculator_max_model_len,
+            **proposer_kwargs,
         )
 
     try:
@@ -2316,7 +2439,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     llm, tok, conversations, args.max_tokens,
                     target_max_num_batched_tokens,
                 )
-            elif mode in ("sparse", "oracle"):
+            elif mode in SPARSE_ARCH_MODES:
                 predictions, stats = run_sparse_attention(
                     llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
@@ -2398,7 +2521,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             # existing row's label changes.
             scope_tag = (
                 " [prefill=sparse]"
-                if args.sparse_prefill and mode in ("sparse", "oracle") else ""
+                if args.sparse_prefill and mode in SPARSE_ARCH_MODES else ""
             )
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
@@ -2412,6 +2535,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 # all_runs.csv files stay append-compatible.
                 "label": (
                     f"{label} [scorer={Path(scorer_model).name}"
+                    # Same reasoning as the scorer identity itself: an EARLY
+                    # row's exp_id carries the layer budget, but `label` is
+                    # what a reader of all_runs.csv sees next to the scorer
+                    # path, and "Llama-3.1-8B-Instruct" alone would read as
+                    # the full 8B.
+                    + (f" first{exp_cfg['scorer_num_layers']}layers"
+                       if exp_cfg.get("scorer_num_layers") else "")
                     + (f" heads={spec_config.score_head_set}"
                        if spec_config is not None and spec_config.score_head_set
                        else "")
@@ -2567,7 +2697,10 @@ def main() -> None:
              "i.e. the accuracy ceiling for the SPARSE rows), 'score' (the "
              "scoring-variant sweep at the k20-g32 probe point), 'heads' "
              "(the retrieval-head-filtering rows, which need "
-             "--head-set-from), or 'all' (every defined experiment).",
+             "--head-set-from), 'early' (all EARLY-k*-g32-L<n> rows -- the "
+             "same sparse architecture scored by the TARGET's own first n "
+             "layers instead of a separate speculator, see "
+             "EARLY_LAYER_BUDGETS), or 'all' (every defined experiment).",
     )
     parser.add_argument("--samples", type=Path, default=DEFAULT_SAMPLES)
     parser.add_argument(
@@ -2670,6 +2803,21 @@ def main() -> None:
              "treatment -- this is the budget that decides whether a given "
              "SCBench conversation's scoring pass is possible at all.",
     )
+    parser.add_argument(
+        "--early-scorer-gpu-memory-utilization", type=float, default=0.3,
+        help="Separate from --oracle-scorer-gpu-memory-utilization (0.6) "
+             "because that number is derived, in its own help text, from a "
+             "FULL 8B scorer: ~16GB of weights and 128 KiB/token of KV. An "
+             "EARLY-k*-g32-L<n> row's scorer is that checkpoint truncated to "
+             "its first n layers -- ~(2.1 + 0.44n) GB of weights (the "
+             "embedding and lm_head dominate at small n) at 4096*n bytes/"
+             "token of KV, so ~3GB and ~8 KiB/token at n=2. Reusing 0.6 "
+             "would reserve ~48GB for a pool that cannot need it, and would "
+             "be a number whose documentation no longer describes it. Every "
+             "other EARLY scorer setting is inherited from the "
+             "--oracle-scorer-* flags, since it is the same checkpoint on "
+             "the same device slot.",
+    )
     parser.add_argument("--target-max-num-batched-tokens", type=int, default=131072)
     parser.add_argument(
         "--speculator-max-num-batched-tokens", type=int, default=131072,
@@ -2755,6 +2903,8 @@ def main() -> None:
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "oracle"]
     elif exp_arg == "heads":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg.get("head_set_size")]
+    elif exp_arg == "early":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "early"]
     elif exp_arg == "score":
         # The scoring-variant sweep only -- NOT the plain SPARSE-k20-g32 row
         # it is compared against, which is already run and published.
@@ -2798,7 +2948,7 @@ def main() -> None:
         # --target-model, already required above), never with the 1B
         # speculator -- so it must NOT be gated on --speculator-model being
         # set. Every other non-baseline row does need it.
-        if exp_cfg["mode"] == "oracle":
+        if exp_cfg["mode"] in ("oracle", "early"):
             if not (args.oracle_scorer_model or args.target_model):
                 parser.error(
                     f"{exp_id} requires --oracle-scorer-model, or "

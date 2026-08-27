@@ -82,6 +82,7 @@ from vllm_patch.scoring import (
     scoring_layer_indices,
 )
 from vllm_patch.pruner import _positions_from_kept_indices
+from vllm_patch.model_truncation import keep_weight_for_layer_range
 from predict_scbench import (
     CSV_FIELDS,
     EXPERIMENTS,
@@ -2595,7 +2596,8 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
 
     import predict_scbench as ps
 
-    calls = {"llm_kwargs": None, "proposer_kwargs": None, "loop": None}
+    calls = {"llm_kwargs": None, "proposer_kwargs": None, "loop": None,
+             "row": None}
 
     class _FakeLLM:
         def __init__(self, **kwargs):
@@ -2651,7 +2653,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
     ps.run_sparse_attention = _fake_loop("sparse")
     ps.run_specprefill = _fake_loop("specprefill")
     ps.run_baseline = _fake_loop("baseline")
-    ps.append_csv_row = lambda row: None
+    ps.append_csv_row = lambda row: calls.__setitem__("row", row)
 
     args = argparse.Namespace(
         samples=None, max_conversations=None, scbench_config=None,
@@ -2667,6 +2669,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         oracle_scorer_model=None, oracle_scorer_device=None,
         oracle_scorer_gpu_memory_utilization=0.6,
         oracle_scorer_max_num_batched_tokens=None,
+        early_scorer_gpu_memory_utilization=0.3,
         max_tokens=64, reps=1, peak_tflops=None,
         sparse_prefill=False,
         output_suffix="", head_set_from=None,
@@ -3054,6 +3057,171 @@ def test_score_head_set_rejects_configs_that_would_silently_mislead():
         assert "different checkpoint" in str(e)
     else:
         raise AssertionError("an out-of-range head list must raise, not silently pass")
+
+
+
+# --------------------------------------------------------------------------
+# EARLY-k*-g32-L<n> -- the target's own first n layers as the speculator
+# --------------------------------------------------------------------------
+
+def test_truncated_layer_weight_filter_keeps_exactly_the_owned_layers():
+    """The mechanism that makes an EARLY row loadable at all.
+
+    `hf_overrides={"num_hidden_layers": n}` builds n decoder layers and
+    nothing where layers n.. used to be (`make_layers` only pads with
+    `PPMissingLayer` for PIPELINE ranks), while the weight loader still
+    yields every tensor in the checkpoint -- so `LlamaModel.load_weights`
+    would `KeyError` on `layers.<n>....`. This predicate is what drops them,
+    and it has to be exact in both directions: dropping too much silently
+    leaves a layer at its initialization values (a plausible-looking run that
+    measures nothing), keeping too much crashes the load.
+
+    Non-layer weights are always kept -- `embed_tokens` and `norm` live on
+    `LlamaModel` itself, `lm_head` one level up, and all three are needed
+    whatever n is."""
+    for i in range(4):
+        assert keep_weight_for_layer_range(f"layers.{i}.self_attn.q_proj.weight", 0, 4)
+    for i in (4, 5, 16, 31):
+        assert not keep_weight_for_layer_range(f"layers.{i}.self_attn.q_proj.weight", 0, 4)
+
+    for name in ("embed_tokens.weight", "norm.weight", "lm_head.weight"):
+        assert keep_weight_for_layer_range(name, 0, 4), name
+
+    # A prefix match is not enough: `layers.10....` must not be kept just
+    # because it starts with the same characters as `layers.1....`. The
+    # trailing dot in the pattern is what makes this hold.
+    assert not keep_weight_for_layer_range("layers.10.mlp.up_proj.weight", 0, 2)
+    assert keep_weight_for_layer_range("layers.1.mlp.up_proj.weight", 0, 2)
+
+    # Honors start_layer too, so the filter stays correct under real pipeline
+    # parallelism instead of only under PP=1.
+    assert not keep_weight_for_layer_range("layers.0.mlp.up_proj.weight", 2, 4)
+    assert keep_weight_for_layer_range("layers.2.mlp.up_proj.weight", 2, 4)
+
+
+def test_truncated_layer_weight_filter_is_a_no_op_on_an_untruncated_model():
+    """Installed unconditionally rather than behind a flag, so this is the
+    property that keeps every already-published SPARSE/ORACLE row loading
+    byte-identically: when the stack owns every layer the checkpoint has,
+    nothing is ever filtered."""
+    names = (
+        ["embed_tokens.weight", "norm.weight", "lm_head.weight"]
+        + [f"layers.{i}.self_attn.qkv_proj.weight" for i in range(32)]
+        + [f"layers.{i}.mlp.gate_up_proj.weight" for i in range(32)]
+    )
+    assert all(keep_weight_for_layer_range(n, 0, 32) for n in names)
+
+
+def test_early_rows_exist_at_every_layer_budget_with_a_sparse_partner():
+    """The grid itself: n = 1..8 at the k20-g32 probe point, plus the k60/k80
+    economics follow-ups.
+
+    n stops at 8 for an arithmetic reason, not a taste one -- `r = n/32`, so
+    n=8 is exactly the 1B speculator's own cost ratio, and past it the family
+    is strictly worse than the status quo on the axis it exists to improve.
+    That also makes `EARLY-k20-g32-L8` vs. `SPARSE-k20-g32` an equal-cost
+    head-to-head, which only means anything if the partner row actually
+    exists at the same keep rate and granularity -- the same invariant the
+    ORACLE rows already assert."""
+    early = {eid: cfg for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "early"}
+    assert set(early) == (
+        {f"EARLY-k20-g32-L{n}" for n in range(1, 9)}
+        | {f"EARLY-k{r}-g32-L{n}" for r in (60, 80) for n in (2, 4)}
+    ), sorted(early)
+
+    for exp_id, cfg in early.items():
+        assert cfg["granularity"] == "32"
+        assert cfg["keep_mode"] == "keep"
+        n = cfg["scorer_num_layers"]
+        assert 1 <= n <= 8, f"{exp_id}: r = n/32 makes n > 8 pointless"
+        assert exp_id.endswith(f"-L{n}"), (
+            f"{exp_id} does not name the layer budget it actually runs"
+        )
+        partner = f"SPARSE-k{int(cfg['keep_percentage'] * 100)}-g32"
+        assert partner in EXPERIMENTS, f"{exp_id} has no 1B-scorer partner"
+        assert EXPERIMENTS[partner]["keep_percentage"] == cfg["keep_percentage"]
+
+
+def test_early_row_truncates_the_target_checkpoint_on_the_sparse_loop():
+    """Same wiring claim the ORACLE test makes, with one addition that is the
+    whole point of the family: the scorer engine must be the TARGET
+    checkpoint carrying `hf_overrides={"num_hidden_layers": n}`.
+
+    Without the override the row still runs and still writes a
+    plausible-looking score -- it would just be a duplicate ORACLE row under
+    an EARLY id, i.e. a full-cost scorer recorded as a cheap one, which is
+    the exact claim the family exists to test."""
+    early = _run_experiment_with_stubs("EARLY-k20-g32-L2")
+
+    assert early["proposer_kwargs"]["speculator_model_path"] == "/ckpt/Llama-3.1-8B-Instruct"
+    assert early["proposer_kwargs"]["hf_overrides"] == {"num_hidden_layers": 2}
+    assert early["loop"] == "sparse"
+    assert early["llm_kwargs"]["worker_cls"] == (
+        "vllm_patch.sparse_target_runner.SparseTargetWorker"
+    )
+    assert early["llm_kwargs"]["async_scheduling"] is False
+
+    # Its own memory fraction, not the oracle's: 0.6 is documented as a full
+    # 8B's ~16GB of weights plus 128 KiB/token of KV, and a 2-layer
+    # truncation is neither.
+    assert early["proposer_kwargs"]["gpu_memory_utilization"] == 0.3
+
+    # The target engine is untouched by any of this -- an EARLY row differs
+    # from its SPARSE partner only in who scores.
+    sparse = _run_experiment_with_stubs("SPARSE-k20-g32")
+    assert early["llm_kwargs"] == sparse["llm_kwargs"]
+    assert "hf_overrides" not in sparse["proposer_kwargs"], (
+        "a non-EARLY row must not carry a layer override at all -- passing "
+        "one with the full layer count would still change the load path"
+    )
+
+    # ORACLE-k20 is the same checkpoint at full depth, i.e. this family's own
+    # n=32 ceiling; the ONLY proposer difference may be the override and the
+    # memory fraction.
+    oracle = _run_experiment_with_stubs("ORACLE-k20")
+    differing = {
+        k for k in set(early["proposer_kwargs"]) | set(oracle["proposer_kwargs"])
+        if early["proposer_kwargs"].get(k) != oracle["proposer_kwargs"].get(k)
+    }
+    assert differing == {"hf_overrides", "gpu_memory_utilization"}, sorted(differing)
+
+
+def test_early_row_label_names_the_truncation():
+    """`exp_id` carries the layer budget, but `label` is what sits next to
+    the scorer path in all_runs.csv -- and "Llama-3.1-8B-Instruct" alone
+    reads as the full 8B. Same append-to-label convention the head sets and
+    the prefill scope already use, for the same reason."""
+    row = _run_experiment_with_stubs("EARLY-k20-g32-L2")["row"]
+    assert "first2layers" in row["label"]
+    assert row["mode"] == "early", (
+        "an EARLY row must not record itself as `oracle`: the oracle row is "
+        "the accuracy CEILING, this one is a cheap approximation of it"
+    )
+
+
+def test_speculator_flops_scale_exactly_with_the_layer_budget():
+    """The family's entire economic claim, stated as arithmetic the FLOP
+    model has to keep reproducing: the first n layers of the target cost
+    `n/32` of what all 32 do.
+
+    This is what makes `r = n/32` true, and therefore what makes the win
+    condition `(d + o)(1 - r - k) > 12r` predict anything. Checked here
+    rather than trusted because nothing else would notice if
+    `_speculator_flop_config` stopped reading the engine's OVERRIDDEN
+    hf_config and started reading the checkpoint's own -- every FLOP column
+    would just silently report the full 8B's cost under an EARLY id."""
+    full = _llama31_8b_flop_cfg()
+    for n in (1, 2, 4, 8):
+        truncated = ModelFlopConfig(**{**full.__dict__, "num_layers": n})
+        kwargs = dict(pool_len=4096, num_cached=0, look_ahead=8)
+        a = speculator_turn_flops(truncated, **kwargs)
+        b = speculator_turn_flops(full, **kwargs)
+        # Prefill and scoring are pure per-layer work, so the ratio is exact.
+        assert a.spec_prefill * 32 == b.spec_prefill * n
+        assert a.spec_scoring * 32 == b.spec_scoring * n
+        # Lookahead carries `lm_head` too, which is layer-count-independent,
+        # so it is bounded rather than exact -- and must still shrink.
+        assert a.spec_lookahead < b.spec_lookahead
 
 
 def _run_all():

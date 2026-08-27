@@ -36,6 +36,12 @@ decisions" for the full reasoning behind each column):
                                   KV read-back via collective_rpc, since a
                                   real engine's Worker process is separate
                                   from the driver -- see its own docstring).
+        model_truncation.py   -- loading only the first N layers of a
+                                  deeper checkpoint, so the TARGET's own
+                                  early layers can act as the scorer
+                                  (predict_scbench.py's EARLY-k*-g32-L<n>
+                                  rows). vLLM-free at import time, so the
+                                  policy half is CPU-testable.
 
     Rewritten (same responsibility, new implementation):
         proposer.py            -- (3-11) SpecPrefillProposer: now a thin
@@ -53,9 +59,9 @@ decisions" for the full reasoning behind each column):
 Public re-exports below are for convenience only -- each module also works
 standalone. Guarded the same way the single-turn pipeline's `__init__.py`
 guards them: `config.py`/`prefill_split.py`/`scoring.py`/
-`pruning_registry.py`/`conversation_state.py` have no vLLM runtime
-dependency and are importable/testable anywhere; the rest pull in vLLM's
-full runtime.
+`pruning_registry.py`/`conversation_state.py`/`model_truncation.py` have
+no vLLM runtime dependency and are importable/testable anywhere; the rest
+pull in vLLM's full runtime.
 """
 
 from .config import SpecConfig, get_spec_config, init_spec_config
