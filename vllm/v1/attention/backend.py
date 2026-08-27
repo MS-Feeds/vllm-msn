@@ -170,14 +170,16 @@ class AttentionBackend(ABC):
             otherwise, including when the backend does not define a layered
             stride order.
         """
+        get_stride_order = getattr(cls, "get_kv_cache_stride_order", None)
+        if get_stride_order is None:
+            return False
+
         try:
-            kv_cache_stride_order = cls.get_kv_cache_stride_order(
-                include_num_layers_dimension=False
-            )
-            layered_kv_cache_stride_order = cls.get_kv_cache_stride_order(
+            kv_cache_stride_order = get_stride_order(include_num_layers_dimension=False)
+            layered_kv_cache_stride_order = get_stride_order(
                 include_num_layers_dimension=True
             )
-        except (AttributeError, NotImplementedError):
+        except NotImplementedError:
             return False
 
         # Check that attention backend includes a layers dimension.
