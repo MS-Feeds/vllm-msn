@@ -37,13 +37,20 @@ def build_llm_kwargs(config: dict) -> dict:
         "trust_remote_code": True,
         "quantization": config["quantization"],
         "max_model_len": config["max_model_len"],
-        "max_num_seqs": config["max_num_seqs"],
-        "max_num_batched_tokens": config["max_num_batched_tokens"],
         "gpu_memory_utilization": config["gpu_memory_utilization"],
         "enforce_eager": config["enforce_eager"],
         "enable_prefix_caching": config["enable_prefix_caching"],
         "enable_chunked_prefill": config["enable_chunked_prefill"],
     }
+    for key in (
+        "max_num_seqs",
+        "max_num_batched_tokens",
+        "optimization_level",
+        "performance_mode",
+        "async_scheduling",
+    ):
+        if key in config:
+            kwargs[key] = config[key]
     if config.get("kv_cache_dtype", "auto") != "auto":
         kwargs["kv_cache_dtype"] = config["kv_cache_dtype"]
     if config.get("moe_backend", "auto") != "auto":
