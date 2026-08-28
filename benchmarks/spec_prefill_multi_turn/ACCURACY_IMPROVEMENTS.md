@@ -366,14 +366,55 @@ way around it.
    them. Zero them in the score and force-keep them separately — wrapper spans
    are already unioned into the selection, so removing them from *scoring*
    costs nothing.
-5. **Better lookahead queries.** Currently 8 tokens the 1B generated itself;
-   if it drifts, the queries are off-distribution. Ablations: (a) use the last
-   N tokens of the user query directly, no generation; (b) union query-token
-   queries with lookahead queries; (c) raise `LOOK_AHEAD_CNT` 8 → 16/32 and
-   look for saturation.
+5. **Better lookahead queries.** ⬆️ **Promoted from "an ablation" to "the
+   prerequisite" by the `EARLY-k20-g32-L8` result.** Currently 8 tokens the
+   scorer generated itself; if it drifts, the queries are off-distribution.
+   Ablations: (a) use the last N tokens of the user query directly, no
+   generation; (b) union query-token queries with lookahead queries; (c) raise
+   `LOOK_AHEAD_CNT` 8 → 16/32 and look for saturation.
+
+   **Why (a) is now first.** `EARLY-k20-g32-L8` scored **16.0** against
+   `SPARSE-k20-g32`'s 56.6 (paired −40.6, 100 conversations), while the §1.3
+   gate measured that same 8-layer prefix at **83%** gold survival. Every
+   mechanical explanation is excluded by the run's own numbers — keep rate
+   0.2000025, prefill and lookahead FLOPs both matching the 8-layer
+   prediction, a full 8 lookahead steps, 99.3k cached tokens.
+
+   The two differ in exactly one variable, by construction rather than by
+   inference: layer-0–7 query vectors are a deterministic function of the
+   tokens fed in, and the gate's came from the *full* model's lookahead while
+   the run's came from an 8-layer early-exit head. So early-layer attention
+   localizes the answer fine; **generation is what failed**, and 16.0 is at or
+   near what a random 20% block selection yields.
+
+   Built (gate side): `--query-source prompt_tail` on
+   `diagnose_retrieval_heads.py`, via `SpecConfig`-free plumbing through
+   `proposer.py` and a position-based capture predicate
+   (`kv_cache_utils.prompt_tail_subslice`). Measured first, before anything is
+   built on top of it, because the 83%/99% prefix numbers were themselves
+   taken with lookahead queries — if prompt-tail queries score worse, this
+   premise is wrong and that is the finding.
 6. **Speculator/target geometry mismatch.** Llama-3.2-1B's head structure is
    not Llama-3.1-8B's. ORACLE quantifies exactly this; if the gap is large,
    consider scoring from a few of the *target's* own layers.
+
+   **This is now the main line, and §5a is what unblocks it.**
+   `run_experiment` states why the oracle needs a second 8B engine: a scoring
+   pass through the target's own session would have to *"either write its
+   lookahead tokens into that session (corrupting the conversation) or unwind
+   them afterwards."* Generation is the only reason that engine exists. Score
+   with the query's own tail and there is nothing to write, nothing to unwind,
+   and no second engine — K at layer n is already resident, and
+   `kv_cache_utils.py` is already documented as pointing at the target's own
+   layers with no code change.
+
+   That removes `r` rather than shrinking it: no useful-keep ceiling, ~0.125
+   fixed overhead instead of `12r`, no turn-0 penalty, and no break-even turn
+   count — which makes `k80`, the only rate clearing a 5% drop on
+   `scbench_kv`, economically positive for the first time. It also makes the
+   scoring layer **free** (all 32 layers run regardless; one is merely read),
+   so the gate's 99% at a 16-layer prefix becomes affordable where `r = n/32`
+   had capped the EARLY sweep at n ≤ 8.
 
 ---
 

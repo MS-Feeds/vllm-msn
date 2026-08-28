@@ -56,6 +56,7 @@ import torch
 from vllm_patch.config import SpecConfig
 from vllm_patch.conversation_state import ConversationState
 from vllm_patch.kv_cache_utils import (
+    prompt_tail_subslice,
     _find_kv_split_dim,
     block_indices_from_positions,
     compute_base_gather_view,
@@ -3222,6 +3223,107 @@ def test_speculator_flops_scale_exactly_with_the_layer_budget():
         # Lookahead carries `lm_head` too, which is layer-count-independent,
         # so it is bounded rather than exact -- and must still shrink.
         assert a.spec_lookahead < b.spec_lookahead
+
+
+
+# --------------------------------------------------------------------------
+# Query-tail scoring source (ACCURACY_IMPROVEMENTS.md section 5a)
+# --------------------------------------------------------------------------
+
+def _tail_rows_over_a_prefill(prompt_len, tail_n, chunk):
+    """Absolute positions `prompt_tail_subslice` retains across a whole
+    chunked prefill, in the order it retains them."""
+    got = []
+    num_computed = 0
+    while num_computed < prompt_len:
+        num_scheduled = min(chunk, prompt_len - num_computed)
+        sub = prompt_tail_subslice(num_computed, num_scheduled, prompt_len, tail_n)
+        if sub is not None:
+            lo, hi = sub
+            assert 0 <= lo < hi <= num_scheduled, (lo, hi, num_scheduled)
+            got.extend(range(num_computed + lo, num_computed + hi))
+        num_computed += num_scheduled
+    return got
+
+
+def test_prompt_tail_subslice_reconstructs_the_tail_exactly():
+    """The property the whole section-5a design rests on: concatenating what
+    the capture hook retains, across however many chunked-prefill forward
+    calls a request takes, yields exactly the prompt's last `tail_n`
+    positions -- in order, once each, none missing and none extra.
+
+    Swept across chunk sizes that put the boundary in every interesting place
+    relative to the tail: the tail split across two calls, the tail entirely
+    inside one call, calls wholly before the tail, and a chunk size that does
+    not divide the prompt length."""
+    for prompt_len in (1, 2, 7, 64, 1000, 118000):
+        for tail_n in (1, 3, 8, 16):
+            for chunk in (1, 2, 3, 7, 64, 999, 32768, 10**6):
+                got = _tail_rows_over_a_prefill(prompt_len, tail_n, chunk)
+                expected = list(range(max(0, prompt_len - tail_n), prompt_len))
+                assert got == expected, (prompt_len, tail_n, chunk, got[:5], expected[:5])
+
+
+def test_prompt_tail_subslice_excludes_generated_tokens():
+    """Generated tokens sit at positions >= prompt_len, so the SAME predicate
+    that selects the tail also rejects them -- no second rule, and no reliance
+    on shape (a 1-token prefill chunk and a decode step are indistinguishable
+    by shape, which is exactly the ambiguity `end_capture`'s docstring flags).
+    """
+    prompt_len = 100
+    for step in range(8):  # decode steps: one token each, at 100, 101, ...
+        assert prompt_tail_subslice(prompt_len + step, 1, prompt_len, 8) is None
+
+    # ...while the final PREFILL token, also a 1-token slice, IS retained.
+    assert prompt_tail_subslice(prompt_len - 1, 1, prompt_len, 8) == (0, 1)
+
+
+def test_prompt_tail_subslice_degenerate_inputs():
+    """Never returns an empty or inverted range, and never asks for rows a
+    step does not have -- a caller slices `q[start+lo:start+hi]` with these
+    directly, so an out-of-range pair would silently capture the wrong
+    request's queries rather than fail."""
+    # tail longer than the prompt: clamps to the whole prompt, not negative.
+    assert prompt_tail_subslice(0, 5, 5, 999) == (0, 5)
+    # nothing scheduled, and a nonsensical tail size: no capture, no crash.
+    assert prompt_tail_subslice(0, 0, 100, 8) is None
+    assert prompt_tail_subslice(0, 10, 100, 0) is None
+    assert prompt_tail_subslice(0, 10, 100, -1) is None
+    # a chunk entirely before the tail region.
+    assert prompt_tail_subslice(0, 50, 100, 8) is None
+
+
+def test_prompt_tail_subslice_under_a_real_prefix_cache_hit():
+    """The dominant production shape, with the measured numbers.
+
+    A steady-state scoring turn submits the whole candidate pool but hits the
+    prefix cache for nearly all of it -- `num_cached_tokens_speculator_mean`
+    was 99,320 on the EARLY-k20-g32-L8 run, against a ~61-token delta. So the
+    tail arrives in ONE short forward call whose absolute positions start deep
+    into the prompt, which is the case a shape-based rule gets wrong (61
+    tokens is not 1, so `is_decode_query_slice` rejects it) and a
+    position-based one gets right."""
+    num_cached, delta = 99320, 61
+    prompt_len = num_cached + delta
+    sub = prompt_tail_subslice(num_cached, delta, prompt_len, 8)
+    assert sub == (delta - 8, delta)
+    lo, hi = sub
+    assert list(range(num_cached + lo, num_cached + hi)) == list(
+        range(prompt_len - 8, prompt_len)
+    )
+
+
+def test_prompt_tail_subslice_is_bounded_by_tail_n():
+    """The memory property that makes this affordable where capturing the
+    whole prefill is not. `is_decode_query_slice` exists because retaining
+    prefill slices pinned 30.3GiB and OOM'd the first ORACLE-k20 run; this
+    predicate retains at most `tail_n` rows per forward call regardless of
+    how large that call is."""
+    for chunk in (1, 32768, 118000):
+        sub = prompt_tail_subslice(0, chunk, chunk, 8)
+        assert sub is not None
+        lo, hi = sub
+        assert hi - lo <= 8
 
 
 def _run_all():

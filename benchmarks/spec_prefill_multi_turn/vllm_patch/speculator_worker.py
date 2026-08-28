@@ -122,6 +122,7 @@ from vllm.v1.worker.gpu_worker import Worker
 from .kv_cache_utils import (
     gather_keys_for_slots,
     is_decode_query_slice,
+    prompt_tail_subslice,
     read_layer_keys,
     stack_decode_only_steps,
 )
@@ -204,6 +205,11 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         # step" rule.
         self._query_buffer: Dict[str, List[List[torch.Tensor]]] = {}
         self._capturing_request_ids: set = set()
+        # request_id -> (prompt_len, tail_n) for requests capturing the
+        # PROMPT TAIL instead of the generated lookahead tokens (see
+        # `begin_capture`'s `query_source`). Absent == the default lookahead
+        # source, so every already-published row takes the identical path.
+        self._prompt_tail_requests: Dict[str, tuple] = {}
         # conversation_salt -> {local_position: physical_slot} -- see module
         # docstring's "Recover K vectors" section.
         self._slot_history: Dict[str, Dict[int, int]] = {}
@@ -225,7 +231,13 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
                 self_attn,
             )
 
-    def begin_capture(self, request_id: str) -> None:
+    def begin_capture(
+        self,
+        request_id: str,
+        query_source: str = "lookahead",
+        prompt_len: Optional[int] = None,
+        tail_n: Optional[int] = None,
+    ) -> None:
         """Must be called BEFORE `add_request` for this `request_id`, not
         reactively in response to observing the request's own progress.
 
@@ -256,7 +268,36 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         (the bootstrap prefill itself) -- `end_capture` is responsible for
         excluding that entry from the returned decode-only stack (see its
         own docstring), not this method.
+
+        `query_source` selects WHICH of the request's queries are retained:
+
+        - `"lookahead"` (default) -- the generated tokens' queries, by shape.
+          The reference behavior and the one every published row was measured
+          under; `prompt_len`/`tail_n` are ignored.
+        - `"prompt_tail"` -- the queries of the PROMPT's last `tail_n`
+          positions, by position (ACCURACY_IMPROVEMENTS.md section 5a).
+          Requires `prompt_len`.
+
+        The two differ only in the retention predicate. Arming is identical,
+        so the EngineCore race this method's ordering exists to prevent is
+        unaffected either way.
         """
+        if query_source not in ("lookahead", "prompt_tail"):
+            raise ValueError(
+                f"unknown query_source {query_source!r} -- expected "
+                f"'lookahead' or 'prompt_tail'"
+            )
+        if query_source == "prompt_tail":
+            if not prompt_len or tail_n is None or tail_n <= 0:
+                raise ValueError(
+                    f"query_source='prompt_tail' needs prompt_len (>0) and "
+                    f"tail_n (>0); got prompt_len={prompt_len!r}, "
+                    f"tail_n={tail_n!r}. Without them the capture would "
+                    f"silently retain nothing and score with no signal."
+                )
+            self._prompt_tail_requests[request_id] = (int(prompt_len), int(tail_n))
+        else:
+            self._prompt_tail_requests.pop(request_id, None)
         self._capturing_request_ids.add(request_id)
         self._query_buffer[request_id] = [[] for _ in self._hooked_layers]
 
@@ -303,11 +344,34 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         for one turn with Q/K both on CPU, most of that plausibly this
         exact inefficiency). Keeping this method itself device-agnostic and
         pushing the CPU decision to whichever caller actually needs it is
-        the correct place for that decision to live."""
+        the correct place for that decision to live.
+
+        **`query_source="prompt_tail"` takes a different path out.** There the
+        capture hook has already selected exactly the wanted rows by position,
+        so the shape filter must NOT run -- it would discard every multi-row
+        entry, which in that mode is all of them. Those entries are simply
+        concatenated in call order (they arrive in position order across
+        chunked-prefill calls, by `prompt_tail_subslice`'s own contract), then
+        given the same `[1, N, H*D]` shape the lookahead path produces, so
+        everything downstream of here is identical."""
         self._capturing_request_ids.discard(request_id)
         per_layer_steps = self._query_buffer.pop(request_id, None)
+        tail_spec = self._prompt_tail_requests.pop(request_id, None)
         if per_layer_steps is None:
             return [torch.empty(1, 0, 0, device=self.device) for _ in self._hooked_layers]
+
+        if tail_spec is not None:
+            return [
+                torch.cat(steps, dim=0).unsqueeze(0)
+                if steps
+                else torch.empty(
+                    1, 0,
+                    self._hooked_layers[layer_idx].num_heads
+                    * self._hooked_layers[layer_idx].head_dim,
+                    device=self.device,
+                )
+                for layer_idx, steps in enumerate(per_layer_steps)
+            ]
 
         result = []
         for layer_idx, steps in enumerate(per_layer_steps):
@@ -362,7 +426,17 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         step's batch -- cheap insurance against a future scheduler that
         batches this request's decode alongside another request's prefill
         chunk, which would otherwise pin that chunk's whole tensor through
-        a 1-token view."""
+        a 1-token view.
+
+        ## The prompt-tail source uses the same discipline, different rule
+
+        A `query_source="prompt_tail"` request wants rows from a PREFILL
+        slice -- exactly what the rule above rejects. It stays bounded the
+        same way: `prompt_tail_subslice` returns at most `tail_n` rows per
+        call per layer (64KiB for one layer at N=8 on Llama-3.1-8B), and the
+        result is `.clone()`d for the same anti-pinning reason. See that
+        function's docstring for why the selection is by position rather than
+        by shape."""
         if not self._capturing_request_ids:
             return
         num_reqs = self.input_batch.num_reqs
@@ -370,6 +444,23 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             if req_id not in self._capturing_request_ids:
+                continue
+            tail_spec = self._prompt_tail_requests.get(req_id)
+            if tail_spec is not None:
+                start = int(query_start_loc_np[req_idx])
+                end = int(query_start_loc_np[req_idx + 1])
+                prompt_len, tail_n = tail_spec
+                sub = prompt_tail_subslice(
+                    int(self.input_batch.num_computed_tokens_cpu[req_idx]),
+                    end - start,
+                    prompt_len,
+                    tail_n,
+                )
+                if sub is not None:
+                    lo, hi = sub
+                    self._query_buffer[req_id][layer_idx].append(
+                        q[start + lo:start + hi].clone()
+                    )
                 continue
             start = int(query_start_loc_np[req_idx])
             end = int(query_start_loc_np[req_idx + 1])
@@ -724,8 +815,16 @@ class SpeculatorWorker(Worker):
         super().load_model(load_dummy_weights=load_dummy_weights)
         self.model_runner.install_query_capture_hooks()
 
-    def begin_capture(self, request_id: str) -> None:
-        self.model_runner.begin_capture(request_id)
+    def begin_capture(
+        self,
+        request_id: str,
+        query_source: str = "lookahead",
+        prompt_len: Optional[int] = None,
+        tail_n: Optional[int] = None,
+    ) -> None:
+        self.model_runner.begin_capture(
+            request_id, query_source, prompt_len, tail_n
+        )
 
     def end_capture(self, request_id: str) -> List[torch.Tensor]:
         """Returns raw `torch.Tensor`s directly -- safe to do because

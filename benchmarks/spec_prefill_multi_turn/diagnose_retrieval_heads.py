@@ -182,6 +182,28 @@ def main() -> None:
                              "'is early-layer attention informative' from "
                              "'can a truncated model produce usable lookahead "
                              "queries'.")
+    parser.add_argument("--query-source", default="lookahead",
+                        choices=["lookahead", "prompt_tail"],
+                        help="Which queries the attention is scored FROM. "
+                             "'lookahead' (default) = the 8 tokens the scorer "
+                             "generates itself, the reference behavior every "
+                             "published row was measured under. 'prompt_tail' "
+                             "= the PROMPT's own last --prompt-tail-n "
+                             "positions, generating nothing "
+                             "(ACCURACY_IMPROVEMENTS.md section 5a). "
+                             "EARLY-k20-g32-L8 scored 16.0 against a gate "
+                             "that predicted ~65 for the same layers, and the "
+                             "queries were the only difference -- so this "
+                             "flag exists to measure the query source itself, "
+                             "before anything is built on top of it. Combine "
+                             "with --layer-prefix-budgets to get both axes in "
+                             "one pass.")
+    parser.add_argument("--prompt-tail-n", type=int, default=8,
+                        help="How many of the prompt's final positions score "
+                             "under --query-source prompt_tail. Defaults to 8 "
+                             "so the scoring tensor has the same shape the "
+                             "look_ahead_cnt=8 rows produce, making the two "
+                             "sources directly comparable.")
     parser.add_argument("--head-mass-out", type=Path, default=None,
                         help="Optional JSON dump of the accumulated per-head gold "
                              "mass -- the input a real §1.3 head list would be built "
@@ -345,6 +367,8 @@ def main() -> None:
                     top_n_list=top_n_list,
                     fixed_head_sets=fixed_head_sets,
                     ignore_eos=spec_config.ignore_eos,
+                    query_source=args.query_source,
+                    prompt_tail_n=args.prompt_tail_n,
                 )
 
             if diagnostics is not None:
@@ -385,9 +409,18 @@ def main() -> None:
         f"{args.skip_conversations + len(conversations)}"
         if args.skip_conversations else ""
     )
+    # The query source goes in the header, not just the flags: two runs of
+    # this script differing only in --query-source produce tables that are
+    # otherwise identical in shape and impossible to tell apart afterwards --
+    # and telling them apart is the entire point of the flag.
+    source_note = (
+        f", queries={args.query_source}"
+        + (f"(n={args.prompt_tail_n})" if args.query_source == "prompt_tail"
+           else f"(look_ahead={LOOK_AHEAD_CNT})")
+    )
     print(f"\n=== retrieval-head ceiling (keep={args.keep_percentage}, "
           f"g{args.granularity}, {args.config}, {turns_measured} turns, "
-          f"{num_heads} heads{slice_note}) ===")
+          f"{num_heads} heads{slice_note}{source_note}) ===")
     if turns_skipped_no_gold:
         print(f"({turns_skipped_no_gold} turns skipped: gold answer not verbatim "
               f"in the context)")

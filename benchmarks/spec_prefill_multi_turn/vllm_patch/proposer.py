@@ -353,15 +353,23 @@ class SpecPrefillProposer:
         top_n_list: List[int],
         fixed_head_sets: Optional[List] = None,
         ignore_eos: bool = False,
+        query_source: str = "lookahead",
+        prompt_tail_n: int = 8,
     ):
         """Drives one turn exactly as `run_turn_and_score` does, then asks
         the worker for the §1.3 retrieval-head gate instead of a selection --
         see `speculator_worker.py::end_capture_and_head_diagnostics`. Shares
         `_submit_and_drive_turn`, so the capture/lookahead conditions are
         identical to a real scoring turn; only what is computed from the
-        captured Q differs."""
+        captured Q differs.
+
+        `query_source="prompt_tail"` is what lets this gate measure the §5a
+        query source BEFORE any of it is built into the scoring path -- the
+        same "measure the ceiling before optimizing toward it" move
+        `ORACLE-k20` made, and the reason the gate runs first."""
         request_id, _num_cached, _t_start = self._submit_and_drive_turn(
-            conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
+            conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt,
+            ignore_eos, query_source, prompt_tail_n,
         )
         return self.llm_engine.collective_rpc(
             "end_capture_and_head_diagnostics",
@@ -384,6 +392,8 @@ class SpecPrefillProposer:
         full_sequence_token_ids: List[int],
         look_ahead_cnt: int,
         ignore_eos: bool,
+        query_source: str = "lookahead",
+        prompt_tail_n: int = 8,
     ) -> Tuple[str, int, float]:
         """Shared submission/driving core for `run_turn` and `run_turn_and_
         score` -- begin_capture, add_request, drive to completion, and the
@@ -411,13 +421,30 @@ class SpecPrefillProposer:
         # history and speculator_worker.py::end_capture's docstring for how
         # the bootstrap prefill's own (now-always-captured) entry gets
         # excluded on the way out instead of by capture timing).
-        self.llm_engine.collective_rpc("begin_capture", args=(request_id,))
+        self.llm_engine.collective_rpc(
+            "begin_capture",
+            args=(
+                request_id,
+                query_source,
+                len(full_sequence_token_ids),
+                prompt_tail_n,
+            ),
+        )
 
         prompt = TokensPrompt(
             prompt_token_ids=full_sequence_token_ids, cache_salt=conversation_salt
         )
+        # `query_source="prompt_tail"` scores with the PROMPT's own last
+        # tokens, so nothing needs to be generated at all -- but vLLM's
+        # minimum is 1, and that one token is sampled and discarded. This is
+        # what removes the 8 sequential, memory-bound lookahead decode steps
+        # over a ~118k-token cache from every turn, and with them any
+        # dependence on the scorer being able to generate good tokens (see
+        # ACCURACY_IMPROVEMENTS.md section 5a, and the EARLY-k20-g32-L8
+        # result that made it the prerequisite rather than an option).
+        max_tokens = 1 if query_source == "prompt_tail" else 1 + look_ahead_cnt
         sampling_params = SamplingParams(
-            max_tokens=1 + look_ahead_cnt, temperature=0.0, ignore_eos=ignore_eos
+            max_tokens=max_tokens, temperature=0.0, ignore_eos=ignore_eos
         )
         real_request_id = self.llm_engine.add_request(request_id, prompt, sampling_params)
         assert real_request_id == request_id, (
@@ -476,12 +503,14 @@ class SpecPrefillProposer:
         # the limiting factor -- see speculator_worker.py::end_capture).
         if final_output is not None:
             total_generated = len(final_output.outputs[0].token_ids)
-            if total_generated != 1 + look_ahead_cnt:
+            if total_generated != max_tokens:
                 print(
                     f"[proposer.run_turn] DIAGNOSTIC: request {request_id!r} "
                     f"generated {total_generated} tokens total (expected "
-                    f"{1 + look_ahead_cnt} = 1 bootstrap + {look_ahead_cnt} "
-                    f"lookahead), finish_reason="
+                    f"{max_tokens}"
+                    + ("" if query_source == "prompt_tail"
+                       else f" = 1 bootstrap + {look_ahead_cnt} lookahead")
+                    + f", query_source={query_source!r}), finish_reason="
                     f"{final_output.outputs[0].finish_reason!r}, "
                     f"ignore_eos={ignore_eos} -- if finish_reason is 'stop' "
                     f"despite ignore_eos=True, ignore_eos isn't reaching "

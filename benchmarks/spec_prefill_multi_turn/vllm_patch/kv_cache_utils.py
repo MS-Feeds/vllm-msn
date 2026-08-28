@@ -220,6 +220,69 @@ def is_decode_query_slice(start: int, end: int) -> bool:
     return end - start == 1
 
 
+def prompt_tail_subslice(
+    num_computed_before: int, num_scheduled: int, prompt_len: int, tail_n: int
+) -> Optional[Tuple[int, int]]:
+    """Which LOCAL rows `[lo, hi)` of this forward call's query slice hold the
+    PROMPT's last `tail_n` positions -- `None` if this step covers none.
+
+    The counterpart to `is_decode_query_slice` for the query-tail scoring
+    source (ACCURACY_IMPROVEMENTS.md section 5a): score with the queries of
+    the tokens the USER actually wrote, instead of with queries from tokens
+    the scorer generated itself.
+
+    **Why by POSITION and not by shape.** `is_decode_query_slice` selects the
+    generated tokens, and does it by shape because every decode step is
+    exactly 1 token. The prompt tail is the opposite case -- it arrives inside
+    a PREFILL slice, which that predicate exists to reject, and rejects for a
+    measured reason (retaining prefill slices pinned 30.3GiB and OOM'd the
+    first ORACLE-k20 run; see `speculator_worker.py::_capture_queries_by_
+    request`). Shape cannot express "the last N of the prompt" at all:
+
+    - Under chunked prefill the tail may straddle two forward calls, or share
+      one with non-tail tokens. Position arithmetic handles both without ever
+      asking "is this the final chunk".
+    - A prompt that is entirely a prefix-cache hit except its last token
+      produces a 1-token PREFILL slice, indistinguishable by shape from a
+      decode step -- the ambiguity `end_capture`'s own docstring flags.
+      By position it is unambiguous.
+    - Generated tokens sit at positions >= `prompt_len` and are excluded by
+      the same predicate, with no second rule.
+
+    Valid only where a request's positions are its own contiguous 0..L-1
+    numbering. That holds for both engines this pipeline scores with: the
+    speculator never prunes its own input (`proposer.py`'s docstring: it needs
+    no RoPE-position override at all), and the target's session token stream
+    IS the gapless conversation ledger (`sparse_selection_registry.py`'s
+    docstring). It is NOT valid for the physically-pruned pipeline's
+    gap-containing prompts, which is why this takes plain integers rather
+    than reading positions from a runner.
+
+    Retention is bounded by `tail_n` rows per forward call per layer, which is
+    what keeps this affordable where capturing the whole prefill is not.
+
+    Args:
+        num_computed_before: this request's already-computed token count
+            entering this step (vLLM's `num_computed_tokens_cpu[req_idx]`), so
+            local row `j` carries absolute position `num_computed_before + j`.
+        num_scheduled: tokens scheduled for this request this step (`end -
+            start` of its query slice).
+        prompt_len: the request's full submitted prompt length.
+        tail_n: how many of the prompt's final positions to score with.
+
+    Returns:
+        `(lo, hi)` local row offsets within this step's slice, or `None`.
+        Concatenating the returned rows over all of a request's forward calls
+        yields exactly positions `[prompt_len - tail_n, prompt_len)`, in
+        order, once each.
+    """
+    if num_scheduled <= 0 or tail_n <= 0:
+        return None
+    lo = max(0, (prompt_len - tail_n) - num_computed_before)
+    hi = min(num_scheduled, prompt_len - num_computed_before)
+    return (lo, hi) if hi > lo else None
+
+
 def stack_decode_only_steps(
     steps: List[torch.Tensor], hidden_dim_fallback: int
 ) -> torch.Tensor:
