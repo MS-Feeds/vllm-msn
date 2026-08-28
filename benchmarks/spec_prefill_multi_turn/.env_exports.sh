@@ -76,5 +76,5 @@ export LLAMA32_3B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2
 # access and export HF_TOKEN first). Verify before trusting:
 #   ls -la /scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/*/
 #   ls -la /scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/*/
-export GEMMA4_31B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/FILL_ME_IN
+export GEMMA4_31B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475
 export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/3e22461f65e89153144f8adb70e3b8c2cc9845a7
