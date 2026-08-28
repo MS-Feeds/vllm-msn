@@ -39,7 +39,9 @@ import yaml
 # closed set keeps both of those honest. Extend the set when a variant earns
 # a row in the experiment matrix.
 SCORE_AGGREGATIONS = frozenset({"max", "mean", "zmean"})
-SCORE_LAYER_SELECTIONS = frozenset({None, "skip_first2", "second_half", "last_quarter"})
+SCORE_LAYER_SELECTIONS = frozenset(
+    {None, "skip_first2", "second_half", "last_quarter", "global_only"}
+)
 
 
 @dataclass
@@ -78,6 +80,18 @@ class SpecConfig:
     #                    positional/sink-dominated.
     #   "second_half" -- layers >= L//2.
     #   "last_quarter"-- layers >= 3L//4.
+    #   "global_only" -- only the FULL-attention layers of an interleaved
+    #                    sliding-window model (Gemma 3/3n/4, Llama 4, ...).
+    #                    Unlike the three above it is not a fixed slice: it
+    #                    needs the model's own `layer_types`, supplied at
+    #                    call time via `scoring.LayerGeometry`, and raises
+    #                    if that isn't available. See the plan's blocker A3
+    #                    -- a sliding layer's score for a position outside
+    #                    its window is arbitrary, and `max` aggregation lets
+    #                    one such layer decide a token's importance by
+    #                    itself. On a uniform-attention model (every layer
+    #                    "full_attention") this selects every layer, i.e. it
+    #                    degenerates to the default.
     score_aggregation: str = "max"
     score_layers: Optional[str] = None
     # Retrieval-head filtering (ACCURACY_IMPROVEMENTS.md §1.3): explicit

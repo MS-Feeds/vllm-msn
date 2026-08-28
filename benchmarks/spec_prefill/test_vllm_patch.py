@@ -20,6 +20,7 @@ if __name__ == "__main__" driver -- adjust here if this repo standardizes on
 pytest later.)
 """
 
+import math
 import sys
 import traceback
 from pathlib import Path
@@ -34,9 +35,11 @@ from vllm_patch.prefill_split import split_prefill_decode_requests
 from vllm_patch import pruning_registry
 from vllm_patch.pruning_registry import PruneRecord
 from vllm_patch.scoring import (
+    LayerGeometry,
     aggregate_attention_score,
     chunk_select_from_smoothed_attention,
     compute_attention_score,
+    layer_geometry_from_attention_layers,
 )
 
 
@@ -392,6 +395,128 @@ def _run_all():
     if failures:
         print("Failed:", failures)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Per-layer attention scale (`LayerGeometry`). `1/sqrt(head_dim)` is Llama's
+# scale, not a universal one -- Gemma 4 sets `scaling = 1.0`, and its head_dim
+# differs between sliding (256) and full (512) layers, so the old formula gave
+# the two layer types different softmax TEMPERATURES. That bias lands directly
+# on the distribution whose `max` over (layer, head) picks every kept token.
+# ---------------------------------------------------------------------------
+
+
+class _FakeImpl:
+    def __init__(self, scale, logits_soft_cap=None):
+        self.scale = scale
+        self.logits_soft_cap = logits_soft_cap
+
+
+class _FakeAttention:
+    """Stands in for a vLLM `Attention` module -- the geometry builder only
+    ever calls `getattr`, so it needs no checkpoint and no GPU."""
+
+    def __init__(self, scale, logits_soft_cap=None):
+        self.impl = _FakeImpl(scale, logits_soft_cap)
+
+
+def test_layer_geometry_reads_the_scale_the_kernel_actually_uses():
+    """The scale is not stored on the `Attention` module -- it is forwarded to
+    the backend impl, which keeps it as `self.scale = float(scale)` (true of
+    both `triton_attn.py` and `flash_attn.py`; TRITON_ATTN is what
+    `Gemma4Config.verify_and_update_config` force-selects here)."""
+    geo = layer_geometry_from_attention_layers(
+        [_FakeAttention(scale=1.0) for _ in range(4)]
+    )
+    assert geo.scales == [1.0, 1.0, 1.0, 1.0]
+    assert geo.logits_soft_cap is None
+
+    capped = layer_geometry_from_attention_layers(
+        [_FakeAttention(scale=1.0, logits_soft_cap=50.0) for _ in range(2)]
+    )
+    assert capped.logits_soft_cap == 50.0
+
+    try:
+        layer_geometry_from_attention_layers([
+            _FakeAttention(scale=1.0, logits_soft_cap=50.0),
+            _FakeAttention(scale=1.0, logits_soft_cap=30.0),
+        ])
+    except ValueError as exc:
+        assert "logits_soft_cap" in str(exc)
+    else:
+        raise AssertionError("disagreeing softcaps must raise")
+
+
+def test_layer_geometry_refuses_to_guess_a_missing_scale():
+    """Silently falling back to 1/sqrt(head_dim) is the bug being fixed, so an
+    unreadable scale must fail loudly rather than reintroduce it."""
+    class _NoScale:
+        impl = None
+
+    try:
+        layer_geometry_from_attention_layers([_NoScale()])
+    except ValueError as exc:
+        assert "scale" in str(exc)
+    else:
+        raise AssertionError("a missing attention scale must raise")
+
+
+def test_compute_attention_score_uses_the_layers_own_scale():
+    num_layers, look_ahead, ctx, heads, head_dim = 2, 3, 7, 4, 8
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers, 1, heads, heads, head_dim, look_ahead, ctx
+    )
+
+    default = compute_attention_score(query_buffer, key_buffer, [look_ahead])[0]
+    ones = LayerGeometry(scales=[1.0] * num_layers)
+    got = compute_attention_score(query_buffer, key_buffer, [look_ahead], ones)[0]
+    assert torch.allclose(got, default * math.sqrt(head_dim), atol=1e-3, rtol=1e-3)
+
+    # Genuinely per-layer, which is the whole point on a model whose head_dim
+    # depends on the layer type.
+    mixed = LayerGeometry(scales=[1.0, 0.25])
+    got = compute_attention_score(query_buffer, key_buffer, [look_ahead], mixed)[0]
+    assert torch.allclose(got[0], default[0] * math.sqrt(head_dim), atol=1e-3, rtol=1e-3)
+    assert torch.allclose(got[1], default[1] * math.sqrt(head_dim) * 0.25,
+                          atol=1e-3, rtol=1e-3)
+
+    try:
+        compute_attention_score(query_buffer, key_buffer, [look_ahead],
+                                LayerGeometry(scales=[1.0]))
+    except ValueError as exc:
+        assert "scales" in str(exc)
+    else:
+        raise AssertionError("a scales/layer-count mismatch must raise")
+
+
+def test_compute_attention_score_applies_logit_softcapping():
+    query_buffer, key_buffer = _synthetic_qk(1, 1, 2, 2, 4, 2, 5)
+    cap = 3.0
+    uncapped = compute_attention_score(
+        query_buffer, key_buffer, [2], LayerGeometry(scales=[1.0])
+    )[0]
+    capped = compute_attention_score(
+        query_buffer, key_buffer, [2], LayerGeometry(scales=[1.0], logits_soft_cap=cap)
+    )[0]
+    assert torch.allclose(capped, cap * torch.tanh(uncapped.float() / cap).to(capped.dtype),
+                          atol=1e-3, rtol=1e-3)
+    assert capped.abs().max().item() <= cap + 1e-3
+
+
+def test_geometry_none_reproduces_the_previously_measured_behavior():
+    """Every row already measured with this pipeline was scored at
+    1/sqrt(head_dim). Defaulting `geometry` to None has to reproduce that
+    exactly, or adding the fix silently invalidates the existing results
+    instead of superseding them."""
+    query_buffer, key_buffer = _synthetic_qk(3, 1, 4, 4, 16, 3, 11)
+    reference = compute_attention_score(query_buffer, key_buffer, [3])[0]
+    assert torch.equal(
+        compute_attention_score(query_buffer, key_buffer, [3], None)[0], reference
+    )
+    assert torch.equal(
+        compute_attention_score(query_buffer, key_buffer, [3], LayerGeometry())[0],
+        reference,
+    )
 
 
 if __name__ == "__main__":

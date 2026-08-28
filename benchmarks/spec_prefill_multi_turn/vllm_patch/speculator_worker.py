@@ -1,7 +1,7 @@
 """SpeculatorWorker / SpeculatorGPUModelRunner -- runs the speculator
-(Llama-3.2-1B) as a genuine persistent `vllm.LLM()` engine, not the
-single-turn pipeline's standalone `get_model()`-loaded, manually-driven
-model. This is the piece of this port with the least real-hardware
+(Llama-3.2-1B, or any decoder whose layers expose `.self_attn.attn`) as a
+genuine persistent `vllm.LLM()` engine, not the single-turn pipeline's
+standalone `get_model()`-loaded, manually-driven model. This is the piece of this port with the least real-hardware
 confidence -- see "Known risk areas" at the end of this docstring before
 relying on it; `validate_proposer.py`'s Step C is where these should be
 checked first.
@@ -79,14 +79,38 @@ for this request_id" ahead of every single forward step.
 ## Known risk areas (checked against this fork's real source where noted,
 but NOT executed -- see `validate_proposer.py`'s Step C)
 
-1. **Single KV-cache-group assumption.** `self.input_batch.block_table` is
-   indexed by KV-cache group (plural, for hybrid-attention models with
-   multiple cache layouts in one model); this file always reads group 0.
-   Confirmed correct in spirit for Llama-3.2-1B (dense, uniform attention,
-   one cache layout for every layer, same reasoning `kv_cache_utils.py`'s
-   own docstring gives for why it degenerates to a no-op simplification
-   there) -- not independently re-confirmed against this fork's actual
-   `input_batch.block_table` construction for a real load.
+1. **Single KV-cache-group assumption -- now the load-bearing one for any
+   interleaved model.** `self.input_batch.block_table` is indexed by
+   KV-cache group (plural, for hybrid-attention models with multiple cache
+   layouts in one model); this file always reads group 0.
+
+   Correct in spirit for Llama-3.2-1B (dense, uniform attention, one cache
+   layout for every layer, same reasoning `kv_cache_utils.py`'s own docstring
+   gives for why it degenerates to a no-op there) -- not independently
+   re-confirmed against this fork's actual `input_batch.block_table`
+   construction for a real load.
+
+   **It is NOT correct for an interleaved sliding-window model** (Gemma 3/3n/4,
+   Llama 4), and the capture hook no longer refuses those, so this is the
+   remaining gate rather than a hypothetical. Traced through this fork's
+   source: heterogeneous specs (SlidingWindow + Full, differing `head_size`
+   and `num_kv_heads`) fall through `get_kv_cache_groups` to
+   `unify_kv_cache_spec_page_size`, which equalises page sizes by MULTIPLYING
+   the smaller-page layers' `block_size`, then `_get_kv_cache_groups_uniform_
+   page_size` yields >= 2 groups with DIFFERENT block sizes. Reading group 0
+   then recovers slot mappings that are wrong for every layer outside it --
+   silently, with no error raised.
+
+   The escape hatch, also traced rather than assumed: run with
+   `--disable-hybrid-kv-cache-manager`. `unify_hybrid_kv_cache_specs` rewrites
+   every SlidingWindowSpec to a FullAttentionSpec (keeping `sliding_window`,
+   so kernel masking still applies), and `UniformTypeKVCacheSpecs.
+   is_uniform_type` returns True for an all-FullAttentionSpec set REGARDLESS
+   of differing head_size, so `_get_kv_cache_groups_uniform_type` puts every
+   layer in one group with one block table -- exactly the invariant this file
+   assumes. That must be ASSERTED at startup before trusting any interleaved
+   run, not left implicit; `vllm/transformers_utils/config.py::is_interleaved`
+   is the predicate for the guard.
 2. **Eviction invalidates the accumulated slot map silently.** If a
    conversation's early blocks are evicted (LRU, `ref_cnt==0`) under memory
    pressure and later re-requested, vLLM recomputes them into DIFFERENT
@@ -126,6 +150,7 @@ from .kv_cache_utils import (
     read_layer_keys,
     stack_decode_only_steps,
 )
+from .model_structure import find_attention_modules
 from .model_truncation import _install_truncated_layer_weight_filter
 
 
@@ -141,56 +166,53 @@ def _conversation_salt_from_request_id(request_id: str) -> Optional[str]:
     return request_id.split("::", 1)[0]
 
 
-def _find_llama_attention_layers(model) -> List:
-    """Locate the speculator's LlamaAttention layers -- identical logic to
-    the single-turn pipeline's `proposer.py::_find_llama_attention_layers`,
-    duplicated here (not imported) because this must run inside the Worker
-    process, importing only from this module and `kv_cache_utils.py`
-    (already vLLM-runtime-free) rather than pulling in `proposer.py`'s own
-    driver-side imports (`vllm.model_executor.model_loader.get_model`, etc.)
-    which are meaningless/unused inside the Worker process."""
-    model_name = type(model).__name__
-    if "Llama" not in model_name:
-        raise NotImplementedError(
-            f"SpeculatorWorker currently only supports Llama models as the "
-            f"speculator (got {model_name}). The query-capture hook is a "
-            f"faithful copy of LlamaAttention.forward's body and is not "
-            f"architecture-generic."
-        )
-    inner = model.model if hasattr(model, "model") else model
-    if not hasattr(inner, "layers"):
-        raise NotImplementedError(
-            f"Could not locate decoder layers on {model_name} -- neither "
-            f".model.layers nor .layers resolved."
-        )
-    return [layer.self_attn for layer in inner.layers]
-
-
-def _query_capturing_llama_attention_forward(
+def _query_capturing_attention_forward(
     self,
-    positions: torch.Tensor,
-    hidden_states: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *args,
     runner: "SpeculatorGPUModelRunner",
     layer_idx: int,
+    original_forward,
     **kwargs,
-) -> torch.Tensor:
-    """Instance-level replacement for `LlamaAttention.forward`, identical
-    body to the single-turn pipeline's own version (see that module for the
-    "why a faithful copy, not a generic wrapper" reasoning) with one
-    difference: capture is delegated to `runner._capture_queries_by_request`
-    instead of appending directly to a flat list, because a real engine step
-    may batch multiple requests' tokens into one `hidden_states` tensor --
-    see module docstring's "What's structurally different" section.
+):
+    """Instance-level replacement for `Attention.forward` that stashes the
+    query before delegating to the real implementation.
+
+    **This replaces a per-architecture copy of the model's own attention
+    `forward` body.** The previous version reproduced `LlamaAttention.forward`
+    line for line, and the single-turn Gemma 4 pipeline carries a second copy
+    of `Gemma4Attention.forward`. That approach has a failure mode this one
+    structurally cannot have: a copied body silently diverges from the model
+    it was copied from -- and Gemma 4 offers plenty to diverge on, since
+    `Gemma4Attention.forward` applies `q_norm` per-head BEFORE RoPE, has a
+    `use_k_eq_v` branch where V is derived from the pre-norm K by a weightless
+    `v_norm`, and a KV-shared branch that RoPEs Q only. Getting any of those
+    subtly wrong yields a plausible-looking Q and a quietly wrong selection.
+
+    Hooking one layer down sidesteps all of it: `query` here is, by
+    construction, exactly the tensor the model handed to attention -- post
+    Q-norm, post-RoPE, whatever that model's own rules were -- because we
+    read the argument instead of recomputing it. The hook needs to know
+    nothing about the architecture, which is why the Llama-only gate is gone
+    rather than joined by a second, Gemma-shaped branch.
+
+    Two conditions this does rely on, both already true here:
+
+    - `enforce_eager=True` on the speculator engine (`proposer.py` sets it,
+      and the whole experiment matrix runs that way). An instance-level
+      `forward` override is visible to `nn.Module.__call__`, but a
+      torch.compile'd graph captured before the override would not see it.
+    - The model invokes `self.attn(q, k, v)`. Any `output_shape=` or future
+      positional argument is forwarded untouched via `*args`/`**kwargs`.
+
+    `original_forward` is the UNBOUND class function captured at install
+    time and called explicitly rather than through `self.forward`, so this
+    cannot recurse into itself.
     """
-    qkv, _ = self.qkv_proj(hidden_states)
-    q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-    q, k = self.rotary_emb(positions, q, k)
-
-    runner._capture_queries_by_request(layer_idx, q.detach())
-
-    attn_output = self.attn(q, k, v)
-    output, _ = self.o_proj(attn_output)
-    return output
+    runner._capture_queries_by_request(layer_idx, query.detach())
+    return original_forward(self, query, key, value, *args, **kwargs)
 
 
 class SpeculatorGPUModelRunner(GPUModelRunner):
@@ -220,16 +242,46 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         this timing mirrors the single-turn pipeline's own
         `install_query_capture_hooks`, just relocated to run inside the
         Worker process instead of the driver process)."""
-        self._hooked_layers = _find_llama_attention_layers(self.model)
-        for layer_idx, self_attn in enumerate(self._hooked_layers):
-            self_attn.forward = types.MethodType(
+        self._hooked_layers = find_attention_modules(self.model)
+        for layer_idx, attn in enumerate(self._hooked_layers):
+            attn.forward = types.MethodType(
                 partial(
-                    _query_capturing_llama_attention_forward,
+                    _query_capturing_attention_forward,
                     runner=self,
                     layer_idx=layer_idx,
+                    # The CLASS function, resolved BEFORE the instance
+                    # attribute below shadows it -- calling it explicitly
+                    # is what keeps the hook from recursing into itself.
+                    original_forward=type(attn).forward,
                 ),
-                self_attn,
+                attn,
             )
+        self._log_layer_geometry()
+
+    def _log_layer_geometry(self) -> None:
+        """Print, once, what this speculator's layers actually are.
+
+        Every scoring result downstream depends on which layers voted, and on
+        an interleaved model that is no longer "all of them". Logging it at
+        load time makes each run self-describing about the thing most likely
+        to differ between checkpoints -- rather than leaving a reader to infer
+        it from the model name, which is exactly how a 26B-A4B assumption ends
+        up quietly applied to a 31B run.
+        """
+        from collections import Counter
+
+        geo = self.layer_geometry()
+        types_count = Counter(geo.layer_types)
+        head_sizes = Counter(attn.head_size for attn in self._hooked_layers)
+        num_shared = sum(geo.kv_shared)
+        print(
+            f"[SpecPrefill] speculator: {len(self._hooked_layers)} layers, "
+            f"types={dict(types_count)}, head_sizes={dict(head_sizes)}, "
+            f"kv_shared={num_shared}, "
+            f"scales={sorted(set(geo.scales))}, "
+            f"soft_cap={geo.logits_soft_cap}",
+            flush=True,
+        )
 
     def begin_capture(
         self,
@@ -367,7 +419,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
                 else torch.empty(
                     1, 0,
                     self._hooked_layers[layer_idx].num_heads
-                    * self._hooked_layers[layer_idx].head_dim,
+                    * self._hooked_layers[layer_idx].head_size,
                     device=self.device,
                 )
                 for layer_idx, steps in enumerate(per_layer_steps)
@@ -377,7 +429,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         for layer_idx, steps in enumerate(per_layer_steps):
             hidden_dim_fallback = (
                 self._hooked_layers[layer_idx].num_heads
-                * self._hooked_layers[layer_idx].head_dim
+                * self._hooked_layers[layer_idx].head_size
             )
             result.append(stack_decode_only_steps(steps, hidden_dim_fallback))
         return result
@@ -547,12 +599,37 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.device)
         block_size = self.vllm_config.cache_config.block_size
         keys = []
-        for self_attn in self._hooked_layers:
-            num_kv_heads = self_attn.num_kv_heads
-            head_size = self_attn.head_dim
-            flat_keys = read_layer_keys(self_attn.attn, block_size, num_kv_heads, head_size)
+        for attn in self._hooked_layers:
+            # Read the geometry off the `Attention` module rather than the
+            # model's own attention wrapper: these are the values the KV cache
+            # was actually allocated with, and they are per-layer, which is
+            # what a model with heterogeneous head dims across layer types
+            # (Gemma 4) requires. `head_size` is the `Attention` spelling of
+            # what the wrapper calls `head_dim`.
+            num_kv_heads = attn.num_kv_heads
+            head_size = attn.head_size
+            flat_keys = read_layer_keys(attn, block_size, num_kv_heads, head_size)
             keys.append(gather_keys_for_slots(flat_keys, slot_tensor))
         return keys
+
+    def layer_geometry(self):
+        """This speculator's own per-layer attention geometry, built once and
+        cached (it cannot change after the model is loaded).
+
+        Read off the live `Attention` modules rather than the `hf_config` --
+        see `scoring.layer_geometry_from_attention_layers` for why. On a
+        uniform-attention model (Llama) every entry says "full_attention",
+        every scale is `1/sqrt(head_dim)`, nothing is KV-shared and there is
+        no softcap, so passing the result through changes no published row.
+        """
+        from .scoring import layer_geometry_from_attention_layers
+
+        cached = getattr(self, "_layer_geometry", None)
+        if cached is None:
+            cached = layer_geometry_from_attention_layers(self._hooked_layers)
+            self._layer_geometry = cached
+        return cached
+
 
     def end_capture_and_score(
         self,
@@ -634,7 +711,11 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             score_head_set=score_head_set,
         )
         kept_local_indices = score_and_select_indices(
-            query_buffer, key_buffer_per_layer, actual_look_ahead_cnt, spec_config
+            query_buffer,
+            key_buffer_per_layer,
+            actual_look_ahead_cnt,
+            spec_config,
+            self.layer_geometry(),
         )
         return kept_local_indices, actual_look_ahead_cnt
 
@@ -705,7 +786,10 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             conversation_salt, list(range(full_sequence_len))
         )
         attn = compute_attention_score(
-            query_buffer, [[k] for k in key_buffer_per_layer], [actual_look_ahead_cnt]
+            query_buffer,
+            [[k] for k in key_buffer_per_layer],
+            [actual_look_ahead_cnt],
+            self.layer_geometry(),
         )[0]
 
         # Same pipeline as `aggregate_attention_score`, stopped one step

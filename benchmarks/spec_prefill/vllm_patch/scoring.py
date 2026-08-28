@@ -18,21 +18,110 @@ restoration, request merging, target forward) are out of scope for this pass
 """
 
 import math
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 
 from .config import SpecConfig
 
 
+@dataclass(frozen=True)
+class LayerGeometry:
+    """Per-layer attention facts that `compute_attention_score` cannot infer
+    from the Q/K tensors alone.
+
+    Deliberately narrower than the multi-turn pipeline's version of this type
+    (`../spec_prefill_multi_turn/vllm_patch/scoring.py`), which additionally
+    carries `layer_types`/`kv_shared` for its `score_layers="global_only"`
+    mode. This pipeline has no layer-selection surface, and more importantly
+    `verify_sliding_window_hypothesis.py` MEASURES what the sliding layers
+    vote for -- restricting them here would delete the very signal that gate
+    exists to report. So this carries only what fixes the scale.
+
+    **Why the scale needed fixing at all.** `1/sqrt(head_dim)` is Llama's
+    scale, not a universal one. Gemma 4 sets `scaling = 1.0` and lets its
+    learnable Q/K norms carry the scaling instead (`gemma4.py`'s
+    `Gemma4Attention.__init__`), and its head_dim differs between sliding
+    (`head_dim`) and full (`global_head_dim`) layers. Dividing by
+    `sqrt(head_dim)` therefore gave the two layer types DIFFERENT softmax
+    temperatures -- not a constant factor, a per-type sharpness bias, applied
+    directly to the distribution whose `max` over (layer, head) decides every
+    token's importance. This pipeline has been running against Gemma 4 with
+    that bias in place.
+
+    Every field defaults to None, and a `geometry=None` reproduces the
+    previous behavior exactly, so nothing already measured changes silently.
+    """
+
+    scales: Optional[List[float]] = None
+    logits_soft_cap: Optional[float] = None
+
+
+def layer_geometry_from_attention_layers(attn_layers) -> LayerGeometry:
+    """Build a `LayerGeometry` from the live per-layer `Attention` modules.
+
+    Reads the backend impl, not the config: `Attention.__init__` forwards the
+    scale to `impl_cls(...)`, which stores it as `self.scale = float(scale)`
+    (confirmed in this fork's `triton_attn.py` and `flash_attn.py` -- and
+    TRITON_ATTN is what `Gemma4Config.verify_and_update_config` force-selects
+    for heterogeneous head dims). That is the number the kernel actually
+    uses, whatever the model chose.
+
+    Only `getattr` is used -- no isinstance, no vLLM import -- so this stays
+    testable on CPU with stand-in objects.
+
+    Args:
+        attn_layers: per-layer `Attention` modules in layer order, e.g.
+            `[self_attn.attn for self_attn in proposer._speculator_layers]`.
+
+    Raises:
+        ValueError: if a scale cannot be read (silently falling back to
+            `1/sqrt(head_dim)` is the exact bug this exists to fix), or if
+            layers disagree on `logits_soft_cap`.
+    """
+    scales: List[float] = []
+    soft_caps = set()
+
+    for idx, attn in enumerate(attn_layers):
+        impl = getattr(attn, "impl", None)
+        scale = getattr(impl, "scale", None)
+        if scale is None:
+            scale = getattr(attn, "scale", None)
+        if scale is None:
+            raise ValueError(
+                f"could not read the attention scale for layer {idx} "
+                f"({type(attn).__name__}) -- expected it on `.impl.scale`. "
+                f"Refusing to fall back to 1/sqrt(head_dim): that is right "
+                f"for Llama and wrong for Gemma 4."
+            )
+        scales.append(float(scale))
+        soft_caps.add(getattr(impl, "logits_soft_cap", None))
+
+    soft_caps.discard(None)
+    if len(soft_caps) > 1:
+        raise ValueError(
+            f"layers disagree on logits_soft_cap ({sorted(soft_caps)}); "
+            f"LayerGeometry carries a single scalar."
+        )
+
+    return LayerGeometry(
+        scales=scales,
+        logits_soft_cap=soft_caps.pop() if soft_caps else None,
+    )
+
+
 def compute_attention_score(
     query_buffer: List[torch.Tensor],
     key_buffer: List[List[torch.Tensor]],
     actual_look_ahead_cnts: List[int],
+    geometry: Optional[LayerGeometry] = None,
 ) -> List[torch.Tensor]:
     """Algorithm line 12: A <- compute_attention_score(Q, K).
 
-    Q @ K^T / sqrt(d) per layer, per sample.
+    Q @ K^T, scaled per layer, per sample. `geometry` supplies the model's own
+    per-layer scale and logit softcapping; None keeps the historical
+    `1/sqrt(head_dim)` with no cap. See `LayerGeometry`.
 
     Args:
         query_buffer: per-layer list of buffered query tensors, each
@@ -49,6 +138,14 @@ def compute_attention_score(
         Per-sample list of [num_layer, num_head, look_ahead_cnt, context_len]
         attention-score tensors.
     """
+    scales = geometry.scales if geometry is not None else None
+    soft_cap = geometry.logits_soft_cap if geometry is not None else None
+    if scales is not None and len(scales) != len(query_buffer):
+        raise ValueError(
+            f"LayerGeometry.scales has {len(scales)} entries but the query "
+            f"buffer holds {len(query_buffer)} layers."
+        )
+
     attn_weights: List[List[torch.Tensor]] = []
 
     for layer_idx in range(len(query_buffer)):
@@ -77,9 +174,17 @@ def compute_attention_score(
 
             query = query[:, :c, :]
 
-            attn = torch.matmul(
-                query, key.transpose(-1, -2)
-            ) / math.sqrt(head_dim)
+            attn = torch.matmul(query, key.transpose(-1, -2))
+            if scales is None:
+                attn = attn / math.sqrt(head_dim)
+            else:
+                attn = attn * scales[layer_idx]
+
+            if soft_cap:
+                # What the attention kernel itself applies before its softmax
+                # (`Attention(..., logits_soft_cap=...)`); without it the
+                # scoring softmax reads tails the model never sees.
+                attn = soft_cap * torch.tanh(attn / soft_cap)
 
             attn_weights[-1].append(attn)
 

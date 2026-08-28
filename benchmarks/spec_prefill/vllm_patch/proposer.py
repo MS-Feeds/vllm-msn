@@ -45,9 +45,13 @@ import torch.nn as nn
 from vllm.config import ModelConfig, VllmConfig, replace, set_current_vllm_config
 from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_tp_group
 from vllm.forward_context import set_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 
 from .kv_cache_utils import retrieve_keys_per_sample
+from .scoring import layer_geometry_from_attention_layers
+
+logger = init_logger(__name__)
 
 _VLLM_REPO_ROOT_ON_SYSPATH = False
 
@@ -241,6 +245,19 @@ class SpecPrefillProposer:
 
         self._speculator_layers = self._find_gemma4_attention_layers(self.model)
         self._num_layers = len(self._speculator_layers)
+        # Built once, here, rather than lazily at scoring time: if a layer's
+        # scale is unreadable that is a load-time fact, and it should surface
+        # at engine construction rather than mid-sweep on turn 0.
+        self._layer_geometry = layer_geometry_from_attention_layers(
+            [self_attn.attn for self_attn in self._speculator_layers]
+        )
+        logger.info(
+            "SpecPrefill: speculator attention scales = %s (soft_cap=%s). "
+            "A uniform 1/sqrt(head_dim) here means a Llama-shaped model; "
+            "Gemma 4 reports 1.0 -- see scoring.LayerGeometry.",
+            sorted(set(self._layer_geometry.scales)),
+            self._layer_geometry.logits_soft_cap,
+        )
         self._layer_names = [layer.attn.layer_name for layer in self._speculator_layers]
         self._query_buffer: List[List[torch.Tensor]] = []
         self.install_query_capture_hooks()
@@ -294,6 +311,13 @@ class SpecPrefillProposer:
         )
 
     @staticmethod
+    def layer_geometry(self):
+        """This speculator's own per-layer attention scale/softcap, as read
+        off the live `Attention` modules at load time. Passed into
+        `scoring.compute_attention_score` so the scoring softmax runs at the
+        model's real temperature."""
+        return self._layer_geometry
+
     def _find_gemma4_attention_layers(model: nn.Module) -> List[nn.Module]:
         """Locate the speculator's Gemma4Attention layers via the known
         Gemma4ForCausalLM/Gemma4Model structure (model.model.layers[i]

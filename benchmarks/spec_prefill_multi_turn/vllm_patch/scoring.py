@@ -21,6 +21,7 @@ restoration, request merging, target forward) are out of scope for this pass
 """
 
 import math
+from dataclasses import dataclass
 from typing import List, Optional
 
 import torch
@@ -28,14 +29,168 @@ import torch
 from .config import SpecConfig
 
 
+# Layer types that attend over the WHOLE sequence, vs. those restricted to a
+# local window. Enumerated rather than "anything that isn't sliding" so an
+# unrecognised type fails loudly instead of being silently counted as global
+# -- the whole point of `global_only` is that a locally-restricted layer's
+# score for a distant position is meaningless, and quietly admitting an
+# unknown type would defeat it. `mamba`/`linear_attention` are deliberately
+# absent: those layers produce no attention scores to aggregate at all.
+GLOBAL_LAYER_TYPES = frozenset({"full_attention", "attention"})
+LOCAL_LAYER_TYPES = frozenset(
+    {"sliding_attention", "chunked_attention", "local_attention"}
+)
+
+
+@dataclass(frozen=True)
+class LayerGeometry:
+    """Per-layer facts about the SCORING model that the attention math needs
+    and cannot infer from the Q/K tensors alone.
+
+    Exists because this module is deliberately vLLM-free (see the module
+    docstring): it takes plain lists rather than a model or an `hf_config`,
+    so every policy below stays unit-testable on CPU with no checkpoint.
+    `speculator_worker.py::layer_geometry_from_attention_layers` is what
+    builds one from a live model.
+
+    **Every field defaults to None, and a `geometry=None` (or an all-None
+    geometry) is a provable no-op**: the scoring math then behaves exactly as
+    it did before this type existed, so every already-published Llama row is
+    reproduced bit-identically rather than "probably unchanged". That is the
+    same discipline `model_truncation.py` uses for its weight filter.
+
+    Fields:
+      layer_types: per-layer `config.layer_types` entry, e.g.
+        `"sliding_attention"` / `"full_attention"`. Required by
+        `score_layers="global_only"`, ignored otherwise.
+      scales: the layer's OWN attention scale -- the multiplier applied to
+        `Q @ K^T` before the softmax. Not always `1/sqrt(head_dim)`: Gemma 4
+        sets `scaling = 1.0` and lets its learnable Q/K norms carry the
+        scaling instead (`gemma4.py`'s `Gemma4Attention.__init__`). Getting
+        this wrong is not a constant factor -- it changes the softmax
+        TEMPERATURE, and on a model whose head_dim differs between layer
+        types it changes it by a DIFFERENT amount per type, which then
+        biases the `max`-over-(layer, head) collapse toward whichever type
+        got the sharper distribution. When None, the historical
+        `1/sqrt(head_dim)` is used.
+      kv_shared: True for a layer that reads another layer's KV cache rather
+        than owning one (Gemma 3n/4's `kv_sharing_target_layer_name`). Such
+        a layer's K is a DUPLICATE of its target's, so leaving it in gives
+        that one K vector a second vote under `max`. Dropped unconditionally
+        when supplied; on a model with no sharing the list is all-False and
+        nothing is dropped.
+      logits_soft_cap: `config.attn_logit_softcapping`, applied as
+        `cap * tanh(x / cap)` before the softmax, matching what the attention
+        kernel itself does. None disables it.
+    """
+
+    layer_types: Optional[List[str]] = None
+    scales: Optional[List[float]] = None
+    kv_shared: Optional[List[bool]] = None
+    logits_soft_cap: Optional[float] = None
+
+    def is_noop(self) -> bool:
+        """Whether this geometry changes nothing -- used to keep the "an
+        unsupplied geometry reproduces published rows exactly" claim checkable
+        rather than merely asserted."""
+        return (
+            self.layer_types is None
+            and self.scales is None
+            and self.kv_shared is None
+            and self.logits_soft_cap is None
+        )
+
+
+def layer_geometry_from_attention_layers(attn_layers) -> LayerGeometry:
+    """Build a `LayerGeometry` by reading each layer's OWN `Attention` module.
+
+    Deliberately reads the live modules rather than the `hf_config`. Three
+    reasons, all checked against this fork's real source rather than assumed:
+
+    1. `Attention.__init__` is where a model's per-layer decisions actually
+       land -- `self.sliding_window` (attention.py, set from
+       `per_layer_sliding_window`) and `self.kv_sharing_target_layer_name`.
+       A config field is the model's INPUT; these are its output, and for an
+       interleaved model the two can diverge (e.g. `CacheConfig.sliding_window`
+       is deliberately left unset for interleaved models precisely so it
+       cannot override the per-layer values -- see `arg_utils.py`'s
+       `is_interleaved` guard).
+    2. The attention SCALE is not stored on the `Attention` module at all --
+       it is forwarded to the backend impl, which keeps it as
+       `self.scale = float(scale)` (confirmed in both `triton_attn.py` and
+       `flash_attn.py`). Reading it there gets the number the kernel actually
+       uses, whatever the model chose: `1/sqrt(head_dim)` for Llama, `1.0`
+       for Gemma 4, `query_pre_attn_scalar**-0.5` for Gemma 2/3.
+    3. It works for a truncated scorer (`hf_overrides={"num_hidden_layers":
+       n}`) with no extra bookkeeping, because there simply are n modules.
+
+    Takes duck-typed objects (only `getattr` is used, no isinstance and no
+    vLLM import), so it is unit-testable on CPU with stand-ins -- the same
+    reason `model_truncation.keep_weight_for_layer_range` is a pure function.
+
+    Args:
+        attn_layers: the per-layer `Attention` modules, in layer order --
+            e.g. `[layer.self_attn.attn for layer in model.model.layers]`.
+
+    Raises:
+        ValueError: if a layer's scale cannot be found (better than silently
+            falling back to `1/sqrt(head_dim)`, which is the exact bug this
+            exists to fix), or if layers disagree on `logits_soft_cap`, which
+            this type can only carry as one scalar.
+    """
+    layer_types: List[str] = []
+    scales: List[float] = []
+    kv_shared: List[bool] = []
+    soft_caps = set()
+
+    for idx, attn in enumerate(attn_layers):
+        window = getattr(attn, "sliding_window", None)
+        layer_types.append("sliding_attention" if window else "full_attention")
+
+        kv_shared.append(
+            getattr(attn, "kv_sharing_target_layer_name", None) is not None
+        )
+
+        impl = getattr(attn, "impl", None)
+        scale = getattr(impl, "scale", None)
+        if scale is None:
+            scale = getattr(attn, "scale", None)
+        if scale is None:
+            raise ValueError(
+                f"could not read the attention scale for layer {idx} "
+                f"({type(attn).__name__}) -- expected it on `.impl.scale`. "
+                f"Refusing to fall back to 1/sqrt(head_dim): that is right "
+                f"for Llama and wrong for Gemma 4, and guessing silently is "
+                f"how the scoring softmax ends up at the wrong temperature."
+            )
+        scales.append(float(scale))
+
+        soft_caps.add(getattr(impl, "logits_soft_cap", None))
+
+    soft_caps.discard(None)
+    if len(soft_caps) > 1:
+        raise ValueError(
+            f"layers disagree on logits_soft_cap ({sorted(soft_caps)}); "
+            f"LayerGeometry carries a single scalar."
+        )
+
+    return LayerGeometry(
+        layer_types=layer_types,
+        scales=scales,
+        kv_shared=kv_shared,
+        logits_soft_cap=soft_caps.pop() if soft_caps else None,
+    )
+
+
 def compute_attention_score(
     query_buffer: List[torch.Tensor],
     key_buffer: List[List[torch.Tensor]],
     actual_look_ahead_cnts: List[int],
+    geometry: Optional[LayerGeometry] = None,
 ) -> List[torch.Tensor]:
     """Algorithm line 12: A <- compute_attention_score(Q, K).
 
-    Q @ K^T / sqrt(d) per layer, per sample.
+    Q @ K^T, scaled per layer, per sample.
 
     Args:
         query_buffer: per-layer list of buffered query tensors, each
@@ -47,11 +202,25 @@ def compute_attention_score(
         actual_look_ahead_cnts: per-sample count of lookahead steps actually
             used (may be less than the configured look_ahead_cnt if a
             sample hit EOS early).
+        geometry: optional per-layer scales and logit softcapping -- see
+            `LayerGeometry`. When None (the default) this falls back to
+            `1/sqrt(head_dim)` with no softcapping, which is the reference
+            implementation's behavior and what every published Llama row was
+            measured under.
 
     Returns:
         Per-sample list of [num_layer, num_head, look_ahead_cnt, context_len]
         attention-score tensors.
     """
+    scales = geometry.scales if geometry is not None else None
+    soft_cap = geometry.logits_soft_cap if geometry is not None else None
+    if scales is not None and len(scales) != len(query_buffer):
+        raise ValueError(
+            f"LayerGeometry.scales has {len(scales)} entries but the query "
+            f"buffer holds {len(query_buffer)} layers -- a geometry built for "
+            f"a different model (or before layer truncation) cannot be used "
+            f"as-is."
+        )
     attn_weights: List[List[torch.Tensor]] = []
 
     for layer_idx in range(len(query_buffer)):
@@ -80,9 +249,18 @@ def compute_attention_score(
 
             query = query[:, :c, :]
 
-            attn = torch.matmul(
-                query, key.transpose(-1, -2)
-            ) / math.sqrt(head_dim)
+            attn = torch.matmul(query, key.transpose(-1, -2))
+            if scales is None:
+                attn = attn / math.sqrt(head_dim)
+            else:
+                attn = attn * scales[layer_idx]
+
+            if soft_cap:
+                # Exactly what the attention kernel applies before its own
+                # softmax (`Attention(..., logits_soft_cap=...)`). Omitting it
+                # leaves the scoring softmax reading pre-cap logits, whose
+                # tails the model itself never sees.
+                attn = soft_cap * torch.tanh(attn / soft_cap)
 
             attn_weights[-1].append(attn)
 
@@ -96,36 +274,107 @@ def compute_attention_score(
     ]
 
 
-def scoring_layer_indices(num_layers: int, score_layers: Optional[str]) -> List[int]:
+def scoring_layer_indices(
+    num_layers: int,
+    score_layers: Optional[str],
+    layer_types: Optional[List[str]] = None,
+    kv_shared: Optional[List[bool]] = None,
+) -> List[int]:
     """Which layer indices get a vote in `aggregate_attention_score`.
 
-    Pure integer arithmetic, no tensors, so the layer-restriction policy is
-    unit-testable without a model -- and so the "does this selection do what
-    its name says" question is answered in one place rather than inside a
-    tensor pipeline.
+    Pure integer/string arithmetic, no tensors and no model, so the
+    layer-restriction policy is unit-testable on CPU -- and so the "does this
+    selection do what its name says" question is answered in one place rather
+    than inside a tensor pipeline.
 
     `None` means every layer (the reference implementation's behavior and the
-    default). Every named selection drops EARLY layers and keeps late ones:
-    layers 0-1 are near-universally positional/sink-dominated, and under the
-    default `max` aggregation a single peaked early head can set the entire
-    importance vector by itself. See ACCURACY_IMPROVEMENTS.md §1.2.
+    default). `"skip_first2"`/`"second_half"`/`"last_quarter"` each drop EARLY
+    layers and keep late ones: layers 0-1 are near-universally
+    positional/sink-dominated, and under the default `max` aggregation a
+    single peaked early head can set the entire importance vector by itself.
+    See ACCURACY_IMPROVEMENTS.md §1.2.
+
+    `"global_only"` is different in kind -- not a fixed slice but a property
+    of the architecture. On an interleaved sliding-window model (Gemma 3/3n/4,
+    Llama 4) most layers can never attend beyond a 512-1024 token window, so
+    their `Q @ K^T` against a distant position is a number the model never
+    computes in real inference. Under `max` over (layer, head), ONE such layer
+    is enough to decide a token's importance. This selects only the
+    full-attention layers, and needs `layer_types` to do it.
+
+    `kv_shared` is applied on top of whichever selection was chosen, and
+    UNCONDITIONALLY rather than behind a flag -- the same discipline
+    `model_truncation.py` uses. A KV-shared layer (Gemma 3n/4's
+    `kv_sharing_target_layer_name`) reads another layer's K, so its row is a
+    duplicate of that layer's and would give one K vector two votes. On a
+    model with no sharing every entry is False and nothing is dropped, making
+    this a provable no-op there rather than a switch that could be set wrong.
 
     Always returns at least one layer -- a selection that would empty the
-    list on a very shallow model falls back to the last layer rather than
-    producing a NaN score vector further down.
+    list falls back to the last surviving candidate rather than producing a
+    NaN score vector further down.
     """
     if score_layers is None:
-        return list(range(num_layers))
-    if score_layers == "skip_first2":
-        start = 2
-    elif score_layers == "second_half":
-        start = num_layers // 2
-    elif score_layers == "last_quarter":
-        start = (3 * num_layers) // 4
+        indices = list(range(num_layers))
+    elif score_layers == "global_only":
+        if layer_types is None:
+            raise ValueError(
+                "score_layers='global_only' needs the model's own layer_types "
+                "(pass scoring.LayerGeometry(layer_types=...)); there is no "
+                "way to tell a sliding layer from a full-attention one from "
+                "the Q/K tensors alone."
+            )
+        if len(layer_types) != num_layers:
+            raise ValueError(
+                f"layer_types has {len(layer_types)} entries but the score "
+                f"tensor has {num_layers} layers -- a geometry built for a "
+                f"different checkpoint (or before layer truncation) cannot be "
+                f"reused as-is."
+            )
+        unknown = sorted(
+            set(layer_types) - GLOBAL_LAYER_TYPES - LOCAL_LAYER_TYPES
+        )
+        if unknown:
+            raise ValueError(
+                f"unrecognised layer_types {unknown} -- refusing to guess "
+                f"whether they attend globally. Known global: "
+                f"{sorted(GLOBAL_LAYER_TYPES)}; known local: "
+                f"{sorted(LOCAL_LAYER_TYPES)}."
+            )
+        indices = [i for i, t in enumerate(layer_types) if t in GLOBAL_LAYER_TYPES]
+        if not indices:
+            raise ValueError(
+                "score_layers='global_only' selected no layer -- this model "
+                "has no full-attention layer at all, so there is nothing that "
+                "can score a long context. Use a different score_layers."
+            )
     else:
-        raise ValueError(f"unknown score_layers: {score_layers!r}")
-    start = min(start, max(num_layers - 1, 0))
-    return list(range(start, num_layers))
+        if score_layers == "skip_first2":
+            start = 2
+        elif score_layers == "second_half":
+            start = num_layers // 2
+        elif score_layers == "last_quarter":
+            start = (3 * num_layers) // 4
+        else:
+            raise ValueError(f"unknown score_layers: {score_layers!r}")
+        start = min(start, max(num_layers - 1, 0))
+        indices = list(range(start, num_layers))
+
+    if kv_shared is not None:
+        if len(kv_shared) != num_layers:
+            raise ValueError(
+                f"kv_shared has {len(kv_shared)} entries but the score tensor "
+                f"has {num_layers} layers."
+            )
+        surviving = [i for i in indices if not kv_shared[i]]
+        # Keep the pre-filter selection if dropping shared layers would empty
+        # it: a degenerate all-shared model is not a reason to return nothing.
+        if surviving:
+            indices = surviving
+
+    if not indices:
+        indices = [max(num_layers - 1, 0)]
+    return indices
 
 
 def _collapse_layer_head(attn: torch.Tensor, score_aggregation: str) -> torch.Tensor:
@@ -154,6 +403,7 @@ def _collapse_layer_head(attn: torch.Tensor, score_aggregation: str) -> torch.Te
 def aggregate_attention_score(
     attn_scores: List[torch.Tensor],
     spec_config: SpecConfig,
+    geometry: Optional[LayerGeometry] = None,
 ) -> List[torch.Tensor]:
     """Algorithm line 14: A <- aggregate_attention_score(A).
 
@@ -174,10 +424,14 @@ def aggregate_attention_score(
             tensors, as returned by compute_attention_score.
         spec_config: supplies `pool_kernel_size`, `score_aggregation`,
             `score_layers`, `score_head_set`.
+        geometry: optional per-layer `layer_types`/`kv_shared`, consumed by
+            `scoring_layer_indices`. None reproduces the reference behavior.
 
     Returns:
         Per-sample 1D [context_len] token-importance tensors.
     """
+    layer_types = geometry.layer_types if geometry is not None else None
+    kv_shared = geometry.kv_shared if geometry is not None else None
     token_importance: List[torch.Tensor] = []
 
     for attn in attn_scores:
@@ -189,9 +443,23 @@ def aggregate_attention_score(
         # Layer restriction happens BEFORE the flatten below -- dim 0 is the
         # layer axis only until (layer, head) are folded together.
         layer_indices = scoring_layer_indices(
-            attn.shape[0], spec_config.score_layers
+            attn.shape[0], spec_config.score_layers, layer_types, kv_shared
         )
         if len(layer_indices) != attn.shape[0]:
+            if spec_config.score_head_set is not None:
+                # `SpecConfig.__post_init__` already forbids combining
+                # score_head_set with score_layers, but a GEOMETRY can drop
+                # layers too (kv_shared) without score_layers being set --
+                # and that shifts the flattened layer*head axis the head
+                # indices are into. Refuse rather than silently scoring with
+                # a different head set than the caller named.
+                raise ValueError(
+                    f"score_head_set indexes the FULL layer*head axis, but "
+                    f"this geometry keeps only {len(layer_indices)} of "
+                    f"{attn.shape[0]} layers, which renumbers that axis. "
+                    f"Re-derive the head list for the restricted layer set, "
+                    f"or drop the geometry's layer restriction."
+                )
             attn = attn[layer_indices]
 
         # Flatten (layer, head) into one axis so pooling/collapse apply
@@ -319,6 +587,7 @@ def score_and_select_indices(
     key_buffer_per_layer: List[torch.Tensor],
     actual_look_ahead_cnt: int,
     spec_config: SpecConfig,
+    geometry: Optional[LayerGeometry] = None,
 ) -> List[int]:
     """One-sample convenience wrapper chaining lines 12/14/16 above
     (`compute_attention_score` -> `aggregate_attention_score` ->
@@ -339,7 +608,9 @@ def score_and_select_indices(
     over zero lookahead steps produces silent NaN, not an error -- both
     real callers already guard this themselves before calling in)."""
     key_buffer = [[k] for k in key_buffer_per_layer]  # one sample
-    attn_scores = compute_attention_score(query_buffer, key_buffer, [actual_look_ahead_cnt])
-    token_importance = aggregate_attention_score(attn_scores, spec_config)
+    attn_scores = compute_attention_score(
+        query_buffer, key_buffer, [actual_look_ahead_cnt], geometry
+    )
+    token_importance = aggregate_attention_score(attn_scores, spec_config, geometry)
     kept_local_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
     return kept_local_indices.tolist()

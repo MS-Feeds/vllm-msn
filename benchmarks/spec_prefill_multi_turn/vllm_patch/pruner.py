@@ -139,6 +139,7 @@ def _score_and_select(
     key_buffer_per_layer: List[torch.Tensor],
     actual_look_ahead_cnt: int,
     spec_config: SpecConfig,
+    geometry=None,
 ) -> Tuple[List[int], List[int], int, List[Tuple[int, int]]]:
     """Oracle-path scoring core: computes indices driver-side (the oracle
     path has no in-process speculator worker to run scoring inside -- its
@@ -150,12 +151,22 @@ def _score_and_select(
     `key_buffer_per_layer[layer_idx]` is a single [full_len, num_kv_heads,
     head_size] tensor (one sample) -- see `score_and_select_indices`'s own
     docstring for the wrapping this passes through.
+
+    `geometry` is the SCORING model's own `scoring.LayerGeometry`. On this
+    path that is the TARGET checkpoint, so the caller that hooked the target's
+    attention layers is the one that must build it -- passing None keeps the
+    historical `1/sqrt(head_dim)`, correct for Llama and wrong for any model
+    that sets its own scale (see `LayerGeometry.scales`).
     """
     kept_local_indices = (
         None
         if actual_look_ahead_cnt == 0
         else score_and_select_indices(
-            query_buffer, key_buffer_per_layer, actual_look_ahead_cnt, spec_config
+            query_buffer,
+            key_buffer_per_layer,
+            actual_look_ahead_cnt,
+            spec_config,
+            geometry,
         )
     )
     return _positions_from_kept_indices(candidate_pool, force_keep_query, kept_local_indices)

@@ -171,31 +171,42 @@ def instrumented_aggregate(
 def analyze_positions(
     positions: list[int],
     winning_layer_idx,  # [look_ahead_cnt, context_len] numpy array
-    layer_head_dims: list[int],
+    layer_windows: list,  # per-layer sliding window, None for full attention
     orig_len: int,
     look_ahead_cnt: int,
-    sliding_window: int,
     label: str,
 ) -> None:
+    """Share of winning (layer, head) votes cast by a layer that could not
+    actually have attended to the position it won.
+
+    `layer_windows[i]` is layer i's OWN `Attention.sliding_window` -- None for
+    a full-attention layer. An earlier version inferred this as
+    `head_dim < max(layer_head_dims)`, exploiting Gemma-4-26B-A4B's 256-vs-512
+    head-dim split. That proxy fails silently, not loudly, on any checkpoint
+    whose head dims happen to be uniform: every layer then reads as
+    full-attention, the phantom rate comes out 0% for both samples, and the
+    hypothesis looks REFUTED when in fact it was never tested. Reading each
+    layer's own window makes the measurement mean the same thing on every
+    checkpoint this is pointed at.
+    """
     phantom_votes = 0
     total_votes = 0
     for p in positions:
         for step in range(look_ahead_cnt):
             layer_idx = int(winning_layer_idx[step, p])
-            head_dim = layer_head_dims[layer_idx]
-            is_sliding_layer = head_dim < max(layer_head_dims)  # 256 < 512 for Gemma4-E2B
+            window = layer_windows[layer_idx]
             query_pos = orig_len + step
             distance = query_pos - p
-            out_of_window = distance > sliding_window
             total_votes += 1
-            if is_sliding_layer and out_of_window:
+            if window is not None and distance > window:
                 phantom_votes += 1
 
+    windows = sorted({w for w in layer_windows if w is not None})
     rate = phantom_votes / total_votes if total_votes else 0.0
     print(f"[verify] {label}: {len(positions)} position(s), {total_votes} "
           f"(position, lookahead-step) votes, {phantom_votes} ({rate:.1%}) "
           f"won by a sliding-window layer scoring OUTSIDE its real "
-          f"{sliding_window}-token window.")
+          f"window (per-layer windows in use: {windows or 'none'}).")
 
 
 def main() -> None:
@@ -303,6 +314,40 @@ def main() -> None:
         print(f"[verify] error reading live sliding_window ({e}) -- falling back "
               f"to assumed value {ASSUMED_SLIDING_WINDOW}.")
 
+    # Which layers are actually sliding, read off the live `Attention`
+    # modules rather than narrated from a checkpoint this may not be running
+    # against. `Attention.sliding_window` is set from the model's own
+    # `per_layer_sliding_window`, so this is true for whatever loaded --
+    # 26B-A4B, 31B, E2B -- instead of the 26B-A4B figures this script's
+    # docstring was originally written around.
+    layer_windows = [
+        getattr(self_attn.attn, "sliding_window", None)
+        for self_attn in proposer._speculator_layers
+    ]
+    sliding_flags = [w is not None for w in layer_windows]
+    num_sliding = sum(sliding_flags)
+    num_global = len(sliding_flags) - num_sliding
+    print(f"[verify] loaded model: {len(sliding_flags)} layers = "
+          f"{num_sliding} sliding + {num_global} full-attention"
+          + (f" (~{num_sliding / num_global:.0f}:1 interleave)" if num_global else "")
+          + f"; attention scales {sorted(set(proposer.layer_geometry().scales))}")
+    if num_sliding == 0:
+        print("[verify] NOTE: this model has no sliding-window layer at all, so "
+              "the hypothesis under test cannot apply to it. Expect a 0% "
+              "phantom-vote rate on both samples below.")
+
+    # The config-derived `sliding_window` above is now a CROSS-CHECK only --
+    # the phantom-vote arithmetic uses each layer's own window (see
+    # `analyze_positions`). Keeping the comparison because a disagreement
+    # between the config field and what the layers were actually built with
+    # is worth seeing: it would mean the window this script's docstring and
+    # the run logs talk about is not the window the kernel enforced.
+    live_windows = sorted({w for w in layer_windows if w is not None})
+    if live_windows and live_windows != [sliding_window]:
+        print(f"[verify] NOTE: per-layer windows {live_windows} differ from the "
+              f"config-derived value {sliding_window}. The per-layer values are "
+              f"what the kernel enforces and what this report uses.")
+
     head_dim = layer_head_dims[0] if len(set(layer_head_dims)) == 1 else layer_head_dims[0]
     look_ahead_cnt = LOOK_AHEAD_CNT
 
@@ -342,8 +387,17 @@ def main() -> None:
     )
 
     # Unmodified production call -- attn_scores is exactly what
-    # aggregate_attention_score/the real run consumed.
-    attn_scores = compute_attention_score(gathered_qk, key_buffer, actual_look_ahead_cnts)
+    # aggregate_attention_score/the real run consumed. The geometry argument
+    # is part of that production path now (see scoring.LayerGeometry): it
+    # supplies the model's OWN attention scale instead of 1/sqrt(head_dim),
+    # which matters here more than anywhere else. This script measures which
+    # (layer, head) wins the max, and the scale sets each layer's softmax
+    # TEMPERATURE -- on Gemma 4, by a different amount for the 256-dim
+    # sliding layers than for the 512-dim global ones. Scoring with the old
+    # scale would have confounded the phantom-vote rate with a known bug.
+    attn_scores = compute_attention_score(
+        gathered_qk, key_buffer, actual_look_ahead_cnts, proposer.layer_geometry()
+    )
 
     spec_config = SpecConfig(
         keep_strategy="percentage",
@@ -373,8 +427,8 @@ def main() -> None:
     )
 
     analyze_positions(
-        sorted(kept_positions), winning_layer_idx, layer_head_dims, orig_len,
-        actual_look_ahead_cnts[0], sliding_window, "KEPT positions (sent to target model)"
+        sorted(kept_positions), winning_layer_idx, layer_windows, orig_len,
+        actual_look_ahead_cnts[0], "KEPT positions (sent to target model)"
     )
 
     pruned_away = [p for p in range(orig_len) if p not in kept_positions]
@@ -382,8 +436,8 @@ def main() -> None:
         pruned_away, min(args.compare_sample_size, len(pruned_away))
     )
     analyze_positions(
-        comparison_sample, winning_layer_idx, layer_head_dims, orig_len,
-        actual_look_ahead_cnts[0], sliding_window,
+        comparison_sample, winning_layer_idx, layer_windows, orig_len,
+        actual_look_ahead_cnts[0],
         f"PRUNED-AWAY positions (random sample of {len(comparison_sample)})"
     )
 

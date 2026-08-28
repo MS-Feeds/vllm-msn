@@ -177,7 +177,9 @@ def compute_pruned_prompt(
         head_dim,
     )
 
-    attn_scores = compute_attention_score(gathered_qk, key_buffer, actual_look_ahead_cnts)
+    attn_scores = compute_attention_score(
+        gathered_qk, key_buffer, actual_look_ahead_cnts, proposer.layer_geometry()
+    )
     token_importance = aggregate_attention_score(attn_scores, spec_config)
     kept_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
 

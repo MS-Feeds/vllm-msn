@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  121/121 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  136/136 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -446,6 +446,73 @@ real, smaller degradation. Not yet investigated further.
 
 ---
 
+## Gemma 4 / interleaved-attention support (gate phase, in progress)
+
+Target for this work: **Gemma-4-31B (dense)** with **Gemma-4-E2B-it** as
+speculator. Scoped deliberately to a gate-plus-scoring-fidelity phase, then a
+re-decision — see the porting plan for the full blocker analysis.
+
+**What is ready.** The speculator-side scoring path no longer assumes Llama:
+
+- The query-capture hook is architecture-generic. It hooks `Attention.forward`
+  and reads the post-RoPE query as an *argument* rather than reproducing a
+  model's attention `forward` body, so it cannot drift from the model it was
+  copied from. Gemma 4 gives such a copy plenty to drift on — `q_norm` applied
+  per-head *before* RoPE, a `use_k_eq_v` branch deriving V from the pre-norm K,
+  and a KV-shared branch that RoPEs Q only. The Llama-only `NotImplementedError`
+  gate is gone as a result, not joined by a second branch.
+- `scoring.LayerGeometry` carries the model's own per-layer facts, read off the
+  live `Attention` modules (not `hf_config`): the attention **scale** — Gemma 4
+  uses `scaling = 1.0`, not `1/sqrt(head_dim)` — plus `attn_logit_softcapping`,
+  `layer_types`, and which layers are KV-shared.
+- `score_layers="global_only"` restricts scoring to full-attention layers. On a
+  5:1 interleave, 5 of every 6 layers can never attend beyond a 512–1024 token
+  window, so their score for a distant position is a number the model never
+  computes — and `max` over (layer, head) lets any one of them decide a token's
+  importance by itself.
+- KV-shared layers are dropped from the vote unconditionally: their K *is*
+  another layer's K, so leaving them in gives one K vector two votes.
+
+Every one of these is a **provable no-op on a uniform-attention model**:
+an unsupplied geometry keeps `1/sqrt(head_dim)` with no cap, and a Llama-shaped
+geometry reports all-`full_attention`, all-False, no softcap. The published
+Llama rows above are reproduced unchanged, which
+`test_layer_geometry_is_a_provable_noop_for_uniform_models` checks directly
+rather than asserting.
+
+**What is NOT ready — do not run a `SPARSE-k*` row on Gemma 4 yet.**
+`sparse_target_runner.py` writes one gathered `block_table` into *every*
+layer's attention metadata, and `speculator_worker.py` reads
+`input_batch.block_table[0]`. Both assume a single KV-cache group. An
+interleaved model has two or more, with *different block sizes*, and neither
+site raises — they produce garbage K and garbage attention silently. See
+`speculator_worker.py`'s "Known risk areas" #1 for the traced chain through
+`get_kv_cache_groups` and for the `--disable-hybrid-kv-cache-manager` escape
+hatch that restores the single-group invariant. A startup assertion for that is
+the next piece of work, not something already in place.
+
+Two further caveats worth knowing before reading any Gemma 4 number:
+
+- **Sliding layers must be excluded from the gather entirely, not patched.**
+  The gather *compacts* the KV view, and a sliding-window kernel decides window
+  membership from a key's index within `seqused_k` — so compaction shifts every
+  key's apparent distance from the query. The contiguous force-kept tail that
+  fixes this for causal masking cannot fix it here, because a window must be
+  contiguous in *true* positions and a top-k block selection is not.
+- **The headroom is 5–6× smaller than on Llama.** The mechanism saves attention
+  compute by restricting how much resident KV each query reads; on Gemma 4 most
+  layers already read only 512–1024 tokens. The saving lives on the ~1/6 global
+  layers, so the keep-rate/accuracy curves above do not transfer, and
+  `SPECULATION_ECONOMICS.md`'s win condition needs both of its terms re-derived.
+
+The cheapest next measurement is the gate that already exists:
+`../spec_prefill/verify_sliding_window_hypothesis.py`, which reports what
+fraction of winning (layer, head) votes came from a sliding layer scoring a
+position it could never attend to, split between kept and pruned-away
+positions. It has never been executed.
+
+---
+
 ## FLOP model (analytic, not hardware-measured)
 
 `flops_model.py` is a pure-Python (no torch/vLLM import) analytic FLOP
@@ -566,7 +633,7 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 121/121 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 136/136 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |

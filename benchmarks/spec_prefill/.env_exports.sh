@@ -59,6 +59,33 @@ export GEMMA4_TEXT_ONLY_MODEL_PATH=/scratch/hf_cache/gemma-4-26B-A4B-it-text-onl
 # present on this node" caveats as GEMMA4_MODEL_PATH above apply here too.
 export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/3e22461f65e89153144f8adb70e3b8c2cc9845a7
 
+# Gemma-4-31B (DENSE) -- the target for the multi-turn port's gate phase (see
+# ../spec_prefill_multi_turn/, and the porting plan's "Decided scope"). Not
+# used by THIS pipeline's own P001-P006 sweep, which stays on the 26B-A4B
+# above; it lives here because this is where the gate script
+# (verify_sliding_window_hypothesis.py) is run from.
+#
+# TODO: fill in with this node's real snapshot path once downloaded (gated HF
+# repo -- request access and export HF_TOKEN first, see REPRODUCE.md step 3).
+# Verify before trusting, same caveat as every path in this file:
+#   ls -la /scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/*/
+#
+# Why dense rather than the MoE 26B-A4B for the port: it keeps the FLOP
+# accounting closer to the Llama model the multi-turn pipeline already has
+# (no parallel dense-MLP + top-8-of-128 routing to model), while still
+# exercising every property that actually blocks the port -- interleaved
+# sliding-window attention, heterogeneous head dims, and cross-layer KV
+# sharing are all still present.
+#
+# Checked so it does not get re-litigated: a DENSE target does NOT put this
+# at risk of the newer "v2" model runner, even though that runner's gate
+# mentions dense/non-quantized. `DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES`
+# (vllm/config/vllm.py) is `{"Qwen3ForCausalLM"}` and
+# `_is_default_v2_model_runner_model` returns False for anything outside it
+# BEFORE reaching the dense/MoE check. VLLM_USE_V2_MODEL_RUNNER=0 above stays
+# as a defensive pin, not a load-bearing one.
+export GEMMA4_31B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/FILL_ME_IN
+
 # NOTE: no "hub/" in these paths -- `hf download --cache-dir X` places
 # snapshots directly under X, not X/hub/ (that hub/ nesting is what
 # HF_HOME-based lazy fetching via transformers/huggingface_hub's default

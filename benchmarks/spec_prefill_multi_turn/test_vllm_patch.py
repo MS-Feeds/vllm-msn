@@ -77,8 +77,10 @@ from vllm_patch.pruning_registry import PruneRecord
 from vllm_patch.scoring import (
     aggregate_attention_score,
     chunk_select_from_smoothed_attention,
+    LayerGeometry,
     aggregate_attention_score,
     compute_attention_score,
+    layer_geometry_from_attention_layers,
     score_and_select_indices,
     scoring_layer_indices,
 )
@@ -3341,6 +3343,447 @@ def _run_all():
     if failures:
         print("Failed:", failures)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Interleaved sliding-window support (Gemma 3/3n/4, Llama 4). See the porting
+# plan's blockers A3 (sliding layers voting on positions they cannot attend
+# to), A4 (wrong attention scale), and A5 (KV-shared layers voting twice).
+# ---------------------------------------------------------------------------
+
+# Gemma 4's larger models interleave 5 sliding layers per global one; E2B/E4B
+# use 4:1. Both patterns are exercised below.
+_GEMMA4_5TO1 = ["sliding_attention"] * 5 + ["full_attention"]
+_GEMMA4_4TO1 = ["sliding_attention"] * 4 + ["full_attention"]
+
+
+class _FakeImpl:
+    def __init__(self, scale, logits_soft_cap=None):
+        self.scale = scale
+        self.logits_soft_cap = logits_soft_cap
+
+
+class _FakeAttention:
+    """Stands in for a vLLM `Attention` module. `layer_geometry_from_
+    attention_layers` only ever calls `getattr`, which is what makes the
+    geometry builder testable with no checkpoint and no GPU."""
+
+    def __init__(self, scale, sliding_window=None, kv_sharing_target_layer_name=None,
+                 logits_soft_cap=None):
+        self.sliding_window = sliding_window
+        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
+        self.impl = _FakeImpl(scale, logits_soft_cap)
+
+
+def test_scoring_layer_indices_global_only_keeps_just_the_full_attention_layers():
+    """Blocker A3. On a 5:1 interleave, 5 of every 6 layers can never attend
+    beyond the sliding window, so their score for a distant position is a
+    number the model never computes in real inference -- and `max` over
+    (layer, head) lets any ONE of them decide a token's importance."""
+    layer_types = _GEMMA4_5TO1 * 5  # 30 layers, the 26B-A4B's depth
+    got = scoring_layer_indices(30, "global_only", layer_types)
+    assert got == [5, 11, 17, 23, 29]
+    assert len(got) == 5, "5:1 interleave must leave 1 in 6 layers voting"
+
+    # 4:1 (E2B/E4B) -- same policy, different density.
+    four_to_one = _GEMMA4_4TO1 * 6  # 30 layers
+    assert scoring_layer_indices(30, "global_only", four_to_one) == [4, 9, 14, 19, 24, 29]
+
+    # A uniform-attention model has no sliding layers, so this degenerates to
+    # "every layer" rather than becoming a special case to remember.
+    assert scoring_layer_indices(4, "global_only", ["full_attention"] * 4) == [0, 1, 2, 3]
+    # "attention" is the Llama-4/hybrid-SSM spelling for the same thing.
+    assert scoring_layer_indices(2, "global_only", ["attention"] * 2) == [0, 1]
+
+
+def test_scoring_layer_indices_global_only_refuses_to_guess():
+    """Each failure mode raises rather than silently mis-selecting, because
+    every one of them produces a plausible-looking score vector."""
+    try:
+        scoring_layer_indices(30, "global_only")
+    except ValueError as exc:
+        assert "layer_types" in str(exc)
+    else:
+        raise AssertionError("global_only without layer_types must raise")
+
+    # A geometry built for a different (or untruncated) checkpoint.
+    try:
+        scoring_layer_indices(30, "global_only", _GEMMA4_5TO1)
+    except ValueError as exc:
+        assert "6" in str(exc) and "30" in str(exc)
+    else:
+        raise AssertionError("a layer_types/num_layers mismatch must raise")
+
+    # An unrecognised type must not be silently counted as global -- that is
+    # exactly the "admit a local layer's phantom vote" failure this prevents.
+    try:
+        scoring_layer_indices(2, "global_only", ["full_attention", "mamba"])
+    except ValueError as exc:
+        assert "mamba" in str(exc)
+    else:
+        raise AssertionError("an unknown layer type must raise, not be assumed global")
+
+    # A model with no global layer cannot score a long context at all.
+    try:
+        scoring_layer_indices(3, "global_only", ["sliding_attention"] * 3)
+    except ValueError as exc:
+        assert "no layer" in str(exc)
+    else:
+        raise AssertionError("an all-sliding model must raise rather than score")
+
+
+def test_scoring_layer_indices_drops_kv_shared_layers_unconditionally():
+    """Blocker A5. A KV-shared layer reads ANOTHER layer's K, so leaving it in
+    gives one K vector two votes under `max`. Dropped without a flag -- on a
+    model with no sharing every entry is False, making this a provable no-op
+    rather than a switch that could be set wrong (the same discipline
+    `model_truncation.py` uses for its weight filter)."""
+    kv_shared = [False] * 4 + [True] * 2
+    assert scoring_layer_indices(6, None, None, kv_shared) == [0, 1, 2, 3]
+
+    # Composes with a layer selection rather than replacing it.
+    layer_types = ["sliding_attention", "full_attention"] * 3
+    assert scoring_layer_indices(6, "global_only", layer_types, kv_shared) == [1, 3]
+
+    # No sharing -> nothing dropped. This is the Llama case, and it must stay
+    # identical to the pre-geometry behavior.
+    for selection in (None, "skip_first2", "second_half", "last_quarter"):
+        assert scoring_layer_indices(16, selection, None, [False] * 16) == (
+            scoring_layer_indices(16, selection)
+        )
+
+    # Degenerate: an all-shared model keeps the pre-filter selection rather
+    # than returning nothing (an empty set is a silent NaN downstream).
+    assert scoring_layer_indices(3, None, None, [True] * 3) == [0, 1, 2]
+
+
+def test_layer_geometry_from_attention_layers_reads_the_live_modules():
+    """The builder reads what the KERNEL actually uses, not what the config
+    says: the scale lives on the backend impl (`impl.scale`), the window and
+    the KV-sharing target on the `Attention` module itself."""
+    layers = [
+        _FakeAttention(scale=1.0, sliding_window=1024),
+        _FakeAttention(scale=1.0, sliding_window=1024),
+        _FakeAttention(scale=1.0, sliding_window=None),          # global
+        _FakeAttention(scale=1.0, sliding_window=1024,
+                       kv_sharing_target_layer_name="layers.0.self_attn.attn"),
+    ]
+    geo = layer_geometry_from_attention_layers(layers)
+    assert geo.layer_types == [
+        "sliding_attention", "sliding_attention", "full_attention", "sliding_attention",
+    ]
+    assert geo.scales == [1.0, 1.0, 1.0, 1.0]
+    assert geo.kv_shared == [False, False, False, True]
+    assert geo.logits_soft_cap is None
+    assert not geo.is_noop()
+
+    # A Llama-shaped model: uniform 1/sqrt(head_dim), no windows, no sharing.
+    llama_scale = 128 ** -0.5
+    llama_geo = layer_geometry_from_attention_layers(
+        [_FakeAttention(scale=llama_scale) for _ in range(16)]
+    )
+    assert llama_geo.layer_types == ["full_attention"] * 16
+    assert llama_geo.kv_shared == [False] * 16
+    assert all(abs(s - llama_scale) < 1e-12 for s in llama_geo.scales)
+
+    # Softcapping is collected once, and disagreement raises rather than
+    # silently picking one -- LayerGeometry can only carry a single scalar.
+    capped = layer_geometry_from_attention_layers(
+        [_FakeAttention(scale=1.0, logits_soft_cap=50.0) for _ in range(3)]
+    )
+    assert capped.logits_soft_cap == 50.0
+    try:
+        layer_geometry_from_attention_layers([
+            _FakeAttention(scale=1.0, logits_soft_cap=50.0),
+            _FakeAttention(scale=1.0, logits_soft_cap=30.0),
+        ])
+    except ValueError as exc:
+        assert "logits_soft_cap" in str(exc)
+    else:
+        raise AssertionError("disagreeing softcaps must raise")
+
+
+def test_layer_geometry_refuses_to_guess_a_missing_scale():
+    """Falling back to 1/sqrt(head_dim) is right for Llama and wrong for
+    Gemma 4 (`scaling = 1.0`), and the difference is a softmax TEMPERATURE,
+    not a constant factor -- so an unreadable scale must fail loudly."""
+    class _NoScale:
+        sliding_window = None
+        kv_sharing_target_layer_name = None
+        impl = None
+
+    try:
+        layer_geometry_from_attention_layers([_NoScale()])
+    except ValueError as exc:
+        assert "scale" in str(exc)
+    else:
+        raise AssertionError("a missing attention scale must raise")
+
+
+def test_compute_attention_score_uses_the_layers_own_scale():
+    """Blocker A4. `1/sqrt(head_dim)` is the model's scale only by
+    coincidence. With a per-layer scale supplied, the raw logits must be
+    scaled by exactly that."""
+    num_layers, look_ahead, ctx, heads, head_dim = 2, 3, 7, 4, 8
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=num_layers, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+
+    default = compute_attention_score(query_buffer, key_buffer, [look_ahead])[0]
+    # Gemma 4's scale: 1.0, not 1/sqrt(d).
+    ones = LayerGeometry(scales=[1.0] * num_layers)
+    got = compute_attention_score(query_buffer, key_buffer, [look_ahead], ones)[0]
+    assert torch.allclose(got, default * math.sqrt(head_dim), atol=1e-3, rtol=1e-3)
+
+    # Per-layer scales really are per-layer: a model whose head_dim differs by
+    # layer type gets a DIFFERENT softmax temperature per type, which is the
+    # bias this fixes.
+    mixed = LayerGeometry(scales=[1.0, 0.25])
+    got = compute_attention_score(query_buffer, key_buffer, [look_ahead], mixed)[0]
+    assert torch.allclose(got[0], default[0] * math.sqrt(head_dim), atol=1e-3, rtol=1e-3)
+    assert torch.allclose(got[1], default[1] * math.sqrt(head_dim) * 0.25,
+                          atol=1e-3, rtol=1e-3)
+
+    # A geometry built for a different layer count must raise, not broadcast.
+    try:
+        compute_attention_score(query_buffer, key_buffer, [look_ahead],
+                                LayerGeometry(scales=[1.0]))
+    except ValueError as exc:
+        assert "scales" in str(exc)
+    else:
+        raise AssertionError("a scales/layer-count mismatch must raise")
+
+
+def test_compute_attention_score_applies_logit_softcapping():
+    """Gemma's `attn_logit_softcapping` is applied by the attention kernel
+    before its own softmax; omitting it here leaves the scoring softmax
+    reading tails the model itself never sees."""
+    num_layers, look_ahead, ctx, heads, head_dim = 1, 2, 5, 2, 4
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=num_layers, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+    cap = 3.0
+    uncapped = compute_attention_score(
+        query_buffer, key_buffer, [look_ahead], LayerGeometry(scales=[1.0])
+    )[0]
+    capped = compute_attention_score(
+        query_buffer, key_buffer, [look_ahead],
+        LayerGeometry(scales=[1.0], logits_soft_cap=cap),
+    )[0]
+    assert torch.allclose(capped, cap * torch.tanh(uncapped.float() / cap).to(capped.dtype),
+                          atol=1e-3, rtol=1e-3)
+    assert capped.abs().max().item() <= cap + 1e-3
+
+
+def test_layer_geometry_is_a_provable_noop_for_uniform_models():
+    """The whole point of defaulting `geometry` to None -- and of a Llama-
+    shaped geometry being all-`full_attention`, all-False, no softcap -- is
+    that every already-published row is reproduced identically rather than
+    'probably unchanged'."""
+    num_layers, look_ahead, ctx, heads, head_dim = 4, 3, 11, 4, 16
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=num_layers, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+    cfg = SpecConfig(keep_strategy="percentage",
+                     keep_kwargs={"percentage": 0.5, "chunk": True, "chunk_size": 2},
+                     pool_kernel_size=3)
+    per_layer_keys = [k[0] for k in key_buffer]
+
+    reference = score_and_select_indices(query_buffer, per_layer_keys, look_ahead, cfg)
+
+    # An all-None geometry is declared a no-op and must behave as one.
+    empty = LayerGeometry()
+    assert empty.is_noop()
+    assert score_and_select_indices(
+        query_buffer, per_layer_keys, look_ahead, cfg, empty
+    ) == reference
+
+    # And so must the geometry a real uniform-attention model produces.
+    llama_geo = layer_geometry_from_attention_layers(
+        [_FakeAttention(scale=head_dim ** -0.5) for _ in range(num_layers)]
+    )
+    assert score_and_select_indices(
+        query_buffer, per_layer_keys, look_ahead, cfg, llama_geo
+    ) == reference
+
+
+def test_score_head_set_refuses_a_geometry_that_renumbers_the_head_axis():
+    """`score_head_set` indexes the FULL flattened layer*head axis. A geometry
+    that drops layers (kv_shared) renumbers that axis WITHOUT score_layers
+    being set, so `SpecConfig.__post_init__`'s existing mutual-exclusion check
+    cannot catch it. Scoring with a silently different head set would be
+    unfalsifiable in the results."""
+    num_layers, look_ahead, ctx, heads, head_dim = 4, 2, 9, 2, 8
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=num_layers, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+    attn = compute_attention_score(query_buffer, key_buffer, [look_ahead])
+    cfg = SpecConfig(keep_strategy="percentage",
+                     keep_kwargs={"percentage": 0.5}, score_head_set=[0, 3])
+
+    geo = LayerGeometry(kv_shared=[False, False, False, True])
+    try:
+        aggregate_attention_score(attn, cfg, geo)
+    except ValueError as exc:
+        assert "score_head_set" in str(exc)
+    else:
+        raise AssertionError("a layer-dropping geometry must not silently renumber heads")
+
+    # Without a dropping geometry the same config is still fine.
+    assert aggregate_attention_score(attn, cfg, LayerGeometry())[0].shape[0] == ctx
+
+
+def test_global_only_is_accepted_by_the_config_surface():
+    """A scoring mode the experiment matrix cannot name is a mode that cannot
+    be run -- `SpecConfig.__post_init__` validates against a closed set."""
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.2},
+                     score_layers="global_only")
+    assert cfg.score_layers == "global_only"
+
+
+def test_global_only_end_to_end_ignores_a_sliding_layers_phantom_votes():
+    """The property the whole `global_only` mode exists for, exercised through
+    the real scoring pipeline rather than the index policy alone.
+
+    Layer 0 is sliding and is given a saturated score on an early context
+    position it could never actually attend to; layer 1 is global and has a
+    milder, genuine preference for a late position. Under the default
+    all-layer `max` the sliding layer's phantom vote wins outright. Under
+    `global_only` that layer is not in the tensor at all.
+
+    `pool_kernel_size=0` so the smoothing pass cannot blur the two peaks into
+    each other -- this test is about WHICH LAYER decides, not about pooling.
+    """
+    look_ahead, ctx, heads, head_dim = 1, 16, 1, 4
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=2, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+    attn = compute_attention_score(query_buffer, key_buffer, [look_ahead])[0].clone()
+    attn.zero_()
+    attn[0, :, :, 1] = 50.0    # sliding layer, saturated, on a position it
+                               # can never reach in real inference
+    attn[1, :, :, 14] = 2.0    # global layer, a real but milder preference
+
+    # ceil(16 * 0.0625) == 1: exactly one position survives, so the assertion
+    # is "who won", with no room for both to be kept.
+    keep_one = {"percentage": 0.0625}
+    geo = LayerGeometry(layer_types=["sliding_attention", "full_attention"])
+
+    all_cfg = SpecConfig(keep_strategy="percentage", keep_kwargs=keep_one,
+                         pool_kernel_size=0)
+    all_layers = chunk_select_from_smoothed_attention(
+        aggregate_attention_score([attn], all_cfg), all_cfg
+    )[0].tolist()
+    assert all_layers == [1], f"expected the phantom vote to win, got {all_layers}"
+
+    global_cfg = SpecConfig(keep_strategy="percentage", keep_kwargs=keep_one,
+                            pool_kernel_size=0, score_layers="global_only")
+    global_only = chunk_select_from_smoothed_attention(
+        aggregate_attention_score([attn], global_cfg, geo), global_cfg
+    )[0].tolist()
+    assert global_only == [14], f"expected the global layer to decide, got {global_only}"
+
+
+# ---------------------------------------------------------------------------
+# Locating the decoder attention modules (`vllm_patch/model_structure.py`).
+# The wrapper shape differs per architecture and the failure mode is quiet:
+# a wrong walk hooks nothing, and the first symptom is an empty query buffer
+# scoring as NaN several steps later.
+# ---------------------------------------------------------------------------
+
+from vllm_patch.model_structure import find_attention_modules, unwrap_text_stack
+
+
+class _Bag:
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class _StubAttention(_Bag):
+    """Named so `find_attention_modules`' MLA guard sees a non-MLA class."""
+
+
+def _stub_layers(n, attn_cls=_StubAttention):
+    return [_Bag(self_attn=_Bag(attn=attn_cls(head_size=128, num_kv_heads=8)))
+            for _ in range(n)]
+
+
+def test_unwrap_text_stack_handles_both_wrapper_shapes():
+    """Llama loads as `LlamaForCausalLM` (one `.model` hop). Gemma 4 loads as
+    `Gemma4ForConditionalGeneration`, whose text stack is a whole
+    `Gemma4ForCausalLM` under `.language_model` -- confirmed by the sibling
+    single-turn pipeline on real hardware, and the reason a `.model`-only walk
+    finds nothing on that checkpoint."""
+    llama = _Bag(model=_Bag(layers=_stub_layers(4)))
+    assert unwrap_text_stack(llama) is llama.model
+
+    gemma4_mm = _Bag(language_model=_Bag(model=_Bag(layers=_stub_layers(6))))
+    assert unwrap_text_stack(gemma4_mm) is gemma4_mm.language_model.model
+
+    # Already the text stack: no hop at all.
+    bare = _Bag(layers=_stub_layers(2))
+    assert unwrap_text_stack(bare) is bare
+
+
+def test_unwrap_text_stack_raises_on_an_unrecognised_shape():
+    """Silently hooking zero layers is the failure this prevents."""
+    try:
+        unwrap_text_stack(_Bag(encoder=_Bag(blocks=[])))
+    except NotImplementedError as exc:
+        assert "layers" in str(exc)
+    else:
+        raise AssertionError("an unrecognised model shape must raise")
+
+
+def test_find_attention_modules_returns_the_inner_attention_in_layer_order():
+    """It must return the vLLM `Attention` (`layer.self_attn.attn`), not the
+    model's own attention wrapper -- that is what lets the capture hook read
+    the post-RoPE query as an ARGUMENT instead of recomputing it, and what
+    makes per-layer `head_size`/`num_kv_heads` available for a model with
+    heterogeneous head dims across layer types."""
+    model = _Bag(model=_Bag(layers=_stub_layers(3)))
+    found = find_attention_modules(model)
+    assert len(found) == 3
+    assert [id(a) for a in found] == [id(l.self_attn.attn) for l in model.model.layers]
+    assert all(hasattr(a, "head_size") and hasattr(a, "num_kv_heads") for a in found)
+
+
+def test_find_attention_modules_rejects_shapes_it_cannot_read():
+    class _MLAAttention(_Bag):
+        pass
+
+    # MLA caches a compressed latent, not K/V, so the K read-back would not be
+    # reading keys at all.
+    mla = _Bag(model=_Bag(layers=_stub_layers(2, attn_cls=_MLAAttention)))
+    try:
+        find_attention_modules(mla)
+    except NotImplementedError as exc:
+        assert "MLA" in str(exc)
+    else:
+        raise AssertionError("an MLA stack must raise rather than be read as K/V")
+
+    # A layer with no `.self_attn.attn`.
+    odd = _Bag(model=_Bag(layers=[_Bag(mlp=_Bag())]))
+    try:
+        find_attention_modules(odd)
+    except NotImplementedError as exc:
+        assert "self_attn" in str(exc)
+    else:
+        raise AssertionError("a layer without an Attention module must raise")
+
+    # An empty stack would produce an empty query buffer, i.e. a NaN score.
+    try:
+        find_attention_modules(_Bag(model=_Bag(layers=[])))
+    except NotImplementedError as exc:
+        assert "empty" in str(exc)
+    else:
+        raise AssertionError("an empty decoder stack must raise")
 
 
 if __name__ == "__main__":

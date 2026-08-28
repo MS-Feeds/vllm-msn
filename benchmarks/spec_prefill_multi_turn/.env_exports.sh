@@ -45,3 +45,36 @@ export LLAMA32_1B_MODEL_PATH=/scratch/hf_cache/models--meta-llama--Llama-3.2-1B-
 # path. Find it with:
 #   ls -la /scratch/hf_cache/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/*/
 export LLAMA32_3B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/0cb88a4f764b7a12671c53f0838cd831a0843b95
+
+# ---------------------------------------------------------------------------
+# Gemma 4 pair (target: Gemma-4-31B dense, speculator: Gemma-4-E2B-it).
+#
+# Added for the Gemma 4 port's GATE phase only. The published SCBench sweep in
+# this directory is Llama-3.1-8B / Llama-3.2-1B and is unaffected: nothing
+# reads these unless a run is launched with them explicitly.
+#
+# What is and is not ready, so a run does not get started on a false premise:
+#
+#   READY   - the speculator-side scoring path. The query-capture hook is now
+#             architecture-generic (it hooks `Attention.forward` and reads the
+#             post-RoPE query as an argument rather than recomputing any
+#             model's forward body), and `scoring.LayerGeometry` supplies the
+#             model's own per-layer attention scale, logit softcapping,
+#             layer types and KV-sharing flags.
+#
+#   NOT READY - the target-side SPARSE path. `sparse_target_runner.py` writes
+#             ONE gathered block_table into every layer's attention metadata,
+#             and `speculator_worker.py` reads `input_batch.block_table[0]`.
+#             Both assume a single KV-cache group, which is false for an
+#             interleaved model and fails SILENTLY. See
+#             `speculator_worker.py`'s "Known risk areas" #1 for the traced
+#             chain and for the `--disable-hybrid-kv-cache-manager` escape
+#             hatch that restores the assumption. Do not run a SPARSE-k* row
+#             against these paths until that guard exists.
+#
+# TODO: fill in this node's real snapshot paths (gated HF repos -- request
+# access and export HF_TOKEN first). Verify before trusting:
+#   ls -la /scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/*/
+#   ls -la /scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/*/
+export GEMMA4_31B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/FILL_ME_IN
+export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/3e22461f65e89153144f8adb70e3b8c2cc9845a7

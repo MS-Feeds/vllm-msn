@@ -42,6 +42,13 @@ decisions" for the full reasoning behind each column):
                                   (predict_scbench.py's EARLY-k*-g32-L<n>
                                   rows). vLLM-free at import time, so the
                                   policy half is CPU-testable.
+        model_structure.py    -- locating a loaded model's per-layer
+                                  `Attention` modules, including the
+                                  `.language_model` hop a multimodal
+                                  wrapper (Gemma 4) adds. vLLM-free for the
+                                  same reason model_truncation.py is: the
+                                  walk is quiet when it is wrong (it hooks
+                                  nothing), so it needs a CPU test.
 
     Rewritten (same responsibility, new implementation):
         proposer.py            -- (3-11) SpecPrefillProposer: now a thin
@@ -59,7 +66,8 @@ decisions" for the full reasoning behind each column):
 Public re-exports below are for convenience only -- each module also works
 standalone. Guarded the same way the single-turn pipeline's `__init__.py`
 guards them: `config.py`/`prefill_split.py`/`scoring.py`/
-`pruning_registry.py`/`conversation_state.py`/`model_truncation.py` have
+`pruning_registry.py`/`conversation_state.py`/`model_truncation.py`/
+`model_structure.py` have
 no vLLM runtime dependency and are importable/testable anywhere; the rest
 pull in vLLM's full runtime.
 """
@@ -73,9 +81,11 @@ from .pruning_registry import discard_finished as discard_finished_prune_records
 from .pruning_registry import get as get_prune_record
 from .pruning_registry import register as register_prune_record
 from .scoring import (
+    LayerGeometry,
     aggregate_attention_score,
     chunk_select_from_smoothed_attention,
     compute_attention_score,
+    layer_geometry_from_attention_layers,
 )
 
 __all__ = [
@@ -87,6 +97,8 @@ __all__ = [
     "compute_attention_score",
     "aggregate_attention_score",
     "chunk_select_from_smoothed_attention",
+    "LayerGeometry",
+    "layer_geometry_from_attention_layers",
     "PruneRecord",
     "register_prune_record",
     "get_prune_record",
