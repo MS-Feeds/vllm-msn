@@ -40,7 +40,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
-    FusedMoE,
+    FusedMoEFactory,
     GateLinear,
     fused_moe_make_expert_params_mapping,
 )
@@ -472,8 +472,8 @@ class Gemma4MoE(nn.Module):
                 gating_output, topk, self.per_expert_scale
             )
 
-        # FusedMoE experts with custom Gemma4 routing
-        self.experts = FusedMoE(
+        # FusedMoEFactory is the v0.28 construction API.
+        self.experts = FusedMoEFactory(
             num_experts=config.num_experts,
             top_k=config.top_k_experts,
             hidden_size=config.hidden_size,
