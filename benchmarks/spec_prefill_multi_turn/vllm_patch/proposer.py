@@ -176,6 +176,43 @@ class SpecPrefillProposer:
             enforce_eager=True,
             disable_log_stats=False,  # needed for RequestOutput.num_cached_tokens
             gpu_memory_utilization=gpu_memory_utilization,
+            # Force ONE KV cache group. Required for any interleaved
+            # sliding-window model (Gemma 3/3n/4, Llama 4); a provable no-op
+            # for a uniform-attention one.
+            #
+            # Confirmed on real hardware, not just traced: without this, a
+            # Gemma-4-E2B speculator raised
+            #   KV cache shape (138140, 2, 32, 1, 256) does not match
+            #   TRITON_ATTN's declared shape (138140, 2, 16, 1, 256)
+            # out of `kv_cache_utils._find_kv_split_dim`. The mechanism, and
+            # why the number is 32: E2B's sliding layers are head_dim=256 /
+            # num_kv_heads=1, so their page is 16*1*256*2*2 = 16KiB, while the
+            # global layers at head_dim=512 are 32KiB.
+            # `unify_kv_cache_spec_page_size` equalises page sizes by
+            # MULTIPLYING the smaller-page layers' block_size -- 16 -> 32 --
+            # and `_get_kv_cache_groups_uniform_page_size` then yields two
+            # groups with DIFFERENT block sizes. Every place this pipeline
+            # assumes one global block_size or reads `block_table[0]` is wrong
+            # in that world, and only the shape check above fails loudly.
+            #
+            # With the flag, `unify_hybrid_kv_cache_specs` rewrites every
+            # SlidingWindowSpec to a FullAttentionSpec (keeping
+            # `sliding_window`, so kernel masking is unaffected), and
+            # `UniformTypeKVCacheSpecs.is_uniform_type` accepts an
+            # all-FullAttentionSpec set REGARDLESS of differing head_size --
+            # so `_get_kv_cache_groups_uniform_type` puts every layer in one
+            # group at one block_size, never reaching the page-size path.
+            #
+            # No-op for Llama: `unify_hybrid_kv_cache_specs` returns early
+            # when the specs are already uniform, so the published rows take
+            # a byte-identical path. The cost, paid only by interleaved
+            # models, is that KV outside the sliding window is retained
+            # rather than dropped -- which this pipeline needs anyway, since
+            # its whole premise is a cache that is never discarded.
+            #
+            # Overridable via `extra_llm_kwargs` (applied below) for anyone
+            # deliberately testing the multi-group path.
+            disable_hybrid_kv_cache_manager=True,
         )
         llm_kwargs.update(extra_llm_kwargs)
 

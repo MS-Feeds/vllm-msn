@@ -597,7 +597,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         `proposer.py`'s docstring for how the two relate)."""
         slots = self.get_slots_for_positions(conversation_salt, positions)
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.device)
-        block_size = self.vllm_config.cache_config.block_size
+        block_size = self._single_kv_group_block_size()
         keys = []
         for attn in self._hooked_layers:
             # Read the geometry off the `Attention` module rather than the
@@ -611,6 +611,41 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             flat_keys = read_layer_keys(attn, block_size, num_kv_heads, head_size)
             keys.append(gather_keys_for_slots(flat_keys, slot_tensor))
         return keys
+
+    def _single_kv_group_block_size(self) -> int:
+        """The block size to read the KV cache with -- and the guard that this
+        pipeline's one-KV-cache-group assumption actually holds.
+
+        `cache_config.block_size` is the CONFIGURED block size, which is not
+        the same thing as the block size a given layer's cache was allocated
+        with. For a model whose layers need different page sizes,
+        `unify_kv_cache_spec_page_size` equalises them by multiplying the
+        smaller-page layers' block_size, so the two differ -- confirmed on
+        real hardware with a Gemma-4-E2B speculator, where the configured 16
+        became an allocated 32 for the head_dim=256 sliding layers.
+
+        Reading the group's own spec instead is both correct and the natural
+        place to check the group count, since every other assumption in this
+        file (`input_batch.block_table[0]`, one slot-mapping numbering for all
+        layers) rests on there being exactly one.
+
+        Raises rather than picking group 0, because picking group 0 is the
+        silent-corruption path: slots computed with one group's block size
+        index the wrong rows of another group's cache, and nothing downstream
+        can tell.
+        """
+        groups = self.kv_cache_config.kv_cache_groups
+        if len(groups) != 1:
+            block_sizes = [g.kv_cache_spec.block_size for g in groups]
+            raise NotImplementedError(
+                f"this speculator has {len(groups)} KV cache groups with block "
+                f"sizes {block_sizes}; every K read-back and slot mapping here "
+                f"assumes exactly one. Construct the engine with "
+                f"`disable_hybrid_kv_cache_manager=True` (proposer.py sets it "
+                f"by default and documents why), which collapses an "
+                f"interleaved model's specs into a single group."
+            )
+        return groups[0].kv_cache_spec.block_size
 
     def layer_geometry(self):
         """This speculator's own per-layer attention geometry, built once and

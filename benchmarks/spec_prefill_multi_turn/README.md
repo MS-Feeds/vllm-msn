@@ -480,6 +480,27 @@ Llama rows above are reproduced unchanged, which
 `test_layer_geometry_is_a_provable_noop_for_uniform_models` checks directly
 rather than asserting.
 
+**The multi-group problem is confirmed on real hardware, not just traced.**
+A Gemma-4-E2B speculator raised, out of `kv_cache_utils._find_kv_split_dim`:
+
+```
+KV cache shape (138140, 2, 32, 1, 256) does not match TRITON_ATTN's declared
+shape (138140, 2, 16, 1, 256) for block_size=16, num_kv_heads=1, head_size=256
+```
+
+The configured block size is 16; the allocated one for that layer is 32.
+E2B's sliding layers are `head_dim=256, num_kv_heads=1` — a 16KiB page against
+the global layers' 32KiB — and `unify_kv_cache_spec_page_size` equalises page
+sizes by *multiplying the smaller-page layers' block_size*. The result is two
+KV cache groups with different block sizes, which breaks every site that
+assumes one global `block_size` or reads `block_table[0]`.
+
+The speculator engine now forces `disable_hybrid_kv_cache_manager=True`
+(`proposer.py`), collapsing the specs into a single group; K read-back takes
+its block size from that group's own spec and raises with an actionable
+message if the group count is ever not 1. Both are no-ops on a
+uniform-attention model.
+
 **What is NOT ready — do not run a `SPARSE-k*` row on Gemma 4 yet.**
 `sparse_target_runner.py` writes one gathered `block_table` into *every*
 layer's attention metadata, and `speculator_worker.py` reads
