@@ -117,6 +117,29 @@ os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
+def _has_multimodal_tower(model_path: str) -> bool:
+    """Whether this checkpoint carries a vision/audio tower whose encoder
+    cache vLLM would otherwise reserve and profile.
+
+    Read off the HF config rather than the architecture name: Gemma 4's
+    text-only variant and its full multimodal checkpoint share an
+    architecture string in some configurations, but only one of them has the
+    sub-configs. Failing open (returning False) is the safe direction -- it
+    just means the engine behaves exactly as it did before this check
+    existed.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        return False
+    return any(
+        getattr(config, name, None) is not None
+        for name in ("vision_config", "audio_config", "video_config")
+    )
+
+
 class SpecPrefillProposer:
     def __init__(
         self,
@@ -214,6 +237,34 @@ class SpecPrefillProposer:
             # deliberately testing the multi-group path.
             disable_hybrid_kv_cache_manager=True,
         )
+        # This pipeline is text-only by construction -- every request it
+        # builds passes `mm_features=None` -- but a natively multimodal
+        # checkpoint does not know that. Gemma 4's speculator loads as
+        # `Gemma4ForConditionalGeneration`, and vLLM then reserves an encoder
+        # cache and PROFILES it, which on Gemma-4-E2B-it means a run of
+        # "52 video items of the maximum feature size" that appears to hang.
+        #
+        # Zeroing every modality limit removes both halves. Traced through
+        # `vllm/multimodal/encoder_budget.py`: `tower_modalities` keeps only
+        # modalities whose limit is > 0 and `embed_only_modalities` only
+        # applies with `enable_mm_embeds`, so all-zero limits leave
+        # `active_modalities` empty, `compute_mm_encoder_budget` returns 0,
+        # and `gpu_model_runner.profile_run`'s `if encoder_budget > 0` never
+        # fires. So no profiling AND no reserved encoder cache -- the latter
+        # matters at this engine's deliberately small
+        # `gpu_memory_utilization`, since the sibling pipeline measured that
+        # reservation at ~12GB on the 26B target.
+        #
+        # Applied only to a checkpoint that actually has a tower: passing
+        # modality limits to a text-only model (Llama, Qwen3) would be
+        # meaningless at best, so the published rows' path is untouched.
+        # `--skip-mm-profiling` is the narrower alternative if this ever needs
+        # loosening -- it skips the profiling but still reserves the cache.
+        if _has_multimodal_tower(speculator_model_path):
+            llm_kwargs.setdefault(
+                "limit_mm_per_prompt", {"image": 0, "video": 0, "audio": 0}
+            )
+
         llm_kwargs.update(extra_llm_kwargs)
 
         device_index = device.index if device.type == "cuda" else None
