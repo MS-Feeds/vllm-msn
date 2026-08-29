@@ -710,6 +710,57 @@ class SpecPrefillProposer:
             )
             self_attn.attn.kv_cache = dummy_cache
 
+        # Mirror the real engine's cross-layer KV-cache aliasing.
+        #
+        # `gpu_model_runner.initialize_kv_cache_tensors` does exactly this for
+        # a live engine: `kv_caches[layer_name] = kv_caches[target_layer_name]`
+        # for every entry in `shared_kv_cache_layers`. The loop above gives
+        # each layer its OWN `torch.randn` tensor instead, and a KV-shared
+        # layer never writes its cache -- `Attention.forward` guards
+        # `unified_kv_cache_update` with `kv_sharing_target_layer_name is
+        # None`. So without this, K read back for such a layer is pure
+        # uninitialized noise, and under `max` over (layer, head) noise can
+        # win, silently deciding which tokens get kept.
+        #
+        # Not hypothetical at this pipeline's own scale: Gemma-4-E2B-it has
+        # 35 layers of which 20 are KV-shared (matching the Gemma 4 technical
+        # report's stated 20/35 ratio for E2B), so more than half the layers
+        # would have been scoring noise. This matters most for
+        # `verify_sliding_window_hypothesis.py`, whose whole purpose is to
+        # attribute winning votes to sliding-window layers -- a second,
+        # unrelated noise source would make that measurement unreadable.
+        #
+        # No-op for a model without KV sharing (Llama, Qwen3): the map is
+        # empty and nothing is reassigned.
+        by_layer_name = {
+            self_attn.attn.layer_name: self_attn.attn
+            for self_attn in self._speculator_layers
+        }
+        num_aliased = 0
+        for self_attn in self._speculator_layers:
+            target_name = getattr(
+                self_attn.attn, "kv_sharing_target_layer_name", None
+            )
+            if target_name is None:
+                continue
+            target = by_layer_name.get(target_name)
+            if target is None:
+                raise RuntimeError(
+                    f"layer {self_attn.attn.layer_name} shares KV with "
+                    f"{target_name}, which is not among the located attention "
+                    f"layers -- refusing to leave it reading uninitialized "
+                    f"memory."
+                )
+            self_attn.attn.kv_cache = target.kv_cache
+            num_aliased += 1
+        if num_aliased:
+            logger.info(
+                "SpecPrefill: aliased %d cross-layer-KV-sharing layer(s) to "
+                "their target's dummy cache (matching the real engine's "
+                "initialize_kv_cache_tensors behavior).",
+                num_aliased,
+            )
+
         builder = builder_cls(
             kv_cache_spec=kv_cache_spec,
             layer_names=self._layer_names,

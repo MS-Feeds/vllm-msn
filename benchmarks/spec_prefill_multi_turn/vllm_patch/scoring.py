@@ -279,6 +279,7 @@ def scoring_layer_indices(
     score_layers: Optional[str],
     layer_types: Optional[List[str]] = None,
     kv_shared: Optional[List[bool]] = None,
+    drop_kv_shared: bool = False,
 ) -> List[int]:
     """Which layer indices get a vote in `aggregate_attention_score`.
 
@@ -302,13 +303,16 @@ def scoring_layer_indices(
     is enough to decide a token's importance. This selects only the
     full-attention layers, and needs `layer_types` to do it.
 
-    `kv_shared` is applied on top of whichever selection was chosen, and
-    UNCONDITIONALLY rather than behind a flag -- the same discipline
-    `model_truncation.py` uses. A KV-shared layer (Gemma 3n/4's
-    `kv_sharing_target_layer_name`) reads another layer's K, so its row is a
-    duplicate of that layer's and would give one K vector two votes. On a
-    model with no sharing every entry is False and nothing is dropped, making
-    this a provable no-op there rather than a switch that could be set wrong.
+    `kv_shared` marks layers that read another layer's KV cache (Gemma 3n/4's
+    `kv_sharing_target_layer_name`). It is applied ONLY when `drop_kv_shared`
+    is set, and that defaults to False -- see `SpecConfig.
+    drop_kv_shared_layers` for why. Short version: such a layer's
+    `attn.kv_cache` is aliased to the target's tensor by
+    `gpu_model_runner.initialize_kv_cache_tensors`, so its K is the target's
+    REAL K, while its Q is its own; the resulting distribution is distinct
+    signal, not a duplicate vote. The flag exists for callers reading from a
+    hand-built dummy cache that does not reproduce that aliasing, where a
+    shared layer's cache is never written.
 
     Always returns at least one layer -- a selection that would empty the
     list falls back to the last surviving candidate rather than producing a
@@ -360,7 +364,7 @@ def scoring_layer_indices(
         start = min(start, max(num_layers - 1, 0))
         indices = list(range(start, num_layers))
 
-    if kv_shared is not None:
+    if kv_shared is not None and drop_kv_shared:
         if len(kv_shared) != num_layers:
             raise ValueError(
                 f"kv_shared has {len(kv_shared)} entries but the score tensor "
@@ -443,7 +447,11 @@ def aggregate_attention_score(
         # Layer restriction happens BEFORE the flatten below -- dim 0 is the
         # layer axis only until (layer, head) are folded together.
         layer_indices = scoring_layer_indices(
-            attn.shape[0], spec_config.score_layers, layer_types, kv_shared
+            attn.shape[0],
+            spec_config.score_layers,
+            layer_types,
+            kv_shared,
+            spec_config.drop_kv_shared_layers,
         )
         if len(layer_indices) != attn.shape[0]:
             if spec_config.score_head_set is not None:

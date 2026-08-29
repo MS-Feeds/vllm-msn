@@ -470,8 +470,15 @@ re-decision — see the porting plan for the full blocker analysis.
   window, so their score for a distant position is a number the model never
   computes — and `max` over (layer, head) lets any one of them decide a token's
   importance by itself.
-- KV-shared layers are dropped from the vote unconditionally: their K *is*
-  another layer's K, so leaving them in gives one K vector two votes.
+- Cross-layer-KV-sharing layers are **kept** in the vote by default. An
+  earlier version dropped them on the premise that their K is a duplicate;
+  that was wrong. `initialize_kv_cache_tensors` aliases such a layer's
+  `attn.kv_cache` to its target's tensor, so the K read back is the target's
+  *real* K while the Q is the layer's own — a distinct distribution, not a
+  duplicate vote. On Gemma-4-E2B (20 of 35 layers KV-shared, matching the
+  technical report's stated ratio) dropping them cut `global_only` from 7
+  voting layers to 3. `SpecConfig.drop_kv_shared_layers` re-enables the drop
+  for a caller whose K read-back does not reproduce that aliasing.
 
 Every one of these is a **provable no-op on a uniform-attention model**:
 an unsupplied geometry keeps `1/sqrt(head_dim)` with no cap, and a Llama-shaped

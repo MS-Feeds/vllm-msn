@@ -94,6 +94,29 @@ class SpecConfig:
     #                    degenerates to the default.
     score_aggregation: str = "max"
     score_layers: Optional[str] = None
+    # Drop cross-layer-KV-sharing layers (Gemma 3n/4's last
+    # `num_kv_shared_layers`) from the vote.
+    #
+    # DEFAULT FALSE, and the reasoning is worth recording because the first
+    # version of this defaulted to True on a mistaken premise. A KV-shared
+    # layer reads another layer's K -- but it computes its OWN Q, and
+    # `gpu_model_runner.initialize_kv_cache_tensors` aliases its
+    # `attn.kv_cache` to the target's tensor (`kv_caches[layer_name] =
+    # kv_caches[target_layer_name]`), so the K read back for it is the
+    # target's REAL K, not garbage. `softmax(Q_i K_target^T)` is therefore a
+    # legitimate, distinct attention distribution -- exactly as distinct as
+    # any two layers are from each other. Dropping it discards signal rather
+    # than removing a duplicate.
+    #
+    # On Gemma-4-E2B that mistake was expensive: 20 of 35 layers are
+    # KV-shared, so dropping them cut `score_layers="global_only"` from 7
+    # voting layers to 3.
+    #
+    # Set True only for a caller whose K read-back does NOT reproduce that
+    # aliasing -- e.g. a hand-built dummy KV cache that allocates every layer
+    # its own tensor, where a shared layer's cache is never written and
+    # scoring it means scoring uninitialized memory.
+    drop_kv_shared_layers: bool = False
     # Retrieval-head filtering (ACCURACY_IMPROVEMENTS.md §1.3): explicit
     # (layer, head) indices into the FLATTENED layer*head axis -- head
     # `l * num_heads + h` -- that alone get a vote. `None` == every head,

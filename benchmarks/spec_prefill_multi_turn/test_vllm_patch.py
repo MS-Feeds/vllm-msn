@@ -3432,29 +3432,44 @@ def test_scoring_layer_indices_global_only_refuses_to_guess():
         raise AssertionError("an all-sliding model must raise rather than score")
 
 
-def test_scoring_layer_indices_drops_kv_shared_layers_unconditionally():
-    """Blocker A5. A KV-shared layer reads ANOTHER layer's K, so leaving it in
-    gives one K vector two votes under `max`. Dropped without a flag -- on a
-    model with no sharing every entry is False, making this a provable no-op
-    rather than a switch that could be set wrong (the same discipline
-    `model_truncation.py` uses for its weight filter)."""
+def test_kv_shared_layers_are_kept_by_default():
+    """A KV-shared layer is NOT a duplicate vote, and this is the regression
+    test for having once believed it was.
+
+    `gpu_model_runner.initialize_kv_cache_tensors` aliases such a layer's
+    `attn.kv_cache` to its target's tensor, so the K read back is the
+    target's REAL K -- while the Q is the layer's own. The resulting
+    distribution is as distinct as any two layers'. On Gemma-4-E2B, where 20
+    of 35 layers are KV-shared, dropping them cut `global_only` from 7 voting
+    layers to 3."""
     kv_shared = [False] * 4 + [True] * 2
-    assert scoring_layer_indices(6, None, None, kv_shared) == [0, 1, 2, 3]
+    assert scoring_layer_indices(6, None, None, kv_shared) == [0, 1, 2, 3, 4, 5]
+
+    layer_types = ["sliding_attention", "full_attention"] * 3
+    assert scoring_layer_indices(6, "global_only", layer_types, kv_shared) == [1, 3, 5]
+
+
+def test_scoring_layer_indices_drops_kv_shared_layers_when_asked():
+    """The opt-in path, for a caller reading from a hand-built dummy cache
+    that does not reproduce the engine's aliasing -- there a shared layer's
+    cache is never written, so scoring it means scoring uninitialized
+    memory."""
+    kv_shared = [False] * 4 + [True] * 2
+    assert scoring_layer_indices(6, None, None, kv_shared, True) == [0, 1, 2, 3]
 
     # Composes with a layer selection rather than replacing it.
     layer_types = ["sliding_attention", "full_attention"] * 3
-    assert scoring_layer_indices(6, "global_only", layer_types, kv_shared) == [1, 3]
+    assert scoring_layer_indices(6, "global_only", layer_types, kv_shared, True) == [1, 3]
 
-    # No sharing -> nothing dropped. This is the Llama case, and it must stay
-    # identical to the pre-geometry behavior.
+    # No sharing -> nothing dropped even when asked. The Llama case.
     for selection in (None, "skip_first2", "second_half", "last_quarter"):
-        assert scoring_layer_indices(16, selection, None, [False] * 16) == (
+        assert scoring_layer_indices(16, selection, None, [False] * 16, True) == (
             scoring_layer_indices(16, selection)
         )
 
     # Degenerate: an all-shared model keeps the pre-filter selection rather
     # than returning nothing (an empty set is a silent NaN downstream).
-    assert scoring_layer_indices(3, None, None, [True] * 3) == [0, 1, 2]
+    assert scoring_layer_indices(3, None, None, [True] * 3, True) == [0, 1, 2]
 
 
 def test_layer_geometry_from_attention_layers_reads_the_live_modules():
@@ -3625,6 +3640,7 @@ def test_score_head_set_refuses_a_geometry_that_renumbers_the_head_axis():
     cfg = SpecConfig(keep_strategy="percentage",
                      keep_kwargs={"percentage": 0.5}, score_head_set=[0, 3])
 
+    cfg.drop_kv_shared_layers = True
     geo = LayerGeometry(kv_shared=[False, False, False, True])
     try:
         aggregate_attention_score(attn, cfg, geo)
