@@ -113,8 +113,31 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--speculator-model", default=None)
     parser.add_argument("--speculator-device", default="cuda:0")
-    parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.3)
-    parser.add_argument("--speculator-max-num-batched-tokens", type=int, default=131072)
+    # 0.5, not the 0.3 the rest of this pipeline uses for its speculator.
+    # That default was set for Llama-3.2-1B; Gemma-4-E2B-it loads its full
+    # 5.1B parameters (the "2.3B effective" figure counts activated
+    # parameters, not resident weights) plus vision/audio towers, so it needs
+    # roughly 5x the weight memory before any KV cache exists.
+    parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--speculator-max-num-batched-tokens", type=int, default=131072,
+                        help="Conversation-length ceiling: a turn longer than "
+                             "this is SKIPPED rather than served. Kept high on "
+                             "purpose -- lowering it silently drops the longest "
+                             "conversations instead of measuring them.")
+    parser.add_argument("--speculator-prefill-chunk-tokens", type=int, default=32768,
+                        help="Per-step prefill batch size, set SEPARATELY from "
+                             "the ceiling above -- the same split "
+                             "`--scorer-prefill-chunk-tokens` makes in "
+                             "diagnose_retrieval_heads.py, and for the same "
+                             "reason. vLLM sizes its KV pool from a PROFILED "
+                             "activation peak, and that peak scales with the "
+                             "per-step batch: at 131072 tokens a single MLP "
+                             "intermediate is gigabytes, with several live at "
+                             "once, which is what drives 'Available KV cache "
+                             "memory' negative. Costs nothing in accuracy here "
+                             "-- `end_capture` filters captured queries by "
+                             "shape, so any number of leading prefill chunks "
+                             "is harmless.")
     args = parser.parse_args()
 
     from transformers import AutoConfig, AutoTokenizer
@@ -175,11 +198,16 @@ def main() -> None:
 
     import torch
 
+    chunk_tokens = min(args.speculator_prefill_chunk_tokens, max_batched)
+    print(f"[gate] speculator: {speculator_model}")
+    print(f"[gate] gpu_memory_utilization={args.speculator_gpu_memory_utilization}, "
+          f"prefill chunk={chunk_tokens}, conversation ceiling={max_batched}, "
+          f"max_model_len={max_model_len}")
     proposer = SpecPrefillProposer(
         speculator_model_path=speculator_model,
         device=torch.device(args.speculator_device),
         gpu_memory_utilization=args.speculator_gpu_memory_utilization,
-        max_num_batched_tokens=max_batched,
+        max_num_batched_tokens=chunk_tokens,
         enable_chunked_prefill=True,
         max_model_len=max_model_len,
     )
