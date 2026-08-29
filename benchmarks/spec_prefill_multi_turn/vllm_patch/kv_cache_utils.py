@@ -49,6 +49,59 @@ from typing import List, Optional, Set, Tuple
 import torch
 
 
+def shared_layer_specs_to_backfill(
+    layer_names: List[str],
+    spec_names,
+    shared_kv_cache_layers: dict,
+) -> dict:
+    """Which layers in a KV cache group are missing a spec, and whose spec
+    they should borrow.
+
+    Pure dict/list logic, no vLLM types, so the policy is unit-testable on
+    CPU -- the caller does the `isinstance(spec, UniformTypeKVCacheSpecs)`
+    check and the actual mutation.
+
+    **The gap this closes.** `vllm/v1/worker/utils.py::
+    add_kv_sharing_layers_to_kv_cache_groups` appends a cross-layer-KV-sharing
+    layer to its target group's `layer_names`, but does not add it to a
+    `UniformTypeKVCacheSpecs`' own `kv_cache_specs` dict. `gpu_model_runner.
+    initialize_attn_backend` then iterates `layer_names` and indexes
+    `kv_cache_specs[layer_name]`, so a shared layer raises `KeyError`.
+
+    Confirmed on real hardware with a Gemma-4-E2B speculator:
+    `KeyError: 'language_model.model.layers.15.self_attn.attn'`, layer 15
+    being one of Gemma 4's last `num_kv_shared_layers`.
+
+    Only reachable when BOTH hold, which is why it is not a general vLLM
+    problem and why it appeared only after this pipeline started forcing a
+    single KV cache group:
+      - the group's spec is a `UniformTypeKVCacheSpecs` (the uniform-TYPE
+        path, taken when `disable_hybrid_kv_cache_manager=True` collapses an
+        interleaved model's specs), and
+      - the model uses cross-layer KV sharing (Gemma 3n/4).
+    Without the flag, the page-size path yields plain specs, the `isinstance`
+    branch is False, and no lookup happens.
+
+    Borrowing the target's spec is the correct resolution, not a workaround:
+    a KV-shared layer reads its target's cache, so the target's spec IS its
+    layout. The fork's own `vllm/v1/spec_decode/gemma4.py::Gemma4Proposer.
+    initialize_attn_backend` resolves it the same way for the draft model.
+
+    Returns `{missing_layer_name: layer_name_to_copy_the_spec_from}`. A layer
+    that is missing for any OTHER reason is deliberately left out, so the
+    stock `KeyError` still fires for it rather than being masked.
+    """
+    present = set(spec_names)
+    backfill = {}
+    for layer_name in layer_names:
+        if layer_name in present:
+            continue
+        target = shared_kv_cache_layers.get(layer_name)
+        if target is not None and target in present:
+            backfill[layer_name] = target
+    return backfill
+
+
 def _find_kv_split_dim(
     attn_backend,
     kv_cache: torch.Tensor,

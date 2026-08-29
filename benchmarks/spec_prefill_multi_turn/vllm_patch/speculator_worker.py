@@ -148,6 +148,7 @@ from .kv_cache_utils import (
     is_decode_query_slice,
     prompt_tail_subslice,
     read_layer_keys,
+    shared_layer_specs_to_backfill,
     stack_decode_only_steps,
 )
 from .model_structure import find_attention_modules
@@ -611,6 +612,47 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             flat_keys = read_layer_keys(attn, block_size, num_kv_heads, head_size)
             keys.append(gather_keys_for_slots(flat_keys, slot_tensor))
         return keys
+
+    def initialize_attn_backend(self, kv_cache_config, *args, **kwargs):
+        """Backfill specs for cross-layer-KV-sharing layers before the stock
+        implementation indexes them.
+
+        See `kv_cache_utils.shared_layer_specs_to_backfill` for the full
+        mechanism and the real-hardware failure it fixes. Overridden here
+        rather than patched into `vllm/v1/worker/`: the gap only bites the
+        combination this pipeline forces (single KV cache group + cross-layer
+        KV sharing), and a core edit would change behavior for every model
+        with KV sharing, well beyond anything this benchmark validates.
+
+        A no-op unless BOTH conditions hold, so Llama takes an unchanged path:
+        no `UniformTypeKVCacheSpecs` group and no shared layers means nothing
+        to backfill.
+        """
+        from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+        for group in kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, UniformTypeKVCacheSpecs):
+                continue
+            backfill = shared_layer_specs_to_backfill(
+                group.layer_names,
+                spec.kv_cache_specs.keys(),
+                self.shared_kv_cache_layers,
+            )
+            for layer_name, target in backfill.items():
+                # `UniformTypeKVCacheSpecs` is a frozen dataclass, but
+                # `kv_cache_specs` is an ordinary dict -- frozen blocks
+                # attribute rebinding, not mutation of a referenced container.
+                spec.kv_cache_specs[layer_name] = spec.kv_cache_specs[target]
+            if backfill:
+                print(
+                    f"[SpecPrefill] backfilled KV cache specs for "
+                    f"{len(backfill)} cross-layer-KV-sharing layer(s): "
+                    f"{sorted(backfill)}",
+                    flush=True,
+                )
+
+        return super().initialize_attn_backend(kv_cache_config, *args, **kwargs)
 
     def _single_kv_group_block_size(self) -> int:
         """The block size to read the KV cache with -- and the guard that this

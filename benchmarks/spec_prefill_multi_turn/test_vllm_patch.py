@@ -3786,5 +3786,50 @@ def test_find_attention_modules_rejects_shapes_it_cannot_read():
         raise AssertionError("an empty decoder stack must raise")
 
 
+# ---------------------------------------------------------------------------
+# Cross-layer KV sharing + a single (UniformType) KV cache group. vLLM appends
+# a KV-sharing layer to its target group's `layer_names` but not to the group
+# spec's `kv_cache_specs`, so the stock runner KeyErrors on it. Confirmed on
+# real hardware with Gemma-4-E2B (layer 15).
+# ---------------------------------------------------------------------------
+
+from vllm_patch.kv_cache_utils import shared_layer_specs_to_backfill
+
+
+def test_shared_layer_specs_to_backfill_borrows_the_targets_spec():
+    """Gemma 4 shares KV in its last `num_kv_shared_layers` layers, each
+    reusing the last non-shared layer of the SAME attention type -- so a
+    shared layer's correct spec is its target's, not a guess."""
+    specs = ["layers.0.self_attn.attn", "layers.1.self_attn.attn"]
+    layer_names = specs + ["layers.2.self_attn.attn", "layers.3.self_attn.attn"]
+    shared = {
+        "layers.2.self_attn.attn": "layers.0.self_attn.attn",
+        "layers.3.self_attn.attn": "layers.1.self_attn.attn",
+    }
+    assert shared_layer_specs_to_backfill(layer_names, specs, shared) == shared
+
+
+def test_shared_layer_specs_to_backfill_is_a_noop_without_sharing():
+    """The Llama case: every layer owns its spec, nothing to backfill. This is
+    what keeps the override off the published rows' path."""
+    specs = [f"layers.{i}.self_attn.attn" for i in range(16)]
+    assert shared_layer_specs_to_backfill(specs, specs, {}) == {}
+
+
+def test_shared_layer_specs_to_backfill_does_not_mask_other_missing_layers():
+    """A layer missing for a reason OTHER than KV sharing must be left alone,
+    so the stock KeyError still fires. Silently inventing a spec for it would
+    turn a loud startup failure into a wrong cache layout at runtime."""
+    specs = ["layers.0.self_attn.attn"]
+    layer_names = specs + ["layers.9.self_attn.attn"]
+
+    # Not in the sharing map at all.
+    assert shared_layer_specs_to_backfill(layer_names, specs, {}) == {}
+
+    # In the map, but pointing at a target that has no spec either.
+    dangling = {"layers.9.self_attn.attn": "layers.8.self_attn.attn"}
+    assert shared_layer_specs_to_backfill(layer_names, specs, dangling) == {}
+
+
 if __name__ == "__main__":
     _run_all()
