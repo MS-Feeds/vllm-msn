@@ -796,6 +796,133 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         )
         return kept_local_indices, actual_look_ahead_cnt
 
+    def end_capture_and_sliding_window_diagnostics(
+        self,
+        request_id: str,
+        conversation_salt: str,
+        full_sequence_len: int,
+        pool_kernel_size,
+        keep_kwargs: dict,
+        score_layers=None,
+        compare_sample_size: int = 200,
+        seed: int = 0,
+    ):
+        """The sliding-window gate: what share of the winning (layer, head)
+        votes came from a layer that could never have attended to the
+        position it won?
+
+        Ported from `../spec_prefill/verify_sliding_window_hypothesis.py`,
+        which ran against the single-turn pipeline's hand-built dummy KV
+        cache. Two things change in the move, both of which make the number
+        more trustworthy rather than merely relocating it:
+
+        1. **It shares production's aggregation instead of copying it.** The
+           original reimplemented `aggregate_attention_score`'s softmax ->
+           pool -> max chain so it could keep `torch.max`'s discarded
+           `.indices`. A copy of a pipeline drifts from the pipeline it
+           copied, and a gate that silently measures something other than
+           production is worse than no gate. `aggregate_attention_score` now
+           takes a `winning_layers` out-list, so there is one implementation.
+        2. **It reads a real engine's KV cache.** The dummy-cache path gives
+           every layer its own tensor, and a cross-layer-KV-sharing layer
+           never writes its own cache -- on Gemma-4-E2B that is 20 of 35
+           layers reading uninitialized memory. Here the engine's own
+           aliasing applies, so every layer's K is real.
+
+        Runs entirely in this process, for the same reason
+        `end_capture_and_score` does: the per-(layer, head) winner tensor is
+        `[look_ahead_cnt, context_len]` and the attention scores behind it
+        are far larger, while only a handful of scalars need to come back.
+
+        Returns a dict (or None if no lookahead step was captured):
+          `kept_phantom` / `kept_total`      votes on the positions the
+                                             selection actually KEPT.
+          `pruned_phantom` / `pruned_total`  same, on a random sample of the
+                                             positions it pruned away -- the
+                                             comparison that turns a bare
+                                             rate into evidence.
+          `num_kept`, `orig_len`, `look_ahead_cnt`
+          `layer_windows`                    each layer's own window, so the
+                                             caller can report what was
+                                             actually in play.
+        """
+        import random
+
+        from .config import SpecConfig
+        from .scoring import (
+            aggregate_attention_score,
+            chunk_select_from_smoothed_attention,
+            compute_attention_score,
+            phantom_vote_counts,
+        )
+
+        query_buffer = self.end_capture(request_id)
+        actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
+        if actual_look_ahead_cnt == 0:
+            return None
+
+        key_buffer_per_layer = self.retrieve_keys(
+            conversation_salt, list(range(full_sequence_len))
+        )
+        geometry = self.layer_geometry()
+        spec_config = SpecConfig(
+            keep_strategy="percentage",
+            keep_kwargs=keep_kwargs,
+            pool_kernel_size=pool_kernel_size,
+            score_layers=score_layers,
+        )
+
+        attn_scores = compute_attention_score(
+            query_buffer,
+            [[k] for k in key_buffer_per_layer],
+            [actual_look_ahead_cnt],
+            geometry,
+        )
+        winners: list = []
+        token_importance = aggregate_attention_score(
+            attn_scores, spec_config, geometry, winning_layers=winners
+        )
+        kept = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
+        kept_positions = set(kept.tolist())
+
+        # `[look_ahead_cnt][context_len]` of original layer indices. Moved to
+        # CPU once, here, rather than indexed on GPU per position.
+        winning_layers = winners[0].cpu().tolist()
+        layer_windows = [
+            getattr(attn, "sliding_window", None) for attn in self._hooked_layers
+        ]
+        # A lookahead token generated after an `orig_len`-token prompt sits at
+        # `orig_len + step`.
+        query_positions = [
+            full_sequence_len + step for step in range(actual_look_ahead_cnt)
+        ]
+
+        pruned_away = [p for p in range(full_sequence_len) if p not in kept_positions]
+        rng = random.Random(seed)
+        comparison = (
+            rng.sample(pruned_away, min(compare_sample_size, len(pruned_away)))
+            if pruned_away
+            else []
+        )
+
+        kept_phantom, kept_total = phantom_vote_counts(
+            winning_layers, layer_windows, sorted(kept_positions), query_positions
+        )
+        pruned_phantom, pruned_total = phantom_vote_counts(
+            winning_layers, layer_windows, comparison, query_positions
+        )
+
+        return {
+            "kept_phantom": kept_phantom,
+            "kept_total": kept_total,
+            "pruned_phantom": pruned_phantom,
+            "pruned_total": pruned_total,
+            "num_kept": len(kept_positions),
+            "orig_len": full_sequence_len,
+            "look_ahead_cnt": actual_look_ahead_cnt,
+            "layer_windows": layer_windows,
+        }
+
     def end_capture_and_head_diagnostics(
         self,
         request_id: str,
@@ -1062,6 +1189,24 @@ class SpeculatorWorker(Worker):
         return self.model_runner.end_capture_and_head_diagnostics(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
             keep_kwargs, gold_positions, top_n_list, fixed_head_sets,
+        )
+
+    def end_capture_and_sliding_window_diagnostics(
+        self,
+        request_id: str,
+        conversation_salt: str,
+        full_sequence_len: int,
+        pool_kernel_size,
+        keep_kwargs: dict,
+        score_layers=None,
+        compare_sample_size: int = 200,
+        seed: int = 0,
+    ):
+        """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
+        end_capture_and_sliding_window_diagnostics`'s docstring."""
+        return self.model_runner.end_capture_and_sliding_window_diagnostics(
+            request_id, conversation_salt, full_sequence_len, pool_kernel_size,
+            keep_kwargs, score_layers, compare_sample_size, seed,
         )
 
     def discard_conversation(self, conversation_salt: str) -> None:

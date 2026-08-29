@@ -1,4 +1,34 @@
 #!/usr/bin/env python3
+"""SUPERSEDED -- migrated to
+`../spec_prefill_multi_turn/diagnose_sliding_window_votes.py`.
+
+Kept for history, not for running. The replacement asks the same question and
+is strictly more trustworthy on three counts, each of which was a real defect
+here rather than a preference:
+
+  - It shares production's aggregation instead of reimplementing it. The
+    `instrumented_aggregate` below is a hand copy of
+    `aggregate_attention_score`'s softmax -> pool -> max chain, made so it
+    could keep `torch.max`'s discarded `.indices`. A copy drifts from what it
+    copied. `aggregate_attention_score` now takes a `winning_layers` out-list,
+    so there is one implementation.
+  - It reads a real engine's KV cache. This script scores through the
+    single-turn pipeline's hand-built dummy cache, which gives every layer its
+    own `torch.randn` tensor -- and a cross-layer-KV-sharing layer never
+    writes its own cache. On Gemma-4-E2B-it that is 20 of 35 layers scored
+    against uninitialized memory, and noise winning under `max` is a second,
+    unrelated source of exactly the signal this script attributes to sliding
+    layers.
+  - It uses each layer's own window. `analyze_positions` below infers "is this
+    a sliding layer" from `head_dim < max(head_dims)`, exploiting
+    Gemma-4-26B-A4B's 256/512 split. That proxy reports every layer as
+    full-attention on a checkpoint with uniform head dims -- 0% for both
+    samples, reading as REFUTED when the hypothesis was never tested.
+
+Original docstring follows.
+
+"""
+
 """Verifies (or refutes) the sliding-window scoring hypothesis for one
 specific LongBench v2 sample -- see the conversation this was written for:
 sample 66f37eb9821e116aacb2d295 degenerated into a hard repetition loop

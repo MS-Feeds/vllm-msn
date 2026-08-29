@@ -3847,5 +3847,129 @@ def test_shared_layer_specs_to_backfill_does_not_mask_other_missing_layers():
     assert shared_layer_specs_to_backfill(layer_names, specs, dangling) == {}
 
 
+# ---------------------------------------------------------------------------
+# The sliding-window gate (diagnose_sliding_window_votes.py). The measurement
+# is "what share of winning (layer, head) votes came from a layer that could
+# never have attended to the position it won".
+# ---------------------------------------------------------------------------
+
+from vllm_patch.scoring import phantom_vote_counts
+
+
+def test_phantom_vote_counts_only_counts_out_of_window_sliding_wins():
+    """A vote is phantom only if BOTH hold: the winner is a sliding layer,
+    and the position it won is further away than that layer's own window."""
+    # 2 layers: 0 sliding (window 4), 1 full attention.
+    layer_windows = [4, None]
+    # 1 lookahead step whose query sits at position 10; 6 context positions.
+    #                     pos: 0  1  2  3  4  5
+    winning_layers = [[0, 1, 0, 1, 0, 0]]
+    query_positions = [10]
+
+    # Distances from the query: 10, 9, 8, 7, 6, 5 -- all beyond the window 4.
+    # So every position won by layer 0 is phantom; layer 1 never is.
+    phantom, total = phantom_vote_counts(
+        winning_layers, layer_windows, [0, 1, 2, 3, 4, 5], query_positions
+    )
+    assert (phantom, total) == (4, 6)
+
+    # A full-attention winner is never phantom, however far away.
+    phantom, total = phantom_vote_counts(
+        winning_layers, layer_windows, [1, 3], query_positions
+    )
+    assert (phantom, total) == (0, 2)
+
+    # Inside the window is not phantom: position 7 is distance 3 <= 4.
+    inside = [[0, 0]]
+    phantom, total = phantom_vote_counts(inside, layer_windows, [0, 1], [3])
+    assert (phantom, total) == (0, 2)
+
+
+def test_phantom_vote_counts_is_zero_for_a_uniform_attention_model():
+    """The Llama case, and the reason the comparison sample matters: with no
+    sliding layer there is nothing to attribute, so a 0% rate says nothing
+    about selection quality."""
+    layer_windows = [None] * 4
+    winning_layers = [[0, 1, 2, 3], [3, 2, 1, 0]]
+    phantom, total = phantom_vote_counts(
+        winning_layers, layer_windows, [0, 1, 2, 3], [100, 101]
+    )
+    assert phantom == 0
+    assert total == 8
+
+
+def test_phantom_vote_counts_requires_one_query_position_per_step():
+    """Each lookahead step's query sits at a different absolute position, so a
+    single global one would mismeasure every step but the first."""
+    try:
+        phantom_vote_counts([[0], [0]], [4], [0], [10])
+    except ValueError as exc:
+        assert "query position" in str(exc)
+    else:
+        raise AssertionError("a query-position/step mismatch must raise")
+
+
+def test_winning_layers_matches_production_and_maps_through_layer_restriction():
+    """The gate's whole credibility rests on measuring what production
+    computed, so the winner collection must not perturb the importance vector
+    it comes from -- and must report ORIGINAL layer indices even when
+    `global_only` has restricted the tensor."""
+    num_layers, look_ahead, ctx, heads, head_dim = 6, 2, 12, 2, 8
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=num_layers, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+    attn = compute_attention_score(query_buffer, key_buffer, [look_ahead])
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.5},
+                     pool_kernel_size=3)
+
+    reference = aggregate_attention_score(attn, cfg)[0]
+    winners = []
+    with_winners = aggregate_attention_score(attn, cfg, None, winning_layers=winners)[0]
+    assert torch.equal(with_winners, reference), "collecting winners changed the score"
+    assert winners[0].shape == (look_ahead, ctx)
+    assert int(winners[0].max()) < num_layers
+
+    # Under global_only, only layers 1 and 3 and 5 vote -- and the reported
+    # indices must be those ORIGINAL numbers, not 0/1/2 within the subset.
+    layer_types = ["sliding_attention", "full_attention"] * 3
+    geo = LayerGeometry(layer_types=layer_types)
+    gcfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.5},
+                      pool_kernel_size=3, score_layers="global_only")
+    gwinners = []
+    aggregate_attention_score(attn, gcfg, geo, winning_layers=gwinners)
+    assert set(gwinners[0].flatten().tolist()) <= {1, 3, 5}
+
+
+def test_winning_layers_refuses_aggregations_that_have_no_argmax():
+    """`mean`/`zmean` have no winner, and `score_head_set` renumbers the axis
+    the winner maps through -- both must raise rather than report a number
+    that looks plausible and means something else."""
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=2, num_samples=1, look_ahead=1,
+        num_heads=2, num_kv_heads=2, head_dim=4, ctx_len=6,
+    )
+    attn = compute_attention_score(query_buffer, key_buffer, [1])
+
+    for aggregation in ("mean", "zmean"):
+        cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.5},
+                         score_aggregation=aggregation)
+        try:
+            aggregate_attention_score(attn, cfg, None, winning_layers=[])
+        except ValueError as exc:
+            assert "max" in str(exc)
+        else:
+            raise AssertionError(f"{aggregation} must refuse to report winners")
+
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.5},
+                     score_head_set=[0, 1])
+    try:
+        aggregate_attention_score(attn, cfg, None, winning_layers=[])
+    except ValueError as exc:
+        assert "score_head_set" in str(exc)
+    else:
+        raise AssertionError("score_head_set must refuse to report winners")
+
+
 if __name__ == "__main__":
     _run_all()

@@ -408,6 +408,7 @@ def aggregate_attention_score(
     attn_scores: List[torch.Tensor],
     spec_config: SpecConfig,
     geometry: Optional[LayerGeometry] = None,
+    winning_layers: Optional[list] = None,
 ) -> List[torch.Tensor]:
     """Algorithm line 14: A <- aggregate_attention_score(A).
 
@@ -430,6 +431,23 @@ def aggregate_attention_score(
             `score_layers`, `score_head_set`.
         geometry: optional per-layer `layer_types`/`kv_shared`, consumed by
             `scoring_layer_indices`. None reproduces the reference behavior.
+        winning_layers: optional list to APPEND per-sample winner tensors to,
+            one `[look_ahead_cnt, context_len]` int tensor per sample giving
+            the ORIGINAL layer index whose head won the `max` at each
+            (lookahead step, context position).
+
+            Production throws this away -- `attn.max(0)` keeps `.values` and
+            discards `.indices`. It is collected here, inside the real
+            function, rather than in a diagnostic that reimplements these
+            steps: a copy of an aggregation pipeline drifts from the pipeline
+            it copied, and a diagnostic that silently measures something
+            other than production is worse than no diagnostic. Indices are
+            mapped back through `layer_indices`, so a restricted selection
+            (`global_only`) still reports true layer numbers.
+
+            Requires `score_aggregation="max"` (there is no argmax to report
+            for `mean`/`zmean`) and is incompatible with `score_head_set`,
+            which renumbers the head axis this maps through.
 
     Returns:
         Per-sample 1D [context_len] token-importance tensors.
@@ -437,6 +455,7 @@ def aggregate_attention_score(
     layer_types = geometry.layer_types if geometry is not None else None
     kv_shared = geometry.kv_shared if geometry is not None else None
     token_importance: List[torch.Tensor] = []
+    collect = winning_layers is not None
 
     for attn in attn_scores:
         original_dtype = attn.dtype
@@ -471,7 +490,9 @@ def aggregate_attention_score(
             attn = attn[layer_indices]
 
         # Flatten (layer, head) into one axis so pooling/collapse apply
-        # uniformly.
+        # uniformly. `num_heads` is captured first: it is what converts a
+        # flattened row index back into a layer, for `winning_layers`.
+        num_heads = attn.shape[1]
         attn = attn.flatten(0, 1)
 
         # Retrieval-head filtering, applied here rather than after pooling:
@@ -500,12 +521,98 @@ def aggregate_attention_score(
                 stride=1,
             )
 
-        attn = _collapse_layer_head(attn, spec_config.score_aggregation)
+        if collect:
+            if spec_config.score_aggregation != "max":
+                raise ValueError(
+                    f"winning_layers needs score_aggregation='max' (got "
+                    f"{spec_config.score_aggregation!r}) -- mean/zmean have no "
+                    f"argmax to report."
+                )
+            if spec_config.score_head_set is not None:
+                raise ValueError(
+                    "winning_layers is incompatible with score_head_set, "
+                    "which renumbers the head axis the winner index maps "
+                    "through."
+                )
+            values, rows = attn.max(0)
+            # Row r of the flattened axis is head (r % num_heads) of the
+            # r // num_heads'th SELECTED layer -- map back through
+            # layer_indices so a restricted selection still reports true
+            # layer numbers.
+            selected = torch.tensor(
+                layer_indices, device=rows.device, dtype=torch.long
+            )
+            winning_layers.append(selected[rows // num_heads])
+            attn = values
+        else:
+            attn = _collapse_layer_head(attn, spec_config.score_aggregation)
         attn = attn.mean(0)  # mean over lookahead steps
 
         token_importance.append(attn)
 
     return token_importance
+
+
+def phantom_vote_counts(
+    winning_layers,
+    layer_windows: List[Optional[int]],
+    positions: List[int],
+    query_positions: List[int],
+) -> tuple:
+    """How many winning (layer, head) votes were cast by a layer that could
+    not actually have attended to the position it won.
+
+    This is the whole measurement behind the sliding-window gate. On an
+    interleaved model most layers can only attend within a 512-1024 token
+    window, but `compute_attention_score` computes `Q @ K^T` over the ENTIRE
+    context for every layer, and `max` over (layer, head) lets any one of
+    them decide a token's importance. A vote is "phantom" when the winning
+    layer is a sliding layer and the position it won is further from that
+    lookahead step's query than that layer's own window.
+
+    Pure integer arithmetic over plain sequences -- no torch, no model -- so
+    the accounting is unit-testable on CPU. The caller supplies each layer's
+    own window rather than a single global one, because inferring "is this a
+    sliding layer" from a proxy fails silently: an earlier version of this
+    gate used `head_dim < max(head_dims)`, which reports every layer as
+    full-attention on any checkpoint with uniform head dims, making the
+    hypothesis look REFUTED when it was never tested.
+
+    Args:
+        winning_layers: `[look_ahead_cnt][context_len]` nested sequence of
+            ORIGINAL layer indices, from `aggregate_attention_score`'s
+            `winning_layers` output.
+        layer_windows: per-layer sliding window; `None` for a full-attention
+            layer, which can never cast a phantom vote.
+        positions: which context positions to score (e.g. the kept set, or a
+            random sample of the pruned-away set).
+        query_positions: absolute position of each lookahead step's own query
+            token, one per step. A lookahead token generated after an
+            `orig_len`-token prompt sits at `orig_len + step`.
+
+    Returns:
+        `(phantom, total)`. A rate of `phantom / total` on the KEPT set that
+        is meaningfully higher than on a pruned-away comparison sample is
+        direct evidence that selection was decided by layers scoring
+        positions they can never reach.
+    """
+    if len(query_positions) != len(winning_layers):
+        raise ValueError(
+            f"got {len(query_positions)} query positions for "
+            f"{len(winning_layers)} lookahead steps -- one per step is needed "
+            f"to measure a distance at all."
+        )
+
+    phantom = 0
+    total = 0
+    for step, row in enumerate(winning_layers):
+        query_pos = query_positions[step]
+        for p in positions:
+            window = layer_windows[int(row[p])]
+            total += 1
+            if window is not None and (query_pos - p) > window:
+                phantom += 1
+    return phantom, total
 
 
 def _chunked_topk_indices(

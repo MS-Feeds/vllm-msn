@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  136/136 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  145/145 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -30,7 +30,8 @@ history-retention setting first.
   "Validation results" below and `REPRODUCE.md` step 4.
 - `diagnose_*.py` — targeted diagnostic scripts written to root-cause
   specific real-hardware bugs/anomalies found during experiments (see
-  "Diagnostics" below).
+  "Diagnostics" below). `diagnose_sliding_window_votes.py` is the
+  interleaved-attention gate — see "Gemma 4 / interleaved-attention support".
 - `datasets/prep_scbench.py` — downloads `microsoft/SCBench`'s 3 MVP
   configs.
 - `predict_scbench.py` — runs the experiment matrix (per-conversation,
@@ -533,11 +534,26 @@ Two further caveats worth knowing before reading any Gemma 4 number:
   layers, so the keep-rate/accuracy curves above do not transfer, and
   `SPECULATION_ECONOMICS.md`'s win condition needs both of its terms re-derived.
 
-The cheapest next measurement is the gate that already exists:
-`../spec_prefill/verify_sliding_window_hypothesis.py`, which reports what
-fraction of winning (layer, head) votes came from a sliding layer scoring a
-position it could never attend to, split between kept and pruned-away
-positions. It has never been executed.
+**The gate: `diagnose_sliding_window_votes.py`.** Reports what fraction of
+winning (layer, head) votes came from a sliding layer scoring a position it
+could never attend to, split between the positions the selection KEPT and a
+random sample of those it pruned away. The comparison is the evidence — a bare
+rate means little. Migrated here from
+`../spec_prefill/verify_sliding_window_hypothesis.py` (now marked superseded),
+and more trustworthy for three reasons: it shares production's aggregation via
+`aggregate_attention_score`'s `winning_layers` out-list instead of copying the
+softmax→pool→max chain; it reads a real engine's KV cache rather than a dummy
+one where 20 of E2B's 35 KV-shared layers would score uninitialized memory; and
+it uses each layer's own window instead of inferring "sliding" from a head-dim
+proxy that reports 0% on any uniform-head-dim checkpoint.
+
+```bash
+python3 diagnose_sliding_window_votes.py --speculator-model "$GEMMA4_E2B_MODEL_PATH" --keep-percentage 0.3
+```
+
+Run it again with `--score-layers global_only`: that should drive the rate to
+0% by construction, which is the check that the harness measures what it
+claims before its answer is believed.
 
 ---
 
@@ -661,7 +677,7 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 136/136 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 145/145 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |

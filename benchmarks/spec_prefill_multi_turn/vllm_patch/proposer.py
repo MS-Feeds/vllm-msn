@@ -422,6 +422,46 @@ class SpecPrefillProposer:
             ),
         )[0]
 
+    def run_turn_and_sliding_window_diagnostics(
+        self,
+        conversation_salt: str,
+        turn_idx: int,
+        full_sequence_token_ids: List[int],
+        look_ahead_cnt: int,
+        pool_kernel_size: Optional[int],
+        keep_kwargs: dict,
+        score_layers: Optional[str] = None,
+        compare_sample_size: int = 200,
+        seed: int = 0,
+        ignore_eos: bool = False,
+    ):
+        """Drives one turn exactly as `run_turn_and_score` does, then asks the
+        worker for the sliding-window gate instead of a selection -- see
+        `speculator_worker.py::end_capture_and_sliding_window_diagnostics`.
+
+        Shares `_submit_and_drive_turn` with the real scoring path, which is
+        the point: the capture conditions, lookahead loop and K read-back are
+        identical to a scored turn, so the votes measured are the votes
+        production would have cast. Only what is computed from them differs.
+        """
+        request_id, _num_cached, _t_start = self._submit_and_drive_turn(
+            conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt,
+            ignore_eos, "lookahead", 8,
+        )
+        return self.llm_engine.collective_rpc(
+            "end_capture_and_sliding_window_diagnostics",
+            args=(
+                request_id,
+                conversation_salt,
+                len(full_sequence_token_ids),
+                pool_kernel_size,
+                keep_kwargs,
+                score_layers,
+                compare_sample_size,
+                seed,
+            ),
+        )[0]
+
     def _submit_and_drive_turn(
         self,
         conversation_salt: str,
