@@ -201,7 +201,7 @@ def main() -> None:
     chunk_tokens = min(args.speculator_prefill_chunk_tokens, max_batched)
     print(f"[gate] speculator: {speculator_model}")
     print(f"[gate] gpu_memory_utilization={args.speculator_gpu_memory_utilization}, "
-          f"prefill chunk={chunk_tokens}, conversation ceiling={max_batched}, "
+          f"prefill chunk={chunk_tokens}, max_position_embeddings={native_len}, "
           f"max_model_len={max_model_len}")
     proposer = SpecPrefillProposer(
         speculator_model_path=speculator_model,
@@ -212,10 +212,17 @@ def main() -> None:
         max_model_len=max_model_len,
     )
 
+    # What one request can actually occupy, leaving room for the lookahead
+    # tokens this turn will generate on top of its prompt.
+    servable = max_model_len - spec_config.look_ahead_cnt - 1
+    print(f"[gate] one turn can occupy {servable} tokens; longer contexts are "
+          f"truncated to fit, not skipped")
+
     totals = {"kept_phantom": 0, "kept_total": 0,
               "pruned_phantom": 0, "pruned_total": 0}
     measured = 0
     skipped = 0
+    truncated = 0
     layer_windows = None
 
     for conv in conversations:
@@ -226,11 +233,33 @@ def main() -> None:
         candidate_pool, force_keep_query = state.begin_turn(query_ids)
         full_ids = [tid for tid, _ in candidate_pool + force_keep_query]
 
-        if len(full_ids) > max_batched:
-            print(f"[gate] {conv_id}: skipped, {len(full_ids)} tokens exceeds "
-                  f"max_num_batched_tokens={max_batched}")
-            skipped += 1
-            continue
+        # TRUNCATE rather than skip. This gate asks which LAYER won each
+        # vote, not whether the task was answered, and that is visible in any
+        # context long enough to put positions outside a 512-1024 token
+        # window. Refusing every conversation that exceeds the speculator's
+        # own servable length -- SCBench contexts reach ~124k, and a small
+        # scorer's `max_position_embeddings` can be well below that --
+        # measures nothing at all, which is strictly worse than measuring a
+        # prefix. Reported per conversation so a truncated run is never
+        # mistaken for a full-length one.
+        if len(full_ids) > servable:
+            room = servable - len(query_ids)
+            if room <= 0:
+                print(f"[gate] {conv_id}: skipped, this turn's own query is "
+                      f"{len(query_ids)} tokens and the scorer can serve only "
+                      f"{servable}")
+                skipped += 1
+                continue
+            # Keep the PREFIX: it preserves the attention-sink tokens at
+            # position 0, whose absence is its own well-documented source of
+            # degeneration in this pipeline, and keeps the far-from-query
+            # positions the measurement depends on.
+            state = ConversationState(conv["id"], context_ids[:room], "keep")
+            candidate_pool, force_keep_query = state.begin_turn(query_ids)
+            full_ids = [tid for tid, _ in candidate_pool + force_keep_query]
+            truncated += 1
+            print(f"[gate] {conv_id}: context truncated to {room} tokens "
+                  f"(scorer serves {servable})")
 
         diag = proposer.run_turn_and_sliding_window_diagnostics(
             conversation_salt=conv_id,
@@ -268,7 +297,8 @@ def main() -> None:
     windows = sorted({w for w in (layer_windows or []) if w is not None})
     num_sliding = sum(1 for w in (layer_windows or []) if w is not None)
     print("\n" + "=" * 72)
-    print(f"[gate] {measured} conversation(s) measured, {skipped} skipped")
+    print(f"[gate] {measured} conversation(s) measured, {truncated} truncated, "
+          f"{skipped} skipped")
     print(f"[gate] scorer: {len(layer_windows or [])} layers, {num_sliding} "
           f"sliding (windows {windows or 'none'}), "
           f"score_layers={args.score_layers!r}, keep={args.keep_percentage}")
