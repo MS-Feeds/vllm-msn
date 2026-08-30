@@ -218,8 +218,8 @@ def main() -> None:
     print(f"[gate] one turn can occupy {servable} tokens; longer contexts are "
           f"truncated to fit, not skipped")
 
-    totals = {"kept_phantom": 0, "kept_total": 0,
-              "pruned_phantom": 0, "pruned_total": 0}
+    totals = {"kept_phantom": 0, "kept_total": 0, "kept_expected": 0.0,
+              "pruned_phantom": 0, "pruned_total": 0, "pruned_expected": 0.0}
     measured = 0
     skipped = 0
     truncated = 0
@@ -302,13 +302,19 @@ def main() -> None:
     print(f"[gate] scorer: {len(layer_windows or [])} layers, {num_sliding} "
           f"sliding (windows {windows or 'none'}), "
           f"score_layers={args.score_layers!r}, keep={args.keep_percentage}")
-    kept_rate = _pct(totals["kept_phantom"], totals["kept_total"])
-    pruned_rate = _pct(totals["pruned_phantom"], totals["pruned_total"])
-    print(f"[gate] KEPT positions:        {kept_rate}  "
-          f"({totals['kept_phantom']}/{totals['kept_total']} votes)")
-    print(f"[gate] PRUNED-AWAY positions: {pruned_rate}  "
-          f"({totals['pruned_phantom']}/{totals['pruned_total']} votes)")
+    for label, key in (("KEPT positions", "kept"), ("PRUNED-AWAY positions", "pruned")):
+        phantom = totals[f"{key}_phantom"]
+        total = totals[f"{key}_total"]
+        null = totals[f"{key}_expected"]
+        excess = (phantom - null) / total if total else 0.0
+        print(f"[gate] {label:<22} {_pct(phantom, total):>6}  "
+              f"(null {_pct(null, total):>6}, excess {excess:+.1%})  "
+              f"{phantom}/{total} votes")
     print("=" * 72)
+    print("[gate] 'null' is what the rate would be if the winning layer were "
+          "chosen at random: on a mostly-sliding model most wins land on a "
+          "sliding layer by composition alone, so the EXCESS over null is the "
+          "signal, not the headline rate.")
 
     if num_sliding == 0:
         print("[gate] NOTE: this scorer has no sliding-window layer, so the "

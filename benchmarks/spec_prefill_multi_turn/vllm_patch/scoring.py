@@ -591,10 +591,19 @@ def phantom_vote_counts(
             `orig_len`-token prompt sits at `orig_len + step`.
 
     Returns:
-        `(phantom, total)`. A rate of `phantom / total` on the KEPT set that
-        is meaningfully higher than on a pruned-away comparison sample is
-        direct evidence that selection was decided by layers scoring
-        positions they can never reach.
+        `(phantom, total, expected)`.
+
+        `expected` is the phantom count you would get if the winning layer at
+        each (step, position) were chosen UNIFORMLY AT RANDOM -- summed, per
+        pair, over the fraction of layers whose window is shorter than that
+        pair's own query distance. It is the null this measurement has to be
+        read against, and without it the headline rate is badly misleading:
+        on a model that is 28/35 sliding layers, ~80% of wins land on a
+        sliding layer by composition alone, so a raw 86% phantom rate is
+        close to what "layer choice carries no signal" looks like, not close
+        to "something is broken". What matters is the EXCESS over this null,
+        and the difference in that excess between kept and pruned-away
+        positions.
     """
     if len(query_positions) != len(winning_layers):
         raise ValueError(
@@ -603,16 +612,30 @@ def phantom_vote_counts(
             f"to measure a distance at all."
         )
 
+    import bisect
+
+    num_layers = len(layer_windows)
+    # Sorted windows of the sliding layers only; a full-attention layer can
+    # never cast a phantom vote, so it contributes to the denominator of the
+    # null but never to its numerator.
+    sliding_windows = sorted(w for w in layer_windows if w is not None)
+
     phantom = 0
     total = 0
+    expected = 0.0
     for step, row in enumerate(winning_layers):
         query_pos = query_positions[step]
         for p in positions:
+            distance = query_pos - p
             window = layer_windows[int(row[p])]
             total += 1
-            if window is not None and (query_pos - p) > window:
+            if window is not None and distance > window:
                 phantom += 1
-    return phantom, total
+            # How many layers COULD have cast a phantom vote at this
+            # distance -- i.e. how many have a window strictly shorter than
+            # it. bisect_left over the sorted windows gives that count.
+            expected += bisect.bisect_left(sliding_windows, distance) / num_layers
+    return phantom, total, expected
 
 
 def _chunked_topk_indices(

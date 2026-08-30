@@ -905,18 +905,20 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             else []
         )
 
-        kept_phantom, kept_total = phantom_vote_counts(
+        kept_phantom, kept_total, kept_expected = phantom_vote_counts(
             winning_layers, layer_windows, sorted(kept_positions), query_positions
         )
-        pruned_phantom, pruned_total = phantom_vote_counts(
+        pruned_phantom, pruned_total, pruned_expected = phantom_vote_counts(
             winning_layers, layer_windows, comparison, query_positions
         )
 
         return {
             "kept_phantom": kept_phantom,
             "kept_total": kept_total,
+            "kept_expected": kept_expected,
             "pruned_phantom": pruned_phantom,
             "pruned_total": pruned_total,
+            "pruned_expected": pruned_expected,
             "num_kept": len(kept_positions),
             "orig_len": full_sequence_len,
             "look_ahead_cnt": actual_look_ahead_cnt,

@@ -3868,20 +3868,20 @@ def test_phantom_vote_counts_only_counts_out_of_window_sliding_wins():
 
     # Distances from the query: 10, 9, 8, 7, 6, 5 -- all beyond the window 4.
     # So every position won by layer 0 is phantom; layer 1 never is.
-    phantom, total = phantom_vote_counts(
+    phantom, total, _null = phantom_vote_counts(
         winning_layers, layer_windows, [0, 1, 2, 3, 4, 5], query_positions
     )
     assert (phantom, total) == (4, 6)
 
     # A full-attention winner is never phantom, however far away.
-    phantom, total = phantom_vote_counts(
+    phantom, total, _null = phantom_vote_counts(
         winning_layers, layer_windows, [1, 3], query_positions
     )
     assert (phantom, total) == (0, 2)
 
     # Inside the window is not phantom: position 7 is distance 3 <= 4.
     inside = [[0, 0]]
-    phantom, total = phantom_vote_counts(inside, layer_windows, [0, 1], [3])
+    phantom, total, _null = phantom_vote_counts(inside, layer_windows, [0, 1], [3])
     assert (phantom, total) == (0, 2)
 
 
@@ -3891,7 +3891,7 @@ def test_phantom_vote_counts_is_zero_for_a_uniform_attention_model():
     about selection quality."""
     layer_windows = [None] * 4
     winning_layers = [[0, 1, 2, 3], [3, 2, 1, 0]]
-    phantom, total = phantom_vote_counts(
+    phantom, total, _null = phantom_vote_counts(
         winning_layers, layer_windows, [0, 1, 2, 3], [100, 101]
     )
     assert phantom == 0
@@ -3969,6 +3969,43 @@ def test_winning_layers_refuses_aggregations_that_have_no_argmax():
         assert "score_head_set" in str(exc)
     else:
         raise AssertionError("score_head_set must refuse to report winners")
+
+
+def test_phantom_vote_counts_reports_the_random_winner_null():
+    """The headline rate is uninterpretable without it. On a model that is
+    mostly sliding layers, most wins land on a sliding layer by composition
+    alone -- so a high raw rate can be exactly what "layer choice carries no
+    signal" looks like. The null makes the excess visible."""
+    # 4 layers, 3 sliding (window 4), 1 full attention.
+    layer_windows = [4, 4, 4, None]
+    query_positions = [100]
+
+    # Every position is far outside the window, so any of the 3 sliding
+    # layers would be a phantom win: null = 3/4 per vote.
+    winning = [[0, 1, 2, 3]]
+    phantom, total, null = phantom_vote_counts(
+        winning, layer_windows, [0, 1, 2, 3], query_positions
+    )
+    assert (phantom, total) == (3, 4)
+    assert abs(null - 3.0) < 1e-9      # 4 votes x 3/4
+
+    # Inside every window, nothing COULD be phantom, so the null is 0 too --
+    # the null tracks DISTANCE, not just layer composition. (The row must
+    # span the context, since it is indexed by position.)
+    near_row = [[0] * 100]
+    phantom, total, null = phantom_vote_counts(
+        near_row, layer_windows, [98, 99], [100]
+    )
+    assert (phantom, total) == (0, 2), "distance 1-2 is inside the window 4"
+    assert null == 0.0
+
+    # An all-sliding model has a null of 1.0 per far vote: a 100% rate there
+    # is not evidence of anything.
+    phantom, total, null = phantom_vote_counts(
+        [[0, 1]], [4, 4], [0, 1], [100]
+    )  # both positions ~100 away, both layers sliding
+    assert (phantom, total) == (2, 2)
+    assert abs(null - 2.0) < 1e-9
 
 
 if __name__ == "__main__":
