@@ -1,0 +1,49 @@
+name: Run CI from PR comment
+
+on:
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: run-ci-comment-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  run-ci-command:
+    if: >-
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/ci run' ||
+      github.event.comment.body == '/ci run all' ||
+      github.event.comment.body == '/ci run nightly' ||
+      github.event.comment.body == '/ci retry' ||
+      github.event.comment.body == '/ci cancel' ||
+      github.event.comment.body == '/amd-ci run' ||
+      github.event.comment.body == '/amd-ci run all' ||
+      github.event.comment.body == '/amd-ci run nightly' ||
+      github.event.comment.body == '/amd-ci retry' ||
+      github.event.comment.body == '/amd-ci cancel')
+    runs-on: [self-hosted, linux, x64, vllm-runners]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Authorize and run CI command
+        run: >-
+          uv run --no-project --python 3.12
+          .github/workflows/scripts/run_ci_command.py
+        env:
+          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+          BUILDKITE_AMD_PIPELINE: amd-ci
+          BUILDKITE_ORGANIZATION: vllm
+          BUILDKITE_PIPELINE: ci
+          CI_TRUSTED_USERS: ${{ vars.CI_TRUSTED_USERS }}
+          GH_TOKEN: ${{ github.token }}

@@ -2,6 +2,18 @@
 
 This directory contains various examples demonstrating how to use vLLM for different inference scenarios and use cases.
 
+## Gemma 4 26B-A4B MoE FP8
+
+End-to-end documentation for the Gemma 4 26B-A4B MoE FP8 optimization work
+(A100 80 GB + H100 NVL): see [GEMMA4.md](GEMMA4.md) for the merged guide.
+Supporting source documents (experiment plans, code-review notes, dataset
+analysis, environment setup) live under [gemma4/](gemma4/).
+
+Key ablation runner scripts:
+- `run_all_ablation_experiments.sh` — runs all 15 Async-engine experiments.
+- `run_ablation_experiment.sh` — runs a single experiment with explicit flags.
+- `run_inference_configurable.py` — the underlying `AsyncLLMEngine` driver.
+
 ## Basic Examples
 
 - `llm_engine_example.py`: A basic example showing how to use the LLMEngine class directly for text generation
