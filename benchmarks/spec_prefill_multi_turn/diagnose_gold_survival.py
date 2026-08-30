@@ -164,6 +164,7 @@ def main() -> None:
         render_turn_query,
     )
     from vllm_patch.config import SpecConfig
+    from vllm_patch.model_structure import native_context_length
     from vllm_patch.conversation_state import ConversationState
     from vllm_patch.proposer import SpecPrefillProposer
     from vllm_patch.pruner import compute_pruned_turn
@@ -199,8 +200,9 @@ def main() -> None:
               f"score_aggregation={args.score_aggregation!r} "
               f"score_layers={args.score_layers!r}")
 
-    native_len = AutoConfig.from_pretrained(
-        speculator_model, trust_remote_code=True).max_position_embeddings
+    # Text config, not the wrapper -- see
+    # `model_structure.native_context_length`.
+    native_len = native_context_length(speculator_model)
     max_batched = args.speculator_max_num_batched_tokens
     if native_len is not None and max_batched > native_len:
         max_batched = int(native_len)

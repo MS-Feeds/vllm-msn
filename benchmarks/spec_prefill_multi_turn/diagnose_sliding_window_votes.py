@@ -155,7 +155,7 @@ def main() -> None:
                              "is harmless.")
     args = parser.parse_args()
 
-    from transformers import AutoConfig, AutoTokenizer
+    from transformers import AutoTokenizer
 
     from predict_scbench import (
         GRANULARITIES,
@@ -164,6 +164,7 @@ def main() -> None:
         render_turn_query,
     )
     from vllm_patch.config import SpecConfig
+    from vllm_patch.model_structure import native_context_length
     from vllm_patch.conversation_state import ConversationState
     from vllm_patch.proposer import SpecPrefillProposer
 
@@ -202,8 +203,7 @@ def main() -> None:
         keep_mode="keep",
     )
 
-    hf_config = AutoConfig.from_pretrained(speculator_model, trust_remote_code=True)
-    native_len = hf_config.get_text_config().max_position_embeddings
+    native_len = native_context_length(speculator_model)
     max_batched = args.speculator_max_num_batched_tokens
     if native_len is not None:
         max_batched = min(max_batched, int(native_len))

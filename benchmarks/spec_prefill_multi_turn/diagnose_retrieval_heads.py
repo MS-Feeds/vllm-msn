@@ -216,6 +216,7 @@ def main() -> None:
 
     from predict_scbench import GRANULARITIES, LOOK_AHEAD_CNT, POOL_KERNEL_SIZE, render_turn_query
     from vllm_patch.config import SpecConfig
+    from vllm_patch.model_structure import native_context_length
     from vllm_patch.conversation_state import ConversationState
     from vllm_patch.proposer import SpecPrefillProposer
 
@@ -260,9 +261,10 @@ def main() -> None:
         keep_mode="keep",
     )
 
-    scorer_hf_config = AutoConfig.from_pretrained(
-        speculator_model, trust_remote_code=True)
-    native_len = scorer_hf_config.max_position_embeddings
+    # Text config, not the wrapper: a natively multimodal checkpoint
+    # (Gemma 4) has no `max_position_embeddings` on its top-level config at
+    # all. See `model_structure.native_context_length`.
+    native_len = native_context_length(speculator_model)
     max_batched = args.speculator_max_num_batched_tokens
     if native_len is not None and max_batched > native_len:
         max_batched = int(native_len)

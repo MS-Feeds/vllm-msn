@@ -155,3 +155,30 @@ def gatherable_layer_names(layer_names, layers_by_name) -> set:
         for name in layer_names
         if getattr(layers_by_name.get(name), "sliding_window", None) is None
     }
+
+
+def native_context_length(model_path: str):
+    """The checkpoint's own `max_position_embeddings`, or None.
+
+    Reads it off the TEXT config, not the top-level one. On a natively
+    multimodal checkpoint those are different objects: Gemma 4 loads as a
+    `Gemma4Config` wrapping a `gemma4_text` config, and the wrapper has no
+    `max_position_embeddings` at all -- reading it raises
+    `AttributeError: 'Gemma4Config' object has no attribute
+    'max_position_embeddings'`, which says nothing about the text/wrapper
+    split that caused it.
+
+    `get_text_config()` returns the config itself on a text-only model, so
+    this is a provable no-op for Llama/Qwen and every already-published row.
+
+    Kept here, next to the other model-shape helpers, because several
+    scripts in this directory clamp their context budgets against this value
+    and each had its own copy of the raw attribute read.
+    """
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    text_config = (
+        config.get_text_config() if hasattr(config, "get_text_config") else config
+    )
+    return getattr(text_config, "max_position_embeddings", None)

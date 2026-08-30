@@ -4226,5 +4226,66 @@ def test_scorer_placement_rejects_a_collision_with_the_targets_tp_ranks():
     assert scorer_placement_error(None, 2, 4, None) is None
 
 
+def test_native_context_length_reads_the_text_config_not_the_wrapper():
+    """A natively multimodal checkpoint has no `max_position_embeddings` on
+    its top-level config at all -- Gemma 4 raised
+    `AttributeError: 'Gemma4Config' object has no attribute
+    'max_position_embeddings'` mid-run, a message that says nothing about the
+    text/wrapper split behind it. Several scripts clamp their context budgets
+    against this value, so it is read in one place now."""
+    import vllm_patch.model_structure as ms
+
+    class _TextConfig:
+        max_position_embeddings = 131072
+
+    class _Wrapper:
+        """No max_position_embeddings of its own -- the Gemma 4 shape."""
+        def get_text_config(self):
+            return _TextConfig()
+
+    class _TextOnly:
+        """Llama: get_text_config() returns self, so this is a no-op there."""
+        max_position_embeddings = 8192
+
+        def get_text_config(self):
+            return self
+
+    class _Ancient:
+        """A config predating get_text_config() must still work."""
+        max_position_embeddings = 4096
+
+    original = ms.__dict__.get("AutoConfig")
+    try:
+        for stub, expected in ((_Wrapper(), 131072), (_TextOnly(), 8192),
+                               (_Ancient(), 4096)):
+            fake = type("AutoConfig", (), {
+                "from_pretrained": staticmethod(lambda *a, **k: stub)})
+            import transformers
+            saved = transformers.AutoConfig
+            transformers.AutoConfig = fake
+            try:
+                assert ms.native_context_length("ignored") == expected
+            finally:
+                transformers.AutoConfig = saved
+    finally:
+        if original is not None:
+            ms.AutoConfig = original
+
+    # A config with neither attribute returns None rather than raising --
+    # every caller already guards `is not None` before clamping.
+    class _Nothing:
+        def get_text_config(self):
+            return self
+
+    import transformers
+    saved = transformers.AutoConfig
+    transformers.AutoConfig = type("AutoConfig", (), {
+        "from_pretrained": staticmethod(lambda *a, **k: _Nothing())})
+    try:
+        assert ms.native_context_length("ignored") is None
+    finally:
+        transformers.AutoConfig = saved
+
+
 if __name__ == "__main__":
     _run_all()

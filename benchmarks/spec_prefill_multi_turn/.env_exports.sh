@@ -76,5 +76,31 @@ export LLAMA32_3B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2
 # access and export HF_TOKEN first). Verify before trusting:
 #   ls -la /scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/*/
 #   ls -la /scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/*/
-export GEMMA4_31B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475
-export GEMMA4_E2B_MODEL_PATH=/scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/3e22461f65e89153144f8adb70e3b8c2cc9845a7
+# Resolved from the snapshot directory rather than hardcoded.
+#
+# A hand-written hash is easy to malform, and the failure is opaque: a single
+# missing slash produced ".../snapshots842da37...", which huggingface_hub then
+# tried to read as a REPO ID and rejected with
+# `HFValidationError: Repo id must be in the form 'repo_name' or
+# 'namespace/repo_name'` -- a message that says nothing about the real problem.
+# A stale hash after a repo update fails just as unhelpfully. Globbing the
+# snapshots directory cannot get either wrong.
+#
+# Unset (not empty-and-silent) when the checkpoint is absent, so a run fails
+# on a missing variable rather than on an empty path that looks like a
+# relative filename.
+_resolve_hf_snapshot() {
+    local cache_dir="$1"
+    local resolved
+    resolved=$(ls -d "$cache_dir"/snapshots/*/ 2>/dev/null | head -1)
+    if [ -z "$resolved" ]; then
+        echo "[.env_exports] WARNING: no snapshot under $cache_dir/snapshots" >&2
+        return 1
+    fi
+    # Strip the trailing slash: from_pretrained accepts either, but the bare
+    # form is what every log line and error message in this pipeline prints.
+    echo "${resolved%/}"
+}
+
+export GEMMA4_31B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-31B-it)
+export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-E2B-it)

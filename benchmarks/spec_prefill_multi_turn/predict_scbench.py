@@ -2092,7 +2092,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
     from vllm_patch.config import SpecConfig
-    from vllm_patch.model_structure import has_multimodal_tower
+    from vllm_patch.model_structure import (
+        has_multimodal_tower,
+        native_context_length,
+    )
 
     label = exp_cfg["label"]
     mode = exp_cfg["mode"]
@@ -2127,9 +2130,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     # than the model's own max context anyway, so clamping only
     # max_model_len while leaving max_num_batched_tokens larger would be
     # internally inconsistent, not a real fix -- both are clamped together.
-    native_max_model_len = AutoConfig.from_pretrained(
-        args.target_model, trust_remote_code=True
-    ).max_position_embeddings
+    native_max_model_len = native_context_length(args.target_model)
     target_max_num_batched_tokens = args.target_max_num_batched_tokens
     if native_max_model_len is not None and target_max_num_batched_tokens > native_max_model_len:
         print(
@@ -2499,9 +2500,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # before pruning ever gets a chance to shrink anything, so this
         # budget (not the target's) is the one that determines whether a
         # turn's SCORING pass is even possible at all.
-        speculator_native_max_model_len = AutoConfig.from_pretrained(
-            scorer_model, trust_remote_code=True
-        ).max_position_embeddings
+        speculator_native_max_model_len = native_context_length(scorer_model)
         speculator_max_num_batched_tokens = scorer_max_num_batched_tokens_arg
         if (
             speculator_native_max_model_len is not None
