@@ -312,6 +312,76 @@ SPARSE_ARCH_MODES = ("sparse", "oracle", "early")
 # published row used and is included EXPLICITLY rather than relied on as a
 # default, so the comparison is three rows measured the same way rather than
 # two rows against a historical figure.
+def scorer_placement_error(
+    scorer_device_index, target_tp: int, device_count: int, cuda_visible_devices
+):
+    """Why this scorer/target GPU placement cannot work, or None if it can.
+
+    Pure integer logic, no torch and no engines, so the placement rule is
+    unit-testable -- which matters because the failure it prevents is
+    invisible in its own traceback. The first ORACLE-k20 run on real hardware
+    died with `torch.OutOfMemoryError: Tried to allocate 3.31 GiB. GPU 0 ...
+    2.63 GiB is free` from inside an activation kernel, tens of minutes in.
+    Every engine calls its own device "GPU 0" (the scorer is placed by
+    rewriting CUDA_VISIBLE_DEVICES for its child process), so that message
+    cannot say WHICH engine or WHICH physical card.
+
+    `device_count == 0` means no CUDA in this process at all -- true for a
+    CPU-only dry run of this wiring, and not something to diagnose here; the
+    engines themselves fail with a clearer message than any guess made here.
+    """
+    if device_count and target_tp > device_count:
+        return (
+            f"--target-tensor-parallel-size {target_tp} exceeds "
+            f"torch.cuda.device_count()={device_count}."
+        )
+    if scorer_device_index is None:
+        return None
+    if device_count and scorer_device_index >= device_count:
+        return (
+            f"scorer device index {scorer_device_index} does not exist -- "
+            f"torch.cuda.device_count() is {device_count} "
+            f"(CUDA_VISIBLE_DEVICES={cuda_visible_devices!r}). Note that "
+            f"SpecPrefillProposer places the scorer by SETTING "
+            f"CUDA_VISIBLE_DEVICES to this index for the child engine "
+            f"process, so the index is interpreted against the devices THIS "
+            f"process can already see, not against physical GPU ids -- on a "
+            f"job allocated e.g. CUDA_VISIBLE_DEVICES=2,3, 'cuda:1' means the "
+            f"second of those two."
+        )
+    return None
+
+
+def scorer_placement_warning(scorer_device_index, target_tp: int):
+    """Whether the scorer shares a card with the target, or None.
+
+    A WARNING and not an error, deliberately. Sharing device 0 with the
+    target is explicitly permitted for a small scorer -- the SPARSE rows'
+    1B speculator is ~2GB of weights and has always run that way -- so
+    refusing it would block a legitimate single-GPU run. Only the oracle
+    case is a hard error, checked separately, because there the arithmetic
+    (two full 8B weight sets plus two long-context KV pools plus scoring's
+    own transients on one 80GB card) is provably impossible rather than
+    merely tight.
+
+    Tensor parallelism widens the footprint without changing that judgement:
+    the target's ranks take the first `target_tp` visible devices, so with
+    TP=2 a scorer on cuda:1 shares a card even though it is not device 0 --
+    easy to miss, since every pre-TP instinct says index 0 is the only
+    collision.
+    """
+    if scorer_device_index is None or scorer_device_index >= target_tp:
+        return None
+    return (
+        f"scorer device index {scorer_device_index} shares a card with the "
+        f"target's tensor-parallel ranks, which occupy the first "
+        f"{target_tp} visible device(s) (0..{target_tp - 1}). Survivable only "
+        f"if the scorer is small AND both gpu_memory_utilization values leave "
+        f"room for each other; otherwise pass --speculator-device "
+        f"cuda:{target_tp} or higher."
+    )
+
+
 SCORE_MODE_VARIANTS = {
     "unmasked": {},
     "global": {"score_layers": "global_only"},
@@ -2130,6 +2200,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         enforce_eager=True,
         disable_log_stats=False,
         gpu_memory_utilization=args.target_gpu_memory_utilization,
+        tensor_parallel_size=args.target_tensor_parallel_size,
         max_num_batched_tokens=target_engine_batch_tokens,
         enable_chunked_prefill=True,
         max_model_len=max_model_len,
@@ -2297,6 +2368,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # ~16GB weight sets plus two long-context KV pools plus scoring's
         # own multi-GB transients do not fit in 80GB.
         scorer_device_index = speculator_device.index
+        target_tp = args.target_tensor_parallel_size
         device_count = torch.cuda.device_count()
         print(
             f"[predict_scbench] scoring engine: {scorer_model}"
@@ -2304,28 +2376,18 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                if scorer_num_layers else "")
             + f" on {speculator_device} "
             f"(gpu_memory_utilization={scorer_gpu_memory_utilization}); "
-            f"target engine on the first visible device "
-            f"(gpu_memory_utilization={args.target_gpu_memory_utilization}); "
+            f"target engine on the first {target_tp} visible device(s) "
+            f"(gpu_memory_utilization={args.target_gpu_memory_utilization}, "
+            f"tensor_parallel_size={target_tp}); "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}, "
             f"torch.cuda.device_count()={device_count}"
         )
-        # `device_count == 0` means no CUDA at all in THIS process -- true
-        # for a CPU-only dry run of this wiring, and not something to
-        # diagnose here (the engines themselves fail with a clearer message
-        # than any guess this could make).
-        if device_count and scorer_device_index is not None and scorer_device_index >= device_count:
-            raise RuntimeError(
-                f"{exp_id}: scorer device {speculator_device} does not exist "
-                f"-- torch.cuda.device_count() is {device_count} "
-                f"(CUDA_VISIBLE_DEVICES="
-                f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r}). Note that "
-                f"SpecPrefillProposer places the scorer by SETTING "
-                f"CUDA_VISIBLE_DEVICES to this index for the child engine "
-                f"process, so the index is interpreted against the devices "
-                f"THIS process can already see, not against physical GPU "
-                f"ids -- on a job allocated e.g. CUDA_VISIBLE_DEVICES=2,3, "
-                f"'cuda:1' means the second of those two."
-            )
+        # Checked BEFORE the generic placement rule below: both fire on
+        # device 0, but this one names --oracle-scorer-device, which is
+        # the flag that actually fixes an oracle row, and explains the
+        # two-8B-engines arithmetic. The generic rule would shadow it
+        # with a correct but less actionable message.
+        #
         # Oracle only, deliberately NOT extended to mode == "early": this
         # guard's reasoning is arithmetic about two FULL 8B weight sets, and
         # that arithmetic is simply false for a truncated scorer (~2.1 +
@@ -2350,6 +2412,16 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 f"it -- which at SCBench's context lengths likely means "
                 f"lowering --target-max-num-batched-tokens too."
             )
+        placement_error = scorer_placement_error(
+            scorer_device_index, target_tp, device_count,
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+        )
+        if placement_error:
+            raise RuntimeError(f"{exp_id}: {placement_error}")
+        placement_warning = scorer_placement_warning(scorer_device_index, target_tp)
+        if placement_warning:
+            print(f"[predict_scbench] WARNING: {exp_id}: {placement_warning}")
+
         gran_kwargs = GRANULARITIES[granularity]
         # Rows that predate the scoring sweep carry neither key and get the
         # reference behavior, so they stay byte-identical to their published
@@ -2809,6 +2881,19 @@ def main() -> None:
     parser.add_argument("--target-model", default=os.environ.get("LLAMA31_8B_MODEL_PATH"))
     parser.add_argument("--speculator-model", default=os.environ.get("LLAMA32_1B_MODEL_PATH"))
     parser.add_argument("--speculator-device", default=None)
+    parser.add_argument("--target-tensor-parallel-size", type=int, default=1,
+                        help="Shard the TARGET across this many GPUs. Needed "
+                             "for a checkpoint whose weights do not fit one "
+                             "card: Gemma-4-31B is ~62GB in bf16, which leaves "
+                             "~4GB for KV and activations on an 80GB card at "
+                             "0.85 -- not enough for a long context, and less "
+                             "than it looks because the sparse path retains KV "
+                             "outside the sliding window. TP=2 halves the "
+                             "weights per card. The speculator is always TP=1 "
+                             "(it is small, and sharding it would complicate "
+                             "the query capture for no benefit). Ranks take "
+                             "the first N visible devices, so "
+                             "--speculator-device must be N or higher.")
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument(

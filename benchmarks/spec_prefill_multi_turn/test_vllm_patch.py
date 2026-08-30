@@ -2677,6 +2677,9 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         speculator_model="/ckpt/Llama-3.2-1B-Instruct",
         speculator_device=None,
         target_gpu_memory_utilization=0.85,
+        # TP=1: the single-card default, so these stub runs keep
+        # exercising the pre-TP placement behaviour.
+        target_tensor_parallel_size=1,
         speculator_gpu_memory_utilization=0.2,
         target_max_num_batched_tokens=131072,
         speculator_max_num_batched_tokens=131072,
@@ -4184,6 +4187,43 @@ def test_sliding_window_layers_are_excluded_from_the_gather():
     # loud failure rather than a silent no-op.
     all_sliding = {f"l{i}": _Attn(512) for i in range(3)}
     assert gatherable_layer_names(all_sliding, all_sliding) == set()
+
+
+def test_scorer_placement_rejects_a_collision_with_the_targets_tp_ranks():
+    """The failure this prevents is invisible in its own traceback: every
+    engine calls its own device "GPU 0", so a mid-run activation OOM cannot
+    say which engine or which card. Before TP, index 0 was the only possible
+    collision and an existence check sufficed; with TP it is every index
+    below the rank count."""
+    from predict_scbench import scorer_placement_error
+
+    from predict_scbench import scorer_placement_warning
+
+    # Sharing is a WARNING, not an error: the SPARSE rows' small speculator
+    # has always been allowed to share the target's card. Only the oracle
+    # case is a hard error, checked separately, because there the arithmetic
+    # is provably impossible rather than merely tight.
+    assert scorer_placement_error(0, 1, 2, None) is None
+    assert scorer_placement_warning(0, 1)
+    assert scorer_placement_warning(1, 1) is None
+
+    # TP=2: ranks own devices 0 AND 1, so cuda:1 now shares a card too --
+    # the case every pre-TP instinct misses, since index 0 used to be the
+    # only collision.
+    assert scorer_placement_warning(1, 2)
+    assert scorer_placement_warning(2, 2) is None
+    assert "cuda:2" in scorer_placement_warning(1, 2)
+
+    # A scorer index that does not exist is still a hard error, and says so.
+    assert "does not exist" in scorer_placement_error(5, 1, 2, None)
+
+    # More TP ranks than GPUs.
+    assert "exceeds" in scorer_placement_error(3, 4, 2, None)
+
+    # No CUDA in this process (CPU dry run): not this function's business.
+    assert scorer_placement_error(1, 1, 0, None) is None
+    # No scorer device requested at all.
+    assert scorer_placement_error(None, 2, 4, None) is None
 
 
 if __name__ == "__main__":

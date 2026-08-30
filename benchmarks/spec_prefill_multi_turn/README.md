@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  153/153 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  154/154 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -595,8 +595,22 @@ are distinguishable at all — at k80 almost nothing is pruned and every scorer
 looks alike).
 
 ```bash
-python3 predict_scbench.py --exp scoremode --scbench-config scbench_kv
+python3 predict_scbench.py --exp scoremode --scbench-config scbench_kv --target-tensor-parallel-size 2 --speculator-device cuda:2 --speculator-gpu-memory-utilization 0.5 --target-prefill-chunk-tokens 32768 --scorer-prefill-chunk-tokens 32768
 ```
+
+`--target-tensor-parallel-size` shards the target across GPUs; the speculator
+is always TP=1. Ranks take the first N visible devices, so `--speculator-device`
+must be N or higher — sharing is warned about, not refused, since a small
+scorer sharing a card has always been legitimate here. Sizing on 80GB cards:
+
+| target | weights (bf16) | TP | GPUs total |
+|---|---:|---:|---:|
+| Gemma-4-26B-A4B | ~49 GB | 1 | 2 |
+| Gemma-4-31B | ~62 GB | **2** | **3** |
+
+At TP=1 a 31B target leaves ~4GB for KV and activations at 0.85 — not enough
+for a long context, and less than it looks because the sparse path retains KV
+outside the sliding window.
 
 ```bash
 python3 compare_ceiling.py --config scbench_kv results/SPARSE-k20-g32-unmasked_predictions.jsonl results/SPARSE-k20-g32-global_predictions.jsonl results/SPARSE-k20-g32-masked_predictions.jsonl
@@ -745,7 +759,7 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 153/153 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 154/154 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |
