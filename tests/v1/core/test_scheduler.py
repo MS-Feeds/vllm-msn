@@ -1732,6 +1732,7 @@ def test_gemma4_mtp_dynamic_k_pads_and_updates_acceptance_ema():
     scheduler._gemma4_mtp_active = True
     scheduler._dynk_min = 3
     scheduler._dynk_max = num_spec
+    scheduler._accept_ema_alpha = 0.3
 
     req = create_requests(num_requests=1, max_tokens=16)[0]
     scheduler.add_request(req)
