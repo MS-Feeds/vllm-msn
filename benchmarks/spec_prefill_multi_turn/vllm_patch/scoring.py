@@ -73,6 +73,10 @@ class LayerGeometry:
         biases the `max`-over-(layer, head) collapse toward whichever type
         got the sharper distribution. When None, the historical
         `1/sqrt(head_dim)` is used.
+      sliding_windows: each layer's own attention window, `None` for a
+        full-attention layer. Required by `mask_to_window` scoring; carries
+        strictly more information than `layer_types`, which is derived from
+        it.
       kv_shared: True for a layer that reads another layer's KV cache rather
         than owning one (Gemma 3n/4's `kv_sharing_target_layer_name`). Such
         a layer's K is a DUPLICATE of its target's, so leaving it in gives
@@ -87,6 +91,7 @@ class LayerGeometry:
     layer_types: Optional[List[str]] = None
     scales: Optional[List[float]] = None
     kv_shared: Optional[List[bool]] = None
+    sliding_windows: Optional[List[Optional[int]]] = None
     logits_soft_cap: Optional[float] = None
 
     def is_noop(self) -> bool:
@@ -97,6 +102,7 @@ class LayerGeometry:
             self.layer_types is None
             and self.scales is None
             and self.kv_shared is None
+            and self.sliding_windows is None
             and self.logits_soft_cap is None
         )
 
@@ -141,11 +147,13 @@ def layer_geometry_from_attention_layers(attn_layers) -> LayerGeometry:
     layer_types: List[str] = []
     scales: List[float] = []
     kv_shared: List[bool] = []
+    sliding_windows: List[Optional[int]] = []
     soft_caps = set()
 
     for idx, attn in enumerate(attn_layers):
         window = getattr(attn, "sliding_window", None)
         layer_types.append("sliding_attention" if window else "full_attention")
+        sliding_windows.append(int(window) if window else None)
 
         kv_shared.append(
             getattr(attn, "kv_sharing_target_layer_name", None) is not None
@@ -178,6 +186,7 @@ def layer_geometry_from_attention_layers(attn_layers) -> LayerGeometry:
         layer_types=layer_types,
         scales=scales,
         kv_shared=kv_shared,
+        sliding_windows=sliding_windows,
         logits_soft_cap=soft_caps.pop() if soft_caps else None,
     )
 
@@ -187,6 +196,7 @@ def compute_attention_score(
     key_buffer: List[List[torch.Tensor]],
     actual_look_ahead_cnts: List[int],
     geometry: Optional[LayerGeometry] = None,
+    mask_to_window: bool = False,
 ) -> List[torch.Tensor]:
     """Algorithm line 12: A <- compute_attention_score(Q, K).
 
@@ -207,6 +217,25 @@ def compute_attention_score(
             `1/sqrt(head_dim)` with no softcapping, which is the reference
             implementation's behavior and what every published Llama row was
             measured under.
+        mask_to_window: restrict each sliding layer to the positions it could
+            actually attend to, by setting everything further than its own
+            window to `-inf` before the softmax -- exactly what the attention
+            kernel does.
+
+            The alternative to dropping those layers outright
+            (`score_layers="global_only"`). Both address the same defect:
+            unmasked, a sliding layer scores `Q · K` for pairs the model never
+            computes in inference, and those uncalibrated values win the `max`
+            aggregation more often than chance. Masking is the more principled
+            of the two -- it keeps a sliding layer's real, trained opinion
+            about positions inside its window instead of discarding the layer
+            -- but note it recovers signal only near the query. At long range
+            a sliding layer is silent either way, so for the long-context
+            retrieval decisions a keep-rate sweep is made of, both modes leave
+            the same handful of full-attention layers deciding.
+
+            Requires `geometry.sliding_windows`. Defaults off, so an
+            unconfigured run scores exactly as before.
 
     Returns:
         Per-sample list of [num_layer, num_head, look_ahead_cnt, context_len]
@@ -214,6 +243,12 @@ def compute_attention_score(
     """
     scales = geometry.scales if geometry is not None else None
     soft_cap = geometry.logits_soft_cap if geometry is not None else None
+    windows = geometry.sliding_windows if geometry is not None else None
+    if mask_to_window and windows is None:
+        raise ValueError(
+            "mask_to_window needs geometry.sliding_windows -- there is no way "
+            "to tell how far a layer can attend from the Q/K tensors alone."
+        )
     if scales is not None and len(scales) != len(query_buffer):
         raise ValueError(
             f"LayerGeometry.scales has {len(scales)} entries but the query "
@@ -261,6 +296,25 @@ def compute_attention_score(
                 # leaves the scoring softmax reading pre-cap logits, whose
                 # tails the model itself never sees.
                 attn = soft_cap * torch.tanh(attn / soft_cap)
+
+            if mask_to_window and windows[layer_idx] is not None:
+                # Lookahead step j is generated after the whole context, so it
+                # sits at absolute position `context_len + j`; context
+                # position i is `context_len + j - i` tokens behind it.
+                context_len = key.shape[1]
+                ctx_pos = torch.arange(context_len, device=attn.device)
+                q_pos = context_len + torch.arange(c, device=attn.device)
+                out_of_window = (q_pos[:, None] - ctx_pos[None, :]) > windows[layer_idx]
+                # -inf, not 0: the softmax below must RENORMALISE over the
+                # in-window positions, which is what the kernel does. Zeroing
+                # after the softmax would instead leave the layer's mass
+                # spread over positions it cannot see.
+                #
+                # No row can be fully masked: the nearest context position is
+                # `j + 1` behind step j, and lookahead counts here are single
+                # digits against windows of 512+, so the minimum distance is
+                # always well inside the window.
+                attn = attn.masked_fill(out_of_window, float("-inf"))
 
             attn_weights[-1].append(attn)
 
@@ -747,7 +801,8 @@ def score_and_select_indices(
     real callers already guard this themselves before calling in)."""
     key_buffer = [[k] for k in key_buffer_per_layer]  # one sample
     attn_scores = compute_attention_score(
-        query_buffer, key_buffer, [actual_look_ahead_cnt], geometry
+        query_buffer, key_buffer, [actual_look_ahead_cnt], geometry,
+        spec_config.mask_sliding_window,
     )
     token_importance = aggregate_attention_score(attn_scores, spec_config, geometry)
     kept_local_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]

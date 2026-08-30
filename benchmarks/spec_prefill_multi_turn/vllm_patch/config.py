@@ -117,6 +117,27 @@ class SpecConfig:
     # its own tensor, where a shared layer's cache is never written and
     # scoring it means scoring uninitialized memory.
     drop_kv_shared_layers: bool = False
+    # Mask each sliding layer to its own attention window before the scoring
+    # softmax, instead of letting it score the whole context unmasked.
+    #
+    # The principled alternative to `score_layers="global_only"`. Unmasked,
+    # a sliding layer scores `Q . K` for pairs the model never computes, and
+    # those uncalibrated values win `max` aggregation more often than chance
+    # -- measured at +14.3 points over a random-winner null on the positions
+    # selection actually kept (Gemma-4-E2B, scbench_kv, keep=0.3), against
+    # +6.1 on positions it pruned. Masking keeps a sliding layer's real
+    # opinion about what is inside its window rather than discarding the
+    # layer; `global_only` throws both away.
+    #
+    # What it does NOT buy: signal at range. Past 512 tokens a sliding layer
+    # is silent either way, so for long-context retrieval both modes leave
+    # the same 7 full-attention layers (of 35, on E2B) deciding. The two are
+    # worth grading against each other and against the unmasked default
+    # rather than reasoned about.
+    #
+    # Needs `LayerGeometry.sliding_windows`; a no-op on a model with no
+    # sliding layer.
+    mask_sliding_window: bool = False
     # Retrieval-head filtering (ACCURACY_IMPROVEMENTS.md §1.3): explicit
     # (layer, head) indices into the FLATTENED layer*head axis -- head
     # `l * num_heads + h` -- that alone get a vote. `None` == every head,

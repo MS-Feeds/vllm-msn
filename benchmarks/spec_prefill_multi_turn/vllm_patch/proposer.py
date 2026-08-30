@@ -372,6 +372,7 @@ class SpecPrefillProposer:
         score_aggregation: str = "max",
         score_layers: Optional[str] = None,
         score_head_set: Optional[List[int]] = None,
+        mask_sliding_window: bool = False,
     ) -> Tuple[Optional[List[int]], int, int]:
         """Same driving/submission as `run_turn` (via the shared
         `_submit_and_drive_turn` helper), but retrieves K and runs the
@@ -418,6 +419,7 @@ class SpecPrefillProposer:
                 score_aggregation,
                 score_layers,
                 score_head_set,
+                mask_sliding_window,
             ),
         )[0]
         num_kept = len(kept_local_indices) if kept_local_indices is not None else None
@@ -485,6 +487,7 @@ class SpecPrefillProposer:
         compare_sample_size: int = 200,
         seed: int = 0,
         ignore_eos: bool = False,
+        mask_sliding_window: bool = False,
     ):
         """Drives one turn exactly as `run_turn_and_score` does, then asks the
         worker for the sliding-window gate instead of a selection -- see
@@ -510,6 +513,7 @@ class SpecPrefillProposer:
                 score_layers,
                 compare_sample_size,
                 seed,
+                mask_sliding_window,
             ),
         )[0]
 

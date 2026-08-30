@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  145/145 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  150/150 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -466,6 +466,20 @@ re-decision — see the porting plan for the full blocker analysis.
   live `Attention` modules (not `hf_config`): the attention **scale** — Gemma 4
   uses `scaling = 1.0`, not `1/sqrt(head_dim)` — plus `attn_logit_softcapping`,
   `layer_types`, and which layers are KV-shared.
+- **Three ways to score an interleaved model**, to be graded against each
+  other rather than argued about:
+  1. *unmasked* (the default, and what every published row used) — every
+     layer scores the whole context. Measured on Gemma-4-E2B / `scbench_kv`
+     at keep=0.3: sliding layers win **+14.3 points over a random-winner
+     null** on the positions selection kept, against +6.1 on positions it
+     pruned. Their long-range `Q·K` is uncalibrated, and `max` selects
+     extremes.
+  2. `score_layers="global_only"` — drop the sliding layers from the vote.
+  3. `mask_sliding_window=True` — mask each sliding layer to its own window
+     before the softmax, keeping its real opinion about what it can see.
+     More principled than (2), but it recovers signal only near the query:
+     past 512 tokens a sliding layer is silent either way, so both leave the
+     same 7 of 35 full-attention layers deciding long-range retrieval.
 - `score_layers="global_only"` restricts scoring to full-attention layers. On a
   5:1 interleave, 5 of every 6 layers can never attend beyond a 512–1024 token
   window, so their score for a distant position is a number the model never
@@ -677,7 +691,7 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 145/145 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 150/150 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |

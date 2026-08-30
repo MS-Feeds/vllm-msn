@@ -718,6 +718,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         score_aggregation: str = "max",
         score_layers: Optional[str] = None,
         score_head_set: Optional[list] = None,
+        mask_sliding_window: bool = False,
     ):
         """Combines `end_capture` + `retrieve_keys` + the scoring/selection
         pipeline (`scoring.score_and_select_indices`) into ONE in-process
@@ -786,6 +787,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             score_aggregation=score_aggregation,
             score_layers=score_layers,
             score_head_set=score_head_set,
+            mask_sliding_window=mask_sliding_window,
         )
         kept_local_indices = score_and_select_indices(
             query_buffer,
@@ -806,6 +808,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         score_layers=None,
         compare_sample_size: int = 200,
         seed: int = 0,
+        mask_sliding_window: bool = False,
     ):
         """The sliding-window gate: what share of the winning (layer, head)
         votes came from a layer that could never have attended to the
@@ -870,6 +873,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             keep_kwargs=keep_kwargs,
             pool_kernel_size=pool_kernel_size,
             score_layers=score_layers,
+            mask_sliding_window=mask_sliding_window,
         )
 
         attn_scores = compute_attention_score(
@@ -877,6 +881,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             [[k] for k in key_buffer_per_layer],
             [actual_look_ahead_cnt],
             geometry,
+            mask_sliding_window,
         )
         winners: list = []
         token_importance = aggregate_attention_score(
@@ -1203,12 +1208,14 @@ class SpeculatorWorker(Worker):
         score_layers=None,
         compare_sample_size: int = 200,
         seed: int = 0,
+        mask_sliding_window: bool = False,
     ):
         """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
         end_capture_and_sliding_window_diagnostics`'s docstring."""
         return self.model_runner.end_capture_and_sliding_window_diagnostics(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
             keep_kwargs, score_layers, compare_sample_size, seed,
+            mask_sliding_window,
         )
 
     def discard_conversation(self, conversation_salt: str) -> None:

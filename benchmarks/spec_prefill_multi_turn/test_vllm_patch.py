@@ -4008,5 +4008,93 @@ def test_phantom_vote_counts_reports_the_random_winner_null():
     assert abs(null - 2.0) < 1e-9
 
 
+# ---------------------------------------------------------------------------
+# Window masking: the third scoring mode, between "score sliding layers over
+# the whole context" (default, measurably corrupted) and "drop them entirely"
+# (global_only).
+# ---------------------------------------------------------------------------
+
+
+def test_mask_to_window_silences_a_sliding_layer_outside_its_window():
+    """A masked position gets -inf before the softmax, so that layer's mass
+    there is 0 and it cannot win the `max`. Inside the window the layer is
+    untouched -- that is the whole point of masking over dropping."""
+    look_ahead, ctx, heads, head_dim = 1, 20, 1, 4
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=2, num_samples=1, look_ahead=look_ahead,
+        num_heads=heads, num_kv_heads=heads, head_dim=head_dim, ctx_len=ctx,
+    )
+    # Layer 0 sliding with a window of 5; layer 1 full attention.
+    geo = LayerGeometry(scales=[1.0, 1.0], sliding_windows=[5, None])
+
+    masked = compute_attention_score(
+        query_buffer, key_buffer, [look_ahead], geo, mask_to_window=True
+    )[0]
+
+    # Lookahead step 0 sits at position ctx, so context position i is
+    # (ctx - i) behind it. Window 5 keeps only i >= ctx - 5.
+    assert torch.isinf(masked[0, :, 0, : ctx - 5]).all(), "far positions must be -inf"
+    assert torch.isfinite(masked[0, :, 0, ctx - 5:]).all(), "near positions must survive"
+    # The full-attention layer is never masked.
+    assert torch.isfinite(masked[1]).all()
+
+    # Unmasked, nothing is -inf -- the default path is unchanged.
+    unmasked = compute_attention_score(query_buffer, key_buffer, [look_ahead], geo)[0]
+    assert torch.isfinite(unmasked).all()
+
+
+def test_mask_to_window_leaves_a_full_attention_model_untouched():
+    """No sliding layer means nothing to mask, so this must be a provable
+    no-op rather than a mode that quietly perturbs uniform models."""
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=3, num_samples=1, look_ahead=2,
+        num_heads=2, num_kv_heads=2, head_dim=8, ctx_len=16,
+    )
+    geo = LayerGeometry(scales=[1.0] * 3, sliding_windows=[None] * 3)
+    plain = compute_attention_score(query_buffer, key_buffer, [2], geo)[0]
+    masked = compute_attention_score(
+        query_buffer, key_buffer, [2], geo, mask_to_window=True
+    )[0]
+    assert torch.equal(plain, masked)
+
+
+def test_mask_to_window_requires_the_windows_it_masks_by():
+    """Silently not masking would look identical to masking on a model whose
+    layers all fit their window -- so a missing geometry must raise."""
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=1, num_samples=1, look_ahead=1,
+        num_heads=1, num_kv_heads=1, head_dim=4, ctx_len=8,
+    )
+    try:
+        compute_attention_score(query_buffer, key_buffer, [1], None, mask_to_window=True)
+    except ValueError as exc:
+        assert "sliding_windows" in str(exc)
+    else:
+        raise AssertionError("mask_to_window without windows must raise")
+
+
+def test_masked_sliding_layer_cannot_win_a_far_vote():
+    """The end-to-end property, and the reason this is an alternative to
+    global_only: after masking, a sliding layer's score at range is zero
+    post-softmax, so the winner at a far position is always a full-attention
+    layer -- exactly what global_only achieves by deletion instead."""
+    look_ahead, ctx = 1, 30
+    query_buffer, key_buffer = _synthetic_qk(
+        num_layers=2, num_samples=1, look_ahead=look_ahead,
+        num_heads=1, num_kv_heads=1, head_dim=4, ctx_len=ctx,
+    )
+    geo = LayerGeometry(scales=[1.0, 1.0], sliding_windows=[5, None])
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.5},
+                     pool_kernel_size=0)
+
+    attn = compute_attention_score(
+        query_buffer, key_buffer, [look_ahead], geo, mask_to_window=True
+    )
+    winners = []
+    aggregate_attention_score(attn, cfg, geo, winning_layers=winners)
+    far = winners[0][0, : ctx - 5].tolist()
+    assert set(far) == {1}, f"a masked sliding layer won a far vote: {set(far)}"
+
+
 if __name__ == "__main__":
     _run_all()

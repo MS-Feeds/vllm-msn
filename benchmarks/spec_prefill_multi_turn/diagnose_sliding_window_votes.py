@@ -106,6 +106,17 @@ def main() -> None:
                              "the problem: it should drive the phantom rate to "
                              "0%% by construction, which is a useful check that "
                              "this harness measures what it claims.")
+    parser.add_argument("--mask-sliding-window", action="store_true",
+                        help="Mask each sliding layer to its own window before "
+                             "the scoring softmax, instead of dropping those "
+                             "layers (--score-layers global_only) or letting "
+                             "them score the whole context unmasked (the "
+                             "default). The third mode: it keeps a sliding "
+                             "layer's real opinion about what is inside its "
+                             "window. Expect a 0%% phantom rate, same as "
+                             "global_only -- masked positions cannot be won -- "
+                             "so the gate cannot separate these two. Grading "
+                             "is what tells them apart.")
     parser.add_argument("--compare-sample-size", type=int, default=200,
                         help="How many pruned-away positions to sample for the "
                              "comparison baseline (all of them would dominate "
@@ -271,6 +282,7 @@ def main() -> None:
             score_layers=spec_config.score_layers,
             compare_sample_size=args.compare_sample_size,
             seed=args.seed,
+            mask_sliding_window=args.mask_sliding_window,
         )
         proposer.discard_conversation(conv_id)
 
@@ -301,7 +313,9 @@ def main() -> None:
           f"{skipped} skipped")
     print(f"[gate] scorer: {len(layer_windows or [])} layers, {num_sliding} "
           f"sliding (windows {windows or 'none'}), "
-          f"score_layers={args.score_layers!r}, keep={args.keep_percentage}")
+          f"score_layers={args.score_layers!r}, "
+          f"mask_to_window={args.mask_sliding_window}, "
+          f"keep={args.keep_percentage}")
     for label, key in (("KEPT positions", "kept"), ("PRUNED-AWAY positions", "pruned")):
         phantom = totals[f"{key}_phantom"]
         total = totals[f"{key}_total"]
