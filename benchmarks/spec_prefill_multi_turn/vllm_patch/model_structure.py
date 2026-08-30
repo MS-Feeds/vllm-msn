@@ -100,3 +100,58 @@ def find_attention_modules(model) -> List:
     if not modules:
         raise NotImplementedError(f"{type(model).__name__} has an empty decoder stack.")
     return modules
+
+
+def has_multimodal_tower(model_path: str) -> bool:
+    """Whether this checkpoint carries a vision/audio tower whose encoder
+    cache vLLM would otherwise reserve and profile.
+
+    Read off the HF config rather than the architecture name: Gemma 4's
+    text-only variant and its full multimodal checkpoint share an
+    architecture string in some configurations, but only one of them has the
+    sub-configs. Failing open (returning False) is the safe direction -- it
+    just means the engine behaves exactly as it did before this check
+    existed.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        return False
+    return any(
+        getattr(config, name, None) is not None
+        for name in ("vision_config", "audio_config", "video_config")
+    )
+
+
+def gatherable_layer_names(layer_names, layers_by_name) -> set:
+    """Which layers a block-table gather may legally be applied to: the
+    full-attention ones.
+
+    Pure `getattr` over plain containers, no vLLM import, for the same reason
+    the rest of this module is -- the rule decides correctness and needs a
+    CPU test, while the caller does the model-registry lookup.
+
+    **Sliding-window layers must be excluded, and it is correctness, not
+    tuning.** A gather COMPACTS the KV view: selected blocks are packed to
+    the front and `seq_lens` shrinks to match. A sliding-window kernel reads
+    window membership from a key's index within `seqused_k`, so after
+    compaction key j is treated as sitting at position j, which it no longer
+    does -- distant keys get admitted and near ones masked out. The
+    contiguous force-kept tail that fixes the analogous problem for causal
+    masking cannot help: a window must be contiguous in TRUE positions, and a
+    top-k block selection is exactly what is not.
+
+    Nothing real is lost by excluding them. A sliding layer already reads at
+    most its own window, so it never had long-context KV traffic to save.
+
+    A layer with no entry in `layers_by_name` is treated as gatherable: that
+    is the uniform-attention case where no registry lookup was needed at all,
+    and the published Llama rows must keep taking an identical path.
+    """
+    return {
+        name
+        for name in layer_names
+        if getattr(layers_by_name.get(name), "sliding_window", None) is None
+    }

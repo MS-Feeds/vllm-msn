@@ -307,6 +307,34 @@ HEAD_SET_RATES = [0.2, 0.4, 0.6]
 SCORING_MODES = ("specprefill", "sparse", "oracle", "early")
 SPARSE_ARCH_MODES = ("sparse", "oracle", "early")
 
+# The three ways to score an interleaved sliding-window model, for the
+# head-to-head in the experiment matrix below. `unmasked` is the default every
+# published row used and is included EXPLICITLY rather than relied on as a
+# default, so the comparison is three rows measured the same way rather than
+# two rows against a historical figure.
+SCORE_MODE_VARIANTS = {
+    "unmasked": {},
+    "global": {"score_layers": "global_only"},
+    "masked": {"mask_sliding_window": True},
+}
+# (keep rate, granularity) the three modes are compared at. Reuses
+# `SCORE_VARIANT_PROBE` deliberately rather than picking its own rate:
+#
+#   - k20 is where scorers are DISTINGUISHABLE. At k80 almost nothing is
+#     pruned and every scorer looks alike; the estimator gap is largest at the
+#     low-keep corner, which is the whole reason the existing scoring-variant
+#     sweep probes there.
+#   - It keeps these rows comparable with those variants, at one operating
+#     point instead of two.
+#   - It introduces no new keep rate, so every SPARSE rate still has an
+#     ORACLE row bounding it (an invariant `test_oracle_rows_pair_one_to_one_
+#     with_a_sparse_row` enforces).
+#
+# The gate measured its +14.3 excess at 0.3; re-run it with
+# `--keep-percentage 0.2` if you want the two measurements at an identical
+# operating point.
+SCORE_MODE_PROBE = SCORE_VARIANT_PROBE
+
 # The target's own first N layers as the speculator (SPECULATION_ECONOMICS.md's
 # third escape from the keep-rate bind). The scorer is the TARGET checkpoint
 # loaded with `hf_overrides={"num_hidden_layers": n}` -- see
@@ -378,6 +406,35 @@ def _build_experiments() -> dict:
                 "mode": "specprefill", "keep_mode": "keep",
                 "keep_percentage": rate, "granularity": gran_name,
             }
+    # ---- Interleaved-attention scoring comparison (Gemma 3/3n/4, Llama 4) --
+    #
+    # Three ways to score a model whose layers mostly cannot see the whole
+    # context, graded head to head at one probe point. The gate
+    # (`diagnose_sliding_window_votes.py`) established that the DEFAULT is
+    # corrupted -- on Gemma-4-E2B / scbench_kv / keep=0.3, sliding layers won
+    # +14.3 points over a random-winner null on the positions selection kept,
+    # against +6.1 on positions it pruned -- and that both fixes drive that to
+    # zero. What the gate CANNOT say is which fix scores better, because both
+    # zero the metric by construction. Only grading separates them.
+    #
+    # On the SPARSE architecture -- this pipeline's actual contribution and
+    # what every published row uses -- rather than the simpler `specprefill`
+    # path. Two Gemma-4 blockers had to be closed first, both now in place:
+    # `disable_hybrid_kv_cache_manager=True` on the target engine (one KV
+    # cache group, asserted by the runner), and excluding sliding-window
+    # layers from the gather (a compacted view misplaces their window; see
+    # `sparse_target_runner._gatherable_layer_names`).
+    for suffix, variant in SCORE_MODE_VARIANTS.items():
+        exp_id = f"SPARSE-k{int(SCORE_MODE_PROBE[0] * 100)}-g{SCORE_MODE_PROBE[1]}-{suffix}"
+        experiments[exp_id] = {
+            "label": f"Sparse attention (persistent cache) "
+                     f"keep={int(SCORE_MODE_PROBE[0] * 100)}% "
+                     f"granularity={SCORE_MODE_PROBE[1]} scoring={suffix}",
+            "mode": "sparse", "keep_mode": "keep",
+            "keep_percentage": SCORE_MODE_PROBE[0],
+            "granularity": SCORE_MODE_PROBE[1],
+            **variant,
+        }
     # Oracle upper bound: the SPARSE architecture, entirely unchanged --
     # same driving loop, same block-gather mechanism, same keep rate, same
     # prompt rendering -- with exactly ONE variable swapped: the importance
@@ -1965,6 +2022,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
     from vllm_patch.config import SpecConfig
+    from vllm_patch.model_structure import has_multimodal_tower
 
     label = exp_cfg["label"]
     mode = exp_cfg["mode"]
@@ -2076,7 +2134,36 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         enable_chunked_prefill=True,
         max_model_len=max_model_len,
     )
+    # Same reasoning as the speculator's engine (see `proposer.py`): this
+    # pipeline is text-only by construction, but a natively multimodal target
+    # still reserves an encoder cache and profiles it. On Gemma 4 that
+    # profiling run allocates a peak large enough to drive "Available KV cache
+    # memory" NEGATIVE -- observed at -2.81 GiB on the E2B speculator before
+    # this was applied there. Zeroing every modality limit leaves
+    # `active_modalities` empty, so `compute_mm_encoder_budget` returns 0 and
+    # `profile_run`'s `if encoder_budget > 0` never fires: no profiling, and
+    # no reserved cache. Applied only to a checkpoint that actually has a
+    # tower, so the published Llama rows take an unchanged path.
+    if has_multimodal_tower(args.target_model):
+        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+        print("[predict_scbench] target is multimodal; zeroing modality limits "
+              "(text-only workload, avoids the encoder-cache reservation)")
     if mode in SPARSE_ARCH_MODES:
+        # One KV cache group, which `sparse_target_runner` requires and now
+        # asserts. Without it, an interleaved model's heterogeneous specs
+        # produce two or more groups with DIFFERENT block sizes, and writing
+        # one gathered block table into every layer's metadata reads
+        # unrelated physical memory -- silently. Collapses those specs into a
+        # single group by rewriting SlidingWindowSpec to FullAttentionSpec
+        # (keeping `sliding_window`, so kernel masking is unaffected).
+        #
+        # No-op for a uniform-attention model: `unify_hybrid_kv_cache_specs`
+        # returns early when the specs already match, so the published Llama
+        # rows take a byte-identical path. The cost, paid only by interleaved
+        # models, is retaining KV outside the sliding window -- which this
+        # architecture needs regardless, its whole premise being a cache that
+        # is never discarded.
+        llm_kwargs["disable_hybrid_kv_cache_manager"] = True
         # SparseTargetWorker, not SpecPrefillWorker -- this path never
         # physically shrinks the prompt (no RoPE-position-override
         # machinery needed at all, see sparse_target_runner.py's module
@@ -2312,12 +2399,18 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             score_aggregation=exp_cfg.get("score_aggregation", "max"),
             score_layers=exp_cfg.get("score_layers"),
             score_head_set=head_set,
+            mask_sliding_window=exp_cfg.get("mask_sliding_window", False),
         )
-        if exp_cfg.get("score_aggregation", "max") != "max" or exp_cfg.get("score_layers"):
+        if (
+            exp_cfg.get("score_aggregation", "max") != "max"
+            or exp_cfg.get("score_layers")
+            or exp_cfg.get("mask_sliding_window")
+        ):
             print(
                 f"[predict_scbench] scoring variant: "
                 f"score_aggregation={spec_config.score_aggregation!r} "
-                f"score_layers={spec_config.score_layers!r}"
+                f"score_layers={spec_config.score_layers!r} "
+                f"mask_sliding_window={spec_config.mask_sliding_window!r}"
             )
 
         # Same clamp-to-native-ceiling reasoning as the target above --
@@ -2911,6 +3004,21 @@ def main() -> None:
         exp_ids = [
             eid for eid, cfg in EXPERIMENTS.items()
             if cfg.get("score_aggregation", "max") != "max" or cfg.get("score_layers")
+        ]
+    elif exp_arg == "scoremode":
+        # Exactly the three-way interleaved-attention comparison, and nothing
+        # else. Not folded into "score" above: that selector keys on
+        # `score_aggregation`/`score_layers`, which would pick up the SPARSE
+        # aggregation variants and MISS both the unmasked control (no flags
+        # set) and the masked row (a different flag). A comparison whose
+        # control row is absent is not a comparison.
+        exp_ids = [
+            eid for eid, cfg in EXPERIMENTS.items()
+            if eid.startswith(
+                f"SPARSE-k{int(SCORE_MODE_PROBE[0] * 100)}-"
+                f"g{SCORE_MODE_PROBE[1]}-"
+            )
+            and eid.rsplit("-", 1)[-1] in SCORE_MODE_VARIANTS
         ]
     elif exp_arg == "all":
         exp_ids = list(EXPERIMENTS.keys())

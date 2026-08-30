@@ -113,10 +113,14 @@ def main() -> None:
                              "them score the whole context unmasked (the "
                              "default). The third mode: it keeps a sliding "
                              "layer's real opinion about what is inside its "
-                             "window. Expect a 0%% phantom rate, same as "
+                             "window. Expect a ~0%% phantom rate, same as "
                              "global_only -- masked positions cannot be won -- "
                              "so the gate cannot separate these two. Grading "
-                             "is what tells them apart.")
+                             "is what tells them apart. Not EXACTLY 0: "
+                             "avg_pool1d runs after the softmax, so in-window "
+                             "mass smears up to pool_kernel_size//2 positions "
+                             "past the boundary and can win there. ~0.015%% on "
+                             "E2B at pool 13; exactly 0 with pooling off.")
     parser.add_argument("--compare-sample-size", type=int, default=200,
                         help="How many pruned-away positions to sample for the "
                              "comparison baseline (all of them would dominate "

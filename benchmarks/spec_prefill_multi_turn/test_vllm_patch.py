@@ -1078,6 +1078,13 @@ def _make_fake_runner(
     cache_config = type("CacheConfig", (), {"block_size": block_size})()
     runner.vllm_config = type("VllmConfig", (), {"cache_config": cache_config})()
 
+    # One KV cache group, which the runner now asserts before gathering --
+    # a real model reaches this via `disable_hybrid_kv_cache_manager=True`.
+    group = type("Group", (), {"kv_cache_spec": type(
+        "Spec", (), {"block_size": block_size})()})()
+    runner.kv_cache_config = type(
+        "KVCacheConfig", (), {"kv_cache_groups": [group]})()
+
     num_reqs = len(req_ids)
     # Distinct physical block ids per row so _kernel_visible_positions can
     # invert the gather unambiguously.
@@ -1096,6 +1103,12 @@ def _make_fake_runner(
         )
         for i in range(num_layers)
     }
+    # Uniform attention: every layer is gatherable. Seeded rather than looked
+    # up because the real lookup goes through vLLM's model registry, which
+    # this CPU-only suite has no engine for. The SELECTION RULE itself is
+    # tested separately and for real, against
+    # `model_structure.gatherable_layer_names`.
+    runner._gatherable_layer_names_cache = set(attn_metadata)
     return runner, attn_metadata
 
 
@@ -4094,6 +4107,83 @@ def test_masked_sliding_layer_cannot_win_a_far_vote():
     aggregate_attention_score(attn, cfg, geo, winning_layers=winners)
     far = winners[0][0, : ctx - 5].tolist()
     assert set(far) == {1}, f"a masked sliding layer won a far vote: {set(far)}"
+
+
+def test_score_mode_comparison_rows_differ_only_in_how_they_score():
+    """The three-way comparison is only readable if the rows are identical
+    apart from the scoring mode -- same path, same keep rate, same
+    granularity. A control row that differs in two things measures neither."""
+    from predict_scbench import EXPERIMENTS, SCORE_MODE_PROBE
+
+    rate, gran = SCORE_MODE_PROBE
+    prefix = f"SPARSE-k{int(rate * 100)}-g{gran}-"
+    rows = {
+        k: v for k, v in EXPERIMENTS.items()
+        if k.startswith(prefix) and k.rsplit("-", 1)[-1] in
+        ("unmasked", "global", "masked")
+    }
+    assert set(rows) == {prefix + s for s in ("unmasked", "global", "masked")}
+
+    for cfg in rows.values():
+        # The SPARSE architecture -- this pipeline's actual contribution, and
+        # what every published row uses. Grading the three scorers on the
+        # simpler physical-pruning path would have measured them on a
+        # substrate the project does not otherwise report.
+        assert cfg["mode"] == "sparse"
+        assert cfg["keep_percentage"] == rate
+        assert cfg["granularity"] == gran
+        assert cfg["keep_mode"] == "keep"
+
+    # The control must carry NO scoring flags: it is the default every
+    # published row used, measured here rather than quoted from history.
+    control = rows[prefix + "unmasked"]
+    assert control.get("score_layers") is None
+    assert control.get("mask_sliding_window", False) is False
+
+    # And the two fixes must differ from it in exactly one way each.
+    assert rows[prefix + "global"]["score_layers"] == "global_only"
+    assert rows[prefix + "global"].get("mask_sliding_window", False) is False
+    assert rows[prefix + "masked"]["mask_sliding_window"] is True
+    assert rows[prefix + "masked"].get("score_layers") is None
+
+
+def test_mask_sliding_window_reaches_the_speculator_config():
+    """The flag has to survive the driver -> SpecConfig hop, since scoring
+    runs in the speculator's own process and reads only what is passed."""
+    cfg = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 0.3},
+                     mask_sliding_window=True)
+    assert cfg.mask_sliding_window is True
+    # Default off, so nothing already measured changes underneath.
+    assert SpecConfig(keep_strategy="percentage",
+                      keep_kwargs={"percentage": 0.3}).mask_sliding_window is False
+
+
+def test_sliding_window_layers_are_excluded_from_the_gather():
+    """Correctness, not optimisation: a gather compacts the KV view, and a
+    sliding-window kernel reads window membership from a key's index within
+    `seqused_k` -- so a compacted view masks the wrong keys entirely."""
+    from vllm_patch.model_structure import gatherable_layer_names
+
+    class _Attn:
+        def __init__(self, window):
+            self.sliding_window = window
+
+    # Gemma-4-style 4:1 interleave.
+    layers = {f"l{i}": _Attn(512 if i % 5 != 4 else None) for i in range(10)}
+    assert gatherable_layer_names(layers, layers) == {"l4", "l9"}
+
+    # Uniform attention (Llama): every layer gatherable, a provable no-op.
+    uniform = {f"l{i}": _Attn(None) for i in range(4)}
+    assert gatherable_layer_names(uniform, uniform) == set(uniform)
+
+    # A layer absent from the registry is treated as gatherable -- that is
+    # the no-lookup-needed case, and it must not silently disable the gather.
+    assert gatherable_layer_names(["unknown"], {}) == {"unknown"}
+
+    # All-sliding leaves nothing to restrict; the runner turns this into a
+    # loud failure rather than a silent no-op.
+    all_sliding = {f"l{i}": _Attn(512) for i in range(3)}
+    assert gatherable_layer_names(all_sliding, all_sliding) == set()
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from .kv_cache_utils import gather_keys_for_slots  # noqa: F401  (re-exported for callers that want the raw utility)
+from .model_structure import has_multimodal_tower
 
 # Same reasoning/placement as the single-turn pipeline's pruner.py: must be
 # set before any add_request() call reads it. Both the speculator's and the
@@ -115,29 +116,6 @@ os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 # specific IPC channel -- the same reasoning that makes `enforce_eager=True`
 # and other same-host-only settings elsewhere in this pipeline uncontroversial.
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
-
-def _has_multimodal_tower(model_path: str) -> bool:
-    """Whether this checkpoint carries a vision/audio tower whose encoder
-    cache vLLM would otherwise reserve and profile.
-
-    Read off the HF config rather than the architecture name: Gemma 4's
-    text-only variant and its full multimodal checkpoint share an
-    architecture string in some configurations, but only one of them has the
-    sub-configs. Failing open (returning False) is the safe direction -- it
-    just means the engine behaves exactly as it did before this check
-    existed.
-    """
-    try:
-        from transformers import AutoConfig
-
-        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    except Exception:
-        return False
-    return any(
-        getattr(config, name, None) is not None
-        for name in ("vision_config", "audio_config", "video_config")
-    )
 
 
 class SpecPrefillProposer:
@@ -260,7 +238,7 @@ class SpecPrefillProposer:
         # meaningless at best, so the published rows' path is untouched.
         # `--skip-mm-profiling` is the narrower alternative if this ever needs
         # loosening -- it skips the profiling but still reserves the cache.
-        if _has_multimodal_tower(speculator_model_path):
+        if has_multimodal_tower(speculator_model_path):
             llm_kwargs.setdefault(
                 "limit_mm_per_prompt", {"image": 0, "video": 0, "audio": 0}
             )

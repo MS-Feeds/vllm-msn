@@ -449,9 +449,98 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         self._apply_sparse_attention_overrides(attn_metadata)
         return attn_metadata, spec_decode_meta
 
+    def _gatherable_layer_names(self, attn_metadata) -> set:
+        """Which layers the block-table gather may legally be applied to.
+
+        **Sliding-window layers must be excluded, and this is a correctness
+        requirement, not an optimisation.** The gather COMPACTS the KV view:
+        selected blocks are packed to the front of the block table and
+        `seq_lens` shrinks to match. A sliding-window kernel decides window
+        membership from a key's index within `seqused_k` -- so after
+        compaction, key j is treated as if it sat at position j, which it no
+        longer does. Every distance the kernel computes is wrong: keys that
+        are genuinely far away get admitted, near ones get masked out. This
+        is the same position-shift hazard `kv_cache_utils.
+        compute_prefill_gather_view` handles for causal masking with a
+        contiguous force-kept tail, but a tail cannot fix it here -- a
+        window must be contiguous in TRUE positions, and a top-k block
+        selection is precisely what is not.
+
+        Excluding them costs nothing that was ever really available. A
+        sliding layer already reads at most its own window (512-1024 tokens),
+        so there was no long-context KV traffic there to save. On
+        Gemma-4-E2B that is 28 of 35 layers, which is the same fact the
+        economics reach from the other side: this mechanism's headroom on an
+        interleaved model lives on the ~1/6 of layers that attend globally.
+
+        Computed once and cached -- layer types cannot change after load.
+        On a uniform-attention model every layer is gatherable and this is a
+        provable no-op, so the published Llama rows take an identical path.
+        """
+        cached = getattr(self, "_gatherable_layer_names_cache", None)
+        if cached is not None:
+            return cached
+
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+
+        from .model_structure import gatherable_layer_names
+
+        layers = get_layers_from_vllm_config(self.vllm_config, Attention)
+        gatherable = gatherable_layer_names(attn_metadata, layers)
+        skipped = len(attn_metadata) - len(gatherable)
+        if skipped:
+            print(
+                f"[SparseTarget] gather restricted to {len(gatherable)} of "
+                f"{len(attn_metadata)} layers; {skipped} sliding-window "
+                f"layer(s) left dense (a compacted view would misplace their "
+                f"window -- see _gatherable_layer_names)",
+                flush=True,
+            )
+        if not gatherable:
+            raise NotImplementedError(
+                "every attention layer in this model is sliding-window, so "
+                "there is nothing the block gather can legally restrict. "
+                "This mechanism has no effect on such a model."
+            )
+        self._gatherable_layer_names_cache = gatherable
+        return gatherable
+
+    def _assert_single_kv_cache_group(self) -> None:
+        """This runner writes ONE gathered block table into every layer it
+        patches, which is only meaningful if every layer shares one block
+        table -- i.e. one KV cache group.
+
+        False by default for an interleaved model: heterogeneous specs fall
+        through `get_kv_cache_groups` to `unify_kv_cache_spec_page_size`,
+        which equalises page sizes by MULTIPLYING the smaller-page layers'
+        block_size, yielding two or more groups with DIFFERENT block sizes.
+        Patching across them writes block ids from one group's table into
+        another's metadata -- silently, with no error, reading unrelated
+        physical memory.
+
+        `disable_hybrid_kv_cache_manager=True` collapses those specs into a
+        single group (`predict_scbench.py` sets it for this reason). Asserted
+        here rather than assumed, because the failure mode is silent
+        corruption and the fix is a flag that is easy to lose.
+        """
+        if getattr(self, "_single_group_checked", False):
+            return
+        groups = self.kv_cache_config.kv_cache_groups
+        if len(groups) != 1:
+            block_sizes = [g.kv_cache_spec.block_size for g in groups]
+            raise NotImplementedError(
+                f"the sparse gather requires exactly one KV cache group; this "
+                f"model has {len(groups)} with block sizes {block_sizes}. "
+                f"Construct the target engine with "
+                f"`disable_hybrid_kv_cache_manager=True`."
+            )
+        self._single_group_checked = True
+
     def _apply_sparse_attention_overrides(self, attn_metadata: Dict[str, object]) -> None:
         if not attn_metadata:
             return
+        self._assert_single_kv_cache_group()
 
         num_reqs = self.input_batch.num_reqs
         block_size = self.vllm_config.cache_config.block_size
@@ -515,7 +604,14 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # AND again below for block_table_width -- same "an arbitrary
             # layer's metadata, assumed uniform across layers" reasoning as
             # before, just consolidated to one lookup.
-            any_layer_metadata = next(iter(attn_metadata.values()))
+            # Read from a layer the gather actually applies to, so the
+            # "uniform across layers" assumption is scoped to the layers this
+            # method touches rather than asserted over the whole model. Under
+            # the single KV cache group this runner requires, every layer's
+            # block table is the same anyway -- but scoping it keeps that a
+            # consequence rather than a dependency.
+            gatherable = self._gatherable_layer_names(attn_metadata)
+            any_layer_metadata = attn_metadata[next(iter(gatherable))]
             full_block_table_row = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD)[req_idx]
 
             if is_prefill:
@@ -617,12 +713,20 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # not theorized. Safe to read only one layer's seq_lens for
             # this, same "assumed uniform across all layers" reasoning this
             # function already relies on for `block_table_width` above.
-            any_layer_metadata = next(iter(attn_metadata.values()))
+            # Read the representative layer from the GATHERED set, and write
+            # back only to that set. A sliding layer keeps its dense
+            # block_table and seq_lens, so handing it a shrunken max_seq_len
+            # would size its kernel's iteration to a span it no longer
+            # matches -- the mirror image of the stale-max_seq_len bug that
+            # made this fix-up necessary in the first place.
+            gatherable = self._gatherable_layer_names(attn_metadata)
+            any_layer_metadata = attn_metadata[next(iter(gatherable))]
             if hasattr(any_layer_metadata, _MAX_SEQ_LEN_FIELD):
                 seq_lens = self._get_field(any_layer_metadata, _SEQ_LENS_FIELD)
                 new_max_seq_len = int(seq_lens.max().item())
-                for layer_metadata in attn_metadata.values():
-                    setattr(layer_metadata, _MAX_SEQ_LEN_FIELD, new_max_seq_len)
+                for layer_name in gatherable:
+                    setattr(attn_metadata[layer_name], _MAX_SEQ_LEN_FIELD,
+                            new_max_seq_len)
 
             # See _SCHEDULER_METADATA_FIELD's own comment above -- a real,
             # confirmed correctness bug (not a performance one, unlike
@@ -636,8 +740,11 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # sync cost the way the max_seq_len recompute above is --
             # always done whenever anything was actually patched.
             if hasattr(any_layer_metadata, _SCHEDULER_METADATA_FIELD):
-                for layer_metadata in attn_metadata.values():
-                    setattr(layer_metadata, _SCHEDULER_METADATA_FIELD, None)
+                # Only the gathered layers' schedules are stale; a sliding
+                # layer's was built for the dense view it still has.
+                for layer_name in gatherable:
+                    setattr(attn_metadata[layer_name],
+                            _SCHEDULER_METADATA_FIELD, None)
 
     def _apply_gathered_view(
         self, attn_metadata, any_layer_metadata, req_idx: int,
@@ -675,7 +782,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         else:
             padded_block_table_row = gathered_block_table_row
 
-        for layer_metadata in attn_metadata.values():
+        gatherable = self._gatherable_layer_names(attn_metadata)
+        for layer_name, layer_metadata in attn_metadata.items():
+            if layer_name not in gatherable:
+                continue  # sliding-window layer: see _gatherable_layer_names
             self._patch_layer_metadata(
                 layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
             )

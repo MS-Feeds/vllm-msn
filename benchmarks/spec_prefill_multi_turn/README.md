@@ -21,7 +21,7 @@ history-retention setting first.
 - `.env_exports.sh` — local env config (model paths, HF token).
 - `vllm_patch/` — the multi-turn Algorithm 1 implementation (SPARSE pipeline).
 - `test_vllm_patch.py` — CPU-only unit tests (no GPU needed). **Currently
-  150/150 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
+  153/153 passing** (re-run `python3 test_vllm_patch.py` to confirm; grows
   as the pipeline grows, so re-check the count rather than trusting a
   stale figure).
 - `validate_proposer.py` / `validate_runner_integration.py` /
@@ -569,6 +569,60 @@ Run it again with `--score-layers global_only`: that should drive the rate to
 0% by construction, which is the check that the harness measures what it
 claims before its answer is believed.
 
+**Measured (Gemma-4-E2B-it, `scbench_kv`, keep=0.3, 10 conversations, all
+context-truncated):**
+
+| mode | phantom rate | random-winner null | excess |
+|---|---:|---:|---:|
+| unmasked (default) — KEPT | 93.3% | 79.0% | **+14.3** |
+| unmasked (default) — PRUNED-AWAY | 86.1% | 80.0% | +6.1 |
+| `--score-layers global_only` | 0.0% | — | 0 |
+| `--mask-sliding-window` | ~0.0% | — | ~0 |
+
+The null matters: 28 of 35 layers are sliding, so ~80% of wins land on one by
+composition alone. The finding is the **excess** — sliding layers win more
+than their share, and more than twice as much on the positions selection keeps
+as on those it discards. Both fixes zero the metric by construction, so the
+gate cannot rank them; that needs grading (below).
+
+### Grading the three modes
+
+`SPARSE-k20-g32-{unmasked,global,masked}` — the head-to-head, selectable as
+`--exp scoremode`. On the **SPARSE architecture**, this pipeline's actual
+contribution and what every published row uses, at the same `k20-g32` probe
+point as the existing scoring variants (the low-keep corner is where scorers
+are distinguishable at all — at k80 almost nothing is pruned and every scorer
+looks alike).
+
+```bash
+python3 predict_scbench.py --exp scoremode --scbench-config scbench_kv
+```
+
+```bash
+python3 compare_ceiling.py --config scbench_kv results/SPARSE-k20-g32-unmasked_predictions.jsonl results/SPARSE-k20-g32-global_predictions.jsonl results/SPARSE-k20-g32-masked_predictions.jsonl
+```
+
+**Two Gemma-4 blockers had to be closed for SPARSE to be correct here**, and
+both are now in place:
+
+- **One KV cache group.** The target engine sets
+  `disable_hybrid_kv_cache_manager=True`; `sparse_target_runner` asserts the
+  group count rather than assuming it. Without this, an interleaved model's
+  heterogeneous specs produce ≥2 groups with *different block sizes*, and
+  writing one gathered block table into every layer reads unrelated physical
+  memory — silently.
+- **Sliding-window layers are excluded from the gather.** Correctness, not
+  tuning: the gather compacts the KV view, and a sliding-window kernel reads
+  window membership from a key's index within `seqused_k`, so a compacted view
+  masks the wrong keys. The contiguous force-kept tail that fixes the
+  analogous causal-masking problem cannot help — a window must be contiguous
+  in *true* positions, which a top-k block selection is not.
+
+Nothing is lost by that exclusion: a sliding layer already reads at most its
+own window, so it never had long-context KV traffic to save. On Gemma-4-E2B
+that leaves the gather operating on 7 of 35 layers — the same 1-in-6 figure
+the economics reach from the compute side.
+
 ---
 
 ## FLOP model (analytic, not hardware-measured)
@@ -691,7 +745,7 @@ eval_utils.py`.
 | `REPRODUCE.md` | Environment setup + reproduction steps |
 | `.env_exports.sh` | Local env config (model paths, HF token) |
 | `vllm_patch/` | The multi-turn Algorithm 1 implementation (SPARSE pipeline) |
-| `test_vllm_patch.py` | CPU-only unit tests — 150/150 passing |
+| `test_vllm_patch.py` | CPU-only unit tests — 153/153 passing |
 | `validate_proposer.py` | GPU-node validation: persistent speculator engine, cross-turn KV read-back |
 | `validate_runner_integration.py` | GPU-node validation: `worker_cls` wiring + multi-turn RoPE position-override correctness |
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) |

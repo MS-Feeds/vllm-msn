@@ -237,6 +237,18 @@ def compute_attention_score(
             Requires `geometry.sliding_windows`. Defaults off, so an
             unconfigured run scores exactly as before.
 
+            **Masking is exact here but not quite exact downstream**, and the
+            residual is expected rather than a bug. `aggregate_attention_score`
+            applies `avg_pool1d` AFTER the softmax, so a sliding layer's
+            in-window mass smears up to `pool_kernel_size // 2` positions past
+            its boundary, and it can occasionally win the `max` there.
+            Measured: on Gemma-4-E2B at `pool_kernel_size=13` this leaves 478
+            out-of-window wins in 3.1M votes (0.015%); with pooling off it is
+            exactly 0. Making it exactly 0 would mean re-masking after the
+            pool, which is deliberately NOT done -- those positions are
+            immediate neighbours of genuinely-attended ones, which is the same
+            boundary smoothing the pool exists to provide.
+
     Returns:
         Per-sample list of [num_layer, num_head, look_ahead_cnt, context_len]
         attention-score tensors.
