@@ -1726,6 +1726,35 @@ def test_spec_decode_padding_first_decode_step():
     assert out.scheduled_spec_decode_tokens[r2.request_id] == [-1] * num_spec
 
 
+def test_gemma4_mtp_dynamic_k_pads_and_updates_acceptance_ema():
+    num_spec = 5
+    scheduler = create_scheduler(num_speculative_tokens=num_spec)
+    scheduler._gemma4_mtp_active = True
+    scheduler._dynk_min = 3
+    scheduler._dynk_max = num_spec
+
+    req = create_requests(num_requests=1, max_tokens=16)[0]
+    scheduler.add_request(req)
+    out = scheduler.schedule()
+    _model_output(scheduler, out, [[100]])
+
+    scheduler._req_accept_ema[req.request_id] = 0.0
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([req.request_id], [[1, 2, 3, 4, 5]])
+    )
+    out = scheduler.schedule()
+
+    assert out.num_scheduled_tokens[req.request_id] == 1 + num_spec
+    assert out.scheduled_spec_decode_tokens[req.request_id] == [
+        1, 2, 3, -1, -1
+    ]
+
+    _model_output(scheduler, out, [[1, 2, 3, 101]])
+
+    # Three accepted drafts over the fixed five-slot verification shape.
+    assert scheduler._req_accept_ema[req.request_id] == pytest.approx(0.18)
+
+
 def test_spec_decode_padding_skipped_for_diffusion():
     """Diffusion spec tokens are the fixed-size denoising canvas, not
     rejectable drafts: a first-decode-step request must keep its 1-token span
