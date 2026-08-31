@@ -143,3 +143,14 @@ _resolve_hf_snapshot() {
 
 export GEMMA4_31B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-31B-it)
 export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-E2B-it)
+
+# Gemma-4-26B-A4B-it (MoE, ~3.8B active). The alternative target when only
+# two GPUs are available: ~49GB of weights fits ONE 80GB card, so the target
+# runs at TP=1 on cuda:0 and the speculator gets cuda:1 to itself -- no
+# tensor parallelism, no card sharing, no memory tuning.
+#
+# The 31B needs TP=2, which on a 2-GPU node means the speculator must share a
+# card with a target rank. Workable, but it stacks three tight budgets at
+# once. For RANKING three scorers the target barely matters -- the comparison
+# is relative -- so the simpler substrate is usually the better trade.
+export GEMMA4_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-26B-A4B-it)
