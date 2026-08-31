@@ -4407,5 +4407,55 @@ def test_gather_refuses_when_the_gathered_layers_span_groups():
         raise AssertionError("gathered layers spanning groups must raise")
 
 
+def test_model_flop_config_reads_the_text_config_and_refuses_shapes_it_cannot_model():
+    """`ModelFlopConfig` is flat -- one head_dim, one num_kv_heads, one
+    intermediate. Gemma 4 breaks that twice over (per-layer-type attention
+    geometry, MoE), so returning an approximate number would put an estimate
+    in the results CSV beside genuinely measured ones with nothing marking
+    it. Refusing is the honest answer."""
+    from flops_model import model_flop_config
+
+    class _Cfg:
+        def __init__(self, **kw):
+            self.num_attention_heads = 32
+            self.num_hidden_layers = 32
+            self.hidden_size = 4096
+            self.intermediate_size = 14336
+            self.vocab_size = 128256
+            self.num_key_value_heads = 8
+            self.head_dim = 128
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+        def get_text_config(self):
+            return self
+
+    # Llama-shaped: modelled exactly as before.
+    cfg = model_flop_config(_Cfg())
+    assert cfg is not None and cfg.num_layers == 32 and cfg.head_dim == 128
+
+    # Interleaved attention -- one head_dim cannot describe both layer types.
+    assert model_flop_config(_Cfg(
+        layer_types=["sliding_attention"] * 4 + ["full_attention"])) is None
+    # Heterogeneous head dims, even without layer_types.
+    assert model_flop_config(_Cfg(head_dim=256, global_head_dim=512)) is None
+    # MoE -- intermediate_size alone does not describe the MLP cost.
+    assert model_flop_config(_Cfg(enable_moe_block=True)) is None
+    assert model_flop_config(_Cfg(num_experts=128)) is None
+
+    # Uniform layer_types is NOT heterogeneous, and global_head_dim equal to
+    # head_dim is not either -- neither should trip the refusal.
+    assert model_flop_config(_Cfg(layer_types=["full_attention"] * 32)) is not None
+    assert model_flop_config(_Cfg(head_dim=128, global_head_dim=128)) is not None
+
+    # The wrapper case: a multimodal config with no attention fields of its
+    # own must be resolved through get_text_config(), not crash.
+    class _Wrapper:
+        def get_text_config(self):
+            return _Cfg()
+
+    assert model_flop_config(_Wrapper()) is not None
+
+
 if __name__ == "__main__":
     _run_all()

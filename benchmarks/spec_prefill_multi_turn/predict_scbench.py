@@ -1110,14 +1110,24 @@ def _target_flop_config(llm):
     config -- same `llm_engine.vllm_config.model_config.hf_config` access
     path `sparse_decode_microbench.py` uses for `bytes_per_token_kv`, so the
     two derived quantities can never disagree about the model's shape."""
-    return model_flop_config(llm.llm_engine.vllm_config.model_config.hf_config)
+    cfg = model_flop_config(llm.llm_engine.vllm_config.model_config.hf_config)
+    if cfg is None:
+        print("[predict_scbench] target model's shape cannot be expressed by "
+              "the flat FLOP model (per-layer-type attention geometry and/or "
+              "MoE) -- FLOP columns will be omitted rather than estimated. "
+              "See flops_model.model_flop_config.")
+    return cfg
 
 
 def _speculator_flop_config(proposer):
     """Speculator's `ModelFlopConfig`, read from its own persistent engine
     (`proposer.llm_engine`, see `vllm_patch/proposer.py`) rather than
     re-loading the checkpoint's config from disk."""
-    return model_flop_config(proposer.llm_engine.vllm_config.model_config.hf_config)
+    cfg = model_flop_config(proposer.llm_engine.vllm_config.model_config.hf_config)
+    if cfg is None:
+        print("[predict_scbench] speculator model's shape cannot be expressed "
+              "by the flat FLOP model -- FLOP columns will be omitted.")
+    return cfg
 
 
 def _record_turn_flops(stats, breakdown: FlopBreakdown, **flop_inputs) -> dict:
@@ -1347,21 +1357,30 @@ def run_baseline(
                 # for.
                 num_cached = output.num_cached_tokens or 0
                 out_len = len(new_output_ids)
-                bd = FlopBreakdown(
-                    target_prefill=target_prefill_flops(
-                        target_flop_cfg, len(prompt_ids), num_cached),
-                    target_decode=target_decode_flops(
-                        target_flop_cfg,
-                        dense_decode_attended_lens(
-                            len(prompt_ids), _num_decode_steps(out_len)),
-                    ),
-                )
-                flop_fields = _record_turn_flops(
-                    stats, bd,
-                    target_prompt_len=len(prompt_ids),
-                    target_cached_tokens=num_cached,
-                    decode_steps=_num_decode_steps(out_len),
-                )
+                # FLOP accounting is skipped when the model's shape cannot
+                # be expressed by the flat FLOP model (per-layer-type
+                # attention geometry and/or MoE -- see
+                # flops_model.model_flop_config). Omitting the columns is
+                # deliberate: an approximate number would land in the
+                # results CSV next to measured ones with nothing marking
+                # it as an estimate.
+                flop_fields = {}
+                if target_flop_cfg is not None:
+                    bd = FlopBreakdown(
+                        target_prefill=target_prefill_flops(
+                            target_flop_cfg, len(prompt_ids), num_cached),
+                        target_decode=target_decode_flops(
+                            target_flop_cfg,
+                            dense_decode_attended_lens(
+                                len(prompt_ids), _num_decode_steps(out_len)),
+                        ),
+                    )
+                    flop_fields = _record_turn_flops(
+                        stats, bd,
+                        target_prompt_len=len(prompt_ids),
+                        target_cached_tokens=num_cached,
+                        decode_steps=_num_decode_steps(out_len),
+                    )
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": completion.text,
@@ -1557,28 +1576,37 @@ def run_specprefill(
                 # arithmetic these two numbers settle.
                 num_cached = output.num_cached_tokens or 0
                 out_len = len(completion.token_ids)
-                bd = speculator_turn_flops(
-                    spec_flop_cfg,
-                    pool_len=result.orig_len,
-                    num_cached=result.num_cached_tokens,
-                    look_ahead=result.actual_look_ahead_cnt,
-                )
-                bd.target_prefill = target_prefill_flops(
-                    target_flop_cfg, len(prompt_ids), num_cached)
-                bd.target_decode = target_decode_flops(
-                    target_flop_cfg,
-                    dense_decode_attended_lens(
-                        len(prompt_ids), _num_decode_steps(out_len)),
-                )
-                flop_fields = _record_turn_flops(
-                    stats, bd,
-                    spec_pool_len=result.orig_len,
-                    spec_cached_tokens=result.num_cached_tokens,
-                    spec_look_ahead=result.actual_look_ahead_cnt,
-                    target_prompt_len=len(prompt_ids),
-                    target_cached_tokens=num_cached,
-                    decode_steps=_num_decode_steps(out_len),
-                )
+                # FLOP accounting is skipped when the model's shape cannot
+                # be expressed by the flat FLOP model (per-layer-type
+                # attention geometry and/or MoE -- see
+                # flops_model.model_flop_config). Omitting the columns is
+                # deliberate: an approximate number would land in the
+                # results CSV next to measured ones with nothing marking
+                # it as an estimate.
+                flop_fields = {}
+                if spec_flop_cfg is not None and target_flop_cfg is not None:
+                    bd = speculator_turn_flops(
+                        spec_flop_cfg,
+                        pool_len=result.orig_len,
+                        num_cached=result.num_cached_tokens,
+                        look_ahead=result.actual_look_ahead_cnt,
+                    )
+                    bd.target_prefill = target_prefill_flops(
+                        target_flop_cfg, len(prompt_ids), num_cached)
+                    bd.target_decode = target_decode_flops(
+                        target_flop_cfg,
+                        dense_decode_attended_lens(
+                            len(prompt_ids), _num_decode_steps(out_len)),
+                    )
+                    flop_fields = _record_turn_flops(
+                        stats, bd,
+                        spec_pool_len=result.orig_len,
+                        spec_cached_tokens=result.num_cached_tokens,
+                        spec_look_ahead=result.actual_look_ahead_cnt,
+                        target_prompt_len=len(prompt_ids),
+                        target_cached_tokens=num_cached,
+                        decode_steps=_num_decode_steps(out_len),
+                    )
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": completion.text,
@@ -2022,48 +2050,57 @@ def run_sparse_attention(
                 # which is exactly why the two scopes must stay
                 # distinguishable in the output rather than silently
                 # sharing a row name.
-                bd = speculator_turn_flops(
-                    spec_flop_cfg,
-                    pool_len=result.orig_len,
-                    num_cached=result.num_cached_tokens,
-                    look_ahead=result.actual_look_ahead_cnt,
-                )
-                if prefill_steps:
-                    # Measured per chunk, for the same reason the decode
-                    # column is measured per step: once the gather fires,
-                    # what the kernel read is decided by how the selection
-                    # lands on block boundaries, and no token-count formula
-                    # driver-side can reconstruct it.
-                    bd.target_prefill = target_sparse_prefill_flops(
-                        target_flop_cfg, prefill_steps
+                # FLOP accounting is skipped when the model's shape cannot
+                # be expressed by the flat FLOP model (per-layer-type
+                # attention geometry and/or MoE -- see
+                # flops_model.model_flop_config). Omitting the columns is
+                # deliberate: an approximate number would land in the
+                # results CSV next to measured ones with nothing marking
+                # it as an estimate.
+                flop_fields = {}
+                if spec_flop_cfg is not None and target_flop_cfg is not None:
+                    bd = speculator_turn_flops(
+                        spec_flop_cfg,
+                        pool_len=result.orig_len,
+                        num_cached=result.num_cached_tokens,
+                        look_ahead=result.actual_look_ahead_cnt,
                     )
-                else:
-                    bd.target_prefill = target_prefill_flops(
-                        target_flop_cfg,
-                        prompt_len=target_resident_len + len(delta_ids),
-                        num_cached=target_resident_len,
+                    if prefill_steps:
+                        # Measured per chunk, for the same reason the decode
+                        # column is measured per step: once the gather fires,
+                        # what the kernel read is decided by how the selection
+                        # lands on block boundaries, and no token-count formula
+                        # driver-side can reconstruct it.
+                        bd.target_prefill = target_sparse_prefill_flops(
+                            target_flop_cfg, prefill_steps
+                        )
+                    else:
+                        bd.target_prefill = target_prefill_flops(
+                            target_flop_cfg,
+                            prompt_len=target_resident_len + len(delta_ids),
+                            num_cached=target_resident_len,
+                        )
+                    # Measured per step, not derived -- these are the
+                    # block-padded lengths the kernel was actually handed.
+                    bd.target_decode = target_decode_flops(target_flop_cfg, attended_lens)
+                    flop_fields = _record_turn_flops(
+                        stats, bd,
+                        spec_pool_len=result.orig_len,
+                        spec_cached_tokens=result.num_cached_tokens,
+                        spec_look_ahead=result.actual_look_ahead_cnt,
+                        target_resident_len=target_resident_len,
+                        target_delta_len=len(delta_ids),
+                        sparse_prefill=sparse_prefill,
+                        prefill_chunks=len(prefill_steps),
+                        prefill_attended_len_mean=(
+                            sum(a for _, a in prefill_steps) / len(prefill_steps)
+                            if prefill_steps else 0
+                        ),
+                        decode_steps=len(attended_lens),
+                        decode_attended_len_mean=(
+                            sum(attended_lens) / len(attended_lens) if attended_lens else 0
+                        ),
                     )
-                # Measured per step, not derived -- these are the
-                # block-padded lengths the kernel was actually handed.
-                bd.target_decode = target_decode_flops(target_flop_cfg, attended_lens)
-                flop_fields = _record_turn_flops(
-                    stats, bd,
-                    spec_pool_len=result.orig_len,
-                    spec_cached_tokens=result.num_cached_tokens,
-                    spec_look_ahead=result.actual_look_ahead_cnt,
-                    target_resident_len=target_resident_len,
-                    target_delta_len=len(delta_ids),
-                    sparse_prefill=sparse_prefill,
-                    prefill_chunks=len(prefill_steps),
-                    prefill_attended_len_mean=(
-                        sum(a for _, a in prefill_steps) / len(prefill_steps)
-                        if prefill_steps else 0
-                    ),
-                    decode_steps=len(attended_lens),
-                    decode_attended_len_mean=(
-                        sum(attended_lens) / len(attended_lens) if attended_lens else 0
-                    ),
-                )
                 predictions.append({
                     "conversation_id": conv["id"], "turn_idx": turn_idx,
                     "config": conv["config"], "pred": pred_text,

@@ -174,24 +174,73 @@ class ModelFlopConfig:
         return self.num_layers * 2 * self.num_heads * self.head_dim * look_ahead * ctx_len
 
 
-def model_flop_config(hf_config) -> ModelFlopConfig:
-    """Derives a `ModelFlopConfig` from a HuggingFace config.
+def model_flop_config(hf_config):
+    """Derives a `ModelFlopConfig` from a HuggingFace config, or None when
+    this model's shape cannot be expressed by one.
 
     Same field-extraction fallbacks as `sparse_decode_microbench.py::
     bytes_per_token_kv` (`num_key_value_heads` defaulting to
     `num_attention_heads` for non-GQA models, `head_dim` defaulting to
     `hidden_size // num_attention_heads`) -- kept identical deliberately so
     the two derived quantities can never disagree about a model's shape.
+
+    **Reads the TEXT config.** A natively multimodal checkpoint wraps it:
+    Gemma 4's top-level `Gemma4Config` has no `num_attention_heads` at all,
+    and reading it raises an AttributeError that never mentions the wrapper.
+    `get_text_config()` returns the config itself on a text-only model, so
+    this is a no-op for Llama/Qwen.
+
+    **Returns None for a shape this dataclass cannot represent**, rather than
+    a number that would be wrong. `ModelFlopConfig` is flat -- one
+    `head_dim`, one `num_kv_heads`, one `intermediate` for the whole model --
+    and two Gemma-4 properties break that:
+
+      - Per-layer-type attention geometry. Sliding layers use `head_dim` /
+        `num_key_value_heads`; full-attention layers use `global_head_dim` /
+        `num_global_key_value_heads`, typically 2x the head dim, and may drop
+        the V projection entirely (`attention_k_eq_v`). Collapsing those to
+        one number misstates every attention FLOP.
+      - MoE. A routed block computes only `top_k` of `num_experts`, in
+        parallel with a dense MLP, so `intermediate_size` alone does not
+        describe the MLP cost either.
+
+    Emitting an approximate number here would put it in the results CSV
+    beside genuinely measured ones with nothing marking it as an estimate.
+    `benchmarks/evaluation_pipeline/hardware_metrics.py` has correct
+    per-layer accounting for Gemma-4-26B-A4B (verified against `gemma4.py`,
+    not inferred from config field names) -- but it computes ACTIVE
+    PARAMETERS and bytes-moved, not the per-stage prefill/lookahead/scoring/
+    decode breakdown this module produces, so it is a starting point for a
+    Gemma 4 FLOP model rather than a drop-in.
     """
-    num_heads = hf_config.num_attention_heads
+    cfg = (
+        hf_config.get_text_config()
+        if hasattr(hf_config, "get_text_config")
+        else hf_config
+    )
+
+    layer_types = getattr(cfg, "layer_types", None)
+    heterogeneous_attention = bool(layer_types) and len(set(layer_types)) > 1
+    global_head_dim = getattr(cfg, "global_head_dim", None)
+    heterogeneous_head_dim = (
+        global_head_dim is not None
+        and global_head_dim != getattr(cfg, "head_dim", global_head_dim)
+    )
+    is_moe = bool(getattr(cfg, "enable_moe_block", False)) or bool(
+        getattr(cfg, "num_experts", 0)
+    )
+    if heterogeneous_attention or heterogeneous_head_dim or is_moe:
+        return None
+
+    num_heads = cfg.num_attention_heads
     return ModelFlopConfig(
-        num_layers=hf_config.num_hidden_layers,
-        hidden=hf_config.hidden_size,
+        num_layers=cfg.num_hidden_layers,
+        hidden=cfg.hidden_size,
         num_heads=num_heads,
-        num_kv_heads=getattr(hf_config, "num_key_value_heads", None) or num_heads,
-        head_dim=getattr(hf_config, "head_dim", None) or (hf_config.hidden_size // num_heads),
-        intermediate=hf_config.intermediate_size,
-        vocab=hf_config.vocab_size,
+        num_kv_heads=getattr(cfg, "num_key_value_heads", None) or num_heads,
+        head_dim=getattr(cfg, "head_dim", None) or (cfg.hidden_size // num_heads),
+        intermediate=cfg.intermediate_size,
+        vocab=cfg.vocab_size,
     )
 
 
