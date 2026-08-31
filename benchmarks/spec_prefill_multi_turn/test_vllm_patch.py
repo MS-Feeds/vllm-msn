@@ -4457,5 +4457,61 @@ def test_model_flop_config_reads_the_text_config_and_refuses_shapes_it_cannot_mo
     assert model_flop_config(_Wrapper()) is not None
 
 
+def test_speculator_worker_rpc_wrappers_match_their_runner_methods():
+    """`collective_rpc` dispatches BY NAME to `SpeculatorWorker`, which
+    forwards to the identically-named `SpeculatorGPUModelRunner` method. Add
+    a parameter to one and not the other and nothing complains until the
+    first scored turn, minutes into a run:
+
+        TypeError: SpeculatorWorker.end_capture_and_score() takes from 6 to 9
+        positional arguments but 10 were given
+
+    That is exactly what happened when `mask_sliding_window` was threaded
+    through the runner alone. Compared via `ast` rather than `inspect`
+    because `speculator_worker.py` imports `vllm.v1.worker.gpu_model_runner`
+    at module scope and is not importable in this CPU-only suite -- the same
+    reason `model_structure.py` and `model_truncation.py` exist as separate
+    vLLM-free modules."""
+    import ast
+
+    source = (Path(__file__).parent / "vllm_patch" / "speculator_worker.py").read_text(
+        encoding="utf-8"
+    )
+    classes = {
+        node.name: node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.ClassDef)
+    }
+    for required in ("SpeculatorGPUModelRunner", "SpeculatorWorker"):
+        assert required in classes, f"{required} not found -- was it renamed?"
+
+    def signatures(cls):
+        return {
+            m.name: [a.arg for a in m.args.args[1:]]  # drop self
+            for m in cls.body
+            if isinstance(m, ast.FunctionDef) and not m.name.startswith("_")
+        }
+
+    runner = signatures(classes["SpeculatorGPUModelRunner"])
+    worker = signatures(classes["SpeculatorWorker"])
+    shared = sorted(set(runner) & set(worker))
+    assert "end_capture_and_score" in shared, (
+        "the scoring entry point must be paired -- if it was renamed, this "
+        "test is no longer guarding the thing it exists for"
+    )
+
+    mismatched = {
+        name: (runner[name], worker[name])
+        for name in shared
+        if runner[name] != worker[name]
+    }
+    assert not mismatched, (
+        "RPC wrapper signatures drifted from their runner methods: "
+        + "; ".join(
+            f"{name}: runner{r} vs worker{w}" for name, (r, w) in mismatched.items()
+        )
+    )
+
+
 if __name__ == "__main__":
     _run_all()

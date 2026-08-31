@@ -1167,17 +1167,27 @@ class SpeculatorWorker(Worker):
         score_aggregation: str = "max",
         score_layers: Optional[str] = None,
         score_head_set: Optional[list] = None,
+        mask_sliding_window: bool = False,
     ):
         """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
         end_capture_and_score`'s docstring for the full reasoning (in-
         process K retrieval + scoring, only the small resulting index list
         crosses `collective_rpc`).
 
-        `score_aggregation`/`score_layers` default to the reference
-        behavior, so this stays callable with the old 5-argument signature."""
+        `score_aggregation`/`score_layers`/`mask_sliding_window` default to
+        the reference behavior, so this stays callable with the old
+        5-argument signature.
+
+        **This signature must track the runner method's, and nothing checks
+        that for you.** `collective_rpc` dispatches by name to THIS class, so
+        a parameter added only to the runner surfaces as
+        `TypeError: takes from 6 to 9 positional arguments but 10 were
+        given` -- at the first scored turn, minutes into a run, not at
+        import."""
         return self.model_runner.end_capture_and_score(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
             keep_kwargs, score_aggregation, score_layers, score_head_set,
+            mask_sliding_window,
         )
 
     def end_capture_and_head_diagnostics(
