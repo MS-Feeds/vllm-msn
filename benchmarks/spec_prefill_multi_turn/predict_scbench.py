@@ -2095,6 +2095,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     from vllm_patch.model_structure import (
         has_multimodal_tower,
         native_context_length,
+        load_tokenizer,
     )
 
     label = exp_cfg["label"]
@@ -2113,7 +2114,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     if config_filter is not None:
         print(f"[predict_scbench] filtered to config(s) {sorted(config_filter)!r}: "
               f"{len(conversations)} conversations")
-    tok = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+    tok = load_tokenizer(args.target_model, trust_remote_code=True)
 
     # Clamp both max_num_batched_tokens and max_model_len to the checkpoint's
     # own native max_position_embeddings -- ported from the single-turn

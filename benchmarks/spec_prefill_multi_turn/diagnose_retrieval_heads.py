@@ -216,7 +216,7 @@ def main() -> None:
 
     from predict_scbench import GRANULARITIES, LOOK_AHEAD_CNT, POOL_KERNEL_SIZE, render_turn_query
     from vllm_patch.config import SpecConfig
-    from vllm_patch.model_structure import native_context_length
+    from vllm_patch.model_structure import load_tokenizer, native_context_length
     from vllm_patch.conversation_state import ConversationState
     from vllm_patch.proposer import SpecPrefillProposer
 
@@ -246,7 +246,7 @@ def main() -> None:
         parser.error(f"no {args.config!r} conversations present in both "
                      f"{args.samples} and {args.predictions_file}")
 
-    tok = AutoTokenizer.from_pretrained(speculator_model, trust_remote_code=True)
+    tok = load_tokenizer(speculator_model, trust_remote_code=True)
     spec_config = SpecConfig(
         keep_strategy="percentage",
         keep_kwargs={**GRANULARITIES[args.granularity], "percentage": args.keep_percentage},

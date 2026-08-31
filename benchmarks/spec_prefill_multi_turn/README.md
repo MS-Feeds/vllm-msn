@@ -612,6 +612,16 @@ At TP=1 a 31B target leaves ~4GB for KV and activations at 0.85 — not enough
 for a long context, and less than it looks because the sparse path retains KV
 outside the sliding window.
 
+**TP needs `TORCHINDUCTOR_COMPILE_THREADS=1`** (pinned in `.env_exports.sh`).
+Without it a TP run dies during `profile_run` with `AssertionError: daemonic
+processes are not allowed to have children` — vLLM's `MultiprocExecutor`
+spawns its workers as daemonic processes, and inductor then tries to start its
+own compile-worker pool inside one. The trigger is
+`VocabParallelEmbedding.forward`'s `@torch.compile`d
+`get_masked_input_and_mask`, which runs only when `tp_size > 1`. Note that
+`enforce_eager=True` does not prevent this: it disables vLLM's compilation and
+CUDA graphs, not a bare `@torch.compile` decorator inside a layer.
+
 ```bash
 python3 compare_ceiling.py --config scbench_kv results/SPARSE-k20-g32-unmasked_predictions.jsonl results/SPARSE-k20-g32-global_predictions.jsonl results/SPARSE-k20-g32-masked_predictions.jsonl
 ```

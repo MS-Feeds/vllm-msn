@@ -4287,5 +4287,57 @@ def test_native_context_length_reads_the_text_config_not_the_wrapper():
         transformers.AutoConfig = saved
 
 
+def test_load_tokenizer_only_overrides_a_malformed_extra_special_tokens():
+    """Gemma 4 declares `extra_special_tokens` as a LIST, which transformers
+    5.14.x rejects with `AttributeError: 'list' object has no attribute
+    'keys'` -- a message that never mentions the tokenizer config behind it.
+    The override must fire ONLY for that malformed shape, so a well-formed
+    checkpoint keeps the stock path."""
+    import json
+    import tempfile
+
+    import transformers
+    from vllm_patch.model_structure import load_tokenizer
+
+    captured = {}
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(path, **kwargs):
+            captured.clear()
+            captured.update(kwargs)
+            return "tokenizer"
+
+    saved = transformers.AutoTokenizer
+    transformers.AutoTokenizer = _FakeAutoTokenizer
+    try:
+        def _load(config):
+            with tempfile.TemporaryDirectory() as d:
+                if config is not None:
+                    with open(f"{d}/tokenizer_config.json", "w", encoding="utf-8") as f:
+                        json.dump(config, f)
+                return load_tokenizer(d, trust_remote_code=True)
+
+        # The Gemma 4 shape: overridden, and the caller's kwargs survive.
+        _load({"extra_special_tokens": ["<|video|>"]})
+        assert captured.get("extra_special_tokens") == {}
+        assert captured.get("trust_remote_code") is True
+
+        # Well-formed mapping: left alone, so the checkpoint's own aliases
+        # are still registered.
+        _load({"extra_special_tokens": {"video_token": "<|video|>"}})
+        assert "extra_special_tokens" not in captured
+
+        # Absent, empty list, and no config at all: nothing to override.
+        _load({})
+        assert "extra_special_tokens" not in captured
+        _load({"extra_special_tokens": []})
+        assert "extra_special_tokens" not in captured
+        _load(None)
+        assert "extra_special_tokens" not in captured
+    finally:
+        transformers.AutoTokenizer = saved
+
+
 if __name__ == "__main__":
     _run_all()

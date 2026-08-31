@@ -182,3 +182,56 @@ def native_context_length(model_path: str):
         config.get_text_config() if hasattr(config, "get_text_config") else config
     )
     return getattr(text_config, "max_position_embeddings", None)
+
+
+def load_tokenizer(model_path: str, **kwargs):
+    """`AutoTokenizer.from_pretrained` with one checkpoint quirk handled.
+
+    Gemma 4's `tokenizer_config.json` declares
+
+        "extra_special_tokens": ["<|video|>"]
+
+    as a LIST, while transformers 5.14.x expects a mapping -- it does
+    `list(special_tokens.keys())` in `_set_model_specific_special_tokens`
+    and dies with `AttributeError: 'list' object has no attribute 'keys'`,
+    a message that never mentions the tokenizer config that caused it.
+
+    Passing an empty mapping overrides the malformed value. What that costs
+    is the NAMED ATTRIBUTE alias only: `<|video|>` remains in the vocabulary
+    and still round-trips through encode/decode, it is simply not registered
+    as `tokenizer.video_token`. This pipeline is text-only by construction --
+    every request passes `mm_features=None`, and both engines zero their
+    modality limits -- so nothing here ever looks that attribute up.
+
+    The alias is NOT reconstructed as a dict, deliberately: the key would
+    become a public attribute name, and guessing it wrong would be worse than
+    not having it. A pipeline that needs the video token by name should map
+    it explicitly rather than inherit a guess made here.
+
+    Only applied when the field is actually malformed, so a well-formed
+    checkpoint (Llama, Qwen3) takes the stock path untouched.
+    """
+    import json
+    import os
+
+    from transformers import AutoTokenizer
+
+    config_path = os.path.join(model_path, "tokenizer_config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            extra = json.load(f).get("extra_special_tokens")
+    except (OSError, ValueError):
+        extra = None
+
+    if isinstance(extra, list) and extra:
+        print(
+            f"[model_structure] {model_path}: tokenizer_config.json declares "
+            f"extra_special_tokens as a list ({extra}); transformers expects a "
+            f"mapping. Loading without it -- the token(s) stay in the vocab, "
+            f"only the named-attribute alias is dropped, which this text-only "
+            f"pipeline never uses.",
+            flush=True,
+        )
+        kwargs.setdefault("extra_special_tokens", {})
+
+    return AutoTokenizer.from_pretrained(model_path, **kwargs)

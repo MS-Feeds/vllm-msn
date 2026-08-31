@@ -17,6 +17,30 @@ export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 # architecture list never growing to include Llama.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
+# Compile inductor kernels IN-PROCESS, not via a subprocess pool.
+#
+# Required whenever the target runs with tensor parallelism, and the failure
+# is not obviously about compilation:
+#
+#   AssertionError: daemonic processes are not allowed to have children
+#
+# raised from `torch._inductor.async_compile.AsyncCompile.wakeup()` during
+# `profile_run`. The chain: with TP > 1 vLLM uses `MultiprocExecutor`, which
+# spawns its `WorkerProc`s as DAEMONIC processes; `VocabParallelEmbedding.
+# forward` then calls `get_masked_input_and_mask`, which is decorated
+# `@torch.compile(dynamic=True, ...)` and runs ONLY when `tp_size > 1`;
+# inductor tries to start its own compile-worker pool from inside that
+# daemonic process, and Python refuses.
+#
+# `enforce_eager=True` does NOT prevent this. That disables vLLM's own
+# compilation and CUDA graphs, not a bare `@torch.compile` decorator inside a
+# layer -- which is why this never appeared before TP was used here.
+#
+# Costs nothing in this pipeline: with enforce_eager on both engines that
+# masking helper is about the only compiled function on the path, and it is a
+# trivial elementwise op over token ids.
+export TORCHINDUCTOR_COMPILE_THREADS=1
+
 # Target model (Llama-3.1-8B-Instruct). Reuse the same downloaded snapshot
 # path as ../spec_prefill_llama/.env_exports.sh if you already have one --
 # TODO: fill in with this node's real path (gated HF repo -- request access

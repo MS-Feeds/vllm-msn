@@ -25,6 +25,30 @@ export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 # see spec_prefill_qwen/.env_exports.sh for the full failure mode.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
+# Compile inductor kernels IN-PROCESS, not via a subprocess pool.
+#
+# Required whenever the target runs with tensor parallelism, and the failure
+# is not obviously about compilation:
+#
+#   AssertionError: daemonic processes are not allowed to have children
+#
+# raised from `torch._inductor.async_compile.AsyncCompile.wakeup()` during
+# `profile_run`. The chain: with TP > 1 vLLM uses `MultiprocExecutor`, which
+# spawns its `WorkerProc`s as DAEMONIC processes; `VocabParallelEmbedding.
+# forward` then calls `get_masked_input_and_mask`, which is decorated
+# `@torch.compile(dynamic=True, ...)` and runs ONLY when `tp_size > 1`;
+# inductor tries to start its own compile-worker pool from inside that
+# daemonic process, and Python refuses.
+#
+# `enforce_eager=True` does NOT prevent this. That disables vLLM's own
+# compilation and CUDA graphs, not a bare `@torch.compile` decorator inside a
+# layer -- which is why this never appeared before TP was used here.
+#
+# Costs nothing in this pipeline: with enforce_eager on both engines that
+# masking helper is about the only compiled function on the path, and it is a
+# trivial elementwise op over token ids.
+export TORCHINDUCTOR_COMPILE_THREADS=1
+
 # Target model. This exact snapshot path was valid on a prior node
 # ("node-0", per the 2026-07-14 rebuild this was originally copied from --
 # see ../gemma4_moe_benchmarks/.env_exports.sh). On a different/fresh node,
