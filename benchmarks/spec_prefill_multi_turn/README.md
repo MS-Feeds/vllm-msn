@@ -612,7 +612,11 @@ At TP=1 a 31B target leaves ~4GB for KV and activations at 0.85 — not enough
 for a long context, and less than it looks because the sparse path retains KV
 outside the sliding window.
 
-**TP needs `TORCHINDUCTOR_COMPILE_THREADS=1`** (pinned in `.env_exports.sh`).
+**TP needs `TORCHDYNAMO_DISABLE=1`** (pinned in `.env_exports.sh`, alongside a
+`TORCHINDUCTOR_COMPILE_THREADS=1` that is kept but is NOT sufficient on its
+own -- `AsyncCompile.wakeup()` calls `use_process_pool()`, which spawns the
+pool as part of deciding whether to use one, so the thread-count knob never
+gets a chance to prevent the spawn).
 Without it a TP run dies during `profile_run` with `AssertionError: daemonic
 processes are not allowed to have children` — vLLM's `MultiprocExecutor`
 spawns its workers as daemonic processes, and inductor then tries to start its
@@ -629,12 +633,26 @@ python3 compare_ceiling.py --config scbench_kv results/SPARSE-k20-g32-unmasked_p
 **Two Gemma-4 blockers had to be closed for SPARSE to be correct here**, and
 both are now in place:
 
-- **One KV cache group.** The target engine sets
-  `disable_hybrid_kv_cache_manager=True`; `sparse_target_runner` asserts the
-  group count rather than assuming it. Without this, an interleaved model's
-  heterogeneous specs produce ≥2 groups with *different block sizes*, and
-  writing one gathered block table into every layer reads unrelated physical
-  memory — silently.
+- **The gathered layers must share one KV cache group** — but only they.
+  The hybrid KV cache manager stays **enabled** on the target, so sliding
+  layers keep their own group and their own windowed allocation.
+  `sparse_target_runner._gatherable_group_block_size` resolves the block table
+  and block size from whichever group holds the full-attention layers, and
+  raises if they straddle groups.
+
+  An earlier version forced `disable_hybrid_kv_cache_manager=True` instead.
+  That guaranteed one group, but budgeted every sliding layer for the full
+  context it can never read: on Gemma-4-31B, 55.03 GiB of KV needed against
+  34.05 GiB available, so the engine would not start. The speculator engine
+  still sets the flag — `unmasked` scoring reads `Q·K` over the whole context
+  for *every* layer, so dropping the sliding layers' out-of-window KV there
+  would feed the control row recycled blocks.
+
+  Note the block size a group actually uses can differ from the configured
+  one: `unify_kv_cache_spec_page_size` equalises page sizes by multiplying the
+  smaller-page layers' `block_size`. Since the gather is block-granular, the
+  runner logs the block size it actually used, which is the real granularity
+  regardless of what the row name says.
 - **Sliding-window layers are excluded from the gather.** Correctness, not
   tuning: the gather compacts the KV view, and a sliding-window kernel reads
   window membership from a key's index within `seqused_k`, so a compacted view

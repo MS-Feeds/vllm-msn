@@ -1078,12 +1078,17 @@ def _make_fake_runner(
     cache_config = type("CacheConfig", (), {"block_size": block_size})()
     runner.vllm_config = type("VllmConfig", (), {"cache_config": cache_config})()
 
-    # One KV cache group, which the runner now asserts before gathering --
-    # a real model reaches this via `disable_hybrid_kv_cache_manager=True`.
-    group = type("Group", (), {"kv_cache_spec": type(
-        "Spec", (), {"block_size": block_size})()})()
+    # One KV cache group holding every layer -- the uniform-attention case.
+    # A real interleaved model has more than one, and the runner resolves the
+    # block size from whichever group holds the GATHERED (full-attention)
+    # layers; that resolution is tested separately.
+    group = type("Group", (), {
+        "kv_cache_spec": type("Spec", (), {"block_size": block_size})(),
+        "layer_names": [f"layer.{i}" for i in range(num_layers)],
+    })()
     runner.kv_cache_config = type(
         "KVCacheConfig", (), {"kv_cache_groups": [group]})()
+    runner._gatherable_group_block_size_cache = block_size
 
     num_reqs = len(req_ids)
     # Distinct physical block ids per row so _kernel_visible_positions can
@@ -4337,6 +4342,69 @@ def test_load_tokenizer_only_overrides_a_malformed_extra_special_tokens():
         assert "extra_special_tokens" not in captured
     finally:
         transformers.AutoTokenizer = saved
+
+
+def _fake_group(block_size, layer_names):
+    return type("Group", (), {
+        "kv_cache_spec": type("Spec", (), {"block_size": block_size})(),
+        "layer_names": list(layer_names),
+    })()
+
+
+def test_gather_resolves_block_size_from_the_gathered_layers_own_group():
+    """With the hybrid KV cache manager enabled, an interleaved model has a
+    group per attention type -- and their block sizes can DIFFER, because
+    `unify_kv_cache_spec_page_size` equalises page sizes by multiplying the
+    smaller-page layers' block_size. The gather is block-granular, so taking
+    `cache_config.block_size` instead of the gathered group's own value would
+    silently select different tokens than the row name claims."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    attn_metadata = {f"l{i}": object() for i in range(6)}
+    # l1, l3, l5 are full attention (gatherable) at block_size 16; the
+    # sliding layers sit in their own group whose block_size was bumped.
+    runner._gatherable_layer_names_cache = {"l1", "l3", "l5"}
+    runner.kv_cache_config = type("KVCacheConfig", (), {"kv_cache_groups": [
+        _fake_group(32, ["l0", "l2", "l4"]),
+        _fake_group(16, ["l1", "l3", "l5"]),
+    ]})()
+    cache_config = type("CacheConfig", (), {"block_size": 16})()
+    runner.vllm_config = type("VllmConfig", (), {"cache_config": cache_config})()
+
+    assert runner._gatherable_group_block_size(attn_metadata) == 16, (
+        "must take the GATHERED group's block size, not the sliding group's"
+    )
+    # Cached: layer types cannot change after load.
+    runner.kv_cache_config = None
+    assert runner._gatherable_group_block_size(attn_metadata) == 16
+
+
+def test_gather_refuses_when_the_gathered_layers_span_groups():
+    """Writing one group's block ids into another group's metadata reads
+    unrelated physical memory with nothing to notice it, so this raises and
+    names the flag that collapses the groups."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    attn_metadata = {f"l{i}": object() for i in range(4)}
+    runner._gatherable_layer_names_cache = {"l0", "l2"}
+    runner.kv_cache_config = type("KVCacheConfig", (), {"kv_cache_groups": [
+        _fake_group(16, ["l0", "l1"]),
+        _fake_group(16, ["l2", "l3"]),
+    ]})()
+    cache_config = type("CacheConfig", (), {"block_size": 16})()
+    runner.vllm_config = type("VllmConfig", (), {"cache_config": cache_config})()
+
+    try:
+        runner._gatherable_group_block_size(attn_metadata)
+    except NotImplementedError as exc:
+        assert "span" in str(exc)
+        assert "disable_hybrid_kv_cache_manager" in str(exc), (
+            "the error must name the flag that fixes it"
+        )
+    else:
+        raise AssertionError("gathered layers spanning groups must raise")
 
 
 if __name__ == "__main__":

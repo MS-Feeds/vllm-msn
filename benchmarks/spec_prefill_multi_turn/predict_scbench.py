@@ -490,10 +490,12 @@ def _build_experiments() -> dict:
     # On the SPARSE architecture -- this pipeline's actual contribution and
     # what every published row uses -- rather than the simpler `specprefill`
     # path. Two Gemma-4 blockers had to be closed first, both now in place:
-    # `disable_hybrid_kv_cache_manager=True` on the target engine (one KV
-    # cache group, asserted by the runner), and excluding sliding-window
-    # layers from the gather (a compacted view misplaces their window; see
-    # `sparse_target_runner._gatherable_layer_names`).
+    # excluding sliding-window layers from the gather (a compacted view
+    # misplaces their window; see
+    # `sparse_target_runner._gatherable_layer_names`), and resolving the block
+    # table and block size from the gathered layers' OWN KV cache group rather
+    # than assuming one global group
+    # (`sparse_target_runner._gatherable_group_block_size`).
     for suffix, variant in SCORE_MODE_VARIANTS.items():
         exp_id = f"SPARSE-k{int(SCORE_MODE_PROBE[0] * 100)}-g{SCORE_MODE_PROBE[1]}-{suffix}"
         experiments[exp_id] = {
@@ -2222,21 +2224,25 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         print("[predict_scbench] target is multimodal; zeroing modality limits "
               "(text-only workload, avoids the encoder-cache reservation)")
     if mode in SPARSE_ARCH_MODES:
-        # One KV cache group, which `sparse_target_runner` requires and now
-        # asserts. Without it, an interleaved model's heterogeneous specs
-        # produce two or more groups with DIFFERENT block sizes, and writing
-        # one gathered block table into every layer's metadata reads
-        # unrelated physical memory -- silently. Collapses those specs into a
-        # single group by rewriting SlidingWindowSpec to FullAttentionSpec
-        # (keeping `sliding_window`, so kernel masking is unaffected).
+        # The hybrid KV cache manager stays ENABLED here, deliberately.
         #
-        # No-op for a uniform-attention model: `unify_hybrid_kv_cache_specs`
-        # returns early when the specs already match, so the published Llama
-        # rows take a byte-identical path. The cost, paid only by interleaved
-        # models, is retaining KV outside the sliding window -- which this
-        # architecture needs regardless, its whole premise being a cache that
-        # is never discarded.
-        llm_kwargs["disable_hybrid_kv_cache_manager"] = True
+        # An earlier version forced it off to guarantee a single KV cache
+        # group, because the gather writes one block table into every layer
+        # it patches. That was the wrong lever: sliding-window layers are
+        # excluded from the gather anyway on correctness grounds (a compacted
+        # view misplaces their window -- see
+        # `sparse_target_runner._gatherable_layer_names`), so they never
+        # needed to share a group with the layers that ARE gathered.
+        #
+        # Forcing it off also budgets every sliding layer for the full
+        # context it can never read. On Gemma-4-31B that was the difference
+        # between 55.03 GiB of KV needed and 34.05 GiB available -- the run
+        # simply would not start. With it enabled those layers keep only
+        # their own window.
+        #
+        # What still has to hold is that the GATHERED layers share one group,
+        # which `sparse_target_runner._gatherable_group_block_size` checks and
+        # raises on, naming this flag as the fallback.
         # SparseTargetWorker, not SpecPrefillWorker -- this path never
         # physically shrinks the prompt (no RoPE-position-override
         # machinery needed at all, see sparse_target_runner.py's module

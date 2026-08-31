@@ -506,44 +506,79 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         self._gatherable_layer_names_cache = gatherable
         return gatherable
 
-    def _assert_single_kv_cache_group(self) -> None:
-        """This runner writes ONE gathered block table into every layer it
-        patches, which is only meaningful if every layer shares one block
-        table -- i.e. one KV cache group.
+    def _gatherable_group_block_size(self, attn_metadata) -> int:
+        """Block size of the KV cache group the gather operates on, and the
+        check that such a single group exists.
 
-        False by default for an interleaved model: heterogeneous specs fall
-        through `get_kv_cache_groups` to `unify_kv_cache_spec_page_size`,
-        which equalises page sizes by MULTIPLYING the smaller-page layers'
-        block_size, yielding two or more groups with DIFFERENT block sizes.
-        Patching across them writes block ids from one group's table into
-        another's metadata -- silently, with no error, reading unrelated
-        physical memory.
+        **Why this is not `cache_config.block_size`.** That is the CONFIGURED
+        value. For a model whose layers need different page sizes,
+        `unify_kv_cache_spec_page_size` equalises them by MULTIPLYING the
+        smaller-page layers' block_size, so a group's real block size can
+        differ from the configured one. The gather is block-granular, so
+        using the wrong number silently changes which tokens are selected.
 
-        `disable_hybrid_kv_cache_manager=True` collapses those specs into a
-        single group (`predict_scbench.py` sets it for this reason). Asserted
-        here rather than assumed, because the failure mode is silent
-        corruption and the fix is a flag that is easy to lose.
+        **Why one group is still required, but only across the GATHERED
+        layers.** This runner writes one gathered block table into every
+        layer it patches; that is meaningful only if those layers share a
+        block table. Sliding-window layers are excluded from the gather
+        anyway (see `_gatherable_layer_names` -- a compacted view misplaces
+        their window), so they are free to live in their own group with their
+        own, much smaller, windowed KV allocation. That is the whole point of
+        letting the hybrid KV cache manager stay enabled: those layers stop
+        being budgeted for the full context they can never read.
+
+        Concretely, on Gemma-4-31B that was the difference between needing
+        55.03 GiB of KV and having 34.05 GiB.
+
+        Raises rather than guessing if the gathered layers straddle groups:
+        picking one group's block ids and writing them into another's
+        metadata reads unrelated physical memory, with nothing to notice it.
         """
-        if getattr(self, "_single_group_checked", False):
-            return
-        groups = self.kv_cache_config.kv_cache_groups
+        cached = getattr(self, "_gatherable_group_block_size_cache", None)
+        if cached is not None:
+            return cached
+
+        gatherable = self._gatherable_layer_names(attn_metadata)
+        group_of = {}
+        for group in self.kv_cache_config.kv_cache_groups:
+            for layer_name in group.layer_names:
+                group_of[layer_name] = group
+
+        groups = {id(group_of[name]): group_of[name]
+                  for name in gatherable if name in group_of}
         if len(groups) != 1:
-            block_sizes = [g.kv_cache_spec.block_size for g in groups]
             raise NotImplementedError(
-                f"the sparse gather requires exactly one KV cache group; this "
-                f"model has {len(groups)} with block sizes {block_sizes}. "
-                f"Construct the target engine with "
-                f"`disable_hybrid_kv_cache_manager=True`."
+                f"the {len(gatherable)} gathered (full-attention) layers span "
+                f"{len(groups)} KV cache groups; the gather writes one block "
+                f"table into all of them, which is only valid within a single "
+                f"group. Construct the target engine with "
+                f"`disable_hybrid_kv_cache_manager=True` to collapse them "
+                f"(at the cost of budgeting every sliding layer for the full "
+                f"context), or extend this runner to gather per group."
             )
-        self._single_group_checked = True
+
+        group = next(iter(groups.values()))
+        block_size = group.kv_cache_spec.block_size
+        configured = self.vllm_config.cache_config.block_size
+        note = "" if block_size == configured else (
+            f" -- NOTE: differs from the configured block_size={configured}, "
+            f"so the effective gather granularity is {block_size} tokens, not "
+            f"{configured}"
+        )
+        print(
+            f"[SparseTarget] gathering {len(gatherable)} layer(s) in one KV "
+            f"cache group at block_size={block_size}{note}",
+            flush=True,
+        )
+        self._gatherable_group_block_size_cache = block_size
+        return block_size
 
     def _apply_sparse_attention_overrides(self, attn_metadata: Dict[str, object]) -> None:
         if not attn_metadata:
             return
-        self._assert_single_kv_cache_group()
 
         num_reqs = self.input_batch.num_reqs
-        block_size = self.vllm_config.cache_config.block_size
+        block_size = self._gatherable_group_block_size(attn_metadata)
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor
 

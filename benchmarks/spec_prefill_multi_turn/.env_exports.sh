@@ -41,6 +41,21 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 # trivial elementwise op over token ids.
 export TORCHINDUCTOR_COMPILE_THREADS=1
 
+# Belt-and-braces: TORCHINDUCTOR_COMPILE_THREADS=1 alone was NOT sufficient on
+# torch 2.13. Read the traceback carefully and the reason is visible --
+# `AsyncCompile.wakeup()` calls `use_process_pool()`, and that function
+# SPAWNS the pool (`cls.process_pool().submit(...)`, async_compile.py:328) as
+# part of deciding whether to use one. So the thread-count knob never gets a
+# chance to prevent the spawn that the daemonic worker forbids.
+#
+# Disabling dynamo stops the compiler being invoked at all, so the path is
+# unreachable rather than merely reconfigured. Safe here because both engines
+# already run `enforce_eager=True` -- vLLM compiles nothing, and the only
+# affected function is a trivial elementwise mask over token ids. If anyone
+# ever runs this pipeline WITHOUT enforce_eager, revisit this: it would then
+# be disabling real model compilation too.
+export TORCHDYNAMO_DISABLE=1
+
 # Target model (Llama-3.1-8B-Instruct). Reuse the same downloaded snapshot
 # path as ../spec_prefill_llama/.env_exports.sh if you already have one --
 # TODO: fill in with this node's real path (gated HF repo -- request access
