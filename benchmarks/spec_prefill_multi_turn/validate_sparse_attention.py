@@ -198,7 +198,7 @@ def main() -> None:
 
     print(f"[validate_sparse_attention] constructing target engine (worker_cls="
           f"SparseTargetWorker) from {model_path}, enforce_eager={args.enforce_eager}")
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=args.enforce_eager,
@@ -211,6 +211,18 @@ def main() -> None:
         max_num_batched_tokens=args.max_num_batched_tokens,
         block_size=args.kv_granularity,
     )
+    # Same reasoning as predict_scbench.py / proposer.py: this check is
+    # text-only, but a natively multimodal checkpoint still reserves an
+    # encoder cache and PROFILES it -- 36s and several GiB of a budget this
+    # script deliberately keeps small. Zeroing the modality limits leaves
+    # `active_modalities` empty, so the profiling never runs.
+    from vllm_patch.model_structure import has_multimodal_tower
+
+    if has_multimodal_tower(model_path):
+        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+        print("[validate_sparse_attention] multimodal checkpoint; zeroing "
+              "modality limits (text-only check)")
+    llm = LLM(**llm_kwargs)
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
 
