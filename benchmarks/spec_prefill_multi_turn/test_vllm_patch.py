@@ -2527,7 +2527,10 @@ def test_flop_summary_fields_match_the_csv_schema():
     raises mid-run, after the experiment has already been paid for."""
     turn = FlopBreakdown(spec_prefill=1e12, spec_lookahead=2e12, spec_scoring=3e12,
                          target_prefill=4e12, target_decode=10e12)
-    populated = _flop_summary_fields([turn, turn], elapsed=10.0, peak_tflops=312.0)
+    # Entries are (turn_idx, breakdown): turn 0 plus one later turn, so the
+    # excl-turn0 columns have exactly one turn to average.
+    populated = _flop_summary_fields([(0, turn), (1, turn)], elapsed=10.0,
+                                     peak_tflops=312.0)
     empty = _flop_summary_fields([], elapsed=10.0, peak_tflops=None)
     assert set(populated) == set(empty)
     missing = set(populated) - set(CSV_FIELDS)
@@ -2542,7 +2545,24 @@ def test_flop_summary_fields_match_the_csv_schema():
     assert populated["achieved_tflops_per_s"] == 4.0
     assert abs(populated["mfu"] - 4.0 / 312.0) < 1e-12
     # No peak given -> no MFU claim, rather than a guessed one.
-    assert _flop_summary_fields([turn], elapsed=1.0, peak_tflops=None)["mfu"] is None
+    assert _flop_summary_fields([(0, turn)], elapsed=1.0,
+                                peak_tflops=None)["mfu"] is None
+
+    # Turn 0 is excluded from the *_excl_turn0 columns, and the two derived
+    # shares are computed over that subset: turn 0 is the only dense prefill
+    # and dominates the plain means, so the steady-state cost is only
+    # visible with it removed.
+    heavy_turn0 = FlopBreakdown(spec_prefill=100e12, target_prefill=100e12)
+    mixed = _flop_summary_fields([(0, heavy_turn0), (1, turn), (2, turn)],
+                                 elapsed=10.0, peak_tflops=None)
+    assert mixed["spec_prefill_tflops_per_turn_excl_turn0_mean"] == 1.0
+    assert mixed["total_tflops_per_turn_excl_turn0_mean"] == 20.0
+    # r: the speculator's share of a steady-state turn.
+    assert abs(mixed["speculator_flops_fraction_excl_turn0"] - 6 / 20) < 1e-12
+    # And how much of that share is the scorer's PREFILL specifically.
+    assert abs(mixed["spec_prefill_share_of_speculator_excl_turn0"] - 1 / 6) < 1e-12
+    # The plain means still include turn 0, so they differ.
+    assert mixed["spec_prefill_tflops_per_turn_mean"] > 30.0
 
 
 def test_num_decode_steps_excludes_the_prefill_sampled_token():
@@ -4423,7 +4443,7 @@ def test_model_flop_config_reads_the_text_config_and_refuses_shapes_it_cannot_mo
     geometry, MoE), so returning an approximate number would put an estimate
     in the results CSV beside genuinely measured ones with nothing marking
     it. Refusing is the honest answer."""
-    from flops_model import model_flop_config
+    from flops_model import ModelFlopConfig, model_flop_config
 
     class _Cfg:
         def __init__(self, **kw):
@@ -4444,14 +4464,26 @@ def test_model_flop_config_reads_the_text_config_and_refuses_shapes_it_cannot_mo
     cfg = model_flop_config(_Cfg())
     assert cfg is not None and cfg.num_layers == 32 and cfg.head_dim == 128
 
-    # Interleaved attention -- one head_dim cannot describe both layer types.
-    assert model_flop_config(_Cfg(
-        layer_types=["sliding_attention"] * 4 + ["full_attention"])) is None
-    # Heterogeneous head dims, even without layer_types.
-    assert model_flop_config(_Cfg(head_dim=256, global_head_dim=512)) is None
-    # MoE -- intermediate_size alone does not describe the MLP cost.
-    assert model_flop_config(_Cfg(enable_moe_block=True)) is None
-    assert model_flop_config(_Cfg(num_experts=128)) is None
+    # Shapes the FLAT dataclass cannot describe are now handed to the
+    # per-layer model rather than refused -- it charges each layer its own
+    # attention geometry, sliding window and experts.
+    from flops_model import LayeredFlopConfig
+    for cfg in (
+        # A real interleaved model always carries a window; without one the
+        # layer types are only a label and the layers really are identical.
+        _Cfg(num_hidden_layers=5, sliding_window=512,
+             layer_types=["sliding_attention"] * 4 + ["full_attention"]),
+        _Cfg(enable_moe_block=True),
+        _Cfg(num_experts=128, top_k_experts=8, moe_intermediate_size=512,
+             use_second_mlp_block=True),
+    ):
+        assert isinstance(model_flop_config(cfg), LayeredFlopConfig)
+
+    # All-full-attention with a differing global_head_dim IS uniform -- but
+    # every layer uses global_head_dim, so the returned flat config must
+    # carry 512, not the 256 a naive read of `head_dim` would give.
+    flat = model_flop_config(_Cfg(head_dim=256, global_head_dim=512))
+    assert isinstance(flat, ModelFlopConfig) and flat.head_dim == 512
 
     # Uniform layer_types is NOT heterogeneous, and global_head_dim equal to
     # head_dim is not either -- neither should trip the refusal.
@@ -4569,6 +4601,131 @@ def test_gather_does_not_rewrite_the_sliding_layers_seq_lens():
     before = only.seq_lens.data_ptr()
     runner._privatise_gathered_seq_lens(uniform, {"l0"})
     assert only.seq_lens.data_ptr() == before, "no sliding layers means no copy"
+
+
+def _gemma4_like_config(**over):
+    class C:
+        num_attention_heads = 8
+        num_hidden_layers = 12
+        hidden_size = 1024
+        intermediate_size = 4096
+        vocab_size = 262144
+        num_key_value_heads = 4
+        head_dim = 256
+        global_head_dim = 512
+        num_global_key_value_heads = 2
+        attention_k_eq_v = True
+        sliding_window = 512
+        layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 2
+        def get_text_config(self):
+            return self
+    c = C()
+    for k, v in over.items():
+        setattr(c, k, v)
+    return c
+
+
+def test_layered_flop_config_matches_the_model_sources_per_layer_rules():
+    """Every rule here was read out of `gemma4.py`, not inferred from config
+    field names -- the combination is what the field names do not say."""
+    from flops_model import LayeredFlopConfig, model_flop_config
+
+    cfg = model_flop_config(_gemma4_like_config())
+    assert isinstance(cfg, LayeredFlopConfig) and cfg.num_layers == 12
+
+    sliding = [l for l in cfg.layers if l.sliding_window is not None]
+    full = [l for l in cfg.layers if l.sliding_window is None]
+    assert (len(sliding), len(full)) == (10, 2)
+
+    # head dim switches by layer type; global_head_dim only for full layers.
+    assert sliding[0].head_dim == 256 and full[0].head_dim == 512
+    # attention_k_eq_v applies ONLY to full layers: it drops v_proj AND
+    # switches the KV head count to num_global_key_value_heads.
+    assert sliding[0].has_v_proj is True and sliding[0].num_kv_heads == 4
+    assert full[0].has_v_proj is False and full[0].num_kv_heads == 2
+    # the window comes from config.sliding_window, and full layers have none
+    assert sliding[0].sliding_window == 512
+
+    # k_eq_v off => full layers keep v_proj and the ordinary KV head count
+    plain = model_flop_config(_gemma4_like_config(attention_k_eq_v=False))
+    plain_full = [l for l in plain.layers if l.sliding_window is None][0]
+    assert plain_full.has_v_proj is True and plain_full.num_kv_heads == 4
+
+
+def test_sliding_layers_are_charged_only_their_window():
+    """The single biggest error a flat FLOP model makes on an interleaved
+    model. A flat model charges every layer the full context; a sliding
+    layer never attends past its window."""
+    from flops_model import LayerFlopSpec
+
+    windowed = LayerFlopSpec(num_heads=8, num_kv_heads=4, head_dim=256,
+                             intermediate=4096, sliding_window=512)
+    glob = LayerFlopSpec(num_heads=8, num_kv_heads=4, head_dim=256,
+                         intermediate=4096, sliding_window=None)
+
+    # Global layer: the closed form must equal the causal triangle exactly.
+    for n in (1, 7, 64, 1000):
+        assert glob.keys_visited_prefill(n, 0) == n * (n + 1) // 2
+
+    # Windowed: capped, and far below the triangle at long context.
+    assert windowed.keys_visited_prefill(100000, 0) < glob.keys_visited_prefill(100000, 0) / 90
+    # Below the window nothing is clipped, so the two agree exactly.
+    assert windowed.keys_visited_prefill(400, 0) == glob.keys_visited_prefill(400, 0)
+
+    # Closed form must match a brute-force sum across the clipping boundary.
+    for n_new, n_cached in ((10, 0), (10, 500), (600, 0), (600, 200), (5, 511)):
+        brute = sum(min(n_cached + i + 1, 512) for i in range(n_new))
+        assert windowed.keys_visited_prefill(n_new, n_cached) == brute, (
+            n_new, n_cached)
+
+    # Decode is capped too.
+    assert windowed.keys_visited_decode(100000) == 512
+    assert glob.keys_visited_decode(100000) == 100000
+
+
+def test_moe_charges_dense_mlp_plus_active_experts_only():
+    """`Gemma4DecoderLayer.forward` says "MLP runs unconditionally" and the
+    routed block runs in ADDITION on the residual -- charging only one would
+    understate every MoE layer. And only top_k of num_experts are computed.
+
+    Note `gemma4.py` enables the block on `enable_moe_block` OR
+    `use_second_mlp_block`; `evaluation_pipeline/hardware_metrics.py` checks
+    only the first, which is why this was written from the model source."""
+    from flops_model import LayerFlopSpec, model_flop_config
+
+    hidden, inter, moe_inter = 1024, 4096, 2048
+    dense_only = LayerFlopSpec(num_heads=8, num_kv_heads=4, head_dim=256,
+                               intermediate=inter)
+    moe = LayerFlopSpec(num_heads=8, num_kv_heads=4, head_dim=256,
+                        intermediate=inter, moe_intermediate=moe_inter,
+                        num_experts=128, moe_top_k=8)
+
+    assert dense_only.mlp_flops_per_token(hidden) == 6 * hidden * inter
+    expected = (6 * hidden * inter                    # dense MLP, still paid
+                + 2 * hidden * 128                    # router
+                + 8 * 6 * hidden * moe_inter)         # top_k experts only
+    assert moe.mlp_flops_per_token(hidden) == expected
+
+    # Both config spellings must enable the experts.
+    for flag in ("enable_moe_block", "use_second_mlp_block"):
+        cfg = model_flop_config(_gemma4_like_config(
+            num_experts=128, top_k_experts=8, moe_intermediate_size=moe_inter,
+            **{flag: True}))
+        assert any(l.num_experts == 128 for l in cfg.layers), flag
+
+
+def test_uniform_models_still_take_the_flat_path():
+    """Every published Llama row was measured through `ModelFlopConfig`; a
+    uniform model must keep its exact arithmetic."""
+    from flops_model import ModelFlopConfig, model_flop_config  # noqa: F811
+
+    class Llama:
+        num_attention_heads = 32; num_hidden_layers = 32; hidden_size = 4096
+        intermediate_size = 14336; vocab_size = 128256
+        num_key_value_heads = 8; head_dim = 128
+        def get_text_config(self): return self
+
+    assert isinstance(model_flop_config(Llama()), ModelFlopConfig)
 
 
 if __name__ == "__main__":

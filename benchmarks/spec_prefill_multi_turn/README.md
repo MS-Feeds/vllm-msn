@@ -665,6 +665,85 @@ own window, so it never had long-context KV traffic to save. On Gemma-4-E2B
 that leaves the gather operating on 7 of 35 layers — the same 1-in-6 figure
 the economics reach from the compute side.
 
+**The shared-`seq_lens` bug (found on real hardware, fixed).** Excluding the
+sliding layers from the gather created a second, non-obvious problem. vLLM
+builds attention metadata per KV cache group, and on an interleaved model the
+two groups get genuinely separate `block_table` tensors — but they **share one
+`seq_lens`**. So writing the gathered (shorter) length to "only the gathered
+layers" also rewrote the sequence length all 28–50 sliding layers read. Their
+block tables stayed dense and correct, so they addressed the right physical
+blocks; they were simply told the sequence was ~80k when it was 102,349, and a
+sliding-window kernel derives its window from exactly that. Every one of them
+attended to a region unrelated to the query.
+
+The signature was distinctive once the control existed:
+
+| keep | gather active? | output |
+|---|---|---|
+| 100% (`SPARSE-k100-g32-control`) | no — returns `None` | clean, matches M000 |
+| 80% | yes | degenerate |
+| 20% | yes | degenerate |
+
+Correct output *only* where nothing is patched, regardless of how much is
+retained — which rules out information starvation and points at the write
+itself. `_privatise_gathered_seq_lens` clones `seq_lens` for the gathered
+layers before writing (one int per request, so per-step cloning is cheap;
+`block_table` is already per-group and must not be copied on the hot path),
+and `_assert_sliding_layers_unaffected` verifies it once per process and
+raises otherwise.
+
+**Invisible on Llama, and not by luck**: a uniform-attention model has one KV
+cache group, so every layer is gathered and no unpatched layer is left to
+corrupt. This bug can only exist where the gather is partial.
+
+Two things found it, after four wrong hypotheses reasoned from source: the
+`SPARSE-k100-g32-control` row (the sparse path with the gather as a provable
+no-op, isolating the gather from the session and request construction that
+M000 also differs in), and a runtime tensor-identity check. Neither required
+guessing a mechanism.
+
+### FLOP accounting on an interleaved / MoE model
+
+`flops_model.ModelFlopConfig` is flat — one `head_dim`, one `num_kv_heads`,
+one `intermediate` — which Gemma 4 breaks twice over. `LayeredFlopConfig`
+carries a `LayerFlopSpec` per layer and implements the same interface, so
+`speculator_turn_flops` / `target_prefill_flops` / `target_decode_flops` take
+either and the per-stage breakdown is identical to the Llama rows'.
+`model_flop_config` picks automatically; a genuinely uniform model still gets
+the flat config, so published Llama rows keep their exact arithmetic.
+
+Every rule was read out of `vllm/model_executor/models/gemma4.py`, not adapted
+from `evaluation_pipeline/hardware_metrics.py`, and two things came out
+differently:
+
+- **MoE is enabled by `enable_moe_block` OR `use_second_mlp_block`**
+  (`gemma4.py:645`). `hardware_metrics.py` checks only the first, so it would
+  charge zero expert FLOPs for a checkpoint configured the other way.
+- **A KV-shared layer is not cheaper.** `Gemma4Attention.forward` runs
+  `qkv_proj` unconditionally and only skips the cache *write*, so the
+  projection is paid in full. Easy to assume otherwise.
+
+The correction that matters most is **sliding windows**: a windowed layer
+never attends past its window, so charging it the full context is the single
+biggest error a flat model makes here. At a 100k prefill a sliding layer
+evaluates ~51M query-key pairs against a global layer's ~5,000M — 98× fewer.
+`attention_k_eq_v` (full-attention layers only) drops the V projection and
+switches the KV head count to `num_global_key_value_heads`.
+
+**Turn-0-excluded columns.** Turn 0 is the only dense prefill in a
+conversation and dominates every per-turn mean, so each stage now has an
+`*_excl_turn0_mean` twin — same reasoning as the existing
+`seconds_per_turn_excl_turn0_mean`. Two derived shares come with them:
+`speculator_flops_fraction_excl_turn0` (the `r` in
+`SPECULATION_ECONOMICS.md`'s win condition, measured rather than assumed) and
+`spec_prefill_share_of_speculator_excl_turn0`, which says how much of the
+scorer's cost is its prefill — the number that decides whether a cheaper
+scorer or a shorter lookahead is the lever worth pulling.
+
+**Validated after the fix**: `SPARSE-k80-g32` scores 35.3 against M000's 38.9
+on `scbench_summary` (paired delta −3.6, CI [−6.8, −1.9]) — a real but modest
+cost, and the first trustworthy sparse-attention number on Gemma 4.
+
 ---
 
 ## FLOP model (analytic, not hardware-measured)

@@ -184,6 +184,19 @@ OUT_DIR.mkdir(exist_ok=True)
 CSV_PATH = OUT_DIR / "all_runs.csv"
 DEFAULT_SAMPLES = Path(__file__).parent / "datasets" / "scbench_samples.jsonl"
 
+
+_FLOP_STAGES = ("spec_prefill", "spec_lookahead", "spec_scoring",
+                "target_prefill", "target_decode")
+_FLOP_FIELDS = (
+    [f"{s}_tflops_per_turn_mean" for s in _FLOP_STAGES]
+    + ["total_tflops_per_turn_mean", "total_tflops", "speculator_flops_fraction",
+       "spec_prefill_share_of_speculator", "achieved_tflops_per_s", "mfu"]
+    + [f"{s}_tflops_per_turn_excl_turn0_mean" for s in _FLOP_STAGES]
+    + ["total_tflops_per_turn_excl_turn0_mean",
+       "speculator_flops_fraction_excl_turn0",
+       "spec_prefill_share_of_speculator_excl_turn0"]
+)
+
 CSV_FIELDS = [
     # `scbench_config` is not derivable from anything else in the row: the
     # same exp_id run against two different --scbench-config values
@@ -212,10 +225,18 @@ CSV_FIELDS = [
     # what is and isn't counted. Per-turn means (not totals) for the stage
     # breakdown, so rows with different turn counts stay comparable;
     # total_tflops is the whole experiment, matching elapsed_time's scope.
-    "spec_prefill_tflops_per_turn_mean", "spec_lookahead_tflops_per_turn_mean",
-    "spec_scoring_tflops_per_turn_mean", "target_prefill_tflops_per_turn_mean",
-    "target_decode_tflops_per_turn_mean", "total_tflops_per_turn_mean",
-    "total_tflops", "speculator_flops_fraction", "achieved_tflops_per_s", "mfu",
+    # Turn-0-excluded twins for every stage, plus two derived shares. Turn 0
+    # is the only dense prefill in a conversation and dominates the plain
+    # means, so the steady-state cost -- what the multi-turn setting is
+    # about -- is only visible with it removed. Same reasoning as the
+    # existing `seconds_per_turn_excl_turn0_mean`.
+    #
+    # `speculator_flops_fraction_excl_turn0` is the `r` in
+    # SPECULATION_ECONOMICS.md's win condition, measured rather than
+    # assumed; `spec_prefill_share_of_speculator_excl_turn0` splits that
+    # into "how much of the scorer's cost is its prefill", which is what
+    # decides whether a cheaper scorer or a shorter lookahead is the lever.
+    *_FLOP_FIELDS,
 ]
 
 # See EXPERIMENT_PLAN.md's "SpecPrefill settings" -- algorithm hyperparameters
@@ -1112,31 +1133,26 @@ def _flop_summary_fields(turn_flops, elapsed, peak_tflops) -> dict:
     num_layers factor) -- no profiler needed to catch that class of bug.
     """
     if not turn_flops:
-        return {f: None for f in (
-            "spec_prefill_tflops_per_turn_mean", "spec_lookahead_tflops_per_turn_mean",
-            "spec_scoring_tflops_per_turn_mean", "target_prefill_tflops_per_turn_mean",
-            "target_decode_tflops_per_turn_mean", "total_tflops_per_turn_mean",
-            "total_tflops", "speculator_flops_fraction", "achieved_tflops_per_s", "mfu",
-        )}
+        return {f: None for f in _FLOP_FIELDS}
+
+    # Entries are (turn_idx, breakdown) -- see `_record_turn_flops`.
+    all_bd = [bd for _, bd in turn_flops]
+    later_bd = [bd for idx, bd in turn_flops if idx != 0]
 
     total = FlopBreakdown()
-    for bd in turn_flops:
+    for bd in all_bd:
         total += bd
-    n = len(turn_flops)
     total_tflops = total.total / _TFLOP
     achieved = total_tflops / elapsed if elapsed > 0 else None
-    return {
-        "spec_prefill_tflops_per_turn_mean": total.spec_prefill / n / _TFLOP,
-        "spec_lookahead_tflops_per_turn_mean": total.spec_lookahead / n / _TFLOP,
-        "spec_scoring_tflops_per_turn_mean": total.spec_scoring / n / _TFLOP,
-        "target_prefill_tflops_per_turn_mean": total.target_prefill / n / _TFLOP,
-        "target_decode_tflops_per_turn_mean": total.target_decode / n / _TFLOP,
-        "total_tflops_per_turn_mean": total.total / n / _TFLOP,
+
+    summary = _stage_means(all_bd)
+    summary.update(_stage_means(later_bd, prefix="_excl_turn0"))
+    summary.update({
         "total_tflops": total_tflops,
-        "speculator_flops_fraction": total.speculator_fraction,
         "achieved_tflops_per_s": achieved,
         "mfu": (achieved / peak_tflops) if (achieved and peak_tflops) else None,
-    }
+    })
+    return summary
 
 
 def _target_flop_config(llm):
@@ -1146,10 +1162,12 @@ def _target_flop_config(llm):
     two derived quantities can never disagree about the model's shape."""
     cfg = model_flop_config(llm.llm_engine.vllm_config.model_config.hf_config)
     if cfg is None:
-        print("[predict_scbench] target model's shape cannot be expressed by "
-              "the flat FLOP model (per-layer-type attention geometry and/or "
-              "MoE) -- FLOP columns will be omitted rather than estimated. "
-              "See flops_model.model_flop_config.")
+        print("[predict_scbench] target model's shape is not describable by "
+              "either FLOP model -- FLOP columns will be omitted rather than "
+              "estimated. See flops_model.model_flop_config.")
+    else:
+        print(f"[predict_scbench] target FLOP model: {type(cfg).__name__} "
+              f"({cfg.num_layers} layers)")
     return cfg
 
 
@@ -1159,12 +1177,45 @@ def _speculator_flop_config(proposer):
     re-loading the checkpoint's config from disk."""
     cfg = model_flop_config(proposer.llm_engine.vllm_config.model_config.hf_config)
     if cfg is None:
-        print("[predict_scbench] speculator model's shape cannot be expressed "
-              "by the flat FLOP model -- FLOP columns will be omitted.")
+        print("[predict_scbench] speculator model's shape is not describable "
+              "by either FLOP model -- FLOP columns will be omitted.")
+    else:
+        print(f"[predict_scbench] speculator FLOP model: {type(cfg).__name__} "
+              f"({cfg.num_layers} layers)")
     return cfg
 
 
-def _record_turn_flops(stats, breakdown: FlopBreakdown, **flop_inputs) -> dict:
+def _stage_means(breakdowns, prefix=""):
+    """Per-stage per-turn means over `breakdowns`, plus the two shares that
+    the raw stage columns make you compute by hand.
+
+    `speculator_flops_fraction` answers "what share of a turn goes to the
+    scorer", which is the term `SPECULATION_ECONOMICS.md`'s win condition
+    calls `r`. `spec_prefill_share_of_speculator` splits that further: the
+    speculator's cost is dominated by its PREFILL, with lookahead and
+    scoring nearly free, and that ratio is what says whether a cheaper
+    scorer or a shorter lookahead is the lever worth pulling.
+    """
+    if not breakdowns:
+        return {f"{s}_tflops_per_turn{prefix}_mean": None for s in _FLOP_STAGES}
+    total = FlopBreakdown()
+    for bd in breakdowns:
+        total += bd
+    n = len(breakdowns)
+    out = {f"{s}_tflops_per_turn{prefix}_mean": getattr(total, s) / n / _TFLOP
+           for s in _FLOP_STAGES}
+    out[f"total_tflops_per_turn{prefix}_mean"] = total.total / n / _TFLOP
+    speculator = total.spec_prefill + total.spec_lookahead + total.spec_scoring
+    out[f"speculator_flops_fraction{prefix}"] = (
+        speculator / total.total if total.total else None
+    )
+    out[f"spec_prefill_share_of_speculator{prefix}"] = (
+        total.spec_prefill / speculator if speculator else None
+    )
+    return out
+
+
+def _record_turn_flops(stats, breakdown: FlopBreakdown, turn_idx: int, **flop_inputs) -> dict:
     """Accumulates one turn's FLOP breakdown into `stats` and returns the
     fields to merge into that turn's prediction record.
 
@@ -1173,7 +1224,12 @@ def _record_turn_flops(stats, breakdown: FlopBreakdown, **flop_inputs) -> dict:
     analytic, so a surprising FLOP number is only debuggable if the inputs
     that produced it are visible next to it. Cheap -- a handful of ints per
     turn."""
-    stats["flops"].append(breakdown)
+    # Stored WITH the turn index so the summary can report turn-0-excluded
+    # means. Turn 0 is the only dense prefill in a conversation -- it
+    # dominates every per-turn average and is not representative of the
+    # steady state the multi-turn setting is actually about, which is
+    # exactly why `seconds_per_turn_excl_turn0_mean` already exists.
+    stats["flops"].append((turn_idx, breakdown))
     return {"flops": breakdown.as_dict(), "flop_inputs": flop_inputs}
 
 
@@ -1410,7 +1466,7 @@ def run_baseline(
                         ),
                     )
                     flop_fields = _record_turn_flops(
-                        stats, bd,
+                        stats, bd, turn_idx,
                         target_prompt_len=len(prompt_ids),
                         target_cached_tokens=num_cached,
                         decode_steps=_num_decode_steps(out_len),
@@ -1633,7 +1689,7 @@ def run_specprefill(
                             len(prompt_ids), _num_decode_steps(out_len)),
                     )
                     flop_fields = _record_turn_flops(
-                        stats, bd,
+                        stats, bd, turn_idx,
                         spec_pool_len=result.orig_len,
                         spec_cached_tokens=result.num_cached_tokens,
                         spec_look_ahead=result.actual_look_ahead_cnt,
@@ -2118,7 +2174,7 @@ def run_sparse_attention(
                     # block-padded lengths the kernel was actually handed.
                     bd.target_decode = target_decode_flops(target_flop_cfg, attended_lens)
                     flop_fields = _record_turn_flops(
-                        stats, bd,
+                        stats, bd, turn_idx,
                         spec_pool_len=result.orig_len,
                         spec_cached_tokens=result.num_cached_tokens,
                         spec_look_ahead=result.actual_look_ahead_cnt,

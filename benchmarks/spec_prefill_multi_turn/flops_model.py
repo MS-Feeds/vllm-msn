@@ -74,7 +74,7 @@ than the entire rest of the prefill.
 """
 
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -174,6 +174,307 @@ class ModelFlopConfig:
         return self.num_layers * 2 * self.num_heads * self.head_dim * look_ahead * ctx_len
 
 
+@dataclass(frozen=True)
+class LayerFlopSpec:
+    """One decoder layer's shape, for models whose layers are not identical.
+
+    Every field was read out of `vllm/model_executor/models/gemma4.py`, not
+    inferred from config field names -- see `layered_flop_config` for the
+    line-by-line derivation and for the two places a nearby implementation
+    (`evaluation_pipeline/hardware_metrics.py`) disagrees with the model
+    code.
+    """
+
+    num_heads: int
+    num_kv_heads: int
+    head_dim: int
+    intermediate: int
+    has_v_proj: bool = True
+    sliding_window: Optional[int] = None
+    moe_intermediate: int = 0
+    num_experts: int = 0
+    moe_top_k: int = 0
+
+    def qkv_flops_per_token(self, hidden: int) -> int:
+        """Q, K and (usually) V projections.
+
+        `has_v_proj=False` is Gemma 4's `attention_k_eq_v`: the checkpoint
+        has no `v_proj` at all and V is derived from the K projection's
+        output, so `QKVParallelLinear` is built with `v_head_size=0` and the
+        GEMM is genuinely smaller (gemma4.py's `Gemma4Attention.__init__`).
+
+        A KV-SHARED layer is NOT cheaper here, which is easy to assume and
+        wrong: `Gemma4Attention.forward` runs `self.qkv_proj(hidden_states)`
+        unconditionally and only skips the cache WRITE, so the projection is
+        paid in full.
+        """
+        kv_multiplier = 2 if self.has_v_proj else 1
+        return (
+            2 * hidden
+            * (self.num_heads + kv_multiplier * self.num_kv_heads)
+            * self.head_dim
+        )
+
+    def o_proj_flops_per_token(self, hidden: int) -> int:
+        return 2 * self.num_heads * self.head_dim * hidden
+
+    def mlp_flops_per_token(self, hidden: int) -> int:
+        """Dense SwiGLU MLP, plus the routed experts when this layer has them.
+
+        The dense MLP is charged even on MoE layers. `Gemma4DecoderLayer.
+        forward` is explicit -- "MLP runs unconditionally (same inputs for
+        MoE and non-MoE)" -- and the routed block runs in ADDITION, on the
+        residual. Charging only one of the two would understate every MoE
+        layer.
+
+        Only `moe_top_k` of `num_experts` are computed per token; the rest
+        are resident but untouched. The router itself is a
+        `hidden -> num_experts` GEMM.
+        """
+        dense = 6 * hidden * self.intermediate
+        if not (self.num_experts and self.moe_top_k and self.moe_intermediate):
+            return dense
+        router = 2 * hidden * self.num_experts
+        experts = self.moe_top_k * 6 * hidden * self.moe_intermediate
+        return dense + router + experts
+
+    @property
+    def attn_flops_per_query_key_pair(self) -> int:
+        # QK^T and AV: 2 GEMMs x 2 FLOPs/MAC x head_dim, per query head.
+        return 4 * self.num_heads * self.head_dim
+
+    def keys_visited_prefill(self, n_new: int, n_cached: int) -> int:
+        """How many (query, key) pairs this layer actually evaluates when
+        `n_new` tokens are prefilled on top of `n_cached` resident ones.
+
+        Query `i` sits at absolute position `n_cached + i` and attends
+        `n_cached + i + 1` keys causally -- but a sliding-window layer
+        attends at most `sliding_window` of them. Ignoring that window is
+        the single biggest error a flat FLOP model makes on an interleaved
+        model: on Gemma-4-31B, 50 of 60 layers are capped at 512 keys while
+        a flat model charges them the full context length.
+
+        Closed form rather than a loop over `n_new`, which reaches ~100k
+        here.
+        """
+        if n_new <= 0:
+            return 0
+        lo = n_cached + 1                 # keys seen by the first new query
+        hi = n_cached + n_new             # keys seen by the last new query
+        window = self.sliding_window
+        if window is None or hi <= window:
+            return (lo + hi) * (hi - lo + 1) // 2
+        if lo > window:
+            return window * (hi - lo + 1)
+        # Split: unclipped up to `window`, then clipped.
+        return (lo + window) * (window - lo + 1) // 2 + window * (hi - window)
+
+    def keys_visited_decode(self, attended_len: int) -> int:
+        if attended_len <= 0:
+            return 0
+        if self.sliding_window is None:
+            return attended_len
+        return min(attended_len, self.sliding_window)
+
+
+@dataclass(frozen=True)
+class LayeredFlopConfig:
+    """A model whose layers differ -- interleaved attention, MoE, or both.
+
+    Implements exactly the interface `ModelFlopConfig` exposes to the stage
+    functions below (`linear_flops_per_token`, `lm_head_flops`,
+    `attn_prefill_flops`, `attn_decode_step_flops`, `scoring_flops`), so
+    `speculator_turn_flops` / `target_prefill_flops` / `target_decode_flops`
+    take either without change, and the per-stage breakdown stays identical
+    to the Llama rows'.
+
+    Kept as a separate type rather than fields bolted onto
+    `ModelFlopConfig`: that type is frozen and its scalar `num_heads` /
+    `head_dim` are the whole point of its simplicity, and every published
+    Llama row was measured through it.
+    """
+
+    hidden: int
+    vocab: int
+    layers: Tuple[LayerFlopSpec, ...]
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.layers)
+
+    @property
+    def linear_flops_per_token(self) -> int:
+        return sum(
+            layer.qkv_flops_per_token(self.hidden)
+            + layer.o_proj_flops_per_token(self.hidden)
+            + layer.mlp_flops_per_token(self.hidden)
+            for layer in self.layers
+        )
+
+    @property
+    def lm_head_flops(self) -> int:
+        return 2 * self.hidden * self.vocab
+
+    def attn_prefill_flops(self, n_new: int, n_cached: int = 0) -> int:
+        if n_new <= 0:
+            return 0
+        n_cached = max(n_cached, 0)
+        return sum(
+            layer.attn_flops_per_query_key_pair
+            * layer.keys_visited_prefill(n_new, n_cached)
+            for layer in self.layers
+        )
+
+    def attn_decode_step_flops(self, attended_len: int) -> int:
+        if attended_len <= 0:
+            return 0
+        return sum(
+            layer.attn_flops_per_query_key_pair
+            * layer.keys_visited_decode(attended_len)
+            for layer in self.layers
+        )
+
+    def scoring_flops(self, look_ahead: int, ctx_len: int) -> int:
+        """`scoring.py::compute_attention_score` -- `Q @ K^T` only, no AV.
+
+        Charged over EVERY layer and the FULL context, deliberately, even
+        for sliding layers and even under `score_layers="global_only"` or
+        `mask_sliding_window`: `compute_attention_score` computes the whole
+        score tensor and the restriction is applied afterwards, by
+        `aggregate_attention_score` dropping rows or by a mask. So the
+        scoring modes change what is USED, not what is computed, and this
+        column is identical across all three.
+        """
+        if look_ahead <= 0 or ctx_len <= 0:
+            return 0
+        return sum(
+            2 * layer.num_heads * layer.head_dim * look_ahead * ctx_len
+            for layer in self.layers
+        )
+
+
+def layered_flop_config(hf_config):
+    """Build a per-layer FLOP config for an interleaved and/or MoE model.
+
+    Derived by reading `vllm/model_executor/models/gemma4.py`, since the
+    config field names alone do not say how they are combined:
+
+      - `layer_types[i] == "full_attention"` decides the layer type
+        (`Gemma4DecoderLayer.__init__`).
+      - head dim is `global_head_dim` for full-attention layers, `head_dim`
+        otherwise -- with `global_head_dim` defaulting to `head_dim`.
+      - `attention_k_eq_v` applies ONLY to full-attention layers, and when it
+        does the KV head count switches to `num_global_key_value_heads` AND
+        the V projection disappears.
+      - a sliding layer's window is `config.sliding_window`.
+      - the MoE block is enabled by `enable_moe_block` OR `use_second_mlp_block`.
+
+    That last one is a real disagreement with
+    `evaluation_pipeline/hardware_metrics.py`, which checks only
+    `enable_moe_block` and would therefore charge no expert FLOPs at all for
+    a checkpoint configured the other way. It is also the reason this was
+    written against the model source rather than adapted from that file.
+
+    Returns None when the model is uniform, so the caller falls back to the
+    simpler `ModelFlopConfig` and every published Llama row keeps its exact
+    arithmetic.
+    """
+    cfg = (
+        hf_config.get_text_config()
+        if hasattr(hf_config, "get_text_config")
+        else hf_config
+    )
+
+    num_layers = getattr(cfg, "num_hidden_layers", None)
+    hidden = getattr(cfg, "hidden_size", None)
+    if not num_layers or not hidden:
+        return None
+
+    layer_types = getattr(cfg, "layer_types", None) or ["full_attention"] * num_layers
+    if len(layer_types) != num_layers:
+        return None
+
+    head_dim = getattr(cfg, "head_dim", None) or (
+        hidden // cfg.num_attention_heads
+    )
+    global_head_dim = getattr(cfg, "global_head_dim", None) or head_dim
+    kv_heads = getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads
+    global_kv_heads = getattr(cfg, "num_global_key_value_heads", None) or kv_heads
+    k_eq_v = bool(getattr(cfg, "attention_k_eq_v", False))
+    window = getattr(cfg, "sliding_window", None)
+
+    moe_on = bool(getattr(cfg, "enable_moe_block", False)) or bool(
+        getattr(cfg, "use_second_mlp_block", False)
+    )
+    num_experts = int(getattr(cfg, "num_experts", 0) or 0)
+    moe_top_k = int(getattr(cfg, "top_k_experts", 0) or 0)
+    moe_intermediate = int(
+        getattr(cfg, "moe_intermediate_size", None)
+        or getattr(cfg, "expert_intermediate_size", None)
+        or 0
+    )
+
+    layers = []
+    for layer_type in layer_types:
+        is_full = layer_type == "full_attention"
+        use_k_eq_v = is_full and k_eq_v
+        layers.append(
+            LayerFlopSpec(
+                num_heads=cfg.num_attention_heads,
+                num_kv_heads=global_kv_heads if use_k_eq_v else kv_heads,
+                head_dim=global_head_dim if is_full else head_dim,
+                intermediate=cfg.intermediate_size,
+                has_v_proj=not use_k_eq_v,
+                sliding_window=None if is_full else window,
+                moe_intermediate=moe_intermediate if moe_on else 0,
+                num_experts=num_experts if moe_on else 0,
+                moe_top_k=moe_top_k if moe_on else 0,
+            )
+        )
+
+    # The flat `ModelFlopConfig` is exact only when every layer is
+    # genuinely identical AND unwindowed AND has no experts. Checking
+    # `layer_types` alone is not enough, and both gaps matter:
+    #
+    #   - all-`full_attention` with `global_head_dim != head_dim` looks
+    #     uniform by type, but the flat builder reads `head_dim` and would
+    #     silently use the wrong (smaller) one for every layer.
+    #   - all-`sliding_attention` also looks uniform, and the flat model has
+    #     no window at all, so it would charge full-context attention for
+    #     layers that never read past 512 keys.
+    #
+    # Compare the built specs instead, which is what actually determines
+    # whether the two models agree.
+    identical = len({
+        (l.num_heads, l.num_kv_heads, l.head_dim, l.intermediate,
+         l.has_v_proj, l.sliding_window, l.num_experts, l.moe_top_k)
+        for l in layers
+    }) == 1
+    windowed = any(l.sliding_window is not None for l in layers)
+    if identical and not windowed and not moe_on:
+        # Uniform after all -- but return the FLAT config built from the
+        # resolved layer spec rather than None. Returning None would send
+        # the caller back to `model_flop_config`'s own flat builder, which
+        # reads `head_dim` directly; on an all-`full_attention` model with
+        # `global_head_dim != head_dim` that is the wrong (smaller) value
+        # for every layer. Building it from the spec cannot disagree with
+        # the per-layer derivation above.
+        one = layers[0]
+        return ModelFlopConfig(
+            num_layers=len(layers),
+            hidden=hidden,
+            num_heads=one.num_heads,
+            num_kv_heads=one.num_kv_heads,
+            head_dim=one.head_dim,
+            intermediate=one.intermediate,
+            vocab=cfg.vocab_size,
+        )
+
+    return LayeredFlopConfig(
+        hidden=hidden, vocab=cfg.vocab_size, layers=tuple(layers)
+    )
+
+
 def model_flop_config(hf_config):
     """Derives a `ModelFlopConfig` from a HuggingFace config, or None when
     this model's shape cannot be expressed by one.
@@ -230,7 +531,13 @@ def model_flop_config(hf_config):
         getattr(cfg, "num_experts", 0)
     )
     if heterogeneous_attention or heterogeneous_head_dim or is_moe:
-        return None
+        # Not representable by this flat dataclass -- hand it to the
+        # per-layer model instead, which charges each layer its own
+        # attention geometry, its own sliding window, and its own MoE
+        # experts. Still returns None if that cannot describe it either, so
+        # a caller that gets None can still omit the columns rather than
+        # print an estimate.
+        return layered_flop_config(hf_config)
 
     num_heads = cfg.num_attention_heads
     return ModelFlopConfig(

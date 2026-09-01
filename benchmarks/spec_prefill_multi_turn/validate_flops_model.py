@@ -84,6 +84,10 @@ os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 from vllm.v1.worker.gpu_worker import Worker
 
 from flops_model import model_flop_config, target_decode_flops
+from vllm_patch.model_structure import (
+    has_multimodal_tower,
+    native_context_length,
+)
 from gpu_vs_host_timing import GpuTimedSparseTargetGPUModelRunner
 from sparse_decode_microbench import (
     InstrumentedSparseTargetWorker,
@@ -299,13 +303,15 @@ def main() -> None:
 
     sys.modules.setdefault("validate_flops_model", sys.modules[__name__])
 
-    native_max_model_len = AutoConfig.from_pretrained(
-        model_path, trust_remote_code=True).max_position_embeddings
+    # Text config, not the wrapper -- a natively multimodal checkpoint
+    # (Gemma 4) has no `max_position_embeddings` at the top level. See
+    # `vllm_patch.model_structure.native_context_length`.
+    native_max_model_len = native_context_length(model_path)
     max_model_len = args.context_tokens + args.decode_tokens + 64
     if native_max_model_len is not None:
         max_model_len = min(max_model_len, int(native_max_model_len))
 
-    llm = LLM(
+    llm_kwargs = dict(
         model=model_path,
         trust_remote_code=True,
         enforce_eager=True,
@@ -318,6 +324,14 @@ def main() -> None:
         enable_prefix_caching=True,
         async_scheduling=False,
     )
+    # Text-only check; a multimodal checkpoint would otherwise reserve and
+    # profile an encoder cache out of this script's deliberately small
+    # budget. Same treatment as predict_scbench.py / proposer.py.
+    if has_multimodal_tower(model_path):
+        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+        print("[validate_flops_model] multimodal checkpoint; zeroing modality "
+              "limits")
+    llm = LLM(**llm_kwargs)
     llm_engine = llm.llm_engine
     tok = llm.get_tokenizer()
     block_size = llm_engine.vllm_config.cache_config.block_size
