@@ -227,6 +227,14 @@ def main() -> None:
 
     ref_mean = rows[0][1]
     ref_by_conversation = rows[0][3]
+    # Decimal places, chosen from the metric's own scale rather than fixed.
+    # SCBench uses metrics on two different scales: `scbench_kv`/`qa_eng`
+    # score 0-100, where one decimal is right, but `scbench_summary` is
+    # ROUGE-L F1 on 0-1, where one decimal rounds 0.23 and 0.26 to "0.2" and
+    # "0.3" and prints every delta as "+0.0" -- the table becomes unreadable
+    # exactly when the differences are small enough to need reading.
+    _scale = max((abs(m) for _, m, _, _ in rows), default=0.0)
+    prec = 3 if _scale < 10.0 else 1
     name_width = max(len(p.stem.replace("_predictions", "")) for p, *_ in rows)
     ref_label = reference.stem.replace("_predictions", "")
     print(f"{'row'.ljust(name_width)}  {'score':>7}  {'95% CI':>16}  "
@@ -234,11 +242,11 @@ def main() -> None:
     print("-" * (name_width + 70))
     for path, mean, (lo, hi), by_conversation in rows:
         label = path.stem.replace("_predictions", "").ljust(name_width)
-        ci_str = f"[{lo:.1f}, {hi:.1f}]" if lo == lo else "n/a"
+        ci_str = f"[{lo:.{prec}f}, {hi:.{prec}f}]" if lo == lo else "n/a"
         if path == reference:
             delta, delta_ci = "", ""
         else:
-            delta = f"{mean - ref_mean:+.1f}"
+            delta = f"{mean - ref_mean:+.{prec}f}"
             if args.bootstrap:
                 dlo, dhi = paired_delta_ci(
                     by_conversation, ref_by_conversation, args.bootstrap, args.seed
@@ -247,10 +255,11 @@ def main() -> None:
                 # difference, regardless of whether the two marginal CIs
                 # to its left happen to overlap -- see paired_delta_ci.
                 excludes_zero = "" if dlo <= 0.0 <= dhi else "  *"
-                delta_ci = f"[{dlo:+.1f}, {dhi:+.1f}]{excludes_zero}"
+                delta_ci = f"[{dlo:+.{prec}f}, {dhi:+.{prec}f}]{excludes_zero}"
             else:
                 delta_ci = "n/a"
-        print(f"{label}  {mean:7.1f}  {ci_str:>16}  {delta:>10}  {delta_ci:>28}")
+        print(f"{label}  {mean:7.{prec}f}  {ci_str:>16}  {delta:>10}  "
+              f"{delta_ci:>28}")
     if args.bootstrap and len(rows) > 1:
         print("  * paired interval excludes 0 -- a real difference. Judge gaps "
               "by THIS column,\n    not by whether the marginal CIs overlap: "
@@ -301,8 +310,12 @@ def main() -> None:
             scored = scored_by_file[path]
             diffs = [abs(scored[k] - ref_scored[k]) for k in common]
             equal = sum(1 for k in common if scored[k] == ref_scored[k])
+            # Same units and precision as the score column above. It used
+            # to be scaled by 100, which on a 0-1 metric printed 0.002 as
+            # "0.2" -- indistinguishable from a score-column 0.2 meaning
+            # something a hundred times larger.
             print(f"  {path.stem.replace('_predictions', '').ljust(name_width)}  "
-                  f"{100.0 * sum(diffs) / len(diffs):12.1f}  "
+                  f"{sum(diffs) / len(diffs):12.{prec}f}  "
                   f"{f'{equal}/{len(common)}':>12}")
         print(
             "  Rows with similar means but LOW agreement are not equivalent -- "

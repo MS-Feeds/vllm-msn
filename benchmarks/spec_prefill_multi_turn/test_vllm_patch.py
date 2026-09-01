@@ -4184,9 +4184,15 @@ def test_sliding_window_layers_are_excluded_from_the_gather():
     uniform = {f"l{i}": _Attn(None) for i in range(4)}
     assert gatherable_layer_names(uniform, uniform) == set(uniform)
 
-    # A layer absent from the registry is treated as gatherable -- that is
-    # the no-lookup-needed case, and it must not silently disable the gather.
-    assert gatherable_layer_names(["unknown"], {}) == {"unknown"}
+    # A layer absent from the registry RAISES. Treating it as gatherable
+    # fails open: a key mismatch would gather every sliding layer too, and
+    # the symptom is degenerate generation rather than an exception.
+    try:
+        gatherable_layer_names(["unknown"], {"l0": _Attn(None)})
+    except KeyError as exc:
+        assert "unknown" in str(exc)
+    else:
+        raise AssertionError("an unresolvable layer name must raise")
 
     # All-sliding leaves nothing to restrict; the runner turns this into a
     # loud failure rather than a silent no-op.

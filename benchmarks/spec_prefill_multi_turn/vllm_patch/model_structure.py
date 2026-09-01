@@ -146,14 +146,32 @@ def gatherable_layer_names(layer_names, layers_by_name) -> set:
     Nothing real is lost by excluding them. A sliding layer already reads at
     most its own window, so it never had long-context KV traffic to save.
 
-    A layer with no entry in `layers_by_name` is treated as gatherable: that
-    is the uniform-attention case where no registry lookup was needed at all,
-    and the published Llama rows must keep taking an identical path.
+    **A layer missing from `layers_by_name` raises.** An earlier version
+    treated it as gatherable, on the theory that an absent entry meant a
+    uniform-attention model needing no lookup. That fails OPEN, and the
+    failure is silent: if the attention-metadata keys and the model-registry
+    keys ever disagree -- different prefixes, a multimodal wrapper, a rename
+    -- every layer including every sliding-window one is gathered, and a
+    compacted view then misplaces their windows. The symptom is degenerate
+    generation, not an exception, so nothing points back here.
+
+    The caller passes the registry it actually resolved, so a mismatch is a
+    real inconsistency worth stopping on rather than papering over.
     """
+    missing = [name for name in layer_names if name not in layers_by_name]
+    if missing:
+        known = sorted(layers_by_name)[:2]
+        raise KeyError(
+            f"{len(missing)} attention layer(s) have no entry in the model's "
+            f"layer registry, so their attention type cannot be determined -- "
+            f"e.g. {missing[:2]}. Registry keys look like {known}. Refusing to "
+            f"assume they are full-attention: gathering a sliding-window layer "
+            f"silently corrupts its window."
+        )
     return {
         name
         for name in layer_names
-        if getattr(layers_by_name.get(name), "sliding_window", None) is None
+        if getattr(layers_by_name[name], "sliding_window", None) is None
     }
 
 
