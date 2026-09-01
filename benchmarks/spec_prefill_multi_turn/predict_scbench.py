@@ -562,6 +562,42 @@ def _build_experiments() -> dict:
             "granularity": SCORE_MODE_PROBE[1],
             **variant,
         }
+    # The keep-rate SWEEP of the winning scoring mode.
+    #
+    # The three-way comparison above runs at ONE probe point (k20) because
+    # that is where scorers are distinguishable. But the question a keep-rate
+    # sweep answers -- where does quality fall off -- has to be asked of the
+    # scoring this pipeline would actually ship, and the plain
+    # `SPARSE-k{N}-g32` rows set neither fix, i.e. they sweep the DEFAULT
+    # scoring the gate showed to be corrupted on an interleaved model.
+    #
+    # `masked` is the mode swept here on the evidence available: at k20 over
+    # 70 conversations / 350 turns the three modes were indistinguishable on
+    # quality (36.1-36.3, a null), so quality could not choose between them,
+    # but agreement with the dense baseline could -- unmasked 56/350, global
+    # 107/350, masked 115/350. Both fixes roughly double agreement with
+    # dense; masked is marginally ahead and is the less invasive of the two
+    # (it restricts what each layer may READ, where `global_only` discards
+    # ~5/6 of the voting layers outright, which is its own scoring-quality
+    # risk on a model that has few global layers to begin with).
+    #
+    # Only the rates the variant loop above does not already cover, so the
+    # k20 probe row keeps its exact identity and stays comparable with the
+    # other two modes rather than being redefined here.
+    for rate in KEEP_RATES:
+        if (rate, SCORE_MODE_PROBE[1]) == SCORE_MODE_PROBE:
+            continue
+        exp_id = f"SPARSE-k{int(rate * 100)}-g{SCORE_MODE_PROBE[1]}-masked"
+        experiments[exp_id] = {
+            "label": f"Sparse attention (persistent cache) "
+                     f"keep={int(rate * 100)}% "
+                     f"granularity={SCORE_MODE_PROBE[1]} scoring=masked",
+            "mode": "sparse", "keep_mode": "keep",
+            "keep_percentage": rate,
+            "granularity": SCORE_MODE_PROBE[1],
+            **SCORE_MODE_VARIANTS["masked"],
+        }
+
     # Oracle upper bound: the SPARSE architecture, entirely unchanged --
     # same driving loop, same block-gather mechanism, same keep rate, same
     # prompt rendering -- with exactly ONE variable swapped: the importance
