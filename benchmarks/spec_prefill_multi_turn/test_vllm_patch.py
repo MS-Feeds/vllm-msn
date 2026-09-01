@@ -4728,5 +4728,40 @@ def test_uniform_models_still_take_the_flat_path():
     assert isinstance(model_flop_config(Llama()), ModelFlopConfig)
 
 
+def test_flop_configs_describe_themselves_serialisably():
+    """`validate_flops_model.py` json.dumps the config it is validating, and
+    a dataclass tuple is not serialisable -- that crashed the validator
+    after the layered model landed. Both config types now expose the same
+    `describe()`, so the caller needs no isinstance check, and the layered
+    one groups by distinct layer shape rather than emitting 60 near-copies."""
+    import json
+    from flops_model import model_flop_config
+
+    layered = model_flop_config(_gemma4_like_config())
+    payload = layered.describe()
+    json.dumps(payload)  # must not raise
+
+    assert payload["kind"] == "LayeredFlopConfig"
+    assert payload["num_layers"] == 12
+    groups = {g["kind"]: g for g in payload["layer_groups"]}
+    assert set(groups) == {"sliding", "full"}
+    assert (groups["sliding"]["count"], groups["full"]["count"]) == (10, 2)
+    # The grouping must carry the facts that distinguish the two types.
+    assert groups["sliding"]["sliding_window"] == 512
+    assert groups["full"]["sliding_window"] is None
+    assert groups["full"]["head_dim"] == 512
+    assert groups["full"]["has_v_proj"] is False
+
+    class Llama:
+        num_attention_heads = 32; num_hidden_layers = 32; hidden_size = 4096
+        intermediate_size = 14336; vocab_size = 128256
+        num_key_value_heads = 8; head_dim = 128
+        def get_text_config(self): return self
+
+    flat = model_flop_config(Llama()).describe()
+    json.dumps(flat)
+    assert flat["kind"] == "ModelFlopConfig" and flat["num_layers"] == 32
+
+
 if __name__ == "__main__":
     _run_all()

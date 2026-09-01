@@ -336,7 +336,7 @@ def main() -> None:
     tok = llm.get_tokenizer()
     block_size = llm_engine.vllm_config.cache_config.block_size
     cfg = model_flop_config(llm_engine.vllm_config.model_config.hf_config)
-    print(f"[validate_flops_model] {json.dumps(cfg.__dict__)}")
+    print(f"[validate_flops_model] {json.dumps(cfg.describe(), indent=2)}")
     print(f"[validate_flops_model] linear_flops_per_token="
           f"{cfg.linear_flops_per_token / 1e9:.2f} GFLOP, lm_head="
           f"{cfg.lm_head_flops / 1e9:.2f} GFLOP, block_size={block_size}")

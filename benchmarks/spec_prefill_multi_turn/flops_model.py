@@ -122,6 +122,12 @@ class ModelFlopConfig:
     def lm_head_flops(self) -> int:
         return 2 * self.hidden * self.vocab
 
+    def describe(self) -> dict:
+        """JSON-serialisable summary, mirroring `LayeredFlopConfig.describe`
+        so a caller can print either without an isinstance check."""
+        return {"kind": "ModelFlopConfig", **self.__dict__,
+                "linear_flops_per_token": self.linear_flops_per_token}
+
     # -- attention ---------------------------------------------------------
 
     @property
@@ -351,6 +357,50 @@ class LayeredFlopConfig:
             2 * layer.num_heads * layer.head_dim * look_ahead * ctx_len
             for layer in self.layers
         )
+
+
+    def describe(self) -> dict:
+        """JSON-serialisable summary, grouped by DISTINCT layer shape.
+
+        A 60-layer Gemma 4 config has 60 `LayerFlopSpec`s but only two
+        distinct shapes; printing all 60 buries the two facts a reader
+        needs (how many of each, and what each charges). Grouping also makes
+        a mis-derived layer obvious -- three groups where there should be
+        two, or a count that does not match the interleave ratio.
+        """
+        from collections import Counter
+
+        counts = Counter(
+            (l.num_heads, l.num_kv_heads, l.head_dim, l.intermediate,
+             l.has_v_proj, l.sliding_window, l.moe_intermediate,
+             l.num_experts, l.moe_top_k)
+            for l in self.layers
+        )
+        groups = []
+        for shape, n in counts.most_common():
+            (num_heads, num_kv_heads, head_dim, intermediate, has_v_proj,
+             window, moe_intermediate, num_experts, moe_top_k) = shape
+            groups.append({
+                "count": n,
+                "kind": "sliding" if window is not None else "full",
+                "sliding_window": window,
+                "num_heads": num_heads,
+                "num_kv_heads": num_kv_heads,
+                "head_dim": head_dim,
+                "has_v_proj": has_v_proj,
+                "intermediate": intermediate,
+                "moe": ({"experts": num_experts, "top_k": moe_top_k,
+                         "intermediate": moe_intermediate}
+                        if num_experts and moe_top_k else None),
+            })
+        return {
+            "kind": "LayeredFlopConfig",
+            "hidden": self.hidden,
+            "vocab": self.vocab,
+            "num_layers": self.num_layers,
+            "linear_flops_per_token": self.linear_flops_per_token,
+            "layer_groups": groups,
+        }
 
 
 def layered_flop_config(hf_config):
