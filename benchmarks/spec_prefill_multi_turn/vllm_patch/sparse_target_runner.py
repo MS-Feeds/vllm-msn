@@ -506,6 +506,61 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         self._gatherable_layer_names_cache = gatherable
         return gatherable
 
+    def _privatise_gathered_seq_lens(self, attn_metadata, gatherable) -> None:
+        """Give the gathered layers their own `seq_lens` tensor before it is
+        written to.
+
+        **Confirmed on real hardware, and the cause of total generation
+        collapse on Gemma 4.** vLLM builds attention metadata per KV cache
+        group, and on an interleaved model the sliding and full-attention
+        layers land in different groups with genuinely separate
+        `block_table` tensors -- but they SHARE one `seq_lens` tensor. So
+        `seq_lens[req_idx] = gathered_seq_len`, applied to "only the
+        gathered layers", also rewrites the sequence length every
+        sliding-window layer reads.
+
+        Their block table stays dense and correct, so they still address the
+        right physical blocks; they are simply told the sequence is shorter
+        than it is. A sliding-window kernel derives its window from the
+        sequence length, so the window lands in the wrong place -- every one
+        of them attends to a region that has nothing to do with the query.
+
+        The observed signature matched exactly: correct output at keep=100%
+        (the gather returns None, nothing is written), degenerate output at
+        ANY lower keep rate regardless of how much was retained, and only
+        mild damage in `validate_sparse_attention.py`, whose context is
+        smaller than one window so a misplaced window still covers most of
+        it.
+
+        Invisible on Llama, and not by luck: a uniform-attention model has
+        ONE KV cache group, so every layer is gathered and there is no
+        unpatched layer left to corrupt. This bug can only exist where the
+        gather is partial.
+
+        Cloned per step rather than once, because the stock builder rebuilds
+        the metadata every step and re-establishes the aliasing. Cheap:
+        `seq_lens` holds one int per request, unlike `block_table`, which is
+        already per-group and must NOT be copied on the hot path.
+        """
+        shared_with_sliding = {
+            self._get_field(md, _SEQ_LENS_FIELD).data_ptr()
+            for name, md in attn_metadata.items()
+            if name not in gatherable
+        }
+        if not shared_with_sliding:
+            return  # uniform-attention model: nothing to protect
+
+        clones: Dict[int, object] = {}
+        for name in gatherable:
+            layer_metadata = attn_metadata[name]
+            seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
+            ptr = seq_lens.data_ptr()
+            if ptr not in shared_with_sliding:
+                continue
+            if ptr not in clones:
+                clones[ptr] = seq_lens.clone()
+            setattr(layer_metadata, _SEQ_LENS_FIELD, clones[ptr])
+
     def _assert_sliding_layers_unaffected(self, attn_metadata, req_idx: int) -> None:
         """Verify, ONCE, that patching the gathered layers does not also
         mutate what the sliding-window layers read.
@@ -887,6 +942,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             padded_block_table_row = gathered_block_table_row
 
         gatherable = self._gatherable_layer_names(attn_metadata)
+        # MUST precede the write: the gathered layers share `seq_lens` with
+        # the sliding ones, so writing without this corrupts every sliding
+        # layer's window. See `_privatise_gathered_seq_lens`.
+        self._privatise_gathered_seq_lens(attn_metadata, gatherable)
         self._assert_sliding_layers_unaffected(attn_metadata, req_idx)
         for layer_name, layer_metadata in attn_metadata.items():
             if layer_name not in gatherable:

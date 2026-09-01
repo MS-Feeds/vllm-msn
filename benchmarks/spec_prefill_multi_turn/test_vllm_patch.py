@@ -4523,5 +4523,53 @@ def test_speculator_worker_rpc_wrappers_match_their_runner_methods():
     )
 
 
+def test_gather_does_not_rewrite_the_sliding_layers_seq_lens():
+    """The bug that collapsed generation on Gemma 4, in one test.
+
+    vLLM builds attention metadata per KV cache group. On an interleaved
+    model the sliding and full-attention layers get genuinely separate
+    `block_table` tensors -- but SHARE one `seq_lens`. Writing the gathered
+    (shorter) length therefore also told all 28 sliding layers the sequence
+    was shorter than it is, and a sliding-window kernel derives its window
+    from that length, so every one of them attended to the wrong region.
+
+    Invisible on a uniform-attention model, and not by luck: one KV cache
+    group means every layer is gathered and there is no unpatched layer left
+    to corrupt."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    shared_seq_lens = torch.tensor([102349], dtype=torch.int32)
+    sliding_blocks = torch.arange(64, dtype=torch.int64).reshape(1, 64)
+    gathered_blocks = torch.arange(100, 164, dtype=torch.int64).reshape(1, 64)
+
+    # Separate block_table per group, ONE shared seq_lens -- the real layout.
+    sliding_md = _FakeLayerMetadata(
+        block_table=sliding_blocks, seq_lens=shared_seq_lens, max_seq_len=102349)
+    gathered_md = _FakeLayerMetadata(
+        block_table=gathered_blocks, seq_lens=shared_seq_lens, max_seq_len=102349)
+    attn_metadata = {"sliding.0": sliding_md, "full.1": gathered_md}
+    assert sliding_md.seq_lens.data_ptr() == gathered_md.seq_lens.data_ptr()
+
+    runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+
+    # The gathered layer now owns its tensor; the sliding one still points at
+    # the original, with its value intact.
+    assert gathered_md.seq_lens.data_ptr() != sliding_md.seq_lens.data_ptr()
+    gathered_md.seq_lens[0] = 81000          # what the gather would write
+    assert int(sliding_md.seq_lens[0]) == 102349, (
+        "writing the gathered length must not change what the sliding layers read"
+    )
+
+    # Uniform-attention model: every layer gathered, nothing to protect, and
+    # no clone made -- the published Llama rows keep the identical path.
+    only = _FakeLayerMetadata(
+        block_table=gathered_blocks, seq_lens=shared_seq_lens, max_seq_len=102349)
+    uniform = {"l0": only}
+    before = only.seq_lens.data_ptr()
+    runner._privatise_gathered_seq_lens(uniform, {"l0"})
+    assert only.seq_lens.data_ptr() == before, "no sliding layers means no copy"
+
+
 if __name__ == "__main__":
     _run_all()
