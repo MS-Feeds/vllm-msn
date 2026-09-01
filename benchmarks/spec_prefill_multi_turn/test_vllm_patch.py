@@ -2591,6 +2591,10 @@ def test_oracle_rows_pair_one_to_one_with_a_sparse_row():
         for cfg in EXPERIMENTS.values()
         if cfg["mode"] == "sparse"
         and cfg["granularity"] == EXPERIMENTS[oracle_ids[0]]["granularity"]
+        # Diagnostic control rows are exempt: they exist to isolate a
+        # mechanism, not to measure a keep rate, so they have no oracle
+        # partner by design.
+        and not cfg.get("control")
     }
     assert oracle_rates == sparse_rates_at_oracle_gran, (
         f"oracle keep rates {sorted(oracle_rates)} do not cover the SPARSE "

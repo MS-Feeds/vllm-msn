@@ -273,16 +273,48 @@ def main() -> None:
     print(f"actual blocks gathered per decode step (from the real kernel-facing metadata): {block_counts}")
     print(f"{'=' * 90}")
 
-    if block_counts and all(b == len(expected_block_indices) for b in block_counts):
-        print("\n[MATCH] the gather mechanism is patching exactly the expected block count every step -- "
-              "the corruption, if the generated text below is still garbage, is NOT in position "
-              "translation or block selection. Look further downstream: the attention kernel call itself, "
-              "or scheduler_metadata staleness (flagged in sparse_target_runner.py's own docstring as "
-              "unverified).")
+    expected = len(expected_block_indices)
+    # The force-keep tail makes the count GROW during a turn, by design: each
+    # decode step must be able to attend to the tokens this turn has already
+    # generated, so `tail_blocks = range(boundary_block, dynamic_end)` picks
+    # up another block every time generation crosses a block boundary. A
+    # prompt ending k tokens short of a boundary therefore gives k steps at
+    # `expected`, then `expected + 1`, and so on.
+    #
+    # An earlier version of this check required every step to equal
+    # `expected` exactly and reported that growth as "[MISMATCH] ... this is
+    # the bug", which is precisely backwards -- without the growth the model
+    # could not see its own output. What actually indicates a bug is the
+    # FIRST step disagreeing (the selection itself is wrong), the count
+    # DECREASING (blocks vanishing mid-turn), or growth faster than decode
+    # can cross boundaries.
+    max_tail_growth = -(-args.decode_tokens // block_size) + 1
+    first_ok = bool(block_counts) and block_counts[0] == expected
+    monotonic = all(b <= c for b, c in zip(block_counts, block_counts[1:]))
+    growth = (max(block_counts) - block_counts[0]) if block_counts else 0
+
+    if first_ok and monotonic and growth <= max_tail_growth:
+        print(f"\n[MATCH] the gather patched exactly the expected {expected} blocks on the "
+              f"first decode step, growing to {max(block_counts)} as the force-keep tail "
+              f"picked up newly generated tokens (at most {max_tail_growth} block(s) for "
+              f"{args.decode_tokens} decode tokens at block_size={block_size} -- expected, "
+              f"not drift).\n"
+              f"So the corruption, if the generated text below is still garbage, is NOT in "
+              f"position translation or block selection. Look further downstream: the "
+              f"attention kernel call itself, or backend-specific scheduling state that the "
+              f"gather does not invalidate (sparse_target_runner.py flags this as unverified "
+              f"for any backend other than FlashAttention).")
     else:
-        print(f"\n[MISMATCH] expected {len(expected_block_indices)} blocks but the gather reported "
-              f"{block_counts} -- this is the bug, and it's in position translation or block selection, "
-              f"not further downstream.")
+        reason = (
+            f"first step gathered {block_counts[0] if block_counts else 'nothing'}, "
+            f"expected {expected}" if not first_ok else
+            "block count DECREASED during the turn" if not monotonic else
+            f"count grew by {growth}, more than the {max_tail_growth} block(s) the "
+            f"force-keep tail can account for"
+        )
+        print(f"\n[MISMATCH] {reason}. Actual per-step counts: {block_counts}. "
+              f"This points at position translation or block selection, not further "
+              f"downstream.")
 
     if last_output is not None:
         generated_text = tgt_tok.decode(last_output.outputs[0].token_ids, skip_special_tokens=True)

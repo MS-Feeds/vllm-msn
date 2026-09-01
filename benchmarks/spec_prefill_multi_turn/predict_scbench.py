@@ -476,6 +476,40 @@ def _build_experiments() -> dict:
                 "mode": "specprefill", "keep_mode": "keep",
                 "keep_percentage": rate, "granularity": gran_name,
             }
+    # ---- Diagnostic control: the SPARSE path with the gather as a no-op ----
+    #
+    # keep=100% selects every position, so
+    # `compute_sparse_gather_view_incremental` hits its "selection covers the
+    # entire resident cache" branch and returns None -- no block_table,
+    # seq_lens or max_seq_len is ever patched. Everything ELSE the sparse
+    # architecture does still runs: the resumable session, the hand-built
+    # `EngineCoreRequest`, the per-turn delta rendering, the speculator's
+    # scoring pass.
+    #
+    # That is the control the matrix was missing. M000 is NOT it: M000 goes
+    # through `run_baseline`, a different driving loop with a different
+    # prompt rendering and the ordinary `add_request` path. So an M000-vs-
+    # SPARSE gap conflates the gather with everything else that differs.
+    # This row differs from a real SPARSE row in exactly one thing -- whether
+    # any block is actually withheld.
+    #
+    # Reading it: garbage here means the fault is NOT the gather (nothing was
+    # gathered), and the session/request construction is where to look --
+    # registered stop tokens being the documented suspect, since the
+    # hand-built request bypasses `input_processor.process_inputs`. Clean
+    # output here while k80 is garbage isolates the fault to the gather.
+    #
+    # `control: True` keeps it out of the ORACLE pairing invariant: it is a
+    # diagnostic, not a keep-rate row, and it deliberately has no oracle
+    # partner.
+    experiments[f"SPARSE-k100-g{SCORE_MODE_PROBE[1]}-control"] = {
+        "label": "Sparse-path control: keep=100% (gather is a provable no-op, "
+                 "session and request construction unchanged)",
+        "mode": "sparse", "keep_mode": "keep",
+        "keep_percentage": 1.0, "granularity": SCORE_MODE_PROBE[1],
+        "control": True,
+    }
+
     # ---- Interleaved-attention scoring comparison (Gemma 3/3n/4, Llama 4) --
     #
     # Three ways to score a model whose layers mostly cannot see the whole
