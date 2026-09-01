@@ -506,6 +506,75 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         self._gatherable_layer_names_cache = gatherable
         return gatherable
 
+    def _assert_sliding_layers_unaffected(self, attn_metadata, req_idx: int) -> None:
+        """Verify, ONCE, that patching the gathered layers does not also
+        mutate what the sliding-window layers read.
+
+        The gather compacts the KV view, which is only legal for
+        full-attention layers -- a sliding layer's kernel derives window
+        membership from a key's index within `seqused_k`, so a compacted
+        view silently misplaces its window (see
+        `_gatherable_layer_names`). This runner therefore patches only the
+        gathered layers' metadata.
+
+        That is sound only if the two sets do not SHARE the underlying
+        tensors. vLLM builds attention metadata per KV cache group, and
+        several layers routinely reference one metadata object; if a
+        `block_table` or `seq_lens` tensor is shared across the gathered and
+        sliding sets, then "patching only the gathered layers" mutates both,
+        and every sliding layer reads a compacted view it cannot interpret.
+
+        The symptom would be exactly what was observed: correct output when
+        the gather is a no-op (keep=100%), degenerate output at ANY lower
+        keep rate regardless of how much is retained, and only mild damage in
+        a small-context validator where the whole sequence fits inside one
+        window anyway.
+
+        Checked once per process rather than per step: tensor identity is
+        fixed by how the metadata was built, so one comparison settles it,
+        and a silent-corruption bug is worth one comparison.
+        """
+        if getattr(self, "_alias_checked", False):
+            return
+        self._alias_checked = True
+
+        gatherable = self._gatherable_layer_names(attn_metadata)
+        witnesses = [n for n in attn_metadata if n not in gatherable]
+        if not witnesses or not gatherable:
+            return
+
+        witness = attn_metadata[witnesses[0]]
+        before_blocks = self._get_field(witness, _BLOCK_TABLE_FIELD)[req_idx].clone()
+        before_seq_len = int(self._get_field(witness, _SEQ_LENS_FIELD)[req_idx].item())
+
+        sample = attn_metadata[next(iter(gatherable))]
+        shares_block_table = (
+            self._get_field(sample, _BLOCK_TABLE_FIELD).data_ptr()
+            == self._get_field(witness, _BLOCK_TABLE_FIELD).data_ptr()
+        )
+        shares_seq_lens = (
+            self._get_field(sample, _SEQ_LENS_FIELD).data_ptr()
+            == self._get_field(witness, _SEQ_LENS_FIELD).data_ptr()
+        )
+        print(
+            f"[SparseTarget] alias check: gathered vs sliding layers share "
+            f"block_table={shares_block_table}, seq_lens={shares_seq_lens} "
+            f"(witness={witnesses[0]!r}, sample={next(iter(gatherable))!r}); "
+            f"witness seq_len={before_seq_len}",
+            flush=True,
+        )
+        if shares_block_table or shares_seq_lens:
+            raise RuntimeError(
+                "the gathered (full-attention) layers and the sliding-window "
+                "layers SHARE their attention-metadata tensors, so patching "
+                "the former also compacts the view the latter read -- which "
+                "misplaces every sliding layer's window and corrupts "
+                "generation. The gather cannot be applied per-layer against "
+                "this metadata layout; it needs per-group metadata objects, "
+                "or a copy-on-write of the tensors it patches."
+            )
+        self._alias_witness = (witnesses[0], before_blocks, before_seq_len, req_idx)
+
     def _gatherable_group_block_size(self, attn_metadata) -> int:
         """Block size of the KV cache group the gather operates on, and the
         check that such a single group exists.
@@ -818,6 +887,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             padded_block_table_row = gathered_block_table_row
 
         gatherable = self._gatherable_layer_names(attn_metadata)
+        self._assert_sliding_layers_unaffected(attn_metadata, req_idx)
         for layer_name, layer_metadata in attn_metadata.items():
             if layer_name not in gatherable:
                 continue  # sliding-window layer: see _gatherable_layer_names
