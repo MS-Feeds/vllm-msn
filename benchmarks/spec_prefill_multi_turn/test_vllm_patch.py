@@ -4652,6 +4652,64 @@ def test_layered_flop_config_matches_the_model_sources_per_layer_rules():
     assert plain_full.has_v_proj is True and plain_full.num_kv_heads == 4
 
 
+def test_double_wide_mlp_widens_only_the_kv_shared_layers():
+    """`Gemma4DecoderLayer.__init__` doubles `intermediate_size` when
+    `use_double_wide_mlp` is set -- but ONLY on layers at or past
+    `num_hidden_layers - num_kv_shared_layers`.
+
+    This is not a cosmetic term. The MLP is the large majority of a layer's
+    linear work, so widening 20 of E2B's 35 layers moves per-token FLOPs by
+    roughly half. Its absence was what `validate_flops_model.py` Check A was
+    reporting as a CONSTANT measured/predicted ratio of ~1.47 across prefill
+    and every decode step -- the signature of a missing per-token term."""
+    from flops_model import model_flop_config
+
+    base = model_flop_config(_gemma4_like_config(num_kv_shared_layers=4))
+    wide = model_flop_config(_gemma4_like_config(
+        num_kv_shared_layers=4, use_double_wide_mlp=True))
+
+    # 12 layers, last 4 shared => layers 8..11 widen, 0..7 untouched.
+    assert [l.intermediate for l in wide.layers] == [4096] * 8 + [8192] * 4
+    assert [l.intermediate for l in base.layers] == [4096] * 12
+
+    # And the flag alone does nothing without shared layers to apply it to:
+    # `first_kv_shared_layer_idx > 0` is a chained guard in the model source.
+    none_shared = model_flop_config(_gemma4_like_config(
+        num_kv_shared_layers=0, use_double_wide_mlp=True))
+    assert [l.intermediate for l in none_shared.layers] == [4096] * 12
+
+    # The widening must show up in per-token cost, not just the dataclass.
+    assert wide.linear_flops_per_token > base.linear_flops_per_token
+
+
+def test_per_layer_embeddings_are_charged_per_token():
+    """Per-Layer Embeddings are real GEMMs on the forward path, and a
+    conventional transformer FLOP model has no term for them.
+
+    Two per decoder layer (`per_layer_input_gate`, `per_layer_projection`,
+    used at `gemma4.py:806-810`) plus one model-level
+    `per_layer_model_projection` into `hidden_size_per_layer_input *
+    num_hidden_layers` (`gemma4.py:1050`, used at `:940`). The embedding
+    table itself is a lookup and correctly contributes nothing."""
+    from flops_model import LayeredFlopConfig, model_flop_config
+
+    ple = 64
+    off = model_flop_config(_gemma4_like_config())
+    on = model_flop_config(_gemma4_like_config(hidden_size_per_layer_input=ple))
+    assert isinstance(on, LayeredFlopConfig)
+
+    hidden, layers = 1024, 12
+    expected = (
+        layers * 4 * hidden * ple          # per-layer gate + projection
+        + 2 * hidden * layers * ple        # model-level per_layer_model_projection
+    )
+    assert on.linear_flops_per_token - off.linear_flops_per_token == expected
+    assert on.ple_total_dim == ple * layers
+
+    # PLE is per-token work only: it must not touch the attention terms.
+    assert on.attn_prefill_flops(1000, 0) == off.attn_prefill_flops(1000, 0)
+
+
 def test_sliding_layers_are_charged_only_their_window():
     """The single biggest error a flat FLOP model makes on an interleaved
     model. A flat model charges every layer the full context; a sliding

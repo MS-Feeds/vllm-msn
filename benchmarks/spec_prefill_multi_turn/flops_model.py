@@ -200,6 +200,7 @@ class LayerFlopSpec:
     moe_intermediate: int = 0
     num_experts: int = 0
     moe_top_k: int = 0
+    ple_dim: int = 0
 
     def qkv_flops_per_token(self, hidden: int) -> int:
         """Q, K and (usually) V projections.
@@ -243,6 +244,26 @@ class LayerFlopSpec:
         router = 2 * hidden * self.num_experts
         experts = self.moe_top_k * 6 * hidden * self.moe_intermediate
         return dense + router + experts
+
+    def ple_flops_per_token(self, hidden: int) -> int:
+        """Per-Layer Embeddings, the mechanism that makes Gemma-4-E2B "2.3B
+        effective of 5.1B total" -- and pure per-token GEMM work that a
+        conventional transformer FLOP model has no term for.
+
+        Two `ReplicatedLinear`s per decoder layer
+        (`Gemma4DecoderLayer.__init__`): `per_layer_input_gate`
+        (hidden -> hidden_size_per_layer_input) and `per_layer_projection`
+        (back to hidden). The model-level `per_layer_model_projection` is
+        charged once per token by `LayeredFlopConfig`, not here.
+
+        Omitting this was measurable, not theoretical: `validate_flops_model.py`
+        Check A on E2B reported a CONSTANT measured/predicted ratio of 1.472
+        across prefill and every decode step -- the signature of a missing
+        per-token term rather than a wrong shape.
+        """
+        if self.ple_dim <= 0:
+            return 0
+        return 4 * hidden * self.ple_dim
 
     @property
     def attn_flops_per_query_key_pair(self) -> int:
@@ -303,6 +324,7 @@ class LayeredFlopConfig:
     hidden: int
     vocab: int
     layers: Tuple[LayerFlopSpec, ...]
+    ple_total_dim: int = 0
 
     @property
     def num_layers(self) -> int:
@@ -310,12 +332,18 @@ class LayeredFlopConfig:
 
     @property
     def linear_flops_per_token(self) -> int:
-        return sum(
+        per_layer = sum(
             layer.qkv_flops_per_token(self.hidden)
             + layer.o_proj_flops_per_token(self.hidden)
             + layer.mlp_flops_per_token(self.hidden)
+            + layer.ple_flops_per_token(self.hidden)
             for layer in self.layers
         )
+        # `per_layer_model_projection`: hidden -> total_ple_dim, where
+        # `total_ple_dim = hidden_size_per_layer_input * num_hidden_layers`
+        # (gemma4.py:1050). Once per token for the whole model, not per
+        # layer -- the per-layer gate/projection pair is charged above.
+        return per_layer + 2 * self.hidden * self.ple_total_dim
 
     @property
     def lm_head_flops(self) -> int:
@@ -373,13 +401,14 @@ class LayeredFlopConfig:
         counts = Counter(
             (l.num_heads, l.num_kv_heads, l.head_dim, l.intermediate,
              l.has_v_proj, l.sliding_window, l.moe_intermediate,
-             l.num_experts, l.moe_top_k)
+             l.num_experts, l.moe_top_k, l.ple_dim)
             for l in self.layers
         )
         groups = []
         for shape, n in counts.most_common():
             (num_heads, num_kv_heads, head_dim, intermediate, has_v_proj,
-             window, moe_intermediate, num_experts, moe_top_k) = shape
+             window, moe_intermediate, num_experts, moe_top_k,
+             ple_dim) = shape
             groups.append({
                 "count": n,
                 "kind": "sliding" if window is not None else "full",
@@ -389,6 +418,7 @@ class LayeredFlopConfig:
                 "head_dim": head_dim,
                 "has_v_proj": has_v_proj,
                 "intermediate": intermediate,
+                "ple_dim": ple_dim,
                 "moe": ({"experts": num_experts, "top_k": moe_top_k,
                          "intermediate": moe_intermediate}
                         if num_experts and moe_top_k else None),
@@ -398,6 +428,7 @@ class LayeredFlopConfig:
             "hidden": self.hidden,
             "vocab": self.vocab,
             "num_layers": self.num_layers,
+            "ple_total_dim": self.ple_total_dim,
             "linear_flops_per_token": self.linear_flops_per_token,
             "layer_groups": groups,
         }
@@ -456,6 +487,18 @@ def layered_flop_config(hf_config):
     moe_on = bool(getattr(cfg, "enable_moe_block", False)) or bool(
         getattr(cfg, "use_second_mlp_block", False)
     )
+    # Per-Layer Embeddings (E2B/E4B). Zero on the larger models.
+    ple_dim = int(getattr(cfg, "hidden_size_per_layer_input", 0) or 0)
+    # `use_double_wide_mlp` doubles `intermediate_size` on the KV-SHARED
+    # layers only (`Gemma4DecoderLayer.__init__`). On E2B that is 20 of 35
+    # layers, and since the MLP is ~83% of a layer's linear work it moves the
+    # per-token total by ~47% -- which is exactly the constant ratio Check A
+    # was reporting. Mirror the model's chained predicate literally, including
+    # `first_kv_shared_layer_idx > 0` guarding the no-sharing case.
+    double_wide = bool(getattr(cfg, "use_double_wide_mlp", False))
+    first_kv_shared_layer_idx = num_layers - int(
+        getattr(cfg, "num_kv_shared_layers", 0) or 0
+    )
     num_experts = int(getattr(cfg, "num_experts", 0) or 0)
     moe_top_k = int(getattr(cfg, "top_k_experts", 0) or 0)
     moe_intermediate = int(
@@ -465,20 +508,23 @@ def layered_flop_config(hf_config):
     )
 
     layers = []
-    for layer_type in layer_types:
+    for layer_idx, layer_type in enumerate(layer_types):
         is_full = layer_type == "full_attention"
         use_k_eq_v = is_full and k_eq_v
+        is_kv_shared = layer_idx >= first_kv_shared_layer_idx > 0
         layers.append(
             LayerFlopSpec(
                 num_heads=cfg.num_attention_heads,
                 num_kv_heads=global_kv_heads if use_k_eq_v else kv_heads,
                 head_dim=global_head_dim if is_full else head_dim,
-                intermediate=cfg.intermediate_size,
+                intermediate=cfg.intermediate_size
+                * (2 if (double_wide and is_kv_shared) else 1),
                 has_v_proj=not use_k_eq_v,
                 sliding_window=None if is_full else window,
                 moe_intermediate=moe_intermediate if moe_on else 0,
                 num_experts=num_experts if moe_on else 0,
                 moe_top_k=moe_top_k if moe_on else 0,
+                ple_dim=ple_dim,
             )
         )
 
@@ -497,11 +543,15 @@ def layered_flop_config(hf_config):
     # whether the two models agree.
     identical = len({
         (l.num_heads, l.num_kv_heads, l.head_dim, l.intermediate,
-         l.has_v_proj, l.sliding_window, l.num_experts, l.moe_top_k)
+         l.has_v_proj, l.sliding_window, l.num_experts, l.moe_top_k,
+         l.ple_dim)
         for l in layers
     }) == 1
     windowed = any(l.sliding_window is not None for l in layers)
-    if identical and not windowed and not moe_on:
+    # PLE is per-token GEMM work the flat config has no term for, so a model
+    # that has it is never describable by `ModelFlopConfig` however uniform
+    # its attention looks.
+    if identical and not windowed and not moe_on and not ple_dim:
         # Uniform after all -- but return the FLAT config built from the
         # resolved layer spec rather than None. Returning None would send
         # the caller back to `model_flop_config`'s own flat builder, which
@@ -521,7 +571,10 @@ def layered_flop_config(hf_config):
         )
 
     return LayeredFlopConfig(
-        hidden=hidden, vocab=cfg.vocab_size, layers=tuple(layers)
+        hidden=hidden,
+        vocab=cfg.vocab_size,
+        layers=tuple(layers),
+        ple_total_dim=ple_dim * num_layers,
     )
 
 
