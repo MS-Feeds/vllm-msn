@@ -64,12 +64,48 @@ def report_missing_columns(fieldnames):
     absent = [c for c in expected if c not in fieldnames]
     if absent:
         print("\n=== columns ABSENT from the CSV header ===")
-        print("  These were never written, so their emptiness says nothing")
-        print("  about the FLOP model -- it says the file was written by code")
-        print("  that predates them. Re-sync and re-run before reading them:")
+        print("  The file's HEADER predates these columns. That is a property")
+        print("  of the results file, NOT of the code that produced the run:")
+        print("  `ensure_csv_header` writes a header only when CREATING the")
+        print("  file, so a CSV that already existed keeps its old header")
+        print("  while new rows carry the full value count.")
         for col in absent:
             print("    " + col)
     return absent
+
+
+def detect_column_shift(csv_path):
+    """Rows carrying MORE values than the header has names.
+
+    `csv.DictReader` files the overflow under the key `None`, so this is
+    directly observable rather than inferred. It matters because the values
+    that DO get names are then shifted: every column after the first added
+    field reads its neighbour's number. Nothing about such a row looks
+    wrong -- in the run this was written for, `achieved_tflops_per_s` read
+    0.9987 (which was the prefill-share value) and `mfu` read 94.05 (which
+    was the achieved throughput), both entirely plausible numbers.
+
+    Not repairable by name: the names in the short header no longer point at
+    the right values, so an affected row has to be re-measured."""
+    shifted = []
+    with open(csv_path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        header_len = len(reader.fieldnames or [])
+        for row in reader:
+            overflow = row.get(None)
+            if overflow:
+                shifted.append((row.get("exp_id", "?"), row.get("ts", "?"),
+                                header_len + len(overflow)))
+    if shifted:
+        print("\n=== rows whose VALUES are shifted against the header ===")
+        print("  These rows have more values than the header has names, so")
+        print("  every column after the first added field is reading its")
+        print("  neighbour's value. They cannot be repaired by name -- the")
+        print("  measurement has to be re-run. Affected:")
+        for exp_id, ts, width in shifted:
+            print("    {:<32} {}  ({} values vs {} header names)".format(
+                exp_id, ts, width, header_len))
+    return shifted
 
 
 def print_breakdown(exp_id, row):
@@ -120,6 +156,7 @@ def main():
         return 2
     by_id, fieldnames = latest_rows(path)
     absent = report_missing_columns(fieldnames)
+    shifted = detect_column_shift(path)
 
     wanted = [args.baseline, args.control, args.sparse]
     missing = [e for e in wanted if e not in by_id]
@@ -129,6 +166,11 @@ def main():
 
     print("\n=== checks ===")
     ok = True
+    if shifted:
+        ok = check("no rows are shifted against the header", False,
+                   "{} row(s) affected -- every number reported below is "
+                   "suspect. Re-run predict_scbench.py (it now migrates the "
+                   "header on startup) and re-check.".format(len(shifted)))
     if missing:
         ok = check("all three rows present", False,
                    "missing from {}: {} -- the run did not get that far, "
@@ -236,14 +278,28 @@ def main():
                        reported, recomputed, total, elapsed, drift)) and ok
 
     # 6. Above-peak is arithmetically impossible, so it proves over-counting.
+    #
+    # Graded on `total_tflops / elapsed_time` RECOMPUTED from the row, never
+    # on the `achieved_tflops_per_s` column. This check once passed on a run
+    # whose throughput column read a bogus 1.00 TFLOP/s -- a falsification
+    # bound that reads its input from a column it cannot verify will happily
+    # confirm anything. The two inputs it uses instead are raw measurements
+    # the driver could not have derived wrongly without check 1 also failing.
     if args.peak_tflops:
         for exp_id in present:
-            val = _f(by_id[exp_id], "achieved_tflops_per_s")
-            if val is None:
+            row = by_id[exp_id]
+            total = _f(row, "total_tflops")
+            elapsed = _f(row, "elapsed_time")
+            if total is None or elapsed is None or not elapsed:
+                ok = check("{}: below peak".format(exp_id), False,
+                           "cannot recompute throughput: total_tflops or "
+                           "elapsed_time is missing") and ok
                 continue
+            val = total / elapsed
             ok = check("{}: below peak".format(exp_id),
                        val <= args.peak_tflops,
-                       "achieved={:,.2f} peak={:,.0f} MFU={:.1%}".format(
+                       "achieved={:,.2f} peak={:,.0f} MFU={:.1%} "
+                       "(recomputed, not read from the CSV column)".format(
                            val, args.peak_tflops, val / args.peak_tflops)) and ok
 
     print("\n" + ("ALL CHECKS PASSED" if ok else "SOME CHECKS FAILED"))

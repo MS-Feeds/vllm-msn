@@ -129,6 +129,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import shutil
 import gc
 import json
 import os
@@ -707,9 +708,62 @@ EXPERIMENTS = _build_experiments()
 
 
 def ensure_csv_header() -> None:
+    """Create the results CSV, or MIGRATE one whose header predates the
+    current `CSV_FIELDS`.
+
+    The migration is not housekeeping -- without it the file silently
+    corrupts every reader. `append_csv_row` writes with today's
+    `CSV_FIELDS`, so once a column is added, an existing file keeps its
+    short header while new rows carry the full value count. `csv.DictReader`
+    then maps names to values POSITIONALLY, and every column after the
+    insertion point reads its neighbour's value.
+
+    That is not hypothetical: adding `spec_prefill_share_of_speculator` (9th
+    of the FLOP fields) ahead of `achieved_tflops_per_s` and `mfu` made a
+    real run report `achieved_tflops_per_s=0.9987` -- which was the
+    prefill-share value -- and `mfu=94.05`, which was the achieved
+    throughput. Both looked like plausible numbers, and the falsification
+    check that reads `achieved_tflops_per_s` PASSED against the wrong
+    column. Nothing about the output said anything was wrong.
+
+    Rewrites in place, matching old rows by NAME so no measurement moves
+    columns, leaving fields the old header lacked empty. A pre-migration
+    copy is kept beside it, since this rewrites a file holding runs that
+    can cost hours each.
+    """
     if not CSV_PATH.exists():
         with CSV_PATH.open("w", newline="") as f:
             csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
+        return
+
+    with CSV_PATH.open(newline="") as f:
+        reader = csv.DictReader(f)
+        existing_header = list(reader.fieldnames or [])
+        if existing_header == list(CSV_FIELDS):
+            return
+        old_rows = list(reader)
+
+    unknown = [c for c in existing_header if c not in CSV_FIELDS]
+    backup = CSV_PATH.with_suffix(
+        ".pre-migration-{}.csv".format(datetime.now().strftime("%Y%m%d-%H%M%S"))
+    )
+    shutil.copy2(CSV_PATH, backup)
+    print(f"[predict_scbench] {CSV_PATH} header is out of date "
+          f"({len(existing_header)} columns, expected {len(CSV_FIELDS)}); "
+          f"migrating in place. Backup: {backup}")
+    if unknown:
+        print(f"[predict_scbench] NOTE: columns not in the current schema "
+              f"will be dropped from the migrated file (they remain in the "
+              f"backup): {unknown}")
+
+    with CSV_PATH.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        for old in old_rows:
+            # `restkey`/`restval` leftovers are dropped by the name lookup;
+            # a row written under a LONGER header than it was read with is
+            # exactly the corruption this exists to stop propagating.
+            writer.writerow({k: old.get(k, "") for k in CSV_FIELDS})
 
 
 def append_csv_row(row: dict) -> None:
