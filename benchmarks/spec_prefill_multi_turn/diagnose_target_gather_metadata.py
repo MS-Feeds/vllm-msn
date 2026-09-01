@@ -106,6 +106,7 @@ def main() -> None:
         render_turn_query,
     )
     from vllm_patch.config import SpecConfig
+    from vllm_patch.model_structure import native_context_length
     from vllm_patch.conversation_state import ConversationState
     from vllm_patch.pruner import compute_pruned_turn
     from vllm_patch.proposer import SpecPrefillProposer
@@ -130,9 +131,10 @@ def main() -> None:
         keep_mode=args.keep_mode,
     )
 
-    speculator_native_max_model_len = AutoConfig.from_pretrained(
-        speculator_model, trust_remote_code=True
-    ).max_position_embeddings
+    # Text config, not the wrapper -- a natively multimodal checkpoint
+    # (Gemma 4) has no `max_position_embeddings` on its top-level config.
+    # See `model_structure.native_context_length`.
+    speculator_native_max_model_len = native_context_length(speculator_model)
     speculator_max_num_batched_tokens = args.speculator_max_num_batched_tokens
     if speculator_native_max_model_len is not None and speculator_max_num_batched_tokens > speculator_native_max_model_len:
         speculator_max_num_batched_tokens = int(speculator_native_max_model_len)
@@ -213,7 +215,7 @@ def main() -> None:
 
     # ---- Step 3: construct the REAL target and register this exact
     # selection ----
-    native_max_model_len = AutoConfig.from_pretrained(target_model, trust_remote_code=True).max_position_embeddings
+    native_max_model_len = native_context_length(target_model)
     max_model_len = len(delta_ids) + args.decode_tokens + 64
     if native_max_model_len is not None:
         max_model_len = min(max_model_len, int(native_max_model_len))
