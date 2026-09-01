@@ -36,13 +36,40 @@ def _f(row, key):
 
 def latest_rows(csv_path):
     """Most recent row per exp_id -- the file is append-only, so a re-run
-    leaves the earlier attempt in place and a naive scan would grade it."""
+    leaves the earlier attempt in place and a naive scan would grade it.
+
+    Returns the header too, because `csv.DictReader` gives `None` both for a
+    column that is EMPTY and for one that does not exist in the file at all.
+    Those are opposite diagnoses -- a real accounting bug versus a results
+    file written by code that predates the column -- and this run hit exactly
+    that ambiguity."""
     with open(csv_path, newline="", encoding="utf-8") as fh:
-        rows = list(csv.DictReader(fh))
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+        fieldnames = list(reader.fieldnames or [])
     by_id = {}
     for row in rows:
         by_id[row.get("exp_id", "")] = row
-    return by_id
+    return by_id, fieldnames
+
+
+def report_missing_columns(fieldnames):
+    """Which FLOP columns the file has no header for at all."""
+    expected = []
+    for suffix in ("", "_excl_turn0"):
+        expected += ["{}_tflops_per_turn{}_mean".format(s, suffix) for s in STAGES]
+        expected += ["total_tflops_per_turn{}_mean".format(suffix),
+                     "speculator_flops_fraction{}".format(suffix),
+                     "spec_prefill_share_of_speculator{}".format(suffix)]
+    absent = [c for c in expected if c not in fieldnames]
+    if absent:
+        print("\n=== columns ABSENT from the CSV header ===")
+        print("  These were never written, so their emptiness says nothing")
+        print("  about the FLOP model -- it says the file was written by code")
+        print("  that predates them. Re-sync and re-run before reading them:")
+        for col in absent:
+            print("    " + col)
+    return absent
 
 
 def print_breakdown(exp_id, row):
@@ -91,7 +118,8 @@ def main():
     if not path.exists():
         print("no such file: {}".format(path))
         return 2
-    by_id = latest_rows(path)
+    by_id, fieldnames = latest_rows(path)
+    absent = report_missing_columns(fieldnames)
 
     wanted = [args.baseline, args.control, args.sparse]
     missing = [e for e in wanted if e not in by_id]
@@ -115,9 +143,20 @@ def main():
                      for s in STAGES]
             total = _f(row, "total_tflops_per_turn{}_mean".format(suffix))
             if total is None or any(p is None for p in parts):
-                ok = check("{}: stages populated ({})".format(exp_id, name), False,
-                           "one or more FLOP columns are empty -- the model "
-                           "config was unavailable, so nothing was charged.")
+                cols = ["{}_tflops_per_turn{}_mean".format(s, suffix)
+                        for s in STAGES]
+                cols.append("total_tflops_per_turn{}_mean".format(suffix))
+                no_header = [c for c in cols if c not in fieldnames]
+                if no_header:
+                    detail = ("column(s) not in the CSV header at all: {} -- "
+                              "stale code wrote this file, not a FLOP bug."
+                              .format(no_header))
+                else:
+                    detail = ("column(s) present but EMPTY -- no turn with "
+                              "that index was recorded, so `_stage_means` "
+                              "returned None for every stage.")
+                ok = check("{}: stages populated ({})".format(exp_id, name),
+                           False, detail)
                 continue
             summed = sum(parts)
             drift = abs(summed - total) / total * 100 if total else 0.0
@@ -176,6 +215,25 @@ def main():
                 continue
             ok = check("{}: {} in [0,1]".format(exp_id, key),
                        0.0 <= val <= 1.0, "value={}".format(val)) and ok
+
+    # 5b. `achieved_tflops_per_s` is `total_tflops / elapsed_time`, and both
+    #     inputs are in the same row -- so it can be recomputed rather than
+    #     trusted. A mismatch means the throughput column is being derived
+    #     from something other than what it claims.
+    for exp_id in present:
+        row = by_id[exp_id]
+        total = _f(row, "total_tflops")
+        elapsed = _f(row, "elapsed_time")
+        reported = _f(row, "achieved_tflops_per_s")
+        if total is None or elapsed is None or reported is None or not elapsed:
+            continue
+        recomputed = total / elapsed
+        drift = (abs(recomputed - reported) / reported * 100) if reported else 0.0
+        ok = check("{}: achieved_tflops_per_s == total_tflops/elapsed".format(exp_id),
+                   drift <= args.tolerance_pct,
+                   "reported={:,.2f} recomputed={:,.2f} "
+                   "(total_tflops={:,.1f} elapsed={:,.1f}s) drift={:.1f}%".format(
+                       reported, recomputed, total, elapsed, drift)) and ok
 
     # 6. Above-peak is arithmetically impossible, so it proves over-counting.
     if args.peak_tflops:
