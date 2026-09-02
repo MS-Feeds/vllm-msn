@@ -140,7 +140,7 @@ def main() -> None:
         async_scheduling=False,
     )
     print(f"[dense_context_sweep] constructing engine: "
-          f"{json.dumps({k: v for k, v in llm_kwargs.items() if k != 'model'})}")
+          f"{json.dumps({k: v for k, v in llm_kwargs.items() if k != 'model'}, default=str)}")
     t_engine = time.time()
     llm = LLM(**llm_kwargs)
     print(f"[dense_context_sweep] engine constructed in {time.time() - t_engine:.1f}s")

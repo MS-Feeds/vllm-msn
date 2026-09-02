@@ -554,7 +554,7 @@ def main() -> None:
         enable_prefix_caching=True,
         async_scheduling=False,
     )
-    print(f"[sparse_decode_microbench] constructing engine: {json.dumps({k: v for k, v in llm_kwargs.items() if k != 'model'})}")
+    print(f"[sparse_decode_microbench] constructing engine: {json.dumps({k: v for k, v in llm_kwargs.items() if k != 'model'}, default=str)}")
     t_engine = time.time()
 
     # Text-only workload, but a natively multimodal checkpoint still reserves
