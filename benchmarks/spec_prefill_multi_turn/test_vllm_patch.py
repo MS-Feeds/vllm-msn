@@ -2839,6 +2839,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         speculator_device=None,
         target_gpu_memory_utilization=0.85,
         target_cudagraph_mode="eager",
+        target_async_scheduling=False,
         # TP=1: the single-card default, so these stub runs keep
         # exercising the pre-TP placement behaviour.
         target_tensor_parallel_size=1,
@@ -4727,6 +4728,59 @@ def test_speculator_worker_rpc_wrappers_match_their_runner_methods():
             f"{name}: runner{r} vs worker{w}" for name, (r, w) in mismatched.items()
         )
     )
+
+
+def test_resumable_stop_discards_in_flight_async_frames():
+    """The async-scheduling race, as a source-level contract.
+
+    Under pipelined scheduling the scheduler optimistically schedules a
+    request's NEXT step before the current step's output is known. A
+    RESUMABLE stop then pulls the request out from under those steps: it is
+    re-parked, and if the driver has already queued the next turn,
+    re-prompted. Their output frames are stale by the time they return, and
+    appending their tokens corrupts the session and re-triggers the stop
+    path -- observed on real hardware as `RuntimeError: Invalid request
+    status: RUNNING` inside `Scheduler.schedule()`.
+
+    vLLM already solves exactly this for force-preemption in
+    `reset_prefix_cache`: stash `num_output_placeholders` into
+    `async_tokens_to_discard`, which `AsyncScheduler._update_request_with_
+    output` drains one frame per call. `_handle_stopped_request` must do the
+    same for a resumable stop.
+
+    Asserted against the scheduler SOURCE rather than by importing it: this
+    suite is CPU-only and cannot import vLLM. The point is to pin the
+    invariant so the fix cannot be silently dropped, and to keep it
+    anchored to the precedent it copies."""
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2]
+    src = (root / "vllm" / "v1" / "core" / "sched" / "scheduler.py").read_text(
+        encoding="utf-8")
+
+    start = src.index("def _handle_stopped_request(self, request: Request) -> bool:")
+    nxt = src.index("\n    def ", start + 1)
+    # CODE lines only. Scanning the raw body would let the comment that
+    # EXPLAINS the fix satisfy this assertion after someone deleted the two
+    # lines it describes -- verified against the naive version, which passes
+    # on the comment alone.
+    body = "\n".join(
+        line for line in src[start:nxt].splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+
+    assert "async_tokens_to_discard" in body, (
+        "a resumable stop must discard in-flight async output frames, or "
+        "pipelined scheduling races with session re-parking")
+    assert "num_output_placeholders = 0" in body, (
+        "the placeholder count must be cleared once moved into the discard "
+        "counter, or the frames are counted twice")
+
+    # The draining half of the contract, in the async scheduler.
+    async_src = (root / "vllm" / "v1" / "core" / "sched"
+                 / "async_scheduler.py").read_text(encoding="utf-8")
+    assert "async_tokens_to_discard -= 1" in async_src, (
+        "AsyncScheduler must drain the discard counter one frame per call")
 
 
 def test_target_cudagraph_mode_is_opt_in_and_bypasses_dynamo():

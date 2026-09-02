@@ -1633,6 +1633,29 @@ class Scheduler(SchedulerInterface):
         if not request.resumable:
             return True
 
+        # For async scheduling, a resumable stop pulls the request out from
+        # under any steps the scheduler already optimistically scheduled for
+        # it. Those output frames are stale by the time they return -- the
+        # session has been re-parked and, if the driver has already queued
+        # the next turn, re-prompted -- so appending their tokens would
+        # corrupt the session and re-trigger this same stop path.
+        #
+        # Exactly the situation `reset_prefix_cache`'s force-preemption
+        # handles, and handled the same way: `num_output_placeholders` is
+        # the count of frames scheduled but not yet observed, and
+        # `AsyncScheduler._update_request_with_output` drains
+        # `async_tokens_to_discard` one frame per call. Zero in sync mode,
+        # so this is a no-op there.
+        #
+        # Ordering is what makes the count exact: `_update_request_with_
+        # output` runs BEFORE this and has already decremented the
+        # placeholder for the frame being processed, so what remains is
+        # precisely the still-in-flight count. Accumulated rather than
+        # assigned, so a stop arriving while an earlier discard is still
+        # draining does not lose those frames.
+        request.async_tokens_to_discard += request.num_output_placeholders
+        request.num_output_placeholders = 0
+
         if request.streaming_queue:
             update = request.streaming_queue.popleft()
             if update is None:

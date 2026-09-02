@@ -2645,7 +2645,21 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # between scheduling and execution) but a correctness requirement
         # for this pipeline's own resumable-session mechanism until/unless
         # this is fixed further upstream.
-        llm_kwargs["async_scheduling"] = False
+        # Opt-in via --target-async-scheduling. Default False reproduces every
+        # published row; the race described above is fixed in the scheduler
+        # (`_handle_stopped_request` now discards stale in-flight frames the
+        # same way force-preemption does), but that fix is unproven on real
+        # hardware, so enabling it is a deliberate act rather than a silent
+        # default change.
+        #
+        # Why it is worth testing: the baseline does NOT take this branch, so
+        # M000 has been running PIPELINED (async_scheduling defaults to True)
+        # while every SPARSE row ran fully serialized. Measured on
+        # Gemma-4-31B under CUDA graphs, the keep=100% control -- which
+        # gathers nothing and patches nothing -- still costs +13.1% per token
+        # over M000, five times the entire cost of the gather itself
+        # (+2.1%). This flag is the main suspect for that gap.
+        llm_kwargs["async_scheduling"] = bool(args.target_async_scheduling)
     elif mode != "baseline":
         llm_kwargs["worker_cls"] = "vllm_patch.worker.SpecPrefillWorker"
 
@@ -3266,6 +3280,16 @@ def main() -> None:
                              "the first N visible devices, so "
                              "--speculator-device must be N or higher.")
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument(
+        "--target-async-scheduling", action="store_true",
+        help="Enable vLLM's pipelined scheduling on the TARGET engine. OFF by "
+             "default: it raced with the resumable-session re-parking this "
+             "pipeline depends on ('Invalid request status: RUNNING'). The "
+             "scheduler now discards stale in-flight frames on a resumable "
+             "stop, which should remove that race -- but every published "
+             "SPARSE row was measured with it off, and M000 has always had it "
+             "ON (the baseline never enters the sparse branch), so this is "
+             "also a fairness fix, not only a speed one.")
     parser.add_argument(
         "--target-cudagraph-mode", default="eager",
         choices=["eager", "FULL_DECODE_ONLY", "FULL"],
