@@ -1653,6 +1653,25 @@ class Scheduler(SchedulerInterface):
         # precisely the still-in-flight count. Accumulated rather than
         # assigned, so a stop arriving while an earlier discard is still
         # draining does not lose those frames.
+        # Roll `num_computed_tokens` back to what was ACTUALLY produced.
+        # It is advanced at SCHEDULE time (`_update_after_schedule`), so
+        # under async scheduling it runs ahead by exactly
+        # `num_output_placeholders` -- the identity
+        # `AsyncScheduler._update_request_with_output` already relies on
+        # when it caches blocks at
+        # `num_computed_tokens - num_output_placeholders`.
+        #
+        # This matters here because `_update_request_as_session` slices the
+        # session's retained history at the RAW count:
+        #
+        #     kept = session._all_token_ids[num_prompt_tokens:num_computed_tokens]
+        #
+        # Leaving it ahead makes the session keep a different amount of
+        # history than sync mode would, and that history becomes the NEXT
+        # turn's prompt -- so every later turn diverges. Measured before
+        # this line existed: turn 0 bit-identical across async on/off,
+        # turns 1-4 all differing, 16/25 turns equal overall.
+        request.num_computed_tokens -= request.num_output_placeholders
         request.async_tokens_to_discard += request.num_output_placeholders
         request.num_output_placeholders = 0
 

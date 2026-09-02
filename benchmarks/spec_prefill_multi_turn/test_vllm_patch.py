@@ -1030,6 +1030,18 @@ def _load_sparse_target_runner():
     return importlib.import_module("vllm_patch.sparse_target_runner")
 
 
+def _load_speculator_worker():
+    """`vllm_patch.speculator_worker` under the same stubs -- it imports the
+    identical two vLLM symbols at module scope (`GPUModelRunner`, `Worker`)
+    and nothing else from vLLM. Same caveat as
+    `_load_sparse_target_runner`: this exercises the module's OWN logic,
+    not the surrounding vLLM contract."""
+    import importlib
+
+    _load_sparse_target_runner()  # installs the stubs, if needed
+    return importlib.import_module("vllm_patch.speculator_worker")
+
+
 class _FakeLayerMetadata:
     """Stands in for one backend's per-layer `AttentionMetadata`, carrying
     exactly the four fields `sparse_target_runner.py` patches."""
@@ -4775,6 +4787,12 @@ def test_resumable_stop_discards_in_flight_async_frames():
     assert "num_output_placeholders = 0" in body, (
         "the placeholder count must be cleared once moved into the discard "
         "counter, or the frames are counted twice")
+    assert "num_computed_tokens -= request.num_output_placeholders" in body, (
+        "`num_computed_tokens` is advanced at SCHEDULE time, so under async "
+        "scheduling it runs ahead of what was produced. "
+        "`_update_request_as_session` slices the session's retained history "
+        "at the raw count, so leaving it ahead changes the NEXT turn's "
+        "prompt -- measured as turn 0 identical but turns 1-4 all differing")
 
     # The draining half of the contract, in the async scheduler.
     async_src = (root / "vllm" / "v1" / "core" / "sched"
@@ -4811,6 +4829,80 @@ def test_target_cudagraph_mode_is_opt_in_and_bypasses_dynamo():
     assert cfg.mode.name == "NONE", (
         f"compilation must be OFF or the AOT path needs Dynamo; got {cfg.mode}")
     assert cfg.cudagraph_mode.name == "FULL_DECODE_ONLY"
+
+
+def test_slot_history_records_on_device_and_looks_up_by_position():
+    """The speculator's slot history, moved off the host.
+
+    It used to be a `Dict[int, int]` filled by
+    `slot_mapping_gpu[start:end].tolist()` -- a full device SYNC on every
+    forward (nine per scored turn, and on turn 0 the prefill slice is the
+    whole ~84k-token context) plus one Python dict insert per token. Then
+    `get_slots_for_positions` walked the pool twice more per turn, ~84k
+    iterations each.
+
+    Now a dense device tensor: recording is a copy, lookup is an index.
+    Nothing needed the values on the host -- `retrieve_keys` gathers with
+    them on-device.
+
+    This asserts the behaviour that has to survive that change: slots come
+    back for the positions they were recorded at, across multiple
+    non-contiguous record calls, and the buffer grows without losing
+    earlier entries."""
+    worker_module = _load_speculator_worker()
+    runner = object.__new__(worker_module.SpeculatorGPUModelRunner)
+    runner._slot_history = {}
+    runner._slot_history_len = {}
+    runner.device = torch.device("cpu")
+
+    # Turn 0: a chunked prefill arriving as two slices.
+    runner._append_slot_history("conv-a", 0, torch.arange(100, 140, dtype=torch.int64))
+    runner._append_slot_history("conv-a", 40, torch.arange(140, 150, dtype=torch.int64))
+    # A second conversation must not disturb the first.
+    runner._append_slot_history("conv-b", 0, torch.arange(900, 905, dtype=torch.int64))
+
+    got = runner.slot_tensor_for_positions("conv-a", [0, 39, 40, 49])
+    assert got.tolist() == [100, 139, 140, 149], got.tolist()
+    assert runner.slot_tensor_for_positions("conv-b", [0, 4]).tolist() == [900, 904]
+
+    # Growth past the initial capacity must preserve everything recorded.
+    runner._append_slot_history("conv-a", 50, torch.arange(150, 9000, dtype=torch.int64))
+    assert runner.slot_tensor_for_positions("conv-a", [0, 49, 50, 8899]).tolist() == [
+        100, 149, 150, 8999]
+
+    # The list form stays available for the RPC surface.
+    assert runner.get_slots_for_positions("conv-a", [1, 2]) == [101, 102]
+
+
+def test_slot_history_still_raises_for_unrecorded_positions():
+    """The dict form raised `KeyError` for a position never prefilled under
+    this salt. The high-water mark must preserve that -- it is exact
+    because the history is dense and contiguous, so a position below the
+    mark cannot be a hole."""
+    worker_module = _load_speculator_worker()
+    runner = object.__new__(worker_module.SpeculatorGPUModelRunner)
+    runner._slot_history = {}
+    runner._slot_history_len = {}
+    runner.device = torch.device("cpu")
+
+    runner._append_slot_history("conv-a", 0, torch.arange(10, dtype=torch.int64))
+
+    try:
+        runner.slot_tensor_for_positions("conv-a", [0, 10])
+    except KeyError as exc:
+        assert "10" in str(exc)
+    else:
+        raise AssertionError("a position past the recorded range was accepted")
+
+    try:
+        runner.slot_tensor_for_positions("never-seen", [0])
+    except KeyError as exc:
+        assert "never-seen" in str(exc)
+    else:
+        raise AssertionError("an unknown conversation salt was accepted")
+
+    # Empty request is not an error -- it is a no-op gather.
+    assert runner.slot_tensor_for_positions("conv-a", []).numel() == 0
 
 
 def test_padded_block_table_row_reuses_its_buffer_and_clears_the_tail():

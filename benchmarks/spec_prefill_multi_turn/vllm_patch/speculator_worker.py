@@ -235,7 +235,13 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         self._prompt_tail_requests: Dict[str, tuple] = {}
         # conversation_salt -> {local_position: physical_slot} -- see module
         # docstring's "Recover K vectors" section.
-        self._slot_history: Dict[str, Dict[int, int]] = {}
+        # Per-conversation slot history as a growing ON-DEVICE int64 tensor
+        # indexed by local position, plus a high-water mark of how many
+        # positions have been recorded. NOT a Dict[int, int]: see
+        # `_record_slot_mapping` for the two costs the dict form imposed on
+        # every forward and every turn.
+        self._slot_history: Dict[str, torch.Tensor] = {}
+        self._slot_history_len: Dict[str, int] = {}
 
     def install_query_capture_hooks(self) -> None:
         """Called once, from `SpeculatorWorker.load_model()` (after weights
@@ -555,28 +561,99 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
                 continue
             num_computed_before = int(self.input_batch.num_computed_tokens_cpu[req_idx])
 
-            slots_this_step = slot_mapping_gpu[start:end].tolist()
-            history = self._slot_history.setdefault(conversation_salt, {})
-            for i, slot in enumerate(slots_this_step):
-                history[num_computed_before + i] = slot
+            # D2D copy into a persistent device tensor. The previous form
+            # was `slot_mapping_gpu[start:end].tolist()` followed by a
+            # Python loop of dict inserts, which cost two things on EVERY
+            # forward of every request:
+            #
+            #   - a full device sync, because `.tolist()` must wait for the
+            #     GPU. Nine per scored turn (one prefill + `look_ahead_cnt`
+            #     decodes), and on turn 0 the prefill slice is the whole
+            #     ~84k-token context.
+            #   - one dict insert per token, so ~84k Python-level inserts
+            #     to build one conversation's history -- which
+            #     `get_slots_for_positions` then walked twice per turn.
+            #
+            # Nothing here needs the values on the host: `retrieve_keys`
+            # wants them on-device to gather with. Keeping them there
+            # removes the sync, the inserts, and the per-turn H2D that used
+            # to ship the list back.
+            self._append_slot_history(
+                conversation_salt, num_computed_before,
+                slot_mapping_gpu[start:end],
+            )
+
+    def _append_slot_history(
+        self, conversation_salt: str, start_position: int, slots
+    ) -> None:
+        """Record `slots` as the physical slots for the contiguous local
+        positions beginning at `start_position`.
+
+        Positions arrive contiguously and monotonically -- a conversation's
+        prompt only ever grows, and chunked prefill plus decode advance
+        `num_computed_tokens` one step at a time -- so the history is a
+        dense array, not a sparse map. That is what lets the high-water
+        mark below stand in for the old per-position membership test.
+        """
+        count = slots.shape[0]
+        end_position = start_position + count
+        buffer = self._slot_history.get(conversation_salt)
+        if buffer is None or buffer.shape[0] < end_position:
+            # Grow geometrically so a long conversation does not reallocate
+            # on every step.
+            capacity = max(end_position, 2 * (buffer.shape[0] if buffer is not None else 0), 4096)
+            grown = torch.empty(capacity, dtype=torch.int64, device=slots.device)
+            if buffer is not None:
+                grown[: buffer.shape[0]].copy_(buffer)
+            buffer = grown
+            self._slot_history[conversation_salt] = buffer
+        buffer[start_position:end_position].copy_(slots)
+        self._slot_history_len[conversation_salt] = max(
+            self._slot_history_len.get(conversation_salt, 0), end_position
+        )
 
     def get_slots_for_positions(
         self, conversation_salt: str, positions: List[int]
     ) -> List[int]:
-        history = self._slot_history.get(conversation_salt, {})
-        missing = [p for p in positions if p not in history]
-        if missing:
-            preview = missing[:5]
+        """Kept for the RPC surface and `validate_proposer.py`; the hot path
+        uses `slot_tensor_for_positions` instead and never materialises a
+        Python list."""
+        return self.slot_tensor_for_positions(
+            conversation_salt, positions
+        ).tolist()
+
+    def slot_tensor_for_positions(
+        self, conversation_salt: str, positions: List[int]
+    ) -> torch.Tensor:
+        """Physical slots for `positions`, as an on-device int64 tensor.
+
+        The membership guard is a high-water mark rather than a
+        per-position lookup, which is exact because the history is dense
+        and contiguous (see `_append_slot_history`). It preserves the
+        failure this raised for before -- positions that were never
+        actually prefilled under this salt -- without the two O(len(pool))
+        Python passes the dict form needed, ~84k iterations each, on every
+        scored turn.
+        """
+        recorded = self._slot_history_len.get(conversation_salt, 0)
+        buffer = self._slot_history.get(conversation_salt)
+        if buffer is None or not positions:
+            if not positions:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
             raise KeyError(
                 f"conversation {conversation_salt!r}: no recorded physical "
-                f"slot for local position(s) {preview}"
-                f"{'...' if len(missing) > 5 else ''} -- either these "
-                f"positions were never actually prefilled under this salt, "
-                f"or their blocks were evicted and silently recomputed "
-                f"under a new slot this accumulator never observed (see "
-                f"module docstring's risk #2)."
+                f"slots at all -- nothing was prefilled under this salt."
             )
-        return [history[p] for p in positions]
+        highest = max(positions)
+        if highest >= recorded or min(positions) < 0:
+            raise KeyError(
+                f"conversation {conversation_salt!r}: no recorded physical "
+                f"slot for local position {highest} -- only positions "
+                f"0..{recorded - 1} have been prefilled under this salt "
+                f"(see module docstring's risk #2)."
+            )
+        index = torch.as_tensor(positions, dtype=torch.int64, device=buffer.device)
+        return buffer[index]
 
     def retrieve_keys(
         self, conversation_salt: str, positions: List[int]
@@ -596,8 +673,9 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         NOT the multi-turn ledger's absolute positions used for the
         TARGET's RoPE restoration, a separate numbering -- see
         `proposer.py`'s docstring for how the two relate)."""
-        slots = self.get_slots_for_positions(conversation_salt, positions)
-        slot_tensor = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        # Stays on-device throughout: the history is already a device
+        # tensor, so this is an index rather than a list round trip.
+        slot_tensor = self.slot_tensor_for_positions(conversation_salt, positions)
         block_size = self._single_kv_group_block_size()
         keys = []
         for attn in self._hooked_layers:
@@ -1071,6 +1149,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         the whole conversation (not just one turn) is done, to avoid
         unbounded growth across a long benchmark run."""
         self._slot_history.pop(conversation_salt, None)
+        self._slot_history_len.pop(conversation_salt, None)
 
 
 class SpeculatorWorker(Worker):
