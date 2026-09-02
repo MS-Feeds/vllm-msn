@@ -308,7 +308,7 @@ class SpecPrefillProposer:
             prefill new tokens" signal EXPERIMENT_PLAN.md's KEEP-mode risk
             note calls for, rather than assuming it.
         """
-        request_id, num_cached_tokens, t_start = self._submit_and_drive_turn(
+        request_id, num_cached_tokens, t_start, _stage_seconds = self._submit_and_drive_turn(
             conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
         )
 
@@ -351,7 +351,7 @@ class SpecPrefillProposer:
         score_layers: Optional[str] = None,
         score_head_set: Optional[List[int]] = None,
         mask_sliding_window: bool = False,
-    ) -> Tuple[Optional[List[int]], int, int]:
+    ) -> Tuple[Optional[List[int]], int, int, dict]:
         """Same driving/submission as `run_turn` (via the shared
         `_submit_and_drive_turn` helper), but retrieves K and runs the
         scoring/selection pipeline IN-PROCESS inside the speculator's own
@@ -374,14 +374,19 @@ class SpecPrefillProposer:
         `pool_kernel_size` are passed.
 
         Returns `(kept_local_indices, actual_look_ahead_cnt,
-        num_cached_tokens)` -- `kept_local_indices` is `None` if
+        num_cached_tokens, stage_seconds)`, where `stage_seconds` carries
+        this turn's `spec_prefill` / `spec_lookahead` / `spec_scoring` wall
+        clock for `timing_model.TimeBreakdown` -- previously these were
+        printed and discarded, which is why the speculator's FLOP share was
+        known and its LATENCY share was not.
+        `kept_local_indices` is `None` if
         `actual_look_ahead_cnt == 0` (see `speculator_worker.py`'s
         docstring for when/why), otherwise a `List[int]` of LOCAL indices
         into the full submitted sequence (candidate history + this turn's
         query) -- `pruner.py` still owns filtering that down to just the
         candidate-history portion and converting to absolute positions.
         """
-        request_id, num_cached_tokens, t_start = self._submit_and_drive_turn(
+        request_id, num_cached_tokens, t_start, stage_seconds = self._submit_and_drive_turn(
             conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
         )
 
@@ -401,13 +406,15 @@ class SpecPrefillProposer:
             ),
         )[0]
         num_kept = len(kept_local_indices) if kept_local_indices is not None else None
+        stage_seconds["spec_scoring"] = time.time() - t_before_score
         print(
             f"[proposer.run_turn_and_score] {request_id!r}: in-process K "
-            f"retrieval + scoring done in {time.time() - t_before_score:.2f}s "
+            f"retrieval + scoring done in {stage_seconds['spec_scoring']:.2f}s "
             f"(actual_look_ahead_cnt={actual_look_ahead_cnt}, kept={num_kept}, "
             f"total turn {time.time() - t_start:.2f}s)"
         )
-        return kept_local_indices, actual_look_ahead_cnt, num_cached_tokens
+        return (kept_local_indices, actual_look_ahead_cnt, num_cached_tokens,
+                stage_seconds)
 
     def run_turn_and_head_diagnostics(
         self,
@@ -435,7 +442,7 @@ class SpecPrefillProposer:
         query source BEFORE any of it is built into the scoring path -- the
         same "measure the ceiling before optimizing toward it" move
         `ORACLE-k20` made, and the reason the gate runs first."""
-        request_id, _num_cached, _t_start = self._submit_and_drive_turn(
+        request_id, _num_cached, _t_start, _stage_seconds = self._submit_and_drive_turn(
             conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt,
             ignore_eos, query_source, prompt_tail_n,
         )
@@ -476,7 +483,7 @@ class SpecPrefillProposer:
         identical to a scored turn, so the votes measured are the votes
         production would have cast. Only what is computed from them differs.
         """
-        request_id, _num_cached, _t_start = self._submit_and_drive_turn(
+        request_id, _num_cached, _t_start, _stage_seconds = self._submit_and_drive_turn(
             conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt,
             ignore_eos, "lookahead", 8,
         )
@@ -629,7 +636,26 @@ class SpecPrefillProposer:
                     f"requested."
                 )
 
-        return request_id, num_cached_tokens, t_start
+        # The prefill/lookahead split is already computed above for the log
+        # lines; return it too rather than only printing it. `predict_scbench`
+        # can then record per-stage LATENCY the way it already records
+        # per-stage FLOPs -- see timing_model.py for why the two being
+        # asymmetric hid the result that matters.
+        #
+        # `t_prefill_done is None` means no output was ever seen (the request
+        # produced nothing), so there is no boundary to split on; charge the
+        # whole span to prefill rather than inventing a lookahead figure.
+        if t_prefill_done is None:
+            stage_seconds = {
+                "spec_prefill": t_decode_done - t_start,
+                "spec_lookahead": 0.0,
+            }
+        else:
+            stage_seconds = {
+                "spec_prefill": t_prefill_done - t_start,
+                "spec_lookahead": t_decode_done - t_prefill_done,
+            }
+        return request_id, num_cached_tokens, t_start, stage_seconds
 
     def retrieve_keys(
         self, conversation_salt: str, local_positions: List[int]

@@ -50,7 +50,7 @@ EXPERIMENT_PLAN.md's "Oracle upper bound".
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import torch
@@ -71,6 +71,12 @@ class PrunedTurnResult:
     kept_history_pairs: List[Tuple[int, int]]  # for ConversationState.complete_turn
     actual_look_ahead_cnt: int
     num_cached_tokens: int  # 0 for the oracle path (no speculator cache involved)
+    # Per-stage speculator wall clock for `timing_model.TimeBreakdown`:
+    # {"spec_prefill": s, "spec_lookahead": s, "spec_scoring": s}. Empty for
+    # the oracle path, which does its scoring driver-side rather than via
+    # `run_turn_and_score`. Carried on the result rather than returned
+    # separately so the whole speculator phase stays one value to thread.
+    stage_seconds: dict = field(default_factory=dict)
 
 
 def _positions_from_kept_indices(
@@ -212,7 +218,8 @@ def compute_pruned_turn(
     full_sequence = candidate_pool + force_keep_query
     full_token_ids = [tid for tid, _ in full_sequence]
 
-    kept_local_indices, actual_look_ahead_cnt, num_cached_tokens = proposer.run_turn_and_score(
+    (kept_local_indices, actual_look_ahead_cnt, num_cached_tokens,
+     stage_seconds) = proposer.run_turn_and_score(
         conversation_salt=conversation_state.conversation_id,
         turn_idx=conversation_state.turn_idx,
         full_sequence_token_ids=full_token_ids,
@@ -241,6 +248,7 @@ def compute_pruned_turn(
         kept_history_pairs=kept_history_pairs,
         actual_look_ahead_cnt=actual_look_ahead_cnt,
         num_cached_tokens=num_cached_tokens,
+        stage_seconds=stage_seconds,
     )
 
 

@@ -22,6 +22,9 @@ from pathlib import Path
 STAGES = ("spec_prefill", "spec_lookahead", "spec_scoring",
           "target_prefill", "target_decode")
 SPECULATOR_STAGES = ("spec_prefill", "spec_lookahead", "spec_scoring")
+#: Wall-clock stages. `driver_overhead` is a residual, so these sum to the
+#: turn clock by construction -- see timing_model.py.
+TIME_STAGES = STAGES + ("driver_overhead",)
 
 
 def _f(row, key):
@@ -61,6 +64,9 @@ def report_missing_columns(fieldnames):
         expected += ["total_tflops_per_turn{}_mean".format(suffix),
                      "speculator_flops_fraction{}".format(suffix),
                      "spec_prefill_share_of_speculator{}".format(suffix)]
+        expected += ["{}_seconds_per_turn{}_mean".format(s, suffix)
+                     for s in TIME_STAGES]
+        expected += ["speculator_seconds_fraction{}".format(suffix)]
     absent = [c for c in expected if c not in fieldnames]
     if absent:
         print("\n=== columns ABSENT from the CSV header ===")
@@ -127,6 +133,22 @@ def print_breakdown(exp_id, row):
                 "spec_prefill_share_of_speculator",
                 "spec_prefill_share_of_speculator_excl_turn0",
                 "achieved_tflops_per_s", "mfu"):
+        val = _f(row, key)
+        print("  {:>44}: {}".format(
+            key, "--" if val is None else "{:,.4f}".format(val)))
+
+    print("  {:>16} | {:>12} | {:>12}   (seconds)".format(
+        "stage", "all turns", "excl turn 0"))
+    for stage in TIME_STAGES:
+        allt = _f(row, stage + "_seconds_per_turn_mean")
+        excl = _f(row, stage + "_seconds_per_turn_excl_turn0_mean")
+        print("  {:>16} | {:>12} | {:>12}".format(
+            stage,
+            "--" if allt is None else "{:,.3f}".format(allt),
+            "--" if excl is None else "{:,.3f}".format(excl)))
+    for key in ("seconds_per_turn_mean", "seconds_per_turn_excl_turn0_mean",
+                "speculator_seconds_fraction",
+                "speculator_seconds_fraction_excl_turn0"):
         val = _f(row, key)
         print("  {:>44}: {}".format(
             key, "--" if val is None else "{:,.4f}".format(val)))
@@ -206,6 +228,44 @@ def main():
                        drift <= args.tolerance_pct,
                        "sum={:,.2f} total={:,.2f} drift={:.2f}%".format(
                            summed, total, drift)) and ok
+
+    # 1b. Timing stages must sum to the measured turn clock. `driver_overhead`
+    #     is a RESIDUAL, so this is an identity unless two stages overlap --
+    #     i.e. it catches double-counting, which is the failure mode that
+    #     would quietly re-create the misattribution this instrumentation
+    #     exists to remove.
+    for exp_id in present:
+        row = by_id[exp_id]
+        for suffix, clock, name in (
+                ("", "seconds_per_turn_mean", "all turns"),
+                ("_excl_turn0", "seconds_per_turn_excl_turn0_mean",
+                 "excl turn 0")):
+            parts = [_f(row, "{}_seconds_per_turn{}_mean".format(s, suffix))
+                     for s in TIME_STAGES]
+            measured = _f(row, clock)
+            if measured is None or any(p is None for p in parts):
+                cols = ["{}_seconds_per_turn{}_mean".format(s, suffix)
+                        for s in TIME_STAGES]
+                no_header = [c for c in cols if c not in fieldnames]
+                detail = ("timing column(s) not in the CSV header: {} -- the "
+                          "run predates the per-stage timings."
+                          .format(no_header) if no_header else
+                          "timing column(s) present but EMPTY")
+                ok = check("{}: timing stages populated ({})".format(exp_id, name),
+                           False, detail)
+                continue
+            summed = sum(parts)
+            drift = abs(summed - measured) / measured * 100 if measured else 0.0
+            ok = check("{}: timing stages sum to the turn clock ({})".format(
+                           exp_id, name),
+                       drift <= args.tolerance_pct,
+                       "sum={:,.3f}s clock={:,.3f}s drift={:.2f}%".format(
+                           summed, measured, drift)) and ok
+            neg = [s for s, p in zip(TIME_STAGES, parts) if p is not None and p < 0]
+            ok = check("{}: no negative timing stage ({})".format(exp_id, name),
+                       not neg,
+                       "negative: {} -- stages overlap, something is being "
+                       "double-counted".format(neg) if neg else "") and ok
 
     # 2. The baseline must charge NOTHING to the speculator: it has none.
     if args.baseline in by_id:

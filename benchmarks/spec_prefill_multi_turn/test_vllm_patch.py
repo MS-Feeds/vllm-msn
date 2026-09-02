@@ -92,6 +92,7 @@ from predict_scbench import (
     LedgerToTargetPositionMap,
     _flop_summary_fields,
     _num_decode_steps,
+    _time_summary_fields,
     build_turn_delta_ids,
 )
 from flops_model import (
@@ -2521,6 +2522,98 @@ def test_flops_hand_computed_tiny_breakdown():
     assert target_decode_flops(cfg, [4, 5]) == 2 * (80 + 32) + 8 * (4 + 5)
 
 
+def test_time_summary_fields_match_the_csv_schema():
+    """Same contract `_flop_summary_fields` is held to: every emitted key
+    must exist in CSV_FIELDS in both the populated and empty case, or
+    DictWriter raises mid-run after the experiment has been paid for."""
+    from timing_model import breakdown_with_residual
+
+    turn = breakdown_with_residual(
+        10.0, spec_prefill=2.0, spec_lookahead=1.0, spec_scoring=0.5,
+        target_prefill=1.5, target_decode=4.0)
+    populated = _time_summary_fields([(0, turn), (1, turn)])
+    empty = _time_summary_fields([])
+    assert set(populated) == set(empty)
+    missing = set(populated) - set(CSV_FIELDS)
+    assert not missing, f"emitted keys absent from CSV_FIELDS: {sorted(missing)}"
+    assert all(v is None for v in empty.values())
+
+    assert populated["spec_prefill_seconds_per_turn_mean"] == 2.0
+    assert populated["target_decode_seconds_per_turn_mean"] == 4.0
+    # 10.0 - (2 + 1 + 0.5 + 1.5 + 4) = 1.0 of un-instrumented driver cost.
+    assert populated["driver_overhead_seconds_per_turn_mean"] == 1.0
+    assert abs(populated["speculator_seconds_fraction"] - 0.35) < 1e-12
+
+
+def test_time_stages_sum_to_the_turn_clock():
+    """The identity that makes the breakdown exhaustive: because
+    `driver_overhead` is a residual, the stage means must sum to the mean
+    turn wall clock. If they ever don't, two stages are double-counting --
+    which is the failure mode that would silently re-create the very
+    misattribution this instrumentation exists to remove."""
+    from timing_model import breakdown_with_residual
+
+    turns = [
+        (0, breakdown_with_residual(30.0, spec_prefill=12.0, target_prefill=9.0,
+                                    target_decode=5.0)),
+        (1, breakdown_with_residual(6.0, spec_prefill=1.5, spec_lookahead=0.4,
+                                    spec_scoring=0.3, target_prefill=0.2,
+                                    target_decode=3.0)),
+        (2, breakdown_with_residual(6.4, spec_prefill=1.6, spec_lookahead=0.4,
+                                    spec_scoring=0.3, target_prefill=0.2,
+                                    target_decode=3.2)),
+    ]
+    fields = _time_summary_fields(turns)
+    from predict_scbench import _TIME_STAGES
+
+    total = sum(fields[f"{s}_seconds_per_turn_mean"] for s in _TIME_STAGES)
+    assert abs(total - (30.0 + 6.0 + 6.4) / 3) < 1e-9, total
+
+    # And the excl-turn0 columns must average ONLY the later turns -- turn 0
+    # is ~5x a steady-state turn here, exactly as on the real workload, so
+    # mixing it in would dominate the mean.
+    later = sum(fields[f"{s}_seconds_per_turn_excl_turn0_mean"] for s in _TIME_STAGES)
+    assert abs(later - (6.0 + 6.4) / 2) < 1e-9, later
+
+
+def test_baseline_turn_charges_no_speculator_seconds():
+    """M000 has no speculator, so its spec_* seconds must be structurally
+    zero -- the same convention `FlopBreakdown` uses, so a baseline row's
+    speculator columns read 0.0 rather than blank."""
+    from timing_model import breakdown_with_residual
+
+    turn = breakdown_with_residual(5.0, target_prefill=1.0, target_decode=3.5)
+    fields = _time_summary_fields([(0, turn), (1, turn)])
+    for stage in ("spec_prefill", "spec_lookahead", "spec_scoring"):
+        assert fields[f"{stage}_seconds_per_turn_mean"] == 0.0
+    assert fields["speculator_seconds_fraction"] == 0.0
+    assert fields["driver_overhead_seconds_per_turn_mean"] == 0.5
+
+
+def test_timing_breakdown_rejects_an_unknown_stage():
+    """A typo'd stage keyword would otherwise silently land its whole value
+    in the residual and read as driver cost."""
+    from timing_model import breakdown_with_residual
+
+    try:
+        breakdown_with_residual(1.0, target_decoode=0.5)
+    except ValueError as exc:
+        assert "target_decoode" in str(exc)
+    else:
+        raise AssertionError("a misspelled stage name was accepted")
+
+
+def test_timing_overlap_surfaces_as_a_negative_residual():
+    """Stages that overlap mean something is double-counted. That must be
+    visible, not clamped to zero -- a clamped residual would make an
+    instrumentation bug look like a fast turn."""
+    from timing_model import breakdown_with_residual
+
+    bd = breakdown_with_residual(1.0, target_prefill=2.0, target_decode=1.0)
+    assert bd.driver_overhead < 0
+    assert abs(bd.total - 1.0) < 1e-12
+
+
 def test_flop_summary_fields_match_the_csv_schema():
     """Every key `_flop_summary_fields` emits must exist in CSV_FIELDS, in
     both the populated and the empty case -- a mismatch means DictWriter
@@ -2662,7 +2755,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
             return [], {
                 "ttfts": [], "out_lens": [], "actual_keep_rates": [],
                 "num_cached_tokens_speculator": [], "num_skipped_too_large": 0,
-                "turn_elapsed": [], "flops": [],
+                "turn_elapsed": [], "flops": [], "turn_times": [],
                 "finish": {"stop": 0, "length": 0, "other": 0},
             }
         return loop

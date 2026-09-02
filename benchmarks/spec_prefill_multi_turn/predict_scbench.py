@@ -149,6 +149,7 @@ from flops_model import (
     target_prefill_flops,
     target_sparse_prefill_flops,
 )
+from timing_model import TimeBreakdown, breakdown_with_residual
 
 sys.path.insert(0, str(Path(__file__).parent))  # for `vllm_patch` imports
 
@@ -188,6 +189,18 @@ DEFAULT_SAMPLES = Path(__file__).parent / "datasets" / "scbench_samples.jsonl"
 
 _FLOP_STAGES = ("spec_prefill", "spec_lookahead", "spec_scoring",
                 "target_prefill", "target_decode")
+#: Wall-clock counterpart to `_FLOP_STAGES`, plus the residual. Time was a
+#: single number per turn while FLOPs were stage-split, which is why the
+#: speculator's FLOP share was known and its LATENCY share was not -- and
+#: why `seconds_per_turn_excl_turn0_mean` silently compares different work
+#: in the baseline and sparse arms. See `timing_model.py`.
+_TIME_STAGES = TimeBreakdown.STAGES
+_TIME_FIELDS = (
+    [f"{s}_seconds_per_turn_mean" for s in _TIME_STAGES]
+    + ["speculator_seconds_fraction"]
+    + [f"{s}_seconds_per_turn_excl_turn0_mean" for s in _TIME_STAGES]
+    + ["speculator_seconds_fraction_excl_turn0"]
+)
 _FLOP_FIELDS = (
     [f"{s}_tflops_per_turn_mean" for s in _FLOP_STAGES]
     + ["total_tflops_per_turn_mean", "total_tflops", "speculator_flops_fraction",
@@ -238,6 +251,7 @@ CSV_FIELDS = [
     # into "how much of the scorer's cost is its prefill", which is what
     # decides whether a cheaper scorer or a shorter lookahead is the lever.
     *_FLOP_FIELDS,
+    *_TIME_FIELDS,
 ]
 
 # See EXPERIMENT_PLAN.md's "SpecPrefill settings" -- algorithm hyperparameters
@@ -933,6 +947,28 @@ def build_turn_delta_ids(
     return list(turn_boundary_ids) + list(query_ids) + list(chat_after_ids)
 
 
+def _target_stage_seconds(t_start, t_prefill_done, t_done) -> dict:
+    """Split a target-side driving loop's span into `target_prefill` and
+    `target_decode` for `timing_model.TimeBreakdown`.
+
+    Both drive helpers below already computed this split for their log
+    lines and then threw it away; this returns it instead. The boundary is
+    the FIRST output seen for the request, which is exactly when prefill
+    finished and the first token was sampled -- there is no earlier signal
+    available from outside the engine.
+
+    `t_prefill_done is None` means no output ever arrived, so there is no
+    boundary to split on: charge the whole span to prefill rather than
+    inventing a decode figure.
+    """
+    if t_prefill_done is None:
+        return {"target_prefill": t_done - t_start, "target_decode": 0.0}
+    return {
+        "target_prefill": t_prefill_done - t_start,
+        "target_decode": t_done - t_prefill_done,
+    }
+
+
 def drive_single_request_to_completion(llm_engine, request_id: str):
     """Same discipline as predict_longbench_v2.py's drive_engine_to_completion
     (never break early, never abort) -- specialized to exactly one in-flight
@@ -963,13 +999,14 @@ def drive_single_request_to_completion(llm_engine, request_id: str):
                         f"done in {t_prefill_done - t_start:.2f}s"
                     )
                 latest_output = output
+    t_done = time.time()
     if t_prefill_done is not None and latest_output is not None:
         print(
             f"[predict_scbench] {request_id!r}: target decode done in "
-            f"{time.time() - t_prefill_done:.2f}s "
+            f"{t_done - t_prefill_done:.2f}s "
             f"({len(latest_output.outputs[0].token_ids)} tokens generated)"
         )
-    return latest_output
+    return latest_output, _target_stage_seconds(t_start, t_prefill_done, t_done)
 
 
 def drive_one_turn_of_session(llm_engine, request_id: str):
@@ -1003,13 +1040,15 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
                 )
             last_output = output
             if output.outputs[0].finish_reason is not None:
+                t_done = time.time()
                 if t_prefill_done is not None:
                     print(
                         f"[predict_scbench] {request_id!r}: target decode "
-                        f"done in {time.time() - t_prefill_done:.2f}s"
+                        f"done in {t_done - t_prefill_done:.2f}s"
                     )
-                return last_output
-    return last_output
+                return last_output, _target_stage_seconds(
+                    t_start, t_prefill_done, t_done)
+    return last_output, _target_stage_seconds(t_start, t_prefill_done, time.time())
 
 
 def build_sparse_session_request(llm_engine, request_id, prompt_token_ids, sampling_params, resumable=True):
@@ -1305,6 +1344,50 @@ def _stage_means(breakdowns, prefix=""):
     return out
 
 
+def _time_stage_means(breakdowns, prefix=""):
+    """Per-stage per-turn mean SECONDS, the wall-clock analogue of
+    `_stage_means`.
+
+    `speculator_seconds_fraction` is deliberately named to invite comparison
+    with `speculator_flops_fraction` and is NOT the same quantity. The
+    speculator can be 17.5% of a turn's FLOPs and a very different share of
+    its seconds, because the two engines run at different efficiencies and,
+    today, strictly one after the other on separate GPUs -- each idle while
+    the other works. That gap between the two fractions is the measurement
+    this whole breakdown exists to expose.
+    """
+    if not breakdowns:
+        return {f"{s}_seconds_per_turn{prefix}_mean": None for s in _TIME_STAGES}
+    total = TimeBreakdown()
+    for bd in breakdowns:
+        total += bd
+    n = len(breakdowns)
+    out = {f"{s}_seconds_per_turn{prefix}_mean": getattr(total, s) / n
+           for s in _TIME_STAGES}
+    out[f"speculator_seconds_fraction{prefix}"] = (
+        total.speculator_total / total.total if total.total else None
+    )
+    return out
+
+
+def _time_summary_fields(turn_times) -> dict:
+    """The `_TIME_FIELDS` half of a run's summary row.
+
+    Stages sum to the turn's measured wall clock BY CONSTRUCTION (the
+    residual absorbs whatever was not instrumented), so
+    `sum(stage means) == seconds_per_turn_mean` is an identity that holds
+    unless something is double-counted -- which makes it a free consistency
+    check rather than a coincidence to verify.
+    """
+    if not turn_times:
+        return {f: None for f in _TIME_FIELDS}
+    all_bd = [bd for _, bd in turn_times]
+    later_bd = [bd for idx, bd in turn_times if idx != 0]
+    fields = _time_stage_means(all_bd)
+    fields.update(_time_stage_means(later_bd, prefix="_excl_turn0"))
+    return fields
+
+
 def _record_turn_flops(stats, breakdown: FlopBreakdown, turn_idx: int, **flop_inputs) -> dict:
     """Accumulates one turn's FLOP breakdown into `stats` and returns the
     fields to merge into that turn's prediction record.
@@ -1412,7 +1495,8 @@ def run_baseline(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": []}
+              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": [],
+              "turn_times": []}
     target_flop_cfg = _target_flop_config(llm)
 
     t_loop_start = time.time()
@@ -1460,7 +1544,8 @@ def run_baseline(
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
             t_gen_start = time.time()
             llm.llm_engine.add_request(request_id, prompt, sampling_params)
-            output = drive_single_request_to_completion(llm.llm_engine, request_id)
+            output, target_stage_seconds = drive_single_request_to_completion(
+                llm.llm_engine, request_id)
             progress.write(
                 f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
                 f"generation done in {time.time() - t_gen_start:.2f}s "
@@ -1521,7 +1606,13 @@ def run_baseline(
                 if output.metrics is not None and output.metrics.first_token_latency:
                     stats["ttfts"].append(output.metrics.first_token_latency * 1000)
                 stats["actual_keep_rates"].append(1.0)
-                stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
+                # M000 has no speculator, so its spec_* stages are zero by
+                # construction -- the same convention the FLOP breakdown uses.
+                spec_stage_seconds = {}
+                turn_seconds = time.time() - t_turn_start
+                stats["turn_elapsed"].append((turn_idx, turn_seconds))
+                stats["turn_times"].append((turn_idx, breakdown_with_residual(
+                    turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
 
                 # M000 pays no speculator cost at all -- every spec_* stage
                 # stays zero, which is exactly what makes this row the
@@ -1638,7 +1729,8 @@ def run_specprefill(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": []}
+              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": [],
+              "turn_times": []}
 
     target_flop_cfg = _target_flop_config(llm)
     spec_flop_cfg = _speculator_flop_config(proposer)
@@ -1728,7 +1820,8 @@ def run_specprefill(
             )
             t_gen_start = time.time()
             prune_and_add_turn(llm.llm_engine, request_id, full_result, sampling_params)
-            output = drive_single_request_to_completion(llm.llm_engine, request_id)
+            output, target_stage_seconds = drive_single_request_to_completion(
+                llm.llm_engine, request_id)
             progress.write(
                 f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
                 f"generation done in {time.time() - t_gen_start:.2f}s"
@@ -1744,7 +1837,11 @@ def run_specprefill(
                 if result.orig_len > 0:
                     stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
-                stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
+                spec_stage_seconds = result.stage_seconds
+                turn_seconds = time.time() - t_turn_start
+                stats["turn_elapsed"].append((turn_idx, turn_seconds))
+                stats["turn_times"].append((turn_idx, breakdown_with_residual(
+                    turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
 
                 # The whole point of this row: the speculator pays a FULL
                 # prefill over the unpruned candidate pool (pruning shrinks
@@ -1939,7 +2036,8 @@ def run_sparse_attention(
     predictions = []
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
-              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": []}
+              "num_skipped_too_large": 0, "turn_elapsed": [], "flops": [],
+              "turn_times": []}
 
     target_flop_cfg = _target_flop_config(llm)
     spec_flop_cfg = _speculator_flop_config(proposer)
@@ -2111,7 +2209,8 @@ def run_sparse_attention(
                 f"be set (proposer.py sets this at import time)."
             )
             session_started = True
-            output = drive_one_turn_of_session(llm.llm_engine, target_request_id)
+            output, target_stage_seconds = drive_one_turn_of_session(
+                llm.llm_engine, target_request_id)
             progress.write(
                 f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
                 f"generation done in {time.time() - t_gen_start:.2f}s "
@@ -2212,7 +2311,11 @@ def run_sparse_attention(
                 if result.orig_len > 0:
                     stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
-                stats["turn_elapsed"].append((turn_idx, time.time() - t_turn_start))
+                spec_stage_seconds = result.stage_seconds
+                turn_seconds = time.time() - t_turn_start
+                stats["turn_elapsed"].append((turn_idx, turn_seconds))
+                stats["turn_times"].append((turn_idx, breakdown_with_residual(
+                    turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
                 # completion.text is ALSO cumulative for the same reason --
                 # re-decode just this turn's own new tokens rather than use
                 # it directly.
@@ -3005,6 +3108,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "finish_length": stats["finish"]["length"],
                 "finish_other": stats["finish"]["other"],
                 **_flop_summary_fields(stats["flops"], elapsed, args.peak_tflops),
+                **_time_summary_fields(stats["turn_times"]),
             }
             append_csv_row(row)
             spc = row["seconds_per_conversation"]
