@@ -103,6 +103,67 @@ def run_decode_only_stock(llm_engine, request_id: str, context_ids: List[int], d
     return step_latencies
 
 
+def run_decode_only_stock_batched(
+    llm_engine, base_request_id: str, contexts: List[List[int]], decode_tokens: int
+) -> List[float]:
+    """`run_decode_only_stock` with N sequences decoding CONCURRENTLY.
+
+    Answers the question the whole sparse-attention economics turns on:
+    **is decode weight-bound or KV-bound at this context length?**
+
+    At batch 1 a decode step streams ~31GB of sharded weights per card
+    against roughly ~7GB of KV, so weights dominate and cutting KV reads by
+    80% can only take a slice of the smaller number -- which is exactly what
+    was measured (38% fewer decode FLOPs, 0.003s faster). Weights amortize
+    across a batch while KV scales with it, so if per-step time barely
+    moves from batch 1 to batch N, decode is weight-bound and batching is
+    the precondition for sparsity paying at all. If per-step time scales
+    with N, KV already dominates and batching will not help.
+
+    Returns per-step latencies for steps where ALL sequences were decoding,
+    so the number is directly comparable to the batch-1 figure as
+    "ms per step", not per token. Divide by N for per-token throughput.
+    """
+    import torch
+    from vllm import SamplingParams
+    from vllm.inputs import TokensPrompt
+
+    sampling_params = SamplingParams(
+        max_tokens=decode_tokens, min_tokens=decode_tokens, ignore_eos=True,
+        temperature=0.0
+    )
+    request_ids = []
+    for i, context_ids in enumerate(contexts):
+        rid = f"{base_request_id}-{i}"
+        llm_engine.add_request(rid, TokensPrompt(prompt_token_ids=context_ids),
+                               sampling_params)
+        request_ids.append(rid)
+
+    step_latencies: List[float] = []
+    seen_first: set = set()
+    while llm_engine.has_unfinished_requests():
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outputs = llm_engine.step()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
+        by_id = {o.request_id: o for o in outputs}
+        for rid in request_ids:
+            out = by_id.get(rid)
+            if out is not None and len(out.outputs[0].token_ids) > 0:
+                seen_first.add(rid)
+        # Only steps where every sequence is past its prefill and still
+        # decoding are comparable -- a step mixing prefill and decode, or
+        # one where a sequence has already finished, is a different shape.
+        if len(seen_first) == len(request_ids) and not any(
+            o.finished for o in by_id.values()
+        ):
+            step_latencies.append(t1 - t0)
+
+    return step_latencies
+
+
 def _str2bool(v: str) -> bool:
     if v.lower() in ("true", "1", "yes"):
         return True
@@ -123,6 +184,13 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--num-sequences", type=int, default=1,
+        help="Decode this many sequences CONCURRENTLY. Batch 1 (default) "
+             "reproduces the existing measurement. Higher values answer "
+             "whether decode is weight-bound (per-step time barely moves, so "
+             "batching is what makes an attention-FLOP saving convertible) or "
+             "KV-bound (per-step time scales, so it already is).")
     parser.add_argument(
         "--cudagraph-mode", default="FULL_DECODE_ONLY",
         choices=["FULL_DECODE_ONLY", "FULL", "PIECEWISE",
@@ -240,13 +308,25 @@ def main() -> None:
           f"cudagraph_mode={cc.cudagraph_mode} "
           f"cudagraph_capture_sizes={list(cc.cudagraph_capture_sizes) if cc.cudagraph_capture_sizes else []}")
 
-    context_ids = build_synthetic_context(tok, args.context_tokens, args.seed)
+    # Distinct contexts per sequence. Identical ones would share prefix-cache
+    # blocks, so the batch would read ONE sequence's KV -- exactly the effect
+    # being measured, silently removed.
+    contexts = [
+        build_synthetic_context(tok, args.context_tokens, args.seed + i)
+        for i in range(args.num_sequences)
+    ]
+    context_ids = contexts[0]
 
     rep_latencies: List[List[float]] = []
     for rep in range(args.reps):
         request_id = f"stockcontrol-{args.enforce_eager}-{rep}"
         t_rep = time.time()
-        latencies = run_decode_only_stock(llm_engine, request_id, context_ids, args.decode_tokens)
+        if args.num_sequences == 1:
+            latencies = run_decode_only_stock(
+                llm_engine, request_id, context_ids, args.decode_tokens)
+        else:
+            latencies = run_decode_only_stock_batched(
+                llm_engine, request_id, contexts, args.decode_tokens)
         print(f"[stock_vllm_control] rep={rep}: {len(latencies)} decode steps in "
               f"{time.time() - t_rep:.1f}s wall ({'WARMUP, discarded' if rep == 0 else 'kept'})")
         if rep == 0:
@@ -260,13 +340,31 @@ def main() -> None:
     print(f"\n{'=' * 60}")
     print(f"enforce_eager={args.enforce_eager}  context_tokens={args.context_tokens}  "
           f"decode_tokens={args.decode_tokens}")
-    print(f"ms/tok median: {median_ms:.3f}   p90: {p90_ms:.3f}")
+    print(f"ms/step median: {median_ms:.3f}   p90: {p90_ms:.3f}"
+          + (f"   (num_sequences={args.num_sequences})" if args.num_sequences > 1 else ""))
+    if args.num_sequences > 1:
+        print(f"ms/tok  median: {median_ms / args.num_sequences:.3f}   "
+              f"-- per-step time divided by {args.num_sequences} concurrent "
+              f"sequences. Compare against the batch-1 ms/tok: if it FALLS "
+              f"roughly in proportion, decode is weight-bound and batching is "
+              f"what makes an attention-FLOP saving convertible; if it barely "
+              f"moves, KV reads already dominate.")
     print(f"{'=' * 60}")
 
-    out_path = Path(f"stock_vllm_control_eager{args.enforce_eager}.json")
+    # Filename carries num_sequences too, so a batch sweep does not overwrite
+    # its own earlier points.
+    suffix = "" if args.num_sequences == 1 else f"_n{args.num_sequences}"
+    out_path = Path(f"stock_vllm_control_eager{args.enforce_eager}{suffix}.json")
     with open(out_path, "w") as f:
-        json.dump(dict(args=vars(args), ms_per_tok_median=median_ms, ms_per_tok_p90=p90_ms,
-                        raw_ms=pooled_ms), f, indent=2)
+        # `ms_per_step_*` is the measured quantity; `ms_per_tok_*` divides by
+        # the concurrency. They are equal at batch 1, which is why the old
+        # key was named for tokens -- keep both so a batch>1 run cannot be
+        # read as if it were per-token.
+        json.dump(dict(args=vars(args),
+                       ms_per_step_median=median_ms, ms_per_step_p90=p90_ms,
+                       ms_per_tok_median=median_ms / args.num_sequences,
+                       ms_per_tok_p90=p90_ms / args.num_sequences,
+                       raw_ms=pooled_ms), f, indent=2)
     print(f"[stock_vllm_control] full results written to {out_path}")
 
 
