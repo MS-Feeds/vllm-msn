@@ -124,6 +124,13 @@ def main() -> None:
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--cudagraph-mode", default="FULL_DECODE_ONLY",
+        choices=["FULL_DECODE_ONLY", "FULL", "PIECEWISE",
+                 "FULL_AND_PIECEWISE", "NONE"],
+        help="Only used when --enforce-eager false. FULL_DECODE_ONLY and "
+             "FULL work without Dynamo; the PIECEWISE variants need it and "
+             "will fail under TORCHDYNAMO_DISABLE=1.")
+    parser.add_argument(
         "--tensor-parallel-size", type=int, default=1,
         help="Shard the model across this many GPUs. Required for a checkpoint "
              "whose weights do not fit one card: Gemma-4-31B is ~62GB in bf16, "
@@ -145,7 +152,10 @@ def main() -> None:
     # (Gemma 4) has no `max_position_embeddings` at the top level, and
     # reading it raises AttributeError. See
     # `vllm_patch.model_structure.native_context_length`.
-    from vllm_patch.model_structure import native_context_length
+    from vllm_patch.model_structure import (
+        has_multimodal_tower,
+        native_context_length,
+    )
 
     native_max_model_len = native_context_length(model_path)
     max_model_len = args.context_tokens + args.decode_tokens + 64
@@ -168,6 +178,53 @@ def main() -> None:
         # resumable sessions, no sparse mechanism), left at vLLM's own
         # defaults.
     )
+
+    # `--enforce-eager false` ALONE is not enough to get CUDA graphs in this
+    # pipeline's environment, and the failure is a hard crash rather than a
+    # silent fallback: it takes `@support_torch_compile`'s AOT path
+    # (`vllm/compilation/wrapper.py`), which needs Dynamo, and this pipeline
+    # pins `TORCHDYNAMO_DISABLE=1` because Inductor's process pool cannot
+    # spawn inside daemonic MultiprocExecutor workers. Observed on
+    # Gemma-4-31B as `RuntimeError: aot_compile is not supported by the
+    # current configuration`.
+    #
+    # The way out is stated by vLLM's own docs (`config/compilation.py`):
+    # "the cudagraph logic is generally orthogonal to the compilation logic.
+    # While piecewise cudagraphs require piecewise compilation ... full
+    # [cudagraphs do not]". So pin BOTH: `mode=NONE` (no torch.compile at
+    # all, hence no Dynamo) and an explicitly FULL cudagraph mode.
+    #
+    # `FULL_DECODE_ONLY` is the default here rather than `FULL` because only
+    # decode batches are being measured, and it leaves prefill eager --
+    # matching what the sparse path would need, since its prefill gather
+    # varies per chunk and must not be captured. Verified reachable: the
+    # empty-`splitting_ops` validation downgrades PIECEWISE and
+    # FULL_AND_PIECEWISE but leaves FULL/FULL_DECODE_ONLY alone (and its own
+    # warning text recommends exactly this), and TRITON_ATTN -- which
+    # Gemma 4 forces -- declares `AttentionCGSupport.ALWAYS`.
+    if not args.enforce_eager:
+        from vllm.config.compilation import (
+            CompilationConfig,
+            CompilationMode,
+            CUDAGraphMode,
+        )
+
+        llm_kwargs["compilation_config"] = CompilationConfig(
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode[args.cudagraph_mode],
+        )
+        print(f"[stock_vllm_control] cudagraph_mode={args.cudagraph_mode} with "
+              f"compilation mode=NONE (no Dynamo -- see comment above)")
+
+    # Text-only workload, but a natively multimodal checkpoint still reserves
+    # an encoder cache and PROFILES it. On Gemma-4-31B the log reads
+    # "profiled with 3 video items of the maximum feature size" and the
+    # reservation eats KV budget for a modality this script never uses.
+    # Same treatment predict_scbench.py applies for the same reason.
+    if has_multimodal_tower(model_path):
+        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+        print("[stock_vllm_control] multimodal checkpoint; zeroing modality "
+              "limits (text-only workload)")
     print(f"[stock_vllm_control] constructing STOCK engine (no worker_cls): "
           f"{json.dumps({k: v for k, v in llm_kwargs.items() if k != 'model'})}")
     t_engine = time.time()

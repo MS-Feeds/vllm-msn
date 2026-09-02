@@ -530,7 +530,10 @@ def main() -> None:
     # (Gemma 4) has no `max_position_embeddings` at the top level, and
     # reading it raises AttributeError. See
     # `vllm_patch.model_structure.native_context_length`.
-    from vllm_patch.model_structure import native_context_length
+    from vllm_patch.model_structure import (
+        has_multimodal_tower,
+        native_context_length,
+    )
 
     native_max_model_len = native_context_length(model_path)
     max_model_len = args.context_tokens + args.decode_tokens + 64
@@ -553,6 +556,16 @@ def main() -> None:
     )
     print(f"[sparse_decode_microbench] constructing engine: {json.dumps({k: v for k, v in llm_kwargs.items() if k != 'model'})}")
     t_engine = time.time()
+
+    # Text-only workload, but a natively multimodal checkpoint still reserves
+    # an encoder cache and PROFILES it (on Gemma-4-31B: "profiled with 3 video
+    # items of the maximum feature size"), eating KV budget for a modality
+    # this script never uses. Same treatment predict_scbench.py applies.
+    if has_multimodal_tower(model_path):
+        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
+        print("[sparse_decode_microbench] multimodal checkpoint; zeroing modality limits "
+              "(text-only workload)")
+
     llm = LLM(**llm_kwargs)
     print(f"[sparse_decode_microbench] engine constructed in {time.time() - t_engine:.1f}s")
 
