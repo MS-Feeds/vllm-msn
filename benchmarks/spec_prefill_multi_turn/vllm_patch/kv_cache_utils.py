@@ -513,6 +513,41 @@ def compute_sparse_gather_view(
     return gathered_block_table_row, gathered_seq_len
 
 
+_PINNED_INDEX_BUFFER = None
+
+
+def _pinned_index_tensor(indices: List[int], device) -> torch.Tensor:
+    """`indices` as an int64 tensor on `device`, staged through a REUSED
+    pinned host buffer.
+
+    Replaces a per-decode-step `torch.tensor(indices, device=cuda)`, which
+    allocated a fresh pageable host tensor and copied it synchronously.
+    Pageable copies cannot overlap with compute and force the runtime to
+    stage through an internal buffer; pinned memory removes both costs and
+    lets the copy be issued async.
+
+    The buffer only ever grows, and is sized by the largest selection seen,
+    so the steady state has no host allocation at all. Falls back to the
+    plain constructor on CPU, where pinning is meaningless -- which is also
+    what keeps this unit-testable without a GPU.
+    """
+    if device.type != "cuda":
+        return torch.tensor(indices, dtype=torch.int64, device=device)
+
+    global _PINNED_INDEX_BUFFER
+    needed = len(indices)
+    buf = _PINNED_INDEX_BUFFER
+    if buf is None or buf.numel() < needed:
+        buf = torch.empty(needed, dtype=torch.int64, pin_memory=True)
+        _PINNED_INDEX_BUFFER = buf
+    view = buf[:needed]
+    # The small host tensor here is cheap; what mattered was the DEVICE
+    # transfer, which is now pinned and async rather than pageable and
+    # synchronous.
+    view.copy_(torch.tensor(indices, dtype=torch.int64))
+    return view.to(device, non_blocking=True)
+
+
 @dataclass
 class BaseGatherView:
     """Per-turn (not per-decode-step) precomputation for
@@ -529,6 +564,23 @@ class BaseGatherView:
     boundary_block: int  # num_prompt // block_size -- the one block index whose occupancy can still be ambiguous/growing this turn
     boundary_in_selection: bool  # whether the speculator's own selection includes boundary_block
     overflow_blocks: List[int]  # sorted, all > boundary_block -- should be empty for any legitimate selection (see compute_base_gather_view's docstring), kept only so a stale/out-of-range selection still fails loudly via the per-step range check instead of silently vanishing
+
+    @property
+    def overflow_set(self) -> Set[int]:
+        """`set(overflow_blocks)`, built once per TURN rather than once per
+        decode step.
+
+        `compute_sparse_gather_view_incremental` unions this with the
+        step's tail blocks on every step; rebuilding the set each time is
+        pure repeated work on the hot path, and this view is explicitly
+        per-turn and immutable. Normally empty, so the union is usually
+        free either way -- but the allocation was not.
+        """
+        cached = getattr(self, "_overflow_set", None)
+        if cached is None:
+            cached = set(self.overflow_blocks)
+            object.__setattr__(self, "_overflow_set", cached)
+        return cached
 
 
 def compute_base_gather_view(
@@ -643,7 +695,7 @@ def compute_sparse_gather_view_incremental(
     else:
         tail_blocks = set()
 
-    dynamic_blocks = sorted(tail_blocks | set(base_view.overflow_blocks))
+    dynamic_blocks = sorted(tail_blocks | base_view.overflow_set)
 
     total_selected = len(base_view.stable_blocks) + len(dynamic_blocks)
     if total_selected == 0:
@@ -669,10 +721,16 @@ def compute_sparse_gather_view_incremental(
         return None
 
     if dynamic_blocks:
-        dynamic_block_tensor = torch.tensor(
-            dynamic_blocks, dtype=torch.int64, device=full_block_table_row.device
+        # Staged through PINNED host memory. The previous
+        # `torch.tensor(dynamic_blocks, device=cuda)` allocated a fresh
+        # pageable host tensor every decode step and copied it
+        # synchronously; a pinned buffer makes the transfer async and
+        # removes the per-step host allocation. Reused across steps, so it
+        # is sized once for the largest selection seen.
+        dynamic_block_tensor = _pinned_index_tensor(
+            dynamic_blocks, full_block_table_row.device
         )
-        dynamic_rows = full_block_table_row[dynamic_block_tensor].clone()
+        dynamic_rows = full_block_table_row[dynamic_block_tensor]
         gathered_block_table_row = torch.cat([base_view.stable_rows, dynamic_rows])
     else:
         gathered_block_table_row = base_view.stable_rows

@@ -808,6 +808,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor
 
         any_patched = False
+        # req_idx -> the gathered length written for it this step. Lets the
+        # post-loop `max_seq_len` fix-up be computed entirely host-side; see
+        # that block for the GPU sync this removes.
+        patched_seq_lens: Dict[int, int] = {}
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
             # get_with_generation(), not get() -- one atomic snapshot of
@@ -906,6 +910,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                     continue
                 gathered_block_table_row, gathered_seq_len = gathered
                 any_patched = True
+                patched_seq_lens[req_idx] = gathered_seq_len
                 self._apply_gathered_view(
                     attn_metadata, any_layer_metadata, req_idx,
                     gathered_block_table_row, gathered_seq_len,
@@ -943,6 +948,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 continue
             gathered_block_table_row, gathered_seq_len = gathered
             any_patched = True
+            patched_seq_lens[req_idx] = gathered_seq_len
             self._apply_gathered_view(
                 attn_metadata, any_layer_metadata, req_idx,
                 gathered_block_table_row, gathered_seq_len,
@@ -982,8 +988,30 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             gatherable = self._gatherable_layer_names(attn_metadata)
             any_layer_metadata = attn_metadata[next(iter(gatherable))]
             if hasattr(any_layer_metadata, _MAX_SEQ_LEN_FIELD):
-                seq_lens = self._get_field(any_layer_metadata, _SEQ_LENS_FIELD)
-                new_max_seq_len = int(seq_lens.max().item())
+                # Computed HOST-SIDE, with no GPU sync at all. Every input
+                # is already known on the CPU: a patched request's length is
+                # the `gathered_seq_len` this method just wrote, and an
+                # unpatched one's is `_step_seq_len`, which reads
+                # `optimistic_seq_lens_cpu` (the same CPU tensor the stock
+                # builder derives `max_seq_len` from).
+                #
+                # The previous version called `.max().item()` on the GPU
+                # tensor -- one blocking sync per decode step, already cut
+                # down from 32. That was tolerable when eager dispatch cost
+                # ~83 ms/tok; under FULL_DECODE_ONLY a decode step is ~42
+                # ms/tok on this path, so a sync is a far larger share of
+                # it. Measured: the override costs +17.7% of decode versus
+                # the dense baseline, which is what this and the sibling
+                # changes below are reclaiming.
+                #
+                # Equivalent to the old `.max()`, and arguably tighter: it
+                # ranges over `num_reqs` rather than the whole tensor, so
+                # padding entries beyond the batch cannot contribute.
+                new_max_seq_len = max(
+                    patched_seq_lens[i] if i in patched_seq_lens
+                    else self._step_seq_len(i)
+                    for i in range(num_reqs)
+                )
                 for layer_name in gatherable:
                     setattr(attn_metadata[layer_name], _MAX_SEQ_LEN_FIELD,
                             new_max_seq_len)
@@ -1033,12 +1061,14 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         block_table_width = self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD).shape[1]
         num_gathered = gathered_block_table_row.shape[0]
         if block_table_width > num_gathered:
-            padded_block_table_row = torch.zeros(
-                block_table_width,
-                dtype=gathered_block_table_row.dtype,
-                device=gathered_block_table_row.device,
-            )
-            padded_block_table_row[:num_gathered] = gathered_block_table_row
+            # Persistent scratch row, zeroed once on allocation and only
+            # ever re-zeroed over the region a PREVIOUS step dirtied. The
+            # old code allocated a fresh `torch.zeros(block_table_width)`
+            # every decode step -- at the driver's default max_model_len
+            # that is ~8192 int32s (32 KiB) allocated and fully zeroed per
+            # step, to hold a few hundred meaningful entries.
+            padded_block_table_row = self._padded_block_table_row(
+                block_table_width, gathered_block_table_row, num_gathered)
         else:
             padded_block_table_row = gathered_block_table_row
 
@@ -1054,6 +1084,39 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             self._patch_layer_metadata(
                 layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
             )
+
+    def _padded_block_table_row(self, width: int, gathered_row, num_gathered: int):
+        """A reusable full-width block-table row: gathered blocks in the
+        leading columns, `NULL_BLOCK_ID` (0) after.
+
+        Two costs removed versus rebuilding it each step. The allocation
+        itself, and -- more importantly -- the zeroing: only the tail a
+        PREVIOUS step actually dirtied needs clearing, not the whole row.
+        The selection's block count is near-constant across the decode
+        steps of one turn, so in the steady state that tail is empty and
+        the zeroing collapses to nothing.
+
+        Correctness rests on the same convention `_patch_layer_metadata`
+        documents: entries past the gathered prefix must read as
+        NULL_BLOCK_ID, matching this fork's own cudagraph padding for
+        out-of-range block-table rows.
+        """
+        cached = getattr(self, "_padded_row_cache", None)
+        if (cached is None or cached.shape[0] != width
+                or cached.dtype != gathered_row.dtype
+                or cached.device != gathered_row.device):
+            cached = torch.zeros(width, dtype=gathered_row.dtype,
+                                 device=gathered_row.device)
+            self._padded_row_cache = cached
+            self._padded_row_dirty = 0
+
+        cached[:num_gathered] = gathered_row
+        dirty = getattr(self, "_padded_row_dirty", width)
+        if dirty > num_gathered:
+            # Only the region the last step left non-zero.
+            cached[num_gathered:dirty] = 0
+        self._padded_row_dirty = num_gathered
+        return cached
 
     @staticmethod
     def _prefill_gather_applies(

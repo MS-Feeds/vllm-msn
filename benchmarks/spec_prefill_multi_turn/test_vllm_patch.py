@@ -4759,6 +4759,71 @@ def test_target_cudagraph_mode_is_opt_in_and_bypasses_dynamo():
     assert cfg.cudagraph_mode.name == "FULL_DECODE_ONLY"
 
 
+def test_padded_block_table_row_reuses_its_buffer_and_clears_the_tail():
+    """The persistent padded row must behave EXACTLY like the fresh
+    `torch.zeros(width)` it replaces -- gathered blocks in the leading
+    columns, zeros after -- while allocating once.
+
+    The subtle case is a selection that SHRINKS between steps: entries the
+    previous step wrote past the new prefix must read as NULL_BLOCK_ID
+    again, or a stale block id from the previous step is left where the
+    kernel may treat it as padding. Only the region a previous step
+    actually dirtied is re-zeroed, which is what keeps this cheaper than
+    re-zeroing the whole row."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+    width = 64
+
+    wide = torch.arange(1, 11, dtype=torch.int32)          # 10 blocks
+    row = runner._padded_block_table_row(width, wide, wide.shape[0])
+    first_addr = row.data_ptr()
+    assert row.shape[0] == width
+    assert torch.equal(row[:10], wide)
+    assert int(row[10:].sum()) == 0
+
+    # Shrink: 4 blocks. Entries 4..10 held real ids a moment ago.
+    narrow = torch.arange(100, 104, dtype=torch.int32)
+    row = runner._padded_block_table_row(width, narrow, narrow.shape[0])
+    assert row.data_ptr() == first_addr, "buffer must be reused, not realloc'd"
+    assert torch.equal(row[:4], narrow)
+    assert int(row[4:].sum()) == 0, (
+        "the previous step's trailing block ids were not cleared")
+
+    # Grow again, past the previous high-water mark.
+    grown = torch.arange(200, 220, dtype=torch.int32)
+    row = runner._padded_block_table_row(width, grown, grown.shape[0])
+    assert row.data_ptr() == first_addr
+    assert torch.equal(row[:20], grown)
+    assert int(row[20:].sum()) == 0
+
+
+def test_gather_hot_path_avoids_per_step_rebuilds():
+    """Two per-decode-step costs removed from
+    `compute_sparse_gather_view_incremental`.
+
+    `overflow_set` is built once per TURN rather than per step (the view is
+    per-turn and immutable), and index staging goes through a helper that
+    uses pinned host memory on CUDA instead of a fresh pageable
+    `torch.tensor(..., device=cuda)` every step. Both are pure hot-path
+    work: the values they produce are unchanged, which is what this
+    asserts."""
+    from vllm_patch import kv_cache_utils as kv
+
+    view = kv.BaseGatherView(
+        stable_blocks=[0, 1], stable_rows=torch.tensor([10, 11]),
+        stable_seq_len=32, boundary_block=2, boundary_in_selection=False,
+        overflow_blocks=[7, 9])
+    first = view.overflow_set
+    assert first == {7, 9}
+    assert view.overflow_set is first, "overflow_set must be built once per turn"
+
+    # The staging helper must produce the same values as the plain
+    # constructor it replaced. CPU path here; CUDA takes the pinned route.
+    out = kv._pinned_index_tensor([3, 1, 4], torch.device("cpu"))
+    assert out.dtype == torch.int64
+    assert out.tolist() == [3, 1, 4]
+
+
 def test_privatised_seq_lens_keeps_a_stable_address_across_steps():
     """The invariant CUDA graph capture actually needs.
 
