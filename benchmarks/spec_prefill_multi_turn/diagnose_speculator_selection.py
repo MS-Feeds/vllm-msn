@@ -171,9 +171,14 @@ def main() -> None:
     print(f"[diagnose_speculator_selection] conversation={args.conversation_id!r} turn={args.turn} "
           f"keep_percentage={args.keep_percentage} granularity={args.granularity!r} keep_mode={args.keep_mode!r}")
 
-    speculator_native_max_model_len = AutoConfig.from_pretrained(
-        speculator_model, trust_remote_code=True
-    ).max_position_embeddings
+    # Text config, not the wrapper -- a natively multimodal checkpoint
+    # (Gemma 4) has no `max_position_embeddings` at the top level, and
+    # reading it raises AttributeError. See
+    # `vllm_patch.model_structure.native_context_length`.
+    from vllm_patch.model_structure import native_context_length
+
+    speculator_native_max_model_len = native_context_length(
+        speculator_model)
     speculator_max_num_batched_tokens = args.speculator_max_num_batched_tokens
     if speculator_native_max_model_len is not None and speculator_max_num_batched_tokens > speculator_native_max_model_len:
         speculator_max_num_batched_tokens = int(speculator_native_max_model_len)

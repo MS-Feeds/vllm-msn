@@ -4354,6 +4354,42 @@ def test_scorer_placement_rejects_a_collision_with_the_targets_tp_ranks():
     assert scorer_placement_error(None, 2, 4, None) is None
 
 
+def test_no_script_reads_max_position_embeddings_directly():
+    """`.max_position_embeddings` must go through
+    `model_structure.native_context_length`, never straight off an
+    `AutoConfig`.
+
+    Gemma 4 loads as a `Gemma4Config` whose text stack is nested, so the
+    top-level attribute does not exist and reading it raises
+    `AttributeError` -- not a wrong number, a crash. Eight scripts had the
+    raw read and each one failed the first time it was pointed at the 31B,
+    one at a time, minutes into a run. A source scan catches the ninth
+    before it is written rather than when someone next runs it on a GPU
+    node.
+
+    Scans source text rather than importing, because most of these modules
+    pull in vLLM at import time and cannot load in this CPU-only suite.
+    """
+    import pathlib
+
+    here = pathlib.Path(__file__).parent
+    allowed = {"model_structure.py", "test_vllm_patch.py"}
+    offenders = []
+    for path in sorted(here.rglob("*.py")):
+        if path.name in allowed:
+            continue
+        for lineno, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue  # prose about the attribute is fine
+            if ".max_position_embeddings" in line:
+                offenders.append(f"{path.relative_to(here)}:{lineno}")
+    assert not offenders, (
+        "read `.max_position_embeddings` directly instead of via "
+        "`native_context_length`: " + ", ".join(offenders))
+
+
 def test_native_context_length_reads_the_text_config_not_the_wrapper():
     """A natively multimodal checkpoint has no `max_position_embeddings` on
     its top-level config at all -- Gemma 4 raised

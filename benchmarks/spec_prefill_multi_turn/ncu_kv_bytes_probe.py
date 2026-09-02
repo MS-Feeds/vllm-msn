@@ -202,7 +202,13 @@ def main() -> None:
 
     sys.modules.setdefault("ncu_kv_bytes_probe", sys.modules[__name__])
 
-    native_max_model_len = AutoConfig.from_pretrained(model_path, trust_remote_code=True).max_position_embeddings
+    # Text config, not the wrapper -- a natively multimodal checkpoint
+    # (Gemma 4) has no `max_position_embeddings` at the top level, and
+    # reading it raises AttributeError. See
+    # `vllm_patch.model_structure.native_context_length`.
+    from vllm_patch.model_structure import native_context_length
+
+    native_max_model_len = native_context_length(model_path)
     max_model_len = args.context_tokens + args.decode_steps + 64
     if native_max_model_len is not None:
         max_model_len = min(max_model_len, int(native_max_model_len))
