@@ -537,10 +537,26 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         unpatched layer left to corrupt. This bug can only exist where the
         gather is partial.
 
-        Re-established every step, because the stock builder rebuilds the
-        metadata each step and restores the aliasing. Cheap: `seq_lens`
-        holds one int per request, unlike `block_table`, which is already
-        per-group and must NOT be copied on the hot path.
+        Re-established every step. **Two metadata regimes exist and this
+        must handle both**, which is not obvious and cost a real run:
+
+        - EAGER: the stock builder rebuilds the metadata each step, so the
+          gathered layer arrives aliasing a sliding layer's tensor again.
+        - CUDAGRAPHS (`FULL_DECODE_ONLY`): vLLM keeps PERSISTENT metadata
+          objects across steps -- that is precisely what capture requires,
+          so the privatising `setattr` survives and the gathered layer no
+          longer holds the shared tensor at all.
+
+        In the second regime, copying from the gathered layer's own tensor
+        would silently re-serve last step's values. So the fresh values are
+        always sourced from a SLIDING layer, which is never patched and
+        therefore always holds the true, in-place-updated tensor. Observed
+        on Gemma-4-31B at `layers.17.self_attn.attn` the first time
+        `--target-cudagraph-mode FULL_DECODE_ONLY` was run.
+
+        Cheap either way: `seq_lens` holds one int per request, unlike
+        `block_table`, which is already per-group and must NOT be copied on
+        the hot path.
 
         **Written into a PERSISTENT buffer rather than a fresh `.clone()`,
         because a fresh clone is a hard CUDA-graph blocker.** Graph replay
@@ -577,49 +593,67 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             layer_metadata = attn_metadata[name]
             seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
             ptr = seq_lens.data_ptr()
-            if ptr in buffers.values_by_ptr:
-                # Already pointing at one of ours, which means the stock
-                # builder did NOT rebuild this step. Raise rather than serve
-                # whatever those buffers happen to hold: the contents would
-                # be a step stale, and a wrong `seq_lens` is exactly the
-                # silent corruption this method exists to prevent.
-                raise RuntimeError(
-                    f"layer {name!r} already holds a privatised seq_lens "
-                    f"buffer -- the attention metadata was not rebuilt this "
-                    f"step, so its contents cannot be refreshed from the "
-                    f"shared tensor. This method assumes the stock builder "
-                    f"re-establishes the aliasing every step."
-                )
-            if ptr not in sliding_sources:
-                continue
-            if ptr not in assigned:
-                assigned[ptr] = buffers.get(len(assigned), seq_lens)
-                assigned[ptr].copy_(seq_lens)
-            setattr(layer_metadata, _SEQ_LENS_FIELD, assigned[ptr])
+
+            if ptr in sliding_sources:
+                # Un-privatised: the builder rebuilt (or this is step one),
+                # and this layer still aliases a sliding layer's tensor.
+                source_ptr = ptr
+            else:
+                owned = buffers.index_by_ptr.get(ptr)
+                if owned is None:
+                    continue  # private already, and not shared with sliding
+                # Already holding one of ours -- the metadata was NOT rebuilt.
+                # That is the normal state under cudagraphs, which keep
+                # persistent metadata objects precisely so captured kernels
+                # keep reading the same addresses. Refresh from the sliding
+                # layer that still holds the un-privatised tensor; reading
+                # our own buffer would just re-copy last step's values.
+                source_ptr = buffers.source_ptr_by_index.get(owned)
+                if source_ptr not in sliding_sources:
+                    raise RuntimeError(
+                        f"layer {name!r} holds privatised seq_lens buffer "
+                        f"{owned} whose source tensor is no longer present "
+                        f"among the sliding layers, so its contents cannot "
+                        f"be refreshed. Serving them would be a step stale, "
+                        f"and a wrong seq_lens is the silent corruption this "
+                        f"method exists to prevent."
+                    )
+
+            if source_ptr not in assigned:
+                source = sliding_sources[source_ptr]
+                buf = buffers.get(len(assigned), source, source_ptr)
+                buf.copy_(source)
+                assigned[source_ptr] = buf
+            setattr(layer_metadata, _SEQ_LENS_FIELD, assigned[source_ptr])
 
     class _SeqLensBuffers:
         """Persistent private `seq_lens` tensors, keyed by a stable index.
 
-        `values_by_ptr` lets `_privatise_gathered_seq_lens` recognise its own
-        buffers, which is how it detects that the metadata was not rebuilt.
+        Also remembers, per buffer, WHICH shared tensor it mirrors. That is
+        what makes the buffers refreshable in both metadata regimes -- see
+        `_privatise_gathered_seq_lens`, which has to cope with the stock
+        builder rebuilding metadata every step (eager) AND with it handing
+        back the same objects every step (cudagraphs).
         """
 
         def __init__(self) -> None:
             self.by_index: Dict[int, object] = {}
-            self.values_by_ptr: set = set()
+            self.index_by_ptr: Dict[int, int] = {}
+            self.source_ptr_by_index: Dict[int, int] = {}
 
-        def get(self, index: int, like) -> object:
+        def get(self, index: int, like, source_ptr: int) -> object:
             buf = self.by_index.get(index)
             if (buf is None or buf.shape != like.shape
                     or buf.dtype != like.dtype or buf.device != like.device):
                 # Reallocating changes the address and would invalidate any
                 # captured graph -- but it only happens on a shape/dtype
                 # change, which invalidates the graph anyway.
+                if buf is not None:
+                    self.index_by_ptr.pop(buf.data_ptr(), None)
                 buf = torch.empty_like(like)
-                if self.by_index.get(index) is not None:
-                    self.values_by_ptr.discard(self.by_index[index].data_ptr())
                 self.by_index[index] = buf
-                self.values_by_ptr.add(buf.data_ptr())
+                self.index_by_ptr[buf.data_ptr()] = index
+            self.source_ptr_by_index[index] = source_ptr
             return buf
 
     def _private_seq_lens_buffers(self) -> "_SeqLensBuffers":

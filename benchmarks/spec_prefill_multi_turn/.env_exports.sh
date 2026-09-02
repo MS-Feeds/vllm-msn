@@ -154,3 +154,39 @@ export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--go
 # once. For RANKING three scorers the target barely matters -- the comparison
 # is relative -- so the simpler substrate is usually the better trade.
 export GEMMA4_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-26B-A4B-it)
+
+# ---------------------------------------------------------------------------
+# transformers MUST be exactly 5.14.1 for the Gemma 4 checkpoints.
+#
+# Not a range, and not "5.14 or newer". Both neighbours fail, differently:
+#
+#   - Older (anything without `gemma4` registered) fails at the FIRST
+#     AutoConfig call with "The checkpoint you are trying to load has model
+#     type `gemma4` but Transformers does not recognize this architecture" --
+#     which surfaces from `model_structure.native_context_length`, minutes
+#     before any GPU work, and reads like a corrupt checkpoint rather than a
+#     version problem.
+#   - 5.15+ raises `AmbiguousGlobalPerLayerAttributeError` on Gemma 4's
+#     per-layer attributes (head_dim vs global_head_dim and friends).
+#
+# **Install order matters.** `pip install datasets` silently DOWNGRADES
+# transformers, so on a fresh node install datasets FIRST and re-pin
+# transformers afterwards:
+#
+#     pip install datasets && pip install "transformers==5.14.1"
+#
+# Warn at source time rather than letting a run discover it. Deliberately a
+# warning and not an error: the Llama rows do not need this pin, so a node
+# set up only for those should still be usable.
+_check_transformers_pin() {
+    local want="5.14.1"
+    local have
+    have=$(python3 -c "import transformers; print(transformers.__version__)" 2>/dev/null)
+    if [ -z "$have" ]; then
+        echo "[.env_exports] WARNING: transformers is not importable; Gemma 4 needs ${want}." >&2
+    elif [ "$have" != "$want" ]; then
+        echo "[.env_exports] WARNING: transformers ${have} found, Gemma 4 needs exactly ${want}." >&2
+        echo "[.env_exports]   pip install \"transformers==${want}\"   (after any 'pip install datasets')" >&2
+    fi
+}
+_check_transformers_pin

@@ -4807,16 +4807,27 @@ def test_privatised_seq_lens_keeps_a_stable_address_across_steps():
         f"captured graph to keep reading it; got {addresses}")
 
 
-def test_privatise_raises_if_the_metadata_was_not_rebuilt():
-    """Reusing a persistent buffer is only safe because the stock builder
-    re-establishes the aliasing every step. If it ever doesn't, the buffer's
-    contents are a step stale -- and a wrong `seq_lens` is precisely the
-    silent corruption this whole mechanism exists to prevent, so it must
-    fail loudly rather than serve them."""
+def test_privatise_refreshes_when_metadata_is_persistent():
+    """The cudagraph regime, which is the opposite of the eager one.
+
+    Under `FULL_DECODE_ONLY` vLLM keeps PERSISTENT attention-metadata
+    objects across steps -- that is exactly what graph capture requires, so
+    captured kernels keep reading the same addresses. The privatising
+    `setattr` therefore survives into the next step, and the gathered layer
+    no longer holds the shared tensor to copy from.
+
+    Reading its own buffer would silently re-serve last step's values. The
+    fresh values must come from a SLIDING layer, which is never patched and
+    so always holds the true, in-place-updated tensor.
+
+    This is not hypothetical: it fired on Gemma-4-31B the first time
+    `--target-cudagraph-mode FULL_DECODE_ONLY` was used, on
+    `language_model.model.layers.17.self_attn.attn`."""
     runner_module = _load_sparse_target_runner()
     runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
 
     blocks = torch.arange(64, dtype=torch.int64).reshape(1, 64)
+    # ONE persistent shared tensor, updated in place -- the cudagraph layout.
     shared = torch.tensor([500], dtype=torch.int32)
     sliding_md = _FakeLayerMetadata(
         block_table=blocks, seq_lens=shared, max_seq_len=500)
@@ -4825,15 +4836,20 @@ def test_privatise_raises_if_the_metadata_was_not_rebuilt():
     attn_metadata = {"sliding.0": sliding_md, "full.1": gathered_md}
 
     runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+    first = gathered_md.seq_lens.data_ptr()
+    assert int(gathered_md.seq_lens[0]) == 500
+    gathered_md.seq_lens[0] = 81000          # what the gather writes
 
-    # Second call WITHOUT rebuilding: the gathered layer still holds our
-    # buffer rather than the shared tensor.
-    try:
-        runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
-    except RuntimeError as exc:
-        assert "not rebuilt" in str(exc), exc
-    else:
-        raise AssertionError("stale privatised buffer was silently reused")
+    # Next step: metadata objects are the SAME, contents updated in place.
+    shared[0] = 501
+    runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+
+    assert gathered_md.seq_lens.data_ptr() == first, (
+        "the buffer must stay at one address for a captured graph")
+    assert int(gathered_md.seq_lens[0]) == 501, (
+        "contents must be refreshed from the sliding layer, not re-read from "
+        "the buffer's own stale values")
+    assert int(sliding_md.seq_lens[0]) == 501, "sliding layer untouched"
 
 
 def test_gather_does_not_rewrite_the_sliding_layers_seq_lens():

@@ -30,6 +30,34 @@ See `../evaluation_pipeline/REPRODUCE.md` steps 3-5 for the full gotchas (do
 not `pip install vllm` from PyPI; OS-level multimodal deps; etc.) — not
 duplicated here.
 
+### Gemma 4 only: pin transformers to exactly 5.14.1
+
+```bash
+pip install "transformers==5.14.1"
+```
+
+Exactly that version — not a floor, not a range. Both neighbours fail, and
+neither failure names the version as the cause:
+
+- **Older** (no `gemma4` in the registry) dies at the first `AutoConfig`
+  call with *"The checkpoint you are trying to load has model type `gemma4`
+  but Transformers does not recognize this architecture"*. It surfaces from
+  `model_structure.native_context_length`, before any GPU work, and reads
+  like a corrupt checkpoint.
+- **5.15+** raises `AmbiguousGlobalPerLayerAttributeError` on Gemma 4's
+  per-layer attributes (`head_dim` vs `global_head_dim` and friends).
+
+**Order matters:** the `pip install pytest datasets` line above silently
+DOWNGRADES transformers. Install datasets first, then re-pin:
+
+```bash
+pip install pytest datasets && pip install "transformers==5.14.1"
+```
+
+`.env_exports.sh` warns at source time if the installed version is wrong, so
+sourcing it on a fresh node reports this immediately instead of two minutes
+into a run. The Llama rows do not need the pin.
+
 Once the env exists, this directory has its own `.env_exports.sh` — local to
 `spec_prefill_multi_turn/`, not `../spec_prefill_llama/`'s (same paths would
 work, since both target Llama-3.1-8B/3.2-1B, but keep this pipeline's own
