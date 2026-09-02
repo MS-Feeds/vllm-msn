@@ -123,6 +123,13 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--tensor-parallel-size", type=int, default=1,
+        help="Shard the model across this many GPUs. Required for a checkpoint "
+             "whose weights do not fit one card: Gemma-4-31B is ~62GB in bf16, "
+             "which leaves nothing for KV on an 80GB card and fails in "
+             "`_check_enough_kv_cache_memory` with 'No available memory for the "
+             "cache blocks' before any measurement is taken.")
     args = parser.parse_args()
 
     model_path = args.model or os.environ.get("LLAMA31_8B_MODEL_PATH")
@@ -151,6 +158,7 @@ def main() -> None:
         enforce_eager=args.enforce_eager,
         disable_log_stats=False,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        tensor_parallel_size=args.tensor_parallel_size,
         block_size=args.kv_granularity,
         max_num_batched_tokens=args.max_num_batched_tokens,
         max_model_len=max_model_len,
