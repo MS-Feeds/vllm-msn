@@ -2767,8 +2767,45 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
     fake_vllm = types.ModuleType("vllm")
     fake_vllm.LLM = _FakeLLM
 
+    # `--target-cudagraph-mode` imports from `vllm.config.compilation`, so
+    # the stub needs that submodule too. Enum stand-ins expose `.name` and
+    # `Enum[name]` lookup, which is all `run_experiment` uses -- keeping the
+    # assertion about WHAT gets configured rather than about vLLM's types,
+    # which cannot be imported in this CPU-only suite.
+    class _FakeEnumMember:
+        def __init__(self, name):
+            self.name = name
+
+        def __repr__(self):
+            return self.name
+
+    class _FakeEnumMeta(type):
+        def __getitem__(cls, name):
+            return _FakeEnumMember(name)
+
+    class _FakeCompilationMode(metaclass=_FakeEnumMeta):
+        NONE = _FakeEnumMember("NONE")
+
+    class _FakeCUDAGraphMode(metaclass=_FakeEnumMeta):
+        pass
+
+    class _FakeCompilationConfig:
+        def __init__(self, mode=None, cudagraph_mode=None):
+            self.mode = mode
+            self.cudagraph_mode = cudagraph_mode
+
+    fake_compilation = types.ModuleType("vllm.config.compilation")
+    fake_compilation.CompilationConfig = _FakeCompilationConfig
+    fake_compilation.CompilationMode = _FakeCompilationMode
+    fake_compilation.CUDAGraphMode = _FakeCUDAGraphMode
+    fake_config_pkg = types.ModuleType("vllm.config")
+    fake_config_pkg.compilation = fake_compilation
+    fake_vllm.config = fake_config_pkg
+
     saved = {
         "vllm": sys.modules.get("vllm"),
+        "vllm.config": sys.modules.get("vllm.config"),
+        "vllm.config.compilation": sys.modules.get("vllm.config.compilation"),
         "proposer": proposer_mod.SpecPrefillProposer,
         "autoconfig": transformers.AutoConfig.from_pretrained,
         "autotok": transformers.AutoTokenizer.from_pretrained,
@@ -2784,6 +2821,8 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
     ps.OUT_DIR = _Path(tmp_dir)
     ps.CSV_PATH = ps.OUT_DIR / "all_runs.csv"
     sys.modules["vllm"] = fake_vllm
+    sys.modules["vllm.config"] = fake_config_pkg
+    sys.modules["vllm.config.compilation"] = fake_compilation
     proposer_mod.SpecPrefillProposer = _FakeProposer
     transformers.AutoConfig.from_pretrained = staticmethod(lambda *a, **k: _FakeHFConfig())
     transformers.AutoTokenizer.from_pretrained = staticmethod(lambda *a, **k: object())
@@ -2799,6 +2838,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         speculator_model="/ckpt/Llama-3.2-1B-Instruct",
         speculator_device=None,
         target_gpu_memory_utilization=0.85,
+        target_cudagraph_mode="eager",
         # TP=1: the single-card default, so these stub runs keep
         # exercising the pre-TP placement behaviour.
         target_tensor_parallel_size=1,
@@ -2826,6 +2866,11 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
             del sys.modules["vllm"]
         else:
             sys.modules["vllm"] = saved["vllm"]
+        for name in ("vllm.config.compilation", "vllm.config"):
+            if saved[name] is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = saved[name]
         proposer_mod.SpecPrefillProposer = saved["proposer"]
         transformers.AutoConfig.from_pretrained = saved["autoconfig"]
         transformers.AutoTokenizer.from_pretrained = saved["autotok"]
@@ -4682,6 +4727,113 @@ def test_speculator_worker_rpc_wrappers_match_their_runner_methods():
             f"{name}: runner{r} vs worker{w}" for name, (r, w) in mismatched.items()
         )
     )
+
+
+def test_target_cudagraph_mode_is_opt_in_and_bypasses_dynamo():
+    """`--target-cudagraph-mode` must default to reproducing the published
+    rows exactly, and when enabled must pin compilation OFF.
+
+    The second half is not cosmetic. `enforce_eager=False` alone takes
+    `@support_torch_compile`'s AOT path, which needs Dynamo -- and this
+    pipeline pins TORCHDYNAMO_DISABLE=1 because Inductor's process pool
+    cannot spawn inside daemonic MultiprocExecutor workers. On real
+    hardware that combination is a hard crash at engine construction
+    (`RuntimeError: aot_compile is not supported by the current
+    configuration`), not a fallback to eager. Full cudagraphs need no
+    compilation at all, so mode=NONE is what makes this reachable."""
+    default = _run_experiment_with_stubs("M000")
+    assert default["llm_kwargs"]["enforce_eager"] is True
+    assert "compilation_config" not in default["llm_kwargs"], (
+        "the default path must construct the engine exactly as every "
+        "published row did")
+
+    graphed = _run_experiment_with_stubs(
+        "M000", target_cudagraph_mode="FULL_DECODE_ONLY")
+    assert graphed["llm_kwargs"]["enforce_eager"] is False
+    cfg = graphed["llm_kwargs"]["compilation_config"]
+    # Compare by name: importing vLLM's enums is not possible in this
+    # CPU-only suite.
+    assert type(cfg).__name__.endswith("CompilationConfig")
+    assert cfg.mode.name == "NONE", (
+        f"compilation must be OFF or the AOT path needs Dynamo; got {cfg.mode}")
+    assert cfg.cudagraph_mode.name == "FULL_DECODE_ONLY"
+
+
+def test_privatised_seq_lens_keeps_a_stable_address_across_steps():
+    """The invariant CUDA graph capture actually needs.
+
+    Graph replay bakes in the ADDRESS of every tensor a captured kernel
+    read. The original implementation handed the metadata a fresh
+    `.clone()` each step, so replay would keep reading whichever tensor
+    existed at capture time -- silently a step stale, never an error.
+
+    This matters because the win is large and measured, not speculative: on
+    Gemma-4-31B / TP=2, a stock runner does 85.9 ms/tok eager against 24.6
+    ms/tok with FULL_DECODE_ONLY. The sparse path can claim none of that
+    while it swaps tensors per step, and enabling graphs only where they
+    already work would accelerate the dense baseline alone -- widening the
+    gap this pipeline exists to close.
+
+    Simulates what the stock builder does: rebuild the metadata each step,
+    re-establishing the shared aliasing with fresh contents."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    sliding_blocks = torch.arange(64, dtype=torch.int64).reshape(1, 64)
+    gathered_blocks = torch.arange(100, 164, dtype=torch.int64).reshape(1, 64)
+
+    addresses = []
+    for step, true_len in enumerate((102349, 102350, 102351)):
+        # A NEW shared tensor each step, exactly as the stock builder makes.
+        shared = torch.tensor([true_len], dtype=torch.int32)
+        sliding_md = _FakeLayerMetadata(
+            block_table=sliding_blocks, seq_lens=shared, max_seq_len=true_len)
+        gathered_md = _FakeLayerMetadata(
+            block_table=gathered_blocks, seq_lens=shared, max_seq_len=true_len)
+        attn_metadata = {"sliding.0": sliding_md, "full.1": gathered_md}
+
+        runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+        addresses.append(gathered_md.seq_lens.data_ptr())
+
+        # Contents must TRACK the step even though the address does not.
+        assert int(gathered_md.seq_lens[0]) == true_len, step
+        # And the original protection still holds.
+        assert gathered_md.seq_lens.data_ptr() != sliding_md.seq_lens.data_ptr()
+        gathered_md.seq_lens[0] = 81000
+        assert int(sliding_md.seq_lens[0]) == true_len, step
+
+    assert len(set(addresses)) == 1, (
+        "privatised seq_lens must live at ONE address across steps for a "
+        f"captured graph to keep reading it; got {addresses}")
+
+
+def test_privatise_raises_if_the_metadata_was_not_rebuilt():
+    """Reusing a persistent buffer is only safe because the stock builder
+    re-establishes the aliasing every step. If it ever doesn't, the buffer's
+    contents are a step stale -- and a wrong `seq_lens` is precisely the
+    silent corruption this whole mechanism exists to prevent, so it must
+    fail loudly rather than serve them."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    blocks = torch.arange(64, dtype=torch.int64).reshape(1, 64)
+    shared = torch.tensor([500], dtype=torch.int32)
+    sliding_md = _FakeLayerMetadata(
+        block_table=blocks, seq_lens=shared, max_seq_len=500)
+    gathered_md = _FakeLayerMetadata(
+        block_table=blocks, seq_lens=shared, max_seq_len=500)
+    attn_metadata = {"sliding.0": sliding_md, "full.1": gathered_md}
+
+    runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+
+    # Second call WITHOUT rebuilding: the gathered layer still holds our
+    # buffer rather than the shared tensor.
+    try:
+        runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+    except RuntimeError as exc:
+        assert "not rebuilt" in str(exc), exc
+    else:
+        raise AssertionError("stale privatised buffer was silently reused")
 
 
 def test_gather_does_not_rewrite_the_sliding_layers_seq_lens():

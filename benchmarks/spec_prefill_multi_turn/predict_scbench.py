@@ -2521,7 +2521,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     llm_kwargs = dict(
         model=args.target_model,
         trust_remote_code=True,
-        enforce_eager=True,
+        enforce_eager=(args.target_cudagraph_mode == "eager"),
         disable_log_stats=False,
         gpu_memory_utilization=args.target_gpu_memory_utilization,
         tensor_parallel_size=args.target_tensor_parallel_size,
@@ -2539,6 +2539,50 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
     # `profile_run`'s `if encoder_budget > 0` never fires: no profiling, and
     # no reserved cache. Applied only to a checkpoint that actually has a
     # tower, so the published Llama rows take an unchanged path.
+    # CUDA graphs on the TARGET's decode. Default "eager" reproduces every
+    # published row byte-identically; this is opt-in, not a silent change of
+    # what the sweep measured.
+    #
+    # The size of the prize, measured on this hardware rather than assumed:
+    # `stock_vllm_control.py` on Gemma-4-31B / TP=2 / 4k context reports
+    # 85.9 ms/tok with enforce_eager and 24.6 ms/tok with FULL_DECODE_ONLY
+    # -- 3.49x. Against a ~15 ms/tok weight-bandwidth floor, 24.6 ms is
+    # 1.6x, so the hardware was never the problem; per-op eager dispatch
+    # across 62 layers was.
+    #
+    # `mode=NONE` is not optional. `enforce_eager=False` alone takes
+    # `@support_torch_compile`'s AOT path, which needs Dynamo, and this
+    # pipeline pins TORCHDYNAMO_DISABLE=1 because Inductor's process pool
+    # cannot spawn inside daemonic MultiprocExecutor workers -- observed as
+    # `RuntimeError: aot_compile is not supported by the current
+    # configuration`. Full cudagraphs need no compilation at all
+    # (`vllm/config/compilation.py`: "the cudagraph logic is generally
+    # orthogonal to the compilation logic"), so pinning mode=NONE plus an
+    # explicitly FULL mode sidesteps Dynamo entirely.
+    #
+    # FULL_DECODE_ONLY rather than FULL: the sparse path's PREFILL gather
+    # varies per chunk and must not be captured, while decode's gathered
+    # view is fixed for the turn. TRITON_ATTN, which Gemma 4 forces,
+    # declares `AttentionCGSupport.ALWAYS`.
+    #
+    # **Only safe on the sparse path because `_privatise_gathered_seq_lens`
+    # now writes into a PERSISTENT buffer.** Graph replay bakes in tensor
+    # addresses; the previous clone-per-step would have replayed against a
+    # stale tensor with no error. See that method's docstring.
+    if args.target_cudagraph_mode != "eager":
+        from vllm.config.compilation import (
+            CompilationConfig,
+            CompilationMode,
+            CUDAGraphMode,
+        )
+
+        llm_kwargs["compilation_config"] = CompilationConfig(
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode[args.target_cudagraph_mode],
+        )
+        print(f"[predict_scbench] target cudagraph_mode="
+              f"{args.target_cudagraph_mode} with compilation mode=NONE")
+
     if has_multimodal_tower(args.target_model):
         llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
         print("[predict_scbench] target is multimodal; zeroing modality limits "
@@ -3222,6 +3266,15 @@ def main() -> None:
                              "the first N visible devices, so "
                              "--speculator-device must be N or higher.")
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument(
+        "--target-cudagraph-mode", default="eager",
+        choices=["eager", "FULL_DECODE_ONLY", "FULL"],
+        help="CUDA graphs on the target engine. Default 'eager' reproduces "
+             "every published row exactly. FULL_DECODE_ONLY measured 3.49x "
+             "faster decode than eager on Gemma-4-31B/TP=2 (85.9 -> 24.6 "
+             "ms/tok, stock_vllm_control.py). The PIECEWISE modes are "
+             "deliberately absent: they need Dynamo, which this pipeline "
+             "disables.")
     parser.add_argument("--speculator-gpu-memory-utilization", type=float, default=0.2)
     parser.add_argument(
         "--target-prefill-chunk-tokens", type=int, default=None,

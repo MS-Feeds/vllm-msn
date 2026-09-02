@@ -537,29 +537,96 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         unpatched layer left to corrupt. This bug can only exist where the
         gather is partial.
 
-        Cloned per step rather than once, because the stock builder rebuilds
-        the metadata every step and re-establishes the aliasing. Cheap:
-        `seq_lens` holds one int per request, unlike `block_table`, which is
-        already per-group and must NOT be copied on the hot path.
+        Re-established every step, because the stock builder rebuilds the
+        metadata each step and restores the aliasing. Cheap: `seq_lens`
+        holds one int per request, unlike `block_table`, which is already
+        per-group and must NOT be copied on the hot path.
+
+        **Written into a PERSISTENT buffer rather than a fresh `.clone()`,
+        because a fresh clone is a hard CUDA-graph blocker.** Graph replay
+        bakes in the ADDRESS of every tensor a captured kernel read, so
+        handing the metadata a newly-allocated tensor each step means replay
+        keeps reading whichever one existed at capture time -- silently
+        stale, not an error. Allocating once and `copy_()`-ing into it keeps
+        the address fixed while the contents track the step, which is the
+        invariant full cudagraphs need.
+
+        That is not a hypothetical requirement: on Gemma-4-31B, TP=2, a
+        stock unmodified runner measures 85.9 ms/tok eager against 24.6
+        ms/tok with `FULL_DECODE_ONLY` -- a 3.49x difference. The sparse
+        path cannot claim any of it while it swaps tensors per step, and
+        enabling graphs only where they already work would speed up the
+        dense baseline alone and widen the very gap this pipeline is trying
+        to close.
         """
-        shared_with_sliding = {
-            self._get_field(md, _SEQ_LENS_FIELD).data_ptr()
-            for name, md in attn_metadata.items()
-            if name not in gatherable
-        }
-        if not shared_with_sliding:
+        sliding_sources: Dict[int, object] = {}
+        for name, md in attn_metadata.items():
+            if name in gatherable:
+                continue
+            shared = self._get_field(md, _SEQ_LENS_FIELD)
+            sliding_sources.setdefault(shared.data_ptr(), shared)
+        if not sliding_sources:
             return  # uniform-attention model: nothing to protect
 
-        clones: Dict[int, object] = {}
-        for name in gatherable:
+        buffers = self._private_seq_lens_buffers()
+        assigned: Dict[int, object] = {}
+        # Sorted so a buffer's identity is tied to a STABLE key across steps;
+        # `attn_metadata` iteration order is not something to rely on when
+        # the whole point is address stability.
+        for name in sorted(gatherable):
             layer_metadata = attn_metadata[name]
             seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
             ptr = seq_lens.data_ptr()
-            if ptr not in shared_with_sliding:
+            if ptr in buffers.values_by_ptr:
+                # Already pointing at one of ours, which means the stock
+                # builder did NOT rebuild this step. Raise rather than serve
+                # whatever those buffers happen to hold: the contents would
+                # be a step stale, and a wrong `seq_lens` is exactly the
+                # silent corruption this method exists to prevent.
+                raise RuntimeError(
+                    f"layer {name!r} already holds a privatised seq_lens "
+                    f"buffer -- the attention metadata was not rebuilt this "
+                    f"step, so its contents cannot be refreshed from the "
+                    f"shared tensor. This method assumes the stock builder "
+                    f"re-establishes the aliasing every step."
+                )
+            if ptr not in sliding_sources:
                 continue
-            if ptr not in clones:
-                clones[ptr] = seq_lens.clone()
-            setattr(layer_metadata, _SEQ_LENS_FIELD, clones[ptr])
+            if ptr not in assigned:
+                assigned[ptr] = buffers.get(len(assigned), seq_lens)
+                assigned[ptr].copy_(seq_lens)
+            setattr(layer_metadata, _SEQ_LENS_FIELD, assigned[ptr])
+
+    class _SeqLensBuffers:
+        """Persistent private `seq_lens` tensors, keyed by a stable index.
+
+        `values_by_ptr` lets `_privatise_gathered_seq_lens` recognise its own
+        buffers, which is how it detects that the metadata was not rebuilt.
+        """
+
+        def __init__(self) -> None:
+            self.by_index: Dict[int, object] = {}
+            self.values_by_ptr: set = set()
+
+        def get(self, index: int, like) -> object:
+            buf = self.by_index.get(index)
+            if (buf is None or buf.shape != like.shape
+                    or buf.dtype != like.dtype or buf.device != like.device):
+                # Reallocating changes the address and would invalidate any
+                # captured graph -- but it only happens on a shape/dtype
+                # change, which invalidates the graph anyway.
+                buf = torch.empty_like(like)
+                if self.by_index.get(index) is not None:
+                    self.values_by_ptr.discard(self.by_index[index].data_ptr())
+                self.by_index[index] = buf
+                self.values_by_ptr.add(buf.data_ptr())
+            return buf
+
+    def _private_seq_lens_buffers(self) -> "_SeqLensBuffers":
+        buffers = getattr(self, "_seq_lens_buffer_cache", None)
+        if buffers is None:
+            buffers = self._seq_lens_buffer_cache = self._SeqLensBuffers()
+        return buffers
 
     def _assert_sliding_layers_unaffected(self, attn_metadata, req_idx: int) -> None:
         """Verify, ONCE, that patching the gathered layers does not also
