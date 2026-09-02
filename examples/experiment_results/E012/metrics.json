@@ -1,0 +1,123 @@
+{
+  "wall_clock_seconds": 827.5020447298884,
+  "counts": {
+    "total_requests": 969,
+    "finished": 969,
+    "failed": 0,
+    "total_prompt_tokens": 5582695,
+    "total_output_tokens": 805638,
+    "total_cached_tokens": 752800,
+    "prefix_cache_hit_rate": 0.13484526738430094,
+    "finish_reasons": {
+      "length": 581,
+      "stop": 388
+    },
+    "failed_errors": {}
+  },
+  "throughput": {
+    "qps": 1.1709940853575764,
+    "output_tokens_per_sec": 973.5782589672932,
+    "prompt_tokens_per_sec": 6746.442544226331,
+    "total_tokens_per_sec": 7720.0208031936245
+  },
+  "latency": {
+    "ttft_client_s": {
+      "count": 969,
+      "unit": "s",
+      "mean": 411.927064215551,
+      "stdev": 240.11492933587857,
+      "min": 8.354596771299839,
+      "p50": 408.435570448637,
+      "p90": 752.1523401066661,
+      "p95": 785.2837351709604,
+      "p99": 808.9569529220462,
+      "max": 812.9560833275318
+    },
+    "ttft_engine_s": {
+      "count": 969,
+      "unit": "s",
+      "mean": 407.62523400352956,
+      "stdev": 237.72953957342983,
+      "min": 8.221116781234741,
+      "p50": 404.1759078502655,
+      "p90": 744.4972887039185,
+      "p95": 777.2756810188293,
+      "p99": 800.7377305030823,
+      "max": 804.6747853755951
+    },
+    "tpot_s": {
+      "count": 969,
+      "unit": "s",
+      "mean": 0.0770768062708921,
+      "stdev": 0.036708151405583644,
+      "min": 0.013836255790492772,
+      "p50": 0.07513558333657704,
+      "p90": 0.09268375989863682,
+      "p95": 0.1161918897432257,
+      "p99": 0.2155874068538348,
+      "max": 0.5788259729743004
+    },
+    "e2e_s": {
+      "count": 969,
+      "unit": "s",
+      "mean": 472.47004996975204,
+      "stdev": 237.0265914222051,
+      "min": 57.225019581615925,
+      "p50": 491.6696823090315,
+      "p90": 803.5224257484078,
+      "p95": 818.9102226644754,
+      "p99": 825.4028701633215,
+      "max": 827.4600410759449
+    }
+  },
+  "dataset": {
+    "input_path": "/nvmedata/data/layer1_delta_1k_test.txt",
+    "n_total_seen": 1000,
+    "n_skipped_format": 0,
+    "n_skipped_length": 31,
+    "n_loaded": 969,
+    "max_input_tokens_threshold": 31744,
+    "used_chat_template": true
+  },
+  "config": {
+    "model_path": "/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-text-only",
+    "dtype": "bfloat16",
+    "quantization": "fp8",
+    "kv_cache_dtype": "auto",
+    "gpu_memory_utilization": 0.75,
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 32768,
+    "max_model_len": 32768,
+    "enforce_eager": false,
+    "speculative_config": {
+      "model": "/nvmedata/hf_checkpoints/gemma-4-26B-A4B-it-assistant",
+      "num_speculative_tokens": 5
+    },
+    "sampling": {
+      "temperature": 0.7,
+      "top_p": 0.9,
+      "max_tokens": 1024
+    }
+  },
+  "gpu": {
+    "samples": 895,
+    "total_mib": 81157,
+    "total_gib": 79.25,
+    "baseline_mib": 1,
+    "baseline_gib": 0.0,
+    "peak_mib": 64803,
+    "peak_gib": 63.28,
+    "peak_pct_of_total": 79.85,
+    "avg_mib": 62300.2,
+    "avg_gib": 60.84,
+    "min_mib": 1,
+    "end_mib": 1,
+    "end_gib": 0.0,
+    "delta_peak_minus_baseline_mib": 64802,
+    "delta_peak_minus_baseline_gib": 63.28,
+    "util_gpu_peak_pct": 100,
+    "util_gpu_avg_pct": 93.6,
+    "util_mem_peak_pct": 54,
+    "util_mem_avg_pct": 25.9
+  }
+}

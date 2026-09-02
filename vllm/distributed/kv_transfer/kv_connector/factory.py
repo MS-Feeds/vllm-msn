@@ -162,6 +162,12 @@ KVConnectorFactory.register_connector(
 )
 
 KVConnectorFactory.register_connector(
+    "Gemma4SharedKVStatesConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.gemma4_shared_kv_states_connector",
+    "Gemma4SharedKVStatesConnector",
+)
+
+KVConnectorFactory.register_connector(
     "LMCacheConnectorV1",
     "vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector",
     "LMCacheConnectorV1",

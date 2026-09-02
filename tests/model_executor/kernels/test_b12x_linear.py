@@ -17,6 +17,7 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_MXFP4_KERNELS,
     _POSSIBLE_MXFP8_KERNELS,
     _POSSIBLE_NVFP4_KERNELS,
+    _prioritize_fp8_marlin,
     B12xFp8BlockScaledMMKernel,
     B12xMxFp4LinearKernel,
     B12xMxfp8LinearKernel,
@@ -39,6 +40,19 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Dynamic,
 )
 from vllm.platforms import PlatformEnum
+
+
+def test_fp8_marlin_is_prioritized_only_without_native_fp8() -> None:
+    kernels = _POSSIBLE_FP8_KERNELS[PlatformEnum.CUDA]
+
+    assert _prioritize_fp8_marlin(kernels, 80)[0].__name__ == (
+        "MarlinFP8ScaledMMLinearKernel"
+    )
+    assert _prioritize_fp8_marlin(kernels, 89) == kernels
+    assert _prioritize_fp8_marlin(kernels, 90) == kernels
+    assert _prioritize_fp8_marlin([B12xTensorFP8ScaledMMLinearKernel], 80) == [
+        B12xTensorFP8ScaledMMLinearKernel
+    ]
 
 
 @pytest.mark.parametrize(
