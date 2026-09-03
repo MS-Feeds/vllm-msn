@@ -808,12 +808,21 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor
 
         any_patched = False
+        # Whether `seq_lens` has already been privatised THIS step. See
+        # `_apply_gathered_view`'s `privatise` argument.
+        privatised = False
         # req_idx -> the gathered length written for it this step. Lets the
         # post-loop `max_seq_len` fix-up be computed entirely host-side; see
         # that block for the GPU sync this removes.
         patched_seq_lens: Dict[int, int] = {}
         for req_idx in range(num_reqs):
             req_id = self.input_batch.req_ids[req_idx]
+            # Timer starts HERE, not after the registry read. The lock
+            # acquire/release in `get_with_generation` and the CPU-side
+            # length reads below are part of what this override costs every
+            # step, and starting the clock after them measured the override
+            # while excluding its own preamble.
+            t_override_start = time.time()
             # get_with_generation(), not get() -- one atomic snapshot of
             # (generation, positions, prefill_turn_start) under a single
             # lock, not three separate calls. See sparse_selection_
@@ -835,6 +844,8 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # needs `step_seq_len` instead, see the comment further down.
             is_prefill = num_computed < num_prompt
             if is_prefill and prefill_turn_start is None:
+                self._accumulate_override_timing(
+                    req_id, time.time() - t_override_start)
                 # Decode-only scope: the default, and what every published
                 # SPARSE-k*/ORACLE-k* row was measured under. This turn's
                 # own new query tokens prefill at full, unrestricted
@@ -861,9 +872,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             if is_prefill and not self._prefill_gather_applies(
                 prefill_turn_start, num_computed, step_seq_len
             ):
+                self._accumulate_override_timing(
+                    req_id, time.time() - t_override_start)
                 continue
 
-            t_override_start = time.time()
             # Read once per request, not once inside _compute_gathered_view
             # AND again below for block_table_width -- same "an arbitrary
             # layer's metadata, assumed uniform across layers" reasoning as
@@ -907,6 +919,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                     step_seq_len if gathered is None else gathered[1],
                 )
                 if gathered is None:
+                    # Same reasoning as the decode branch below: a dense
+                    # chunk still paid for the override that decided so.
+                    self._accumulate_override_timing(
+                        req_id, time.time() - t_override_start)
                     continue
                 gathered_block_table_row, gathered_seq_len = gathered
                 any_patched = True
@@ -914,7 +930,9 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 self._apply_gathered_view(
                     attn_metadata, any_layer_metadata, req_idx,
                     gathered_block_table_row, gathered_seq_len,
+                    privatise=not privatised,
                 )
+                privatised = True
                 self._accumulate_override_timing(req_id, time.time() - t_override_start)
                 continue
 
@@ -945,6 +963,22 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 req_id, step_seq_len if gathered is None else gathered[1]
             )
             if gathered is None:
+                # Recorded BEFORE the early-out, for the same reason
+                # `_accumulate_attended_len` above is: a `None` gather is a
+                # step this override still ran on, not a free one. It reads
+                # the registry under a lock, reads the CPU-side lengths,
+                # looks up the cached base view and computes the incremental
+                # gather right up to its degenerate branch -- and only then
+                # decides there is nothing to patch.
+                #
+                # Skipping it here made the ONE row that isolates this cost
+                # invisible: `SPARSE-k100-g32-control` gathers nothing by
+                # construction, so it reported 0.000s of override overhead
+                # while measuring +5.2% per token against the dense
+                # baseline. The stage carrying the entire unexplained cost
+                # was the stage the accumulator declined to time.
+                self._accumulate_override_timing(
+                    req_id, time.time() - t_override_start)
                 continue
             gathered_block_table_row, gathered_seq_len = gathered
             any_patched = True
@@ -952,7 +986,9 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             self._apply_gathered_view(
                 attn_metadata, any_layer_metadata, req_idx,
                 gathered_block_table_row, gathered_seq_len,
+                privatise=not privatised,
             )
+            privatised = True
             self._accumulate_override_timing(req_id, time.time() - t_override_start)
 
         if any_patched:
@@ -1037,6 +1073,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
     def _apply_gathered_view(
         self, attn_metadata, any_layer_metadata, req_idx: int,
         gathered_block_table_row, gathered_seq_len: int,
+        privatise: bool = True,
     ) -> None:
         """Write one request's gathered `(block_table_row, seq_len)` into
         every layer's metadata. Shared verbatim by the prefill and decode
@@ -1076,7 +1113,16 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         # MUST precede the write: the gathered layers share `seq_lens` with
         # the sliding ones, so writing without this corrupts every sliding
         # layer's window. See `_privatise_gathered_seq_lens`.
-        self._privatise_gathered_seq_lens(attn_metadata, gatherable)
+        #
+        # ONCE PER STEP, not once per patched request. Privatising refreshes
+        # the private buffer from the sliding layers' (un-patched) tensor, so
+        # calling it again after another request's `seq_lens[req_idx]` has
+        # been written would wipe that write. Harmless at batch 1, where only
+        # one request is ever patched per step -- and silently wrong the
+        # moment a second one is, which is precisely the batch-size-1
+        # assumption this module documents.
+        if privatise:
+            self._privatise_gathered_seq_lens(attn_metadata, gatherable)
         self._assert_sliding_layers_unaffected(attn_metadata, req_idx)
         for layer_name, layer_metadata in attn_metadata.items():
             if layer_name not in gatherable:
@@ -1301,7 +1347,21 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         is the right thing to measure for that question -- but treat the
         returned number as a lower bound on true wall-clock GPU cost, not
         an exact figure, since queued-but-not-yet-executed GPU work isn't
-        captured here."""
+        captured here.
+
+        **Scope, as of the no-op-step fix**: every step a REGISTERED request
+        takes through the override is now timed, including the ones where
+        the gather returns `None` and nothing is patched. It previously
+        counted only steps that actually patched, which made the one row
+        built to isolate this cost report zero: `SPARSE-k100-g32-control`
+        gathers nothing by construction, yet measures +5.2% per token
+        against the dense baseline. The window also now opens before the
+        selection-registry read, since that lock and the CPU-side length
+        reads are part of what the override costs.
+
+        Still EXCLUDED, deliberately: the post-loop `max_seq_len` and
+        `scheduler_metadata` fix-ups, which run once per step rather than
+        per request and only when something was patched."""
         accum = self._override_timing_accum()
         return accum.pop(request_id, (0.0, 0))
 

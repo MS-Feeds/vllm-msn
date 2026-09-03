@@ -5018,6 +5018,86 @@ def test_privatised_seq_lens_keeps_a_stable_address_across_steps():
         f"captured graph to keep reading it; got {addresses}")
 
 
+def test_override_timing_counts_steps_that_gather_nothing():
+    """A step where the gather returns `None` still paid for the override
+    that decided so, and must be timed.
+
+    This is the same rule `_accumulate_attended_len` already follows -- "a
+    `None` gather is a DENSE decode step, not a zero-work one" -- applied to
+    the timing accumulator, which was recording only steps that actually
+    patched.
+
+    The consequence of not doing so was concrete: `SPARSE-k100-g32-control`
+    exists precisely to isolate what the sparse path costs when the gather
+    is a provable no-op, and it reported 0.000s of override overhead while
+    measuring +5.2% per token against the dense baseline. The stage
+    carrying the entire unexplained cost was the one the accumulator
+    declined to time."""
+    import pathlib
+
+    src = (pathlib.Path(__file__).parent / "vllm_patch"
+           / "sparse_target_runner.py").read_text(encoding="utf-8")
+    start = src.index("def _apply_sparse_attention_overrides")
+    body = src[start:src.index("\n    def ", start + 1)]
+    code = "\n".join(
+        line for line in body.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    )
+
+    # The timer must open before the registry read, not after it.
+    assert code.index("t_override_start = time.time()") < code.index(
+        "sparse_selection_registry.get_with_generation"), (
+        "the registry lock and CPU-side reads are part of what the override "
+        "costs per step and must be inside the timed window")
+
+    # Every `continue` inside the request loop that follows a successful
+    # registration must accumulate first, or that path goes unmeasured.
+    accumulations = code.count("self._accumulate_override_timing(")
+    assert accumulations >= 4, (
+        f"expected the no-op and scope-skip paths to be timed too; found "
+        f"only {accumulations} accumulation sites")
+
+
+def test_privatising_twice_in_a_step_would_wipe_an_earlier_requests_length():
+    """Why privatisation is once per STEP, not once per patched request.
+
+    Privatising refreshes the private buffer from the SLIDING layers'
+    un-patched tensor. Doing that again, after another request's
+    `seq_lens[req_idx]` has already been written, silently reverts that
+    write -- the gathered layer would tell the kernel the full sequence
+    length for a request whose view was compacted, which is the same class
+    of corruption `_privatise_gathered_seq_lens` exists to prevent.
+
+    Invisible at batch 1, where only one request is ever patched per step.
+    That is exactly the batch-size-1 assumption this module documents, and
+    this test pins the hazard so lifting that assumption does not
+    reintroduce it."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    blocks = torch.arange(64, dtype=torch.int64).reshape(2, 32)
+    shared = torch.tensor([500, 600], dtype=torch.int32)
+    sliding_md = _FakeLayerMetadata(
+        block_table=blocks.clone(), seq_lens=shared, max_seq_len=600)
+    gathered_md = _FakeLayerMetadata(
+        block_table=blocks.clone(), seq_lens=shared, max_seq_len=600)
+    attn_metadata = {"sliding.0": sliding_md, "full.1": gathered_md}
+
+    # Request 0 patched.
+    runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+    gathered_md.seq_lens[0] = 120
+
+    # A SECOND privatise in the same step -- what the per-request call did.
+    runner._privatise_gathered_seq_lens(attn_metadata, {"full.1"})
+    assert int(gathered_md.seq_lens[0]) == 500, (
+        "sanity: a second privatise in the same step does revert the write, "
+        "which is why the caller must only do it once")
+
+    # And the sliding layer is untouched throughout, as always.
+    assert int(sliding_md.seq_lens[0]) == 500
+    assert int(sliding_md.seq_lens[1]) == 600
+
+
 def test_privatise_refreshes_when_metadata_is_persistent():
     """The cudagraph regime, which is the opposite of the eager one.
 
