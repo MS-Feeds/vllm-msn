@@ -983,11 +983,31 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             gathered_block_table_row, gathered_seq_len = gathered
             any_patched = True
             patched_seq_lens[req_idx] = gathered_seq_len
+            # ONE-SHOT split of the timed window. The override measures 33
+            # ms/step at k20 against 1.2 ms/step for the keep=100% control,
+            # and the two differ in TWO places, not one: the control's gather
+            # early-returns before its tensor work (pinned H2D, index_select,
+            # cat), AND never reaches `_apply_gathered_view`. Deduplicating
+            # the per-layer writes moved nothing, so print the split once
+            # rather than guess which half it is.
+            t_apply_start = time.time()
             self._apply_gathered_view(
                 attn_metadata, any_layer_metadata, req_idx,
                 gathered_block_table_row, gathered_seq_len,
                 privatise=not privatised,
             )
+            # Sample a STEADY-STATE step, not the first. The first patched
+            # step of a turn also builds the per-turn base gather view (a
+            # sort over the whole selection plus a GPU gather), which is
+            # amortized across the turn and would misrepresent the split.
+            patched_count = getattr(self, "_phase_split_count", 0) + 1
+            self._phase_split_count = patched_count
+            if patched_count in (2, 20, 100):
+                now = time.time()
+                print(f"[SparseTarget] override phase split (patched step "
+                      f"#{patched_count}): "
+                      f"gather={1000 * (t_apply_start - t_override_start):.2f}ms "
+                      f"apply={1000 * (now - t_apply_start):.2f}ms")
             privatised = True
             self._accumulate_override_timing(req_id, time.time() - t_override_start)
 
@@ -1150,6 +1170,14 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         # stays correct if the layers ever genuinely differ: each distinct
         # pair is still written exactly once.
         written: set = set()
+        # ONE-SHOT diagnostic, same discipline as
+        # `_assert_sliding_layers_unaffected`: report how much sharing there
+        # actually is, once per process, instead of assuming it. Deduplicating
+        # these writes did not move `pop_override_timing` at all (33.24 vs
+        # 33.23 ms/step), which means either the layers do NOT share tensors
+        # or the cost is not in this loop -- and guessing between those has
+        # already cost two rounds.
+        report_sharing = not getattr(self, "_sharing_reported", False)
         for layer_name, layer_metadata in attn_metadata.items():
             if layer_name not in gatherable:
                 continue  # sliding-window layer: see _gatherable_layer_names
@@ -1162,6 +1190,14 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             self._patch_layer_metadata(
                 layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
             )
+
+        if report_sharing:
+            self._sharing_reported = True
+            print(f"[SparseTarget] gathered layers={len(gatherable)} "
+                  f"distinct (block_table, seq_lens) pairs written="
+                  f"{len(written)}; block_table row width="
+                  f"{self._get_field(any_layer_metadata, _BLOCK_TABLE_FIELD).shape[1]}, "
+                  f"gathered blocks={num_gathered}")
 
     def _padded_block_table_row(self, width: int, gathered_row, num_gathered: int):
         """A reusable full-width block-table row: gathered blocks in the
