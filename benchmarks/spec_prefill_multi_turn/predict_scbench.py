@@ -969,6 +969,37 @@ def _target_stage_seconds(t_start, t_prefill_done, t_done) -> dict:
     }
 
 
+def _target_sampling_params(max_tokens: int, args):
+    """The target's `SamplingParams`, with an optional forced generation
+    length for TIMING experiments.
+
+    `--max-tokens` alone cannot lengthen a turn: SCBench summary answers
+    stop naturally at ~55-58 tokens, so raising the cap from 64 to 512
+    changed `out_len_mean` by 1.1 tokens and measured the same operating
+    point twice.
+
+    That matters because the fixed-vs-per-token split -- what decides
+    whether longer turns favour the sparse path -- is badly conditioned at
+    58 tokens: the per-token slope is being estimated from a small decode
+    window sitting on a large fixed cost, and two runs of the identical
+    config disagreed about it by 43%. Forcing hundreds of tokens makes the
+    slope the dominant term and estimates it far more precisely.
+
+    **`--target-min-tokens` invalidates accuracy for that run.** Text past
+    the model's own stop is whatever it emits with EOS suppressed; grading
+    it is meaningless. It exists to measure the timing curve, and rows
+    produced with it carry a `[min_tokens=N]` tag in `label` so they cannot
+    be mistaken for a gradeable run.
+    """
+    if not getattr(args, "target_min_tokens", 0):
+        return SamplingParams(max_tokens=max_tokens, temperature=0.0)
+    forced = min(int(args.target_min_tokens), max_tokens)
+    return SamplingParams(
+        max_tokens=max_tokens, min_tokens=forced, ignore_eos=True,
+        temperature=0.0,
+    )
+
+
 def drive_single_request_to_completion(llm_engine, request_id: str):
     """Same discipline as predict_longbench_v2.py's drive_engine_to_completion
     (never break early, never abort) -- specialized to exactly one in-flight
@@ -1540,7 +1571,7 @@ def run_baseline(
             prompt_ids = chat_ids
 
             request_id = f"{conv['id']}::turn{turn_idx}"
-            sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+            sampling_params = _target_sampling_params(max_tokens, args)
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
             t_gen_start = time.time()
             llm.llm_engine.add_request(request_id, prompt, sampling_params)
@@ -1786,7 +1817,7 @@ def run_specprefill(
                 break
 
             request_id = f"{conv['id']}::turn{turn_idx}"
-            sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+            sampling_params = _target_sampling_params(max_tokens, args)
             # PruneRecord positions must cover the FULL prompt actually sent
             # (including the constant chat wrapper pieces), not just the
             # scored candidate+query span -- offset kept_positions/orig_len
@@ -2197,7 +2228,7 @@ def run_sparse_attention(
                 chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
             )
 
-            sampling_params = SamplingParams(max_tokens=max_tokens, temperature=0.0)
+            sampling_params = _target_sampling_params(max_tokens, args)
             prompt = build_sparse_session_request(
                 llm.llm_engine, target_request_id, delta_ids, sampling_params, resumable=True,
             )
@@ -3072,6 +3103,12 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 " [prefill=sparse]"
                 if args.sparse_prefill and mode in SPARSE_ARCH_MODES else ""
             )
+            # Same append-to-label convention, for the same reason: a forced
+            # generation length makes the row's TEXT meaningless while
+            # leaving every timing column valid, and nothing else written
+            # here would tell the two apart afterwards.
+            if getattr(args, "target_min_tokens", 0):
+                scope_tag += f" [min_tokens={int(args.target_min_tokens)}]"
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "exp_id": exp_id,
@@ -3426,6 +3463,14 @@ def main() -> None:
     )
     parser.add_argument("--max-tokens", type=int, default=64,
                          help="Generation cap per turn.")
+    parser.add_argument(
+        "--target-min-tokens", type=int, default=0,
+        help="TIMING ONLY: force at least this many generated tokens per "
+             "turn (min_tokens + ignore_eos), clamped to --max-tokens. "
+             "Raising --max-tokens alone does not lengthen a turn -- "
+             "SCBench answers stop naturally at ~58 tokens. Text past the "
+             "natural stop is meaningless, so ACCURACY FROM SUCH A RUN MUST "
+             "NOT BE GRADED; rows carry a [min_tokens=N] label tag.")
     parser.add_argument("--reps", type=int, default=1)
     parser.add_argument(
         "--peak-tflops", type=float, default=None,

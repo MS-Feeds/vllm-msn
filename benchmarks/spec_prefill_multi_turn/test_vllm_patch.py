@@ -2852,6 +2852,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         target_gpu_memory_utilization=0.85,
         target_cudagraph_mode="eager",
         target_async_scheduling=False,
+        target_min_tokens=0,
         # TP=1: the single-card default, so these stub runs keep
         # exercising the pre-TP placement behaviour.
         target_tensor_parallel_size=1,
