@@ -991,6 +991,13 @@ def _target_sampling_params(max_tokens: int, target_min_tokens: int = 0):
     produced with it carry a `[min_tokens=N]` tag in `label` so they cannot
     be mistaken for a gradeable run.
     """
+    # Imported HERE, not at module scope. Every `run_*` function imports
+    # `SamplingParams` locally so this module stays importable without vLLM
+    # installed -- which is what lets `test_vllm_patch.py` import it in a
+    # CPU-only environment. A module-level import here would silently
+    # break that.
+    from vllm import SamplingParams
+
     if not target_min_tokens:
         return SamplingParams(max_tokens=max_tokens, temperature=0.0)
     forced = min(int(target_min_tokens), max_tokens)
