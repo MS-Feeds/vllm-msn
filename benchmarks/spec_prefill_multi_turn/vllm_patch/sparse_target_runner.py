@@ -1124,9 +1124,41 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         if privatise:
             self._privatise_gathered_seq_lens(attn_metadata, gatherable)
         self._assert_sliding_layers_unaffected(attn_metadata, req_idx)
+        # Write once per DISTINCT (block_table, seq_lens) tensor pair, not
+        # once per layer.
+        #
+        # Attention metadata is built per KV CACHE GROUP, not per layer, and
+        # `_gatherable_group_block_size` already enforces that every gathered
+        # layer lives in one group -- so in production all of them share the
+        # same two tensors, and 61 of a 62-layer model's iterations rewrote
+        # identical values to identical memory.
+        #
+        # Measured, not estimated: `pop_override_timing` reported **33
+        # ms/step** for k20 against **1.2 ms/step** for the keep=100%
+        # control, which patches nothing. ~0.53 ms per layer, for what is
+        # nominally a row copy -- because `seq_lens[req_idx] =
+        # gathered_seq_len` assigns a PYTHON INT into a GPU tensor, an
+        # implicit scalar H2D that synchronizes, 62 times a step.
+        #
+        # It was invisible end-to-end because the CPU work overlaps the ~38
+        # ms GPU step, so k20 and the control differ by only 0.14 ms/tok.
+        # That is not a reason to leave it: 33 of 38 ms consumes 87% of the
+        # overlap budget, so any GPU-side speedup -- batching, a better
+        # kernel -- would make the CPU the bottleneck immediately.
+        #
+        # Keyed on the tensor pair rather than assuming the sharing, so this
+        # stays correct if the layers ever genuinely differ: each distinct
+        # pair is still written exactly once.
+        written: set = set()
         for layer_name, layer_metadata in attn_metadata.items():
             if layer_name not in gatherable:
                 continue  # sliding-window layer: see _gatherable_layer_names
+            block_table = self._get_field(layer_metadata, _BLOCK_TABLE_FIELD)
+            seq_lens = self._get_field(layer_metadata, _SEQ_LENS_FIELD)
+            key = (block_table.data_ptr(), seq_lens.data_ptr())
+            if key in written:
+                continue
+            written.add(key)
             self._patch_layer_metadata(
                 layer_metadata, req_idx, padded_block_table_row, gathered_seq_len
             )

@@ -5018,6 +5018,64 @@ def test_privatised_seq_lens_keeps_a_stable_address_across_steps():
         f"captured graph to keep reading it; got {addresses}")
 
 
+def test_gathered_layers_sharing_tensors_are_written_once():
+    """62 gathered layers share ONE (block_table, seq_lens) pair, because
+    attention metadata is built per KV cache GROUP and
+    `_gatherable_group_block_size` enforces that they all live in one.
+    Writing per layer therefore rewrote identical values to identical
+    memory 61 redundant times.
+
+    Not a micro-optimization: `pop_override_timing` measured **33 ms/step**
+    for k20 against **1.2 ms/step** for the keep=100% control, which
+    patches nothing -- ~0.53 ms per layer, because `seq_lens[req_idx] =
+    gathered_seq_len` assigns a Python int into a GPU tensor, an implicit
+    synchronizing scalar H2D, once per layer.
+
+    Layers that genuinely have DISTINCT tensors must still each be written,
+    which is why this keys on the tensor pair rather than assuming sharing."""
+    runner_module = _load_sparse_target_runner()
+    runner = object.__new__(runner_module.SparseTargetGPUModelRunner)
+
+    shared_block_table = torch.zeros((1, 8), dtype=torch.int64)
+    shared_seq_lens = torch.tensor([500], dtype=torch.int32)
+    # Three layers in one group: same tensors, as in production.
+    md = {
+        f"full.{i}": _FakeLayerMetadata(
+            block_table=shared_block_table, seq_lens=shared_seq_lens,
+            max_seq_len=500)
+        for i in range(3)
+    }
+    # ...plus one with its OWN tensors, which must not be skipped.
+    own_block_table = torch.zeros((1, 8), dtype=torch.int64)
+    own_seq_lens = torch.tensor([500], dtype=torch.int32)
+    md["full.9"] = _FakeLayerMetadata(
+        block_table=own_block_table, seq_lens=own_seq_lens, max_seq_len=500)
+    # Pre-seed the layer-name cache: resolving it for real needs
+    # `vllm.config`, which this CPU-only suite cannot import. Every layer
+    # here is gatherable by construction.
+    runner._gatherable_layer_names_cache = frozenset(md)
+
+    calls = []
+    original = runner_module.SparseTargetGPUModelRunner._patch_layer_metadata
+    def counting(self, layer_metadata, req_idx, padded_row, gathered_seq_len):
+        calls.append(id(layer_metadata))
+        return original(self, layer_metadata, req_idx, padded_row, gathered_seq_len)
+    runner_module.SparseTargetGPUModelRunner._patch_layer_metadata = counting
+    try:
+        runner._apply_gathered_view(
+            md, md["full.0"], 0, torch.arange(4, dtype=torch.int64), 128,
+            privatise=False)
+    finally:
+        runner_module.SparseTargetGPUModelRunner._patch_layer_metadata = original
+
+    assert len(calls) == 2, (
+        f"expected one write per DISTINCT tensor pair (the shared group plus "
+        f"the standalone layer), got {len(calls)}")
+    # And the values actually landed on both.
+    assert int(shared_seq_lens[0]) == 128
+    assert int(own_seq_lens[0]) == 128
+
+
 def test_override_timing_counts_steps_that_gather_nothing():
     """A step where the gather returns `None` still paid for the override
     that decided so, and must be timed.
