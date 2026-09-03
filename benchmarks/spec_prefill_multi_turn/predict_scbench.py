@@ -969,7 +969,7 @@ def _target_stage_seconds(t_start, t_prefill_done, t_done) -> dict:
     }
 
 
-def _target_sampling_params(max_tokens: int, args):
+def _target_sampling_params(max_tokens: int, target_min_tokens: int = 0):
     """The target's `SamplingParams`, with an optional forced generation
     length for TIMING experiments.
 
@@ -991,9 +991,9 @@ def _target_sampling_params(max_tokens: int, args):
     produced with it carry a `[min_tokens=N]` tag in `label` so they cannot
     be mistaken for a gradeable run.
     """
-    if not getattr(args, "target_min_tokens", 0):
+    if not target_min_tokens:
         return SamplingParams(max_tokens=max_tokens, temperature=0.0)
-    forced = min(int(args.target_min_tokens), max_tokens)
+    forced = min(int(target_min_tokens), max_tokens)
     return SamplingParams(
         max_tokens=max_tokens, min_tokens=forced, ignore_eos=True,
         temperature=0.0,
@@ -1446,7 +1446,8 @@ def _num_decode_steps(out_len: int) -> int:
 
 
 def run_baseline(
-    llm, tok, conversations, max_tokens, target_max_num_batched_tokens
+    llm, tok, conversations, max_tokens, target_max_num_batched_tokens,
+    target_min_tokens: int = 0,
 ) -> tuple[list[dict], dict]:
     """M000: plain add_request per turn, no worker_cls/proposer/pruning --
     keeps every token of the conversation unconditionally.
@@ -1571,7 +1572,8 @@ def run_baseline(
             prompt_ids = chat_ids
 
             request_id = f"{conv['id']}::turn{turn_idx}"
-            sampling_params = _target_sampling_params(max_tokens, args)
+            sampling_params = _target_sampling_params(
+                max_tokens, target_min_tokens)
             prompt = TokensPrompt(prompt_token_ids=prompt_ids)
             t_gen_start = time.time()
             llm.llm_engine.add_request(request_id, prompt, sampling_params)
@@ -1711,6 +1713,7 @@ def run_specprefill(
     keep_mode,
     speculator_max_num_batched_tokens,
     target_max_num_batched_tokens,
+    target_min_tokens: int = 0,
 ) -> tuple[list[dict], dict]:
     """M-k*-g*: SpecPrefill pruning via the speculator, per turn.
 
@@ -1817,7 +1820,8 @@ def run_specprefill(
                 break
 
             request_id = f"{conv['id']}::turn{turn_idx}"
-            sampling_params = _target_sampling_params(max_tokens, args)
+            sampling_params = _target_sampling_params(
+                max_tokens, target_min_tokens)
             # PruneRecord positions must cover the FULL prompt actually sent
             # (including the constant chat wrapper pieces), not just the
             # scored candidate+query span -- offset kept_positions/orig_len
@@ -1942,6 +1946,7 @@ def run_sparse_attention(
     speculator_max_num_batched_tokens,
     target_max_num_batched_tokens,
     sparse_prefill: bool = False,
+    target_min_tokens: int = 0,
 ) -> tuple[list[dict], dict]:
     """SPARSE-k*-g* **and ORACLE-k***: persistent full-KV-cache target
     session, scorer-selected sparse attention over it during decode (see
@@ -2228,7 +2233,8 @@ def run_sparse_attention(
                 chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
             )
 
-            sampling_params = _target_sampling_params(max_tokens, args)
+            sampling_params = _target_sampling_params(
+                max_tokens, target_min_tokens)
             prompt = build_sparse_session_request(
                 llm.llm_engine, target_request_id, delta_ids, sampling_params, resumable=True,
             )
@@ -3018,17 +3024,20 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 predictions, stats = run_baseline(
                     llm, tok, conversations, args.max_tokens,
                     target_max_num_batched_tokens,
+                    target_min_tokens=args.target_min_tokens,
                 )
             elif mode in SPARSE_ARCH_MODES:
                 predictions, stats = run_sparse_attention(
                     llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
                     sparse_prefill=args.sparse_prefill,
+                    target_min_tokens=args.target_min_tokens,
                 )
             else:
                 predictions, stats = run_specprefill(
                     llm, tok, proposer, spec_config, conversations, args.max_tokens, keep_mode,
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
+                    target_min_tokens=args.target_min_tokens,
                 )
             elapsed = time.time() - t0
             # "Processed" == actually contributed >=1 turn to `predictions`
