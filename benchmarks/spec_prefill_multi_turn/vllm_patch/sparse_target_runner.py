@@ -990,6 +990,23 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # cat), AND never reaches `_apply_gathered_view`. Deduplicating
             # the per-layer writes moved nothing, so print the split once
             # rather than guess which half it is.
+            # On the SAMPLED steps only, drain the GPU first and time that
+            # separately. `apply` measures 32ms while doing one row copy and
+            # one scalar write -- that is not work, it is a wait. These
+            # tensors are the CUDA graph's input buffers, so writing them
+            # has to wait for the previous step's replay to finish.
+            #
+            # If `gpu_wait` absorbs the 32ms and `apply` collapses, the
+            # override is not costing CPU time at all and `pop_override_
+            # timing`'s "CPU-side dispatch" framing is wrong for this path.
+            # Sampled steps only, so the synchronize never perturbs a
+            # measured run.
+            sampled = (getattr(self, "_phase_split_count", 0) + 1) in (2, 20, 100)
+            gpu_wait_ms = None
+            if sampled and torch.cuda.is_available():
+                t_sync = time.time()
+                torch.cuda.synchronize()
+                gpu_wait_ms = 1000 * (time.time() - t_sync)
             t_apply_start = time.time()
             self._apply_gathered_view(
                 attn_metadata, any_layer_metadata, req_idx,
@@ -1007,6 +1024,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 print(f"[SparseTarget] override phase split (patched step "
                       f"#{patched_count}): "
                       f"gather={1000 * (t_apply_start - t_override_start):.2f}ms "
+                      f"gpu_wait={-1.0 if gpu_wait_ms is None else gpu_wait_ms:.2f}ms "
                       f"apply={1000 * (now - t_apply_start):.2f}ms")
             privatised = True
             self._accumulate_override_timing(req_id, time.time() - t_override_start)
