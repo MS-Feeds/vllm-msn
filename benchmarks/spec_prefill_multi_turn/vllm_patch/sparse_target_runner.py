@@ -294,6 +294,7 @@ is where these should be checked first, before trusting any real sweep:
    defect lived.
 """
 
+import os
 import time
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -1001,7 +1002,15 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # timing`'s "CPU-side dispatch" framing is wrong for this path.
             # Sampled steps only, so the synchronize never perturbs a
             # measured run.
-            sampled = (getattr(self, "_phase_split_count", 0) + 1) in (2, 20, 100)
+            # Off unless SPARSE_TARGET_PHASE_SPLIT=1. The probe inserts a
+            # real `torch.cuda.synchronize()` on its sampled steps, which
+            # perturbs exactly the thing being measured -- fine for a
+            # one-off diagnostic, not something to leave armed in a
+            # measured run.
+            sampled = (
+                os.environ.get("SPARSE_TARGET_PHASE_SPLIT") == "1"
+                and (getattr(self, "_phase_split_count", 0) + 1) in (2, 20, 100)
+            )
             gpu_wait_ms = None
             if sampled and torch.cuda.is_available():
                 t_sync = time.time()
@@ -1019,7 +1028,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # amortized across the turn and would misrepresent the split.
             patched_count = getattr(self, "_phase_split_count", 0) + 1
             self._phase_split_count = patched_count
-            if patched_count in (2, 20, 100):
+            if sampled:
                 now = time.time()
                 print(f"[SparseTarget] override phase split (patched step "
                       f"#{patched_count}): "
@@ -1422,12 +1431,29 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         was suspected as a real cost, not just theorized) instead of only
         inferring it from the overall turn-timing gap vs. baseline.
 
-        **Measures CPU-side dispatch time, not confirmed GPU execution
-        time** -- no `torch.cuda.synchronize()` is inserted around the
-        timed region in `_apply_sparse_attention_overrides` (that would
-        itself perturb the very cost being measured, forcing
-        synchronization this pipeline wouldn't otherwise need at that
-        point). Under `enforce_eager=True`, CPU-side dispatch overhead
+        **This is wall-clock time inside the override, and on the CUDA-graph
+        path most of it is a STALL, not work.** Measured on Gemma-4-31B with
+        `FULL_DECODE_ONLY`, via the `SPARSE_TARGET_PHASE_SPLIT=1` probe
+        below: of a reported 32.4 ms/step, **32.2 ms was the CPU waiting for
+        the GPU and 0.43 ms was actual CPU work**. The override writes the
+        attention metadata, which are the captured graph's INPUT buffers, so
+        those writes block until the previous step's replay drains.
+
+        Read the raw number as "wall-clock spent inside this region", never
+        as "CPU cost this mechanism adds". The keep=100% control reports ~1.2
+        ms/step and the keep=20% row ~33 ms/step, a 27x difference that
+        corresponds to a 0.14 ms/tok difference in actual decode time -- the
+        control simply returns early, before reaching the writes that wait.
+
+        An earlier version of this docstring claimed the opposite ("measures
+        CPU-side dispatch time"), and that framing led to a round of
+        optimizing a path that costs 0.43 ms. Use
+        `SPARSE_TARGET_PHASE_SPLIT=1` to split work from waiting before
+        acting on any number from here.
+
+        No `torch.cuda.synchronize()` is inserted around the timed region in
+        normal operation (that would itself perturb the cost being
+        measured). Under `enforce_eager=True`, CPU-side dispatch overhead
         (the Python loop plus each op's kernel-launch cost) is exactly
         the thing hypothesized to dominate this mechanism's cost, so this
         is the right thing to measure for that question -- but treat the
