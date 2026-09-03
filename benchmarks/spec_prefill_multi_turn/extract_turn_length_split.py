@@ -44,31 +44,57 @@ def split(row):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "results/all_runs.csv"
-    baseline = sys.argv[2] if len(sys.argv) > 2 else "M000"
-    sparse = sys.argv[3] if len(sys.argv) > 3 else "SPARSE-k20-g32-masked"
+    exps = sys.argv[2:] or ["M000", "SPARSE-k100-g32-control",
+                            "SPARSE-k20-g32-masked"]
+    baseline = exps[0]
 
-    rows = load(path, [baseline, sparse])
-    missing = [e for e in (baseline, sparse) if e not in rows]
+    rows = load(path, exps)
+    missing = [e for e in exps if e not in rows]
     if missing:
-        print(f"missing rows: {missing}")
-        return 2
+        print(f"missing rows (never run, or run under a different exp_id): "
+              f"{missing}")
+        exps = [e for e in exps if e in rows]
+        if len(exps) < 2:
+            return 2
+        baseline = exps[0]
 
     print(f"{'row':<26} {'out_len':>8} {'fixed/turn':>12} {'per-token':>12} {'turn':>9}")
     print("-" * 72)
     stats = {}
-    for exp in (baseline, sparse):
+    for exp in exps:
         fixed, per_tok, tokens, turn = split(rows[exp])
         stats[exp] = (fixed, per_tok, tokens, turn)
         print(f"{exp:<26} {tokens:>8.1f} {fixed:>11.3f}s {per_tok * 1000:>9.2f}ms "
               f"{turn:>8.3f}s")
 
+    # Rows are the LATEST per exp_id, which may come from runs at different
+    # --max-tokens / --target-min-tokens. Comparing across generation
+    # lengths is meaningless here -- the whole point of this script is that
+    # the two terms scale differently, and the per-token slope measured at
+    # 58 tokens came out 6-8x larger than the same quantity at 512. So
+    # refuse rather than print a plausible-looking number.
+    lengths = {e: stats[e][2] for e in exps}
+    shortest = min(lengths.values())
+    if shortest and (max(lengths.values()) - shortest) / shortest > 0.10:
+        print(f"\n  REFUSING to compare: out_len differs by more than 10% "
+              f"across rows ({ {k: round(v, 1) for k, v in lengths.items()} }).")
+        print("  These are the latest row per exp_id and evidently come from "
+              "runs at different generation lengths.")
+        print("  Re-run the missing arm at the same length before comparing.")
+        return 2
+
     b_fixed, b_pt, _, _ = stats[baseline]
-    s_fixed, s_pt, s_tokens, _ = stats[sparse]
+    for exp in exps[1:]:
+        e_fixed, e_pt, _, _ = stats[exp]
+        print(f"\n{exp} vs {baseline}: fixed {e_fixed - b_fixed:+.3f}s "
+              f"per-turn, per-token {(e_pt - b_pt) * 1000:+.2f}ms")
+
+    # The curve is for the LAST row given -- the sparse arm by convention.
+    # Any rows between baseline and it are there to split its cost.
+    s_fixed, s_pt, s_tokens, _ = stats[exps[-1]]
     d_fixed = s_fixed - b_fixed
     d_pt = s_pt - b_pt
-
-    print(f"\ndifference: fixed {d_fixed:+.3f}s per-turn, "
-          f"per-token {d_pt * 1000:+.2f}ms")
+    print(f"\ncurve for {exps[-1]}:")
     print(f"  gap(T) = {d_fixed:.3f} {d_pt * 1000:+.5f}ms * T")
 
     if d_pt > 0:
