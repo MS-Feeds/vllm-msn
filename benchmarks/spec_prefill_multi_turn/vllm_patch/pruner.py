@@ -83,6 +83,7 @@ def _positions_from_kept_indices(
     candidate_pool: List[Tuple[int, int]],
     force_keep_query: List[Tuple[int, int]],
     kept_local_indices: Optional[List[int]],
+    force_keep: bool = True,
 ) -> Tuple[List[int], List[int], int, List[Tuple[int, int]]]:
     """Converts a scorer's chosen LOCAL indices (0..len(candidate_pool)+
     len(force_keep_query)-1) into the four `PrunedTurnResult` fields --
@@ -128,6 +129,25 @@ def _positions_from_kept_indices(
     # but because force_keep_query is unconditionally appended below anyway.
     kept_history_local = [i for i in kept_local_indices if i < candidate_len]
     kept_history_pairs = [candidate_pool[i] for i in kept_history_local]
+
+    if not force_keep:
+        # Ablation (`SpecConfig.force_keep_query=False`): honor the scorer
+        # across the WHOLE sequence, so the query region survives only on its
+        # own score. `kept_history_pairs` is deliberately left as the history
+        # slice -- it is what `ConversationState.complete_turn` records as the
+        # turn's candidate-pool decision, and the query is appended to the
+        # ledger by `begin_turn` regardless of what scoring said about it.
+        query_local = [
+            i - candidate_len for i in kept_local_indices if i >= candidate_len
+        ]
+        kept_query = [force_keep_query[i] for i in query_local]
+        pruned_token_ids = [tid for tid, _ in kept_history_pairs] + [
+            tid for tid, _ in kept_query
+        ]
+        kept_positions = [pos for _, pos in kept_history_pairs] + [
+            pos for _, pos in kept_query
+        ]
+        return pruned_token_ids, kept_positions, orig_len, kept_history_pairs
 
     pruned_token_ids = [tid for tid, _ in kept_history_pairs] + [
         tid for tid, _ in force_keep_query
@@ -175,7 +195,10 @@ def _score_and_select(
             geometry,
         )
     )
-    return _positions_from_kept_indices(candidate_pool, force_keep_query, kept_local_indices)
+    return _positions_from_kept_indices(
+        candidate_pool, force_keep_query, kept_local_indices,
+        force_keep=spec_config.force_keep_query,
+    )
 
 
 def compute_pruned_turn(
@@ -238,7 +261,8 @@ def compute_pruned_turn(
     )
 
     pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(
-        candidate_pool, force_keep_query, kept_local_indices
+        candidate_pool, force_keep_query, kept_local_indices,
+        force_keep=spec_config.force_keep_query,
     )
 
     return PrunedTurnResult(

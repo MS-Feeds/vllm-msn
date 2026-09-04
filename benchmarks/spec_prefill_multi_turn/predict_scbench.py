@@ -2902,6 +2902,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             score_layers=exp_cfg.get("score_layers"),
             score_head_set=head_set,
             mask_sliding_window=exp_cfg.get("mask_sliding_window", False),
+            force_keep_query=not args.no_force_keep_query,
         )
         if (
             exp_cfg.get("score_aggregation", "max") != "max"
@@ -3125,6 +3126,12 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             # here would tell the two apart afterwards.
             if getattr(args, "target_min_tokens", 0):
                 scope_tag += f" [min_tokens={int(args.target_min_tokens)}]"
+            # Same convention again: force-keep changes what
+            # `actual_keep_rate_mean` MEASURES, so a row run without it is not
+            # comparable on that column to one run with it, and nothing else
+            # in the CSV distinguishes them.
+            if getattr(args, "no_force_keep_query", False):
+                scope_tag += " [force_keep=off]"
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "exp_id": exp_id,
@@ -3384,6 +3391,24 @@ def main() -> None:
              "refused outright, but this is how you keep both). A suffix that "
              "starts with '-' must use the '=' form -- --output-suffix=-qaeng "
              "-- since argparse otherwise reads the value as another flag.",
+    )
+    parser.add_argument(
+        "--no-force-keep-query", action="store_true",
+        help="ABLATION: stop exempting each turn's own new query from "
+             "scoring, so it survives only on its own score. OFF by default "
+             "-- every published row force-keeps, mirroring the single-turn "
+             "pipeline's force-kept question/instruction (see pruner.py's "
+             "'Force-keep' section for the gibberish it prevents). Rows carry "
+             "a `[force_keep=off]` tag in `label`. "
+             "READ THIS BEFORE USING IT ON A SPARSE ROW: it does NOT change "
+             "what the target attends to. compute_sparse_gather_view drops "
+             "every selected block at or above `first_tail_block` and then "
+             "force-includes the whole tail contiguously -- that contiguity "
+             "is the causal-mask invariant, so this turn's own tokens are in "
+             "the gathered view whatever the selection says. What it changes "
+             "is the reported `actual_keep_rate` (which starts reporting the "
+             "HISTORY keep rate instead of history+query) and the physically "
+             "pruned prompt on the M-k*-g* rows.",
     )
     parser.add_argument(
         "--head-set-from", default=None,

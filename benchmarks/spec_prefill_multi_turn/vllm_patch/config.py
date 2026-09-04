@@ -57,6 +57,25 @@ class SpecConfig:
     # protocol's own stated priority ("Keep old history or discard (FIRST:
     # KEEP)").
     keep_mode: str = "keep"
+    # Whether this turn's own new query is exempt from scoring. True (the
+    # default, and what every published row ran) mirrors the single-turn
+    # pipeline's force-kept question/instruction suffix -- see `pruner.py`'s
+    # "Force-keep" section for the real-hardware gibberish it exists to
+    # prevent.
+    #
+    # Set False ONLY as a deliberate ablation. Note what it does and does not
+    # change: it is driver-side only (it never crosses the `collective_rpc`
+    # hop into the scorer, which scores the full candidate+query sequence
+    # either way), and in the SPARSE architecture it does NOT change what the
+    # target attends to. `kv_cache_utils.compute_sparse_gather_view` drops
+    # every selected block at or above `first_tail_block` and then
+    # force-includes the whole tail contiguously, so this turn's own tokens
+    # are in the gathered view whatever the selection says -- that contiguity
+    # is the causal-mask invariant, not a policy. What this flag actually
+    # changes is the recorded `actual_keep_rate` (which starts reporting the
+    # HISTORY keep rate rather than history+query) and the physically-pruned
+    # prompt built by `prune_and_add_turn` for the M-k*-g* rows.
+    force_keep_query: bool = True
     # How per-(layer, head) attention is collapsed into ONE importance score
     # per prompt token, and which layers get a vote. Both exist because
     # ORACLE-k20 measured the 1B speculator's estimation error at 17.0 of the
