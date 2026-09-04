@@ -153,10 +153,45 @@ def rouge_l_f1(prediction: str, ground_truth: str) -> float:
     return (2 * precision * recall) / (precision + recall)
 
 
+# Ported from ../spec_prefill_llama/grade_longbench_v2.py's
+# `extract_answer_letter` rather than reinvented, so a multi-turn LongBench v2
+# score is directly readable against that pipeline's published single-turn
+# numbers instead of being a second, subtly different letter parser.
+_ANSWER_IS_RE = re.compile(r"answer is\s*\(?([A-D])\)?", re.IGNORECASE)
+_STANDALONE_LETTER_RE = re.compile(r"\b([A-D])\b")
+
+
+def multiple_choice_letter(prediction: str, ground_truth: str) -> float:
+    """1.0 if the A-D letter extracted from `prediction` matches, else 0.0.
+
+    Unparseable output scores 0.0, NOT None: unlike a config with no assigned
+    metric (see `score_turn`), a prediction that came back with no extractable
+    letter is a real model-output failure and belongs in the denominator --
+    the same `missing` (excluded) vs. `unparseable` (counted wrong)
+    distinction ../spec_prefill_llama/grade_longbench_v2.py::grade draws.
+
+    The `\\b([A-D])\\b` fallback is deliberately loose, which is safe only for
+    naturally-terminated generations under the prompt's own "Answer with ONLY
+    a single letter" instruction. Do NOT grade a run carrying the
+    `[min_tokens=N]` label tag (predict_scbench.py's --target-min-tokens):
+    hundreds of tokens of EOS-suppressed text will contain a stray capital
+    A-D almost surely, and this would score it as an answer.
+    """
+    match = _ANSWER_IS_RE.search(prediction) or _STANDALONE_LETTER_RE.search(prediction)
+    if match is None:
+        return 0.0
+    return 1.0 if match.group(1).upper() == (ground_truth or "").strip().upper() else 0.0
+
+
 _METRIC_BY_CONFIG = {
     "scbench_kv": in_match,
     "scbench_qa_eng": qa_f1_score,
     "scbench_summary": rouge_l_f1,
+    # Synthetic multi-turn LongBench v2 (datasets/prep_longbench_v2_multiturn.py).
+    # Discrete letter match, so unlike the three above a 0.0 here means "wrong
+    # answer", not "low overlap" -- averages across a mix of these configs would
+    # not be meaningful, which is why the report breaks down by config.
+    "longbench_v2_mc": multiple_choice_letter,
 }
 
 
