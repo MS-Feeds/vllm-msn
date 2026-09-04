@@ -539,8 +539,23 @@ def main() -> int:
           f"dropped_failed_verify={dropped_verify}")
     print(_histogram(per_turn, "per-turn d (rendered query tokens)"))
     print(_histogram(resident, "resident len at last turn"))
-    print(f"  max resident {max(resident):,} vs target budget "
-          f"{budget.target_budget:,} -- headroom {budget.target_budget - max(resident):,}")
+
+    # Report BOTH engines' headroom, and say which one is actually binding.
+    # Reporting only the target's is actively misleading whenever the scorer
+    # has the smaller context window (Gemma-4-31B is 262,144 against E2B's
+    # 131,072): the target can show six figures of slack while the scorer sits
+    # a few thousand tokens from its ceiling.
+    per_conv_lens = [[t["query_tokens"] for t in r["turns"]] for r in out_rows]
+    worst_target = max(budget.target_check(q) + budget.max_tokens for q in per_conv_lens)
+    worst_spec = max(budget.spec_check(q) + 1 + LOOK_AHEAD_CNT for q in per_conv_lens)
+    t_head = budget.target_budget - worst_target
+    s_head = budget.spec_budget - worst_spec
+    for name, worst, head, cap in (
+        ("target    ", worst_target, t_head, budget.target_budget),
+        ("speculator", worst_spec, s_head, budget.spec_budget),
+    ):
+        mark = "  <-- BINDING" if head == min(t_head, s_head) else ""
+        print(f"  {name} worst-case {worst:,} of {cap:,} -- headroom {head:,}{mark}")
     print(f"  mean d:o ratio  {statistics.mean(per_turn) / args.max_tokens:.1f}:1 "
           f"(SCBench steady-state is ~1:7)")
     print(f"[prep_lbv2_mt] wrote {args.output}")
