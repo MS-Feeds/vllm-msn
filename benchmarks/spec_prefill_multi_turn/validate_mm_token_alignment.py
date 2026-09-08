@@ -49,6 +49,28 @@ That is why this is a gate and not a runtime assertion.
   E. Multi-image prompts stay consistent -- video benchmarks send many
      frames per turn, so the per-image cost has to be additive.
 
+## Building the probe prompt: why there is a strategy ladder
+
+A VLM processor does NOT inject the image placeholder marker for you. The
+caller puts `<|image|>` (or `<start_of_image>`, or whatever that model
+calls it) into the text, and the processor EXPANDS that one marker into the
+model's real placeholder run. Hand a processor images with no marker in the
+text and it raises -- "Found [0] <|image|> tokens and [1] images per
+sample" -- which is a caller error, not a model property.
+
+There is no single API that does this across families, so this script tries
+three strategies in order and reports which one worked:
+
+  1. `chat_template_then_process` -- apply_chat_template(tokenize=False),
+     then processor(text=..., images=...). The canonical VLM pattern.
+  2. `chat_template_tokenize` -- apply_chat_template(tokenize=True) with
+     images embedded in the message content.
+  3. `manual_placeholder` -- prepend the resolved marker string once per
+     image. The last resort, for processors with no usable chat template.
+
+**Both models must land on the SAME strategy** for the comparison to be
+apples-to-apples; the script warns loudly if they do not.
+
 ## How the count is measured
 
 Two independent ways, cross-checked, because neither alone is trustworthy:
@@ -62,6 +84,16 @@ Two independent ways, cross-checked, because neither alone is trustworthy:
 They can legitimately differ -- (1) includes per-image boi/eoi marker
 tokens that (2) excludes -- so both are reported. (1) is authoritative for
 the ledger arithmetic, since it is what actually consumes positions.
+
+## Exit codes
+
+  0  PASS         -- counts agree at every probed resolution.
+  1  FAIL         -- the models genuinely disagree. Do not proceed.
+  3  INCONCLUSIVE -- could not encode at all (API/environment problem).
+                    NOT a statement about the model pair. Distinguished
+                    from 1 on purpose: a broken probe must never be read
+                    as a model-pair incompatibility.
+  2  argparse usage error.
 
 No GPU and no model weights required: this loads processors only, so it
 runs on a login node in seconds.
@@ -77,6 +109,8 @@ import os
 import sys
 
 _EXPECTED_TRANSFORMERS = "5.14.1"
+
+EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_INCONCLUSIVE = 0, 1, 2, 3
 
 #: Probe resolutions, deliberately including non-square and both sides of
 #: the common 896/1024 pan-and-scan thresholds. If per-image token count is
@@ -116,7 +150,7 @@ def _check_transformers_pin() -> None:
         import transformers
     except ImportError:
         print(f"[FAIL] transformers is not importable; Gemma 4 needs {_EXPECTED_TRANSFORMERS}.")
-        sys.exit(1)
+        sys.exit(EXIT_INCONCLUSIVE)
     have = transformers.__version__
     if have != _EXPECTED_TRANSFORMERS:
         print(
@@ -137,8 +171,9 @@ def _load_processor(path: str, label: str):
     except Exception as exc:
         print(f"[FAIL] {label}: could not load AutoProcessor from {path}")
         print(f"       {exc}")
-        sys.exit(1)
-    print(f"[OK]   {label}: loaded {type(proc).__name__} from {path}")
+        sys.exit(EXIT_INCONCLUSIVE)
+    print(f"[OK]   {label}: loaded {type(proc).__name__}")
+    print(f"       from {path}")
     return proc
 
 
@@ -173,14 +208,90 @@ def _image_token_id(proc):
     return None
 
 
-def _encode(proc, images):
-    """input_ids for _PROBE_TEXT plus len(images) copies of the image.
+def _image_token_str(proc):
+    """The placeholder marker STRING the caller must put in the text."""
+    for attr in ("image_token", "boi_token"):
+        val = getattr(proc, attr, None)
+        if isinstance(val, str) and val:
+            return val
+    tok = getattr(proc, "tokenizer", None)
+    tid = _image_token_id(proc)
+    if tok is not None and isinstance(tid, int):
+        try:
+            decoded = tok.decode([tid])
+            if decoded:
+                return decoded
+        except Exception:
+            pass
+    return None
 
-    Lets exceptions propagate: a processor that cannot encode its own
-    model's image format is a hard stop, not a data point.
+
+# --- encode strategies (see module docstring) ------------------------------
+
+
+def _encode_chat_template_then_process(proc, images):
+    content = [{"type": "image"} for _ in images]
+    content.append({"type": "text", "text": _PROBE_TEXT})
+    text = proc.apply_chat_template(
+        [{"role": "user", "content": content}],
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    out = proc(text=[text], images=list(images) or None, return_tensors="pt")
+    return out["input_ids"][0]
+
+
+def _encode_chat_template_tokenize(proc, images):
+    content = [{"type": "image", "image": im} for im in images]
+    content.append({"type": "text", "text": _PROBE_TEXT})
+    out = proc.apply_chat_template(
+        [{"role": "user", "content": content}],
+        add_generation_prompt=True,
+        tokenize=True,
+        return_dict=True,
+        return_tensors="pt",
+    )
+    return out["input_ids"][0]
+
+
+def _encode_manual_placeholder(proc, images):
+    marker = _image_token_str(proc)
+    if not marker:
+        raise RuntimeError("no image placeholder marker string could be resolved")
+    out = proc(
+        text=[marker * len(images) + _PROBE_TEXT],
+        images=list(images) or None,
+        return_tensors="pt",
+    )
+    return out["input_ids"][0]
+
+
+_STRATEGIES = (
+    ("chat_template_then_process", _encode_chat_template_then_process),
+    ("chat_template_tokenize", _encode_chat_template_tokenize),
+    ("manual_placeholder", _encode_manual_placeholder),
+)
+
+
+def _pick_strategy(proc, label):
+    """First strategy that round-trips a tiny image. Returns (name, fn).
+
+    Raises RuntimeError carrying EVERY strategy's error, because when all
+    three fail the individual messages are the only diagnostic available.
     """
-    out = proc(text=[_PROBE_TEXT], images=images if images else None, return_tensors="pt")
-    return [int(t) for t in out["input_ids"][0]]
+    probe = [_make_image(64, 64)]
+    errors = []
+    for name, fn in _STRATEGIES:
+        try:
+            ids = fn(proc, probe)
+            if len(ids) > 0:
+                print(f"[OK]   {label}: encode strategy '{name}'")
+                return name, fn
+            errors.append((name, "returned empty input_ids"))
+        except Exception as exc:
+            errors.append((name, f"{type(exc).__name__}: {exc}"))
+    detail = "\n".join(f"         {n}: {e}" for n, e in errors)
+    raise RuntimeError(f"no working encode strategy for {label}:\n{detail}")
 
 
 def _contiguous_spans(ids, token_id):
@@ -197,16 +308,15 @@ def _contiguous_spans(ids, token_id):
     return spans
 
 
-def _probe(proc, width, height, img_token_id):
+def _probe(fn, proc, width, height, img_token_id):
     """Per-image token cost at one resolution, measured both ways."""
-    ids_1 = _encode(proc, [_make_image(width, height)])
-    ids_2 = _encode(proc, [_make_image(width, height), _make_image(width, height)])
+    ids_1 = [int(t) for t in fn(proc, [_make_image(width, height)])]
+    ids_2 = [int(t) for t in fn(proc, [_make_image(width, height),
+                                       _make_image(width, height)])]
     return {
         "marginal": len(ids_2) - len(ids_1),
         "direct": ids_1.count(img_token_id) if img_token_id is not None else None,
         "spans": _contiguous_spans(ids_1, img_token_id) if img_token_id is not None else [],
-        "len_1img": len(ids_1),
-        "len_2img": len(ids_2),
     }
 
 
@@ -247,7 +357,9 @@ def main() -> None:
     proc_s = _load_processor(spec, "speculator")
 
     tid_t, tid_s = _image_token_id(proc_t), _image_token_id(proc_s)
-    print(f"       image placeholder token id: target={tid_t} speculator={tid_s}")
+    str_t, str_s = _image_token_str(proc_t), _image_token_str(proc_s)
+    print(f"       placeholder token: target id={tid_t} str={str_t!r} | "
+          f"speculator id={tid_s} str={str_s!r}")
     if tid_t is None or tid_s is None:
         print("[WARN] could not resolve the placeholder token id for at least one model; "
               "the contiguity check (C) will be skipped. The gate (B) does not need it.")
@@ -256,17 +368,34 @@ def main() -> None:
               "Not fatal on its own -- what matters is the COUNT -- but it means the ledger "
               "cannot identify image spans by a single shared id.")
 
+    try:
+        name_t, fn_t = _pick_strategy(proc_t, "target")
+        name_s, fn_s = _pick_strategy(proc_s, "speculator")
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        print("\n=== Verdict ===")
+        print("[INCONCLUSIVE] could not build a valid multimodal prompt for one of the "
+              "models. This is an API/environment problem in THIS SCRIPT or the installed "
+              "transformers -- it says NOTHING about whether the model pair agrees. The "
+              "gate has not been evaluated. Fix the encode path and re-run.")
+        sys.exit(EXIT_INCONCLUSIVE)
+
+    if name_t != name_s:
+        print(f"[WARN] the two models needed DIFFERENT encode strategies "
+              f"({name_t} vs {name_s}). The per-image counts below may not be "
+              "apples-to-apples; treat a PASS here as provisional.")
+
     print("\n=== B. The gate: per-image token cost, target vs speculator ===")
     print(f"{'size':>12}  {'target':>17}  {'speculator':>17}  verdict")
-    failures, marginals_t, all_spans_ok = [], [], True
+    mismatches, errors, marginals_t, all_spans_ok = [], [], [], True
     for (w, h) in sizes:
         label = f"{w}x{h}"
         try:
-            rt = _probe(proc_t, w, h, tid_t)
-            rs = _probe(proc_s, w, h, tid_s)
+            rt = _probe(fn_t, proc_t, w, h, tid_t)
+            rs = _probe(fn_s, proc_s, w, h, tid_s)
         except Exception as exc:
-            print(f"{label:>12}  encode failed: {exc}")
-            failures.append((label, f"encode failed: {exc}"))
+            print(f"{label:>12}  encode failed: {type(exc).__name__}: {exc}")
+            errors.append((label, f"{type(exc).__name__}: {exc}"))
             continue
 
         def _fmt(r):
@@ -276,7 +405,7 @@ def main() -> None:
         ok = rt["marginal"] == rs["marginal"]
         print(f"{label:>12}  {_fmt(rt):>17}  {_fmt(rs):>17}  {'OK' if ok else 'MISMATCH'}")
         if not ok:
-            failures.append((label, f"target {rt['marginal']} vs speculator {rs['marginal']}"))
+            mismatches.append((label, f"target {rt['marginal']} vs speculator {rs['marginal']}"))
         marginals_t.append(rt["marginal"])
         for who, r in (("target", rt), ("speculator", rs)):
             if r["spans"] and len(r["spans"]) != 1:
@@ -288,6 +417,8 @@ def main() -> None:
     print("\n=== C. Contiguity (force-keep-whole-image assumption) ===")
     if tid_t is None or tid_s is None:
         print("[SKIP] placeholder token id unresolved.")
+    elif not marginals_t:
+        print("[SKIP] no successful probes.")
     elif all_spans_ok:
         print("[OK]   every image expands to exactly ONE contiguous run of placeholders; "
               "force-keeping an image is a single interval.")
@@ -308,15 +439,22 @@ def main() -> None:
               "constant; see datasets/prep_longbench_v2_multiturn.py's Budget.")
 
     print("\n=== Verdict ===")
-    if failures:
+    if mismatches:
         print("[FAIL] GATE FAILED -- target and speculator disagree on per-image token count:")
-        for (label, why) in failures:
+        for (label, why) in mismatches:
             print(f"         {label}: {why}")
         print("       Do NOT proceed with the multimodal port using this model pair. The "
               "local->absolute position translation in pruner.py would corrupt silently.")
-        sys.exit(1)
+        sys.exit(EXIT_FAIL)
+    if errors or not marginals_t:
+        print("[INCONCLUSIVE] no resolution produced a comparable pair of counts:")
+        for (label, why) in errors:
+            print(f"         {label}: {why}")
+        print("       This is an encode/environment problem, NOT evidence that the models "
+              "disagree. The gate has not been evaluated.")
+        sys.exit(EXIT_INCONCLUSIVE)
     print("[PASS] GATE PASSED -- both models expand an image into the same number of "
-          "positions at every probed resolution.")
+          f"positions at every probed resolution ({len(marginals_t)}/{len(sizes)} probes).")
     print("       Safe to proceed to step 2 (un-zero limit_mm_per_prompt).")
 
 
