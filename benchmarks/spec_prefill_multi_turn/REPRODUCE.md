@@ -94,6 +94,31 @@ hf download meta-llama/Llama-3.2-3B-Instruct --exclude "original/*"
 ls -la /scratch/hf_cache/models--meta-llama--Llama-3.2-3B-Instruct/snapshots/*/
 ```
 
+**Gemma 4 checkpoints** (GATE-phase only — see "Gemma 4 only" pin above; the
+published SCBench sweep in this directory does not need these). Three gated
+repos, matching `.env_exports.sh`'s `GEMMA4_31B_MODEL_PATH`,
+`GEMMA4_E2B_MODEL_PATH`, `GEMMA4_MODEL_PATH` (the 26B-A4B MoE, the two-GPU
+alternative to the 31B — see that file's comment for when to use which):
+
+```bash
+export HF_TOKEN=<your token>
+hf download google/gemma-4-31B-it --exclude "original/*"
+hf download google/gemma-4-E2B-it --exclude "original/*"
+hf download google/gemma-4-26B-A4B-it --exclude "original/*"
+```
+
+```bash
+ls -la /scratch/hf_cache/hub/models--google--gemma-4-31B-it/snapshots/*/
+ls -la /scratch/hf_cache/hub/models--google--gemma-4-E2B-it/snapshots/*/
+ls -la /scratch/hf_cache/hub/models--google--gemma-4-26B-A4B-it/snapshots/*/
+```
+
+The `hub/` segment comes from `HF_HOME=/scratch/hf_cache` (the `hf` CLI
+downloads under `$HF_HOME/hub/`) — check `echo $HF_HOME` if paths don't
+resolve; older downloads on some nodes landed one level up, without `hub/`
+(see `LLAMA31_8B_MODEL_PATH`/`LLAMA32_1B_MODEL_PATH` in `.env_exports.sh` vs
+`LLAMA32_3B_MODEL_PATH`).
+
 ## 3. SCBench dataset
 
 `datasets/prep_scbench.py` fetches `microsoft/SCBench`'s 3 MVP configs

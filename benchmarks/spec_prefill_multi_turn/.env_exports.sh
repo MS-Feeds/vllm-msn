@@ -113,8 +113,8 @@ export LLAMA32_3B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2
 #
 # TODO: fill in this node's real snapshot paths (gated HF repos -- request
 # access and export HF_TOKEN first). Verify before trusting:
-#   ls -la /scratch/hf_cache/models--google--gemma-4-31B-it/snapshots/*/
-#   ls -la /scratch/hf_cache/models--google--gemma-4-E2B-it/snapshots/*/
+#   ls -la /scratch/hf_cache/hub/models--google--gemma-4-31B-it/snapshots/*/
+#   ls -la /scratch/hf_cache/hub/models--google--gemma-4-E2B-it/snapshots/*/
 # Resolved from the snapshot directory rather than hardcoded.
 #
 # A hand-written hash is easy to malform, and the failure is opaque: a single
@@ -141,8 +141,8 @@ _resolve_hf_snapshot() {
     echo "${resolved%/}"
 }
 
-export GEMMA4_31B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-31B-it)
-export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-E2B-it)
+export GEMMA4_31B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/hub/models--google--gemma-4-31B-it)
+export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/hub/models--google--gemma-4-E2B-it)
 
 # Gemma-4-26B-A4B-it (MoE, ~3.8B active). The alternative target when only
 # two GPUs are available: ~49GB of weights fits ONE 80GB card, so the target
@@ -153,7 +153,7 @@ export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--go
 # card with a target rank. Workable, but it stacks three tight budgets at
 # once. For RANKING three scorers the target barely matters -- the comparison
 # is relative -- so the simpler substrate is usually the better trade.
-export GEMMA4_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/models--google--gemma-4-26B-A4B-it)
+export GEMMA4_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/hub/models--google--gemma-4-26B-A4B-it)
 
 # ---------------------------------------------------------------------------
 # transformers MUST be exactly 5.14.1 for the Gemma 4 checkpoints.
