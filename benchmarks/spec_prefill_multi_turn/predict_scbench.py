@@ -599,19 +599,26 @@ def _build_experiments() -> dict:
     # Only the rates the variant loop above does not already cover, so the
     # k20 probe row keeps its exact identity and stays comparable with the
     # other two modes rather than being redefined here.
-    for rate in KEEP_RATES:
-        if (rate, SCORE_MODE_PROBE[1]) == SCORE_MODE_PROBE:
-            continue
-        exp_id = f"SPARSE-k{int(rate * 100)}-g{SCORE_MODE_PROBE[1]}-masked"
-        experiments[exp_id] = {
-            "label": f"Sparse attention (persistent cache) "
-                     f"keep={int(rate * 100)}% "
-                     f"granularity={SCORE_MODE_PROBE[1]} scoring=masked",
-            "mode": "sparse", "keep_mode": "keep",
-            "keep_percentage": rate,
-            "granularity": SCORE_MODE_PROBE[1],
-            **SCORE_MODE_VARIANTS["masked"],
-        }
+    # Swept at the probe granularity AND at 64. Purely additive: no g32 row's
+    # exp_id or label changes, so every already-published `-masked` number
+    # stays comparable. Granularity changes only which CHUNKS the scorer votes
+    # over, so g32-vs-g64 at a fixed keep rate and fixed scoring mode isolates
+    # selection granularity by itself -- the same one-variable discipline the
+    # ORACLE rows use for estimator quality.
+    for gran_name in (SCORE_MODE_PROBE[1], "64"):
+        for rate in KEEP_RATES:
+            if (rate, gran_name) == SCORE_MODE_PROBE:
+                continue
+            exp_id = f"SPARSE-k{int(rate * 100)}-g{gran_name}-masked"
+            experiments[exp_id] = {
+                "label": f"Sparse attention (persistent cache) "
+                         f"keep={int(rate * 100)}% "
+                         f"granularity={gran_name} scoring=masked",
+                "mode": "sparse", "keep_mode": "keep",
+                "keep_percentage": rate,
+                "granularity": gran_name,
+                **SCORE_MODE_VARIANTS["masked"],
+            }
 
     # Oracle upper bound: the SPARSE architecture, entirely unchanged --
     # same driving loop, same block-gather mechanism, same keep rate, same
@@ -3130,7 +3137,11 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             # `actual_keep_rate_mean` MEASURES, so a row run without it is not
             # comparable on that column to one run with it, and nothing else
             # in the CSV distinguishes them.
-            if getattr(args, "no_force_keep_query", False):
+            # Gated on the row actually HAVING a scorer: M000 runs no
+            # selection at all, so the flag is inert for it and tagging its
+            # label would imply a difference from the untagged baseline that
+            # does not exist.
+            if getattr(args, "no_force_keep_query", False) and mode != "baseline":
                 scope_tag += " [force_keep=off]"
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
