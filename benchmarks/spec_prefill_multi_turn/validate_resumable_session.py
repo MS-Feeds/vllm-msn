@@ -121,6 +121,94 @@ def drive_one_turn_of_session(llm_engine, request_id: str):
     return last_output
 
 
+def drive_concurrent_session_turns(llm_engine, request_ids):
+    """One turn each for N resumable sessions driven together. Returns
+    `{request_id: RequestOutput}`.
+
+    Mirrors `predict_scbench.py::drive_session_turns_to_completion`, and
+    exists here for the same reason the single-session helper above does: to
+    exercise the mechanism against a real engine, independently of the driver.
+
+    **The terminator is the whole point.** A resumable session's turn-level
+    stop does NOT make `has_unfinished_requests()` go False -- it parks in
+    `RequestStatus.WAITING_FOR_STREAMING_REQ` and re-enqueues. At N=1 that was
+    already confirmed here. At N>1 the consequence is sharper: once every
+    session in a wave has parked, a `has_unfinished_requests()`-terminated
+    loop hangs forever with every result already in hand. So this watches each
+    id's own `finish_reason` and uses the engine flag only as a hang watchdog.
+    """
+    outstanding = set(request_ids)
+    outputs = {}
+    while outstanding:
+        step_outputs = llm_engine.step()
+        for output in step_outputs:
+            rid = output.request_id
+            if rid not in outstanding:
+                continue
+            outputs[rid] = output
+            if output.outputs[0].finish_reason is not None:
+                outstanding.discard(rid)
+        if outstanding and not llm_engine.has_unfinished_requests():
+            raise RuntimeError(
+                f"engine quiesced with {sorted(outstanding)} still "
+                f"outstanding -- they were dropped rather than parked."
+            )
+    return outputs
+
+
+def check_concurrent_sessions(llm_engine, tok, conversations, sampling_params,
+                              num_turns=3):
+    """Drive N resumable sessions concurrently for `num_turns` turns each and
+    assert no cross-contamination.
+
+    **Nothing else in this repository exercises `WAITING_FOR_STREAMING_REQ` at
+    N > 1**, and that is the single riskiest assumption the batched driver
+    rests on. Two specific things are checked:
+
+    1. Each session's CUMULATIVE output stays its own. The engine's non-DELTA
+       output kind means `outputs[0].token_ids` grows across a session's whole
+       lifetime; if two sessions' streams were ever crossed, the prefix of
+       turn N+1's cumulative list would stop matching turn N's.
+    2. Every session parks and resumes for every turn -- i.e. all N produce a
+       `finish_reason` on every wave, rather than one starving.
+
+    `conversations` is a list of `(conversation_id, [turn_delta_ids, ...])`.
+    """
+    results = {}
+    cumulative_by_id = {cid: [] for cid, _ in conversations}
+
+    for turn_idx in range(num_turns):
+        request_ids = []
+        for conv_id, turn_deltas in conversations:
+            request_id = f"{conv_id}::session"
+            delta_ids = turn_deltas[turn_idx]
+            prompt = build_resumable_request(
+                llm_engine, request_id, delta_ids, sampling_params, resumable=True)
+            llm_engine.add_request(request_id, prompt, sampling_params)
+            request_ids.append(request_id)
+
+        outputs = drive_concurrent_session_turns(llm_engine, set(request_ids))
+        assert set(outputs) == set(request_ids), (
+            f"turn {turn_idx}: only {sorted(outputs)} of {sorted(request_ids)} "
+            f"produced output -- a session starved rather than parking."
+        )
+
+        for conv_id, _ in conversations:
+            request_id = f"{conv_id}::session"
+            cumulative = list(outputs[request_id].outputs[0].token_ids)
+            previous = cumulative_by_id[conv_id]
+            assert cumulative[:len(previous)] == previous, (
+                f"turn {turn_idx}: {conv_id}'s cumulative output no longer "
+                f"starts with its own previous output -- two sessions' streams "
+                f"have been crossed. This is the failure batching exists to "
+                f"rule out."
+            )
+            cumulative_by_id[conv_id] = cumulative
+            results.setdefault(conv_id, []).append(cumulative[len(previous):])
+
+    return results
+
+
 def build_resumable_request(llm_engine, request_id, prompt_token_ids, sampling_params, resumable=True):
     """Constructs an EngineCoreRequest directly and returns it -- the one
     confirmed way to set resumable=True, since LLMEngine.add_request()'s

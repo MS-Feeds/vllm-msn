@@ -96,6 +96,69 @@ Under `--sparse-prefill` the `target_prefill` FLOPs are measured per prefill
 chunk rather than derived analytically, since the analytic model assumes
 every new token attends every cached token.
 
+### Batching (`--batch-conversations`, default 1)
+
+`M000` and every `SPARSE-k*`/`ORACLE-k*`/`EARLY-k*` row can advance N
+conversations concurrently, in lockstep **waves**: each active session takes
+one turn — all scored in a single speculator pass and driven in a single
+target pass — before any takes its next. Conversations are the only available
+batch axis; turns within one are strictly ordered, since turn N+1's candidate
+pool depends on turn N's own outcome.
+
+**Default 1 reproduces the serial path exactly**, which is what every
+published row was measured on.
+
+Why it exists: batch-1 decode on this pipeline does not respond to KV volume
+(steady-state decode runs at ~0.57% MFU, and a 34% FLOP cut moved no time), so
+FLOP savings only convert to seconds either in prefill or in a throughput-bound
+batched regime. Batching is the second of those.
+
+What changes at N > 1:
+
+| | N = 1 | N > 1 |
+| --- | --- | --- |
+| `seconds_per_turn_mean`, `*_seconds_per_turn_*` | measured | **blank** |
+| `turns_per_second`, `out_tokens_per_second`, all FLOP columns | measured | measured |
+| `*_engine_seconds`, `batch_occupancy_mean`, `num_waves` | measured | measured |
+| `label` | untagged | `[batch=N]` |
+
+Per-turn wall clock is *suppressed*, not approximated. `timing_model.py` makes
+a turn's stages sum exactly to its wall clock and deliberately refuses to clamp
+a negative residual, because negative means double-counting. Concurrent turns
+overlap by construction, so at N > 1 that residual would go negative routinely
+and destroy a signal that is genuinely diagnostic at N = 1. The wave-level
+`*_engine_seconds` columns replace it: each is a window during which one engine
+did exactly one wave of work and nothing else.
+
+Three things to know before running one:
+
+- **Both arms must be batched the same way.** `--baseline-async-scheduling`
+  exists because they never agreed: `M000` has always run with vLLM's pipelined
+  async scheduling while every `SPARSE` row ran serialized (that flag defaults
+  off for a confirmed resumable-session race). Serially that was a constant
+  offset; under batching, async scheduling overlaps one request's scheduling
+  with another's execution, so the offset *scales with N*. A mismatch at N > 1
+  is a startup error.
+- **N is capped by KV capacity on both engines**, and is pre-flighted at
+  startup — a batch that cannot fit is refused rather than warned about,
+  because the failure is silent: vLLM relieves KV pressure by preempting, a
+  preempted session's recomputed history is forced dense, and the run finishes
+  and reports a sparse-labelled row that largely measured dense attention.
+  `num_preempted_turns` and `num_dense_fallback_prefill_before_turn_start` are
+  the signature; non-zero means the row did not measure what its name says.
+- **On a `prep_longbench_v2_multiturn.py` dataset the ceiling is about 2.**
+  That prep sizes every conversation to *fill* `--target-max-num-batched-tokens`
+  (130,560), so N sessions need N times that much resident KV. Reaching the
+  batch size at which the decode-side saving could pay for itself (~13 on
+  2×A100, from `step = W + N·K` with W ≈ 29.4 ms and K ≈ 0.63 ms) needs a
+  re-prep at a smaller `--doc-budget-tokens`, not a code change. Note that
+  shrinking documents also shrinks `d` — the very quantity that dataset exists
+  to make large — so run an N=1 control on the re-prepped file or the batch
+  effect and the length effect cannot be separated.
+
+`--no-batch-refill` holds wave membership fixed instead of topping it back up,
+for a strictly-constant-N window when batch size is the independent variable.
+
 ---
 
 ## Experiment matrix (as configured)

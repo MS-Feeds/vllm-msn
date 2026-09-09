@@ -55,23 +55,39 @@ it as an ordinary prompt. Local position `i` in that submission is
 whatever token conversation_state.py's candidate pool put at index `i`,
 full stop; the speculator has no notion of "gap" at all.
 
-## One request per turn, one in-flight speculator request at a time (MVP scope)
+## In-flight requests: one per turn, or a whole wave
 
-`run_turn` drives its own request to completion before returning -- this
-pipeline never submits a second conversation's speculator request while one
-is still in flight. This sacrifices some throughput (no cross-conversation
-batching on the speculator's own engine) in exchange for a much simpler,
-easier-to-reason-about driving loop; `speculator_worker.py`'s
-request-id-keyed (not global) query buffer and RPC surface would support
-concurrent in-flight requests if this were relaxed later, but that's not
-attempted here -- flagged as a real, deliberate scope boundary for this
-pass, not an oversight (mirrors the single-turn pipeline's own
-`tensor_model_parallel_size=1`-only scoping in spirit, just a batching axis
-instead of a parallelism one).
+`run_turn` (and every other single-turn entry point) still drives its own
+request to completion before returning, so a caller that wants one
+conversation at a time gets exactly the behaviour every published row was
+measured under.
+
+`run_turns_and_score` submits and drives a WAVE of conversations together --
+this is what `predict_scbench.py`'s `--batch-conversations` uses. It was the
+prediction of this docstring's earlier revision that this would be
+straightforward, and it was: `speculator_worker.py`'s query buffer, slot
+history and RPC surface have always been request-id-keyed rather than global,
+its Q capture already slices per request out of `query_start_loc` and clones
+the result, and `scoring.py`'s underlying math was already multi-sample. The
+only genuinely single-sample piece was the `score_and_select_indices`
+wrapper, which now has a `_multi` sibling.
+
+The two share their machinery rather than duplicating it:
+`_begin_and_submit_turn` (capture registration + `add_request`) and
+`_drive_speculator_requests` (the stepping loop) are the common core, and
+`_submit_and_drive_turn` is a one-element wrapper over them. What must NOT be
+duplicated is the begin_capture-strictly-before-add_request ordering, which
+is a confirmed real race and now lives in exactly one place.
+
+One measurement caveat worth carrying: at wave size > 1 the per-request
+`stage_seconds` spans OVERLAP (concurrent prefills, one shared decode-done
+timestamp), so they are honest only at wave size 1. `predict_scbench.py`
+stops feeding them into `timing_model` once batching is on.
 """
 
 import os
 import time
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import torch
@@ -116,6 +132,37 @@ os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 # specific IPC channel -- the same reasoning that makes `enforce_eager=True`
 # and other same-host-only settings elsewhere in this pipeline uncontroversial.
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+
+@dataclass
+class _SpeculatorSubmission:
+    """One submitted-but-not-yet-driven speculator request.
+
+    Exists so `_begin_and_submit_turn` can hand `_drive_speculator_requests`
+    everything the driving loop's logs and diagnostics need without either
+    method reaching back into the other's locals -- which is what let the two
+    be one blocking function before batching required them to be separable.
+    """
+
+    request_id: str
+    conversation_salt: str
+    t_start: float
+    max_tokens: int
+    query_source: str
+    look_ahead_cnt: int
+    ignore_eos: bool
+    prompt_len: int
+
+
+@dataclass
+class _DrivenRequest:
+    """One speculator request's result, after driving."""
+
+    request_id: str
+    num_cached_tokens: int
+    t_start: float
+    stage_seconds: dict
+    final_output: object
 
 
 class SpecPrefillProposer:
@@ -416,6 +463,115 @@ class SpecPrefillProposer:
         return (kept_local_indices, actual_look_ahead_cnt, num_cached_tokens,
                 stage_seconds)
 
+    def run_turns_and_score(self, specs: List[dict]) -> List[tuple]:
+        """`run_turn_and_score` for a WAVE of conversations, in one pass.
+        Returns one `(kept_local_indices, actual_look_ahead_cnt,
+        num_cached_tokens, stage_seconds)` tuple per spec, in the order given.
+
+        Each `spec` is a dict carrying exactly `run_turn_and_score`'s own
+        arguments. A dict rather than a dataclass because every field is
+        already a plain scoring hyperparameter that `pruner.py` reads straight
+        off `SpecConfig` -- a second type here would only be a place for the
+        two to drift.
+
+        **This is what relaxes the one-in-flight-request scope** this module's
+        docstring declares. That scope was a simplicity choice, not a
+        capability limit: `speculator_worker.py`'s query buffer and slot
+        history have always been request-id-keyed rather than global, and its
+        Q capture already slices per request out of `query_start_loc` and
+        `.clone()`s the result specifically as insurance against a scheduler
+        that batches this request's decode alongside another's prefill chunk.
+
+        Order of operations, and why:
+
+        1. **Every `begin_capture` first, then every `add_request`.** Each
+           request individually satisfies the
+           begin_capture-strictly-before-add_request rule either way, so
+           interleaving would also be correct -- doing all the registrations
+           up front is simply strictly safer against a future EngineCore that
+           begins stepping the moment the first request lands.
+        2. **One drive loop for the whole wave**, so the requests actually
+           share prefill steps. This is the batching; steps 1 and 3 are
+           bookkeeping around it.
+        3. **One `end_capture_and_score_many` round trip** instead of N.
+           Scoring itself is not made faster by this (see
+           `scoring.score_and_select_indices_multi`); what it removes is N-1
+           msgpack round trips across the EngineCore process boundary.
+        """
+        if not specs:
+            return []
+
+        submissions = [
+            self._begin_and_submit_turn(
+                spec["conversation_salt"],
+                spec["turn_idx"],
+                spec["full_sequence_token_ids"],
+                spec["look_ahead_cnt"],
+                spec.get("ignore_eos", False),
+                spec.get("query_source", "lookahead"),
+                spec.get("prompt_tail_n", 8),
+            )
+            for spec in specs
+        ]
+        driven = self._drive_speculator_requests(submissions)
+
+        t_before_score = time.time()
+        score_args = [
+            (
+                sub.request_id,
+                spec["conversation_salt"],
+                len(spec["full_sequence_token_ids"]),
+                spec.get("pool_kernel_size"),
+                spec["keep_kwargs"],
+                spec.get("score_aggregation", "max"),
+                spec.get("score_layers"),
+                spec.get("score_head_set"),
+                spec.get("mask_sliding_window", False),
+            )
+            for spec, sub in zip(specs, submissions)
+        ]
+        scored = self.llm_engine.collective_rpc(
+            "end_capture_and_score_many", args=(score_args,),
+        )[0]
+        scoring_seconds = time.time() - t_before_score
+
+        results = []
+        for spec, sub, (kept_local_indices, actual_look_ahead_cnt) in zip(
+            specs, submissions, scored
+        ):
+            d = driven[sub.request_id]
+            stage_seconds = dict(d.stage_seconds)
+            # The scoring RPC covers the whole wave, so there is no per-request
+            # scoring span to report. Charging each request the FULL wave
+            # figure would N-times-overcount it; charging a 1/N share would
+            # invent a split the measurement does not have. Record the shared
+            # cost once, on the FIRST spec, and zero for the rest -- summing
+            # over the wave then gives the true total, which is the quantity
+            # the wave-level accounting in `predict_scbench.py` actually uses.
+            stage_seconds["spec_scoring"] = (
+                scoring_seconds if sub is submissions[0] else 0.0
+            )
+            num_kept = (
+                len(kept_local_indices) if kept_local_indices is not None else None
+            )
+            print(
+                f"[proposer.run_turns_and_score] {sub.request_id!r}: "
+                f"actual_look_ahead_cnt={actual_look_ahead_cnt}, kept={num_kept}, "
+                f"total turn {time.time() - d.t_start:.2f}s"
+            )
+            results.append(
+                (kept_local_indices, actual_look_ahead_cnt, d.num_cached_tokens,
+                 stage_seconds)
+            )
+        if len(specs) > 1:
+            print(
+                f"[proposer.run_turns_and_score] wave of {len(specs)}: "
+                f"in-process K retrieval + scoring done in "
+                f"{scoring_seconds:.2f}s (one RPC round trip, not "
+                f"{len(specs)})"
+            )
+        return results
+
     def run_turn_and_head_diagnostics(
         self,
         conversation_salt: str,
@@ -502,7 +658,7 @@ class SpecPrefillProposer:
             ),
         )[0]
 
-    def _submit_and_drive_turn(
+    def _begin_and_submit_turn(
         self,
         conversation_salt: str,
         turn_idx: int,
@@ -511,33 +667,35 @@ class SpecPrefillProposer:
         ignore_eos: bool,
         query_source: str = "lookahead",
         prompt_tail_n: int = 8,
-    ) -> Tuple[str, int, float]:
-        """Shared submission/driving core for `run_turn` and `run_turn_and_
-        score` -- begin_capture, add_request, drive to completion, and the
-        bootstrap-prefill/lookahead-speculation timing logs and DIAGNOSTIC
-        check, all identical regardless of how the caller retrieves the
-        result afterward. Returns (request_id, num_cached_tokens, t_start)
-        -- `t_start` handed back so callers' own post-driving timing logs
-        report a "total turn" figure that includes submission/driving, not
-        just their own retrieval step."""
+    ) -> "_SpeculatorSubmission":
+        """Register capture and submit ONE speculator request. Does not drive
+        it -- see `_drive_speculator_requests`.
+
+        Split out of the former `_submit_and_drive_turn` so a whole wave of
+        conversations can be submitted before any of them is driven, which is
+        what lets the speculator engine batch them (`--batch-conversations`).
+        The ordering rule below is the reason this is a separate method rather
+        than inlined per call site: there is now exactly one place to get it
+        wrong.
+
+        **`begin_capture` MUST precede `add_request`** -- not reactively, in
+        response to observed output progress, as an earlier version did.
+        Confirmed on real hardware: EngineCore runs its own autonomous
+        stepping loop, decoupled from the driver's own `step()` calls, so a
+        reactive `begin_capture` can miss steps that already ran in the
+        background before the RPC round-trip lands (a second real occurrence
+        of the exact race `pruner.py`'s "Correction #2" documents and fixes
+        the same way -- see `speculator_worker.py::begin_capture`'s docstring
+        for the full history, and `end_capture`'s for how the bootstrap
+        prefill's own now-always-captured entry gets excluded on the way out
+        instead of by capture timing).
+        """
         from vllm import SamplingParams
         from vllm.inputs import TokensPrompt
 
         request_id = f"{conversation_salt}::turn{turn_idx}"
         t_start = time.time()
 
-        # Register capture BEFORE add_request -- NOT reactively, in response
-        # to observed output progress, as an earlier version of this method
-        # did. Confirmed on real hardware: EngineCore runs its own
-        # autonomous stepping loop, decoupled from the driver's own step()
-        # calls, so a reactive begin_capture can miss steps that already ran
-        # in the background before the RPC round-trip lands (a second real
-        # occurrence of the exact race pruner.py's "Correction #2" already
-        # documents and fixes the same way -- see
-        # speculator_worker.py::begin_capture's docstring for the full
-        # history and speculator_worker.py::end_capture's docstring for how
-        # the bootstrap prefill's own (now-always-captured) entry gets
-        # excluded on the way out instead of by capture timing).
         self.llm_engine.collective_rpc(
             "begin_capture",
             args=(
@@ -569,93 +727,167 @@ class SpecPrefillProposer:
             f"(VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1 is set at this module's "
             f"import time) but got {real_request_id!r} back instead."
         )
+        return _SpeculatorSubmission(
+            request_id=request_id,
+            conversation_salt=conversation_salt,
+            t_start=t_start,
+            max_tokens=max_tokens,
+            query_source=query_source,
+            look_ahead_cnt=look_ahead_cnt,
+            ignore_eos=ignore_eos,
+            prompt_len=len(full_sequence_token_ids),
+        )
 
-        num_cached_tokens = 0
-        final_output = None
-        t_prefill_done = None
-        # Same "never break early / never abort" discipline as
-        # predict_longbench_v2.py's drive_engine_to_completion -- an
-        # unconditional step() without checking has_unfinished_requests()
-        # first can block forever once this (the only in-flight) request
-        # finishes.
+    def _drive_speculator_requests(self, submissions) -> dict:
+        """Drive N already-submitted speculator requests to completion.
+        Returns `{request_id: _DrivenRequest}`.
+
+        **`has_unfinished_requests()` IS the right terminator here** -- the
+        opposite of `predict_scbench.py::drive_session_turns_to_completion`,
+        and the difference is worth stating because the two loops look alike.
+        Speculator requests are ORDINARY, non-resumable requests: they truly
+        finish, and the engine's unfinished count really does fall to zero. A
+        target SESSION does not -- its turn-level stop parks it in
+        `WAITING_FOR_STREAMING_REQ` and re-enqueues, so a loop of this shape
+        would spin there forever.
+
+        Same "never break early / never abort" discipline as
+        `predict_longbench_v2.py::drive_engine_to_completion`: an
+        unconditional `step()` without first checking
+        `has_unfinished_requests()` can block forever once the last in-flight
+        request finishes.
+        """
+        by_id = {sub.request_id: sub for sub in submissions}
+        if not by_id:
+            return {}
+        final_outputs: dict = {}
+        num_cached: dict = {rid: 0 for rid in by_id}
+        t_prefill_done: dict = {}
+
         while self.llm_engine.has_unfinished_requests():
             for output in self.llm_engine.step():
-                if output.request_id != request_id:
-                    # Shouldn't happen under this pass's one-in-flight-
-                    # request scope (see module docstring), but don't
-                    # silently mis-handle another request's output if it
-                    # does -- just ignore it, it'll be driven to completion
-                    # by whatever submitted it.
+                rid = output.request_id
+                sub = by_id.get(rid)
+                if sub is None:
+                    # Not one of ours -- whoever submitted it drives it.
                     continue
-                if final_output is None:
+                if rid not in final_outputs:
                     # The FIRST output seen for a fresh (non-resumable,
-                    # non-streamed) request is exactly the point the
-                    # bootstrap prefill finished and the first token was
-                    # sampled -- there is no earlier signal available from
-                    # outside the engine.
-                    t_prefill_done = time.time()
+                    # non-streamed) request is exactly the point the bootstrap
+                    # prefill finished and the first token was sampled --
+                    # there is no earlier signal available from outside the
+                    # engine.
+                    t_prefill_done[rid] = time.time()
                     print(
-                        f"[proposer.run_turn] {request_id!r}: bootstrap "
-                        f"prefill done in {t_prefill_done - t_start:.2f}s "
-                        f"({len(full_sequence_token_ids)} tokens, "
+                        f"[proposer.run_turn] {rid!r}: bootstrap prefill done "
+                        f"in {t_prefill_done[rid] - sub.t_start:.2f}s "
+                        f"({sub.prompt_len} tokens, "
                         f"num_cached_tokens={output.num_cached_tokens})"
                     )
-                final_output = output
+                final_outputs[rid] = output
                 if output.num_cached_tokens:
-                    num_cached_tokens = output.num_cached_tokens
+                    num_cached[rid] = output.num_cached_tokens
 
         t_decode_done = time.time()
-        if t_prefill_done is not None and final_output is not None:
-            print(
-                f"[proposer.run_turn] {request_id!r}: lookahead speculation "
-                f"done in {t_decode_done - t_prefill_done:.2f}s "
-                f"({len(final_output.outputs[0].token_ids) - 1} lookahead "
-                f"steps, total turn so far {t_decode_done - t_start:.2f}s)"
-            )
-
-        # Diagnostic, not a hard assertion -- still worth surfacing if
-        # generation itself stopped short of the requested length (distinct
-        # from end_capture's own decode-step count, which is now expected to
-        # match generation length exactly since capture timing is no longer
-        # the limiting factor -- see speculator_worker.py::end_capture).
-        if final_output is not None:
-            total_generated = len(final_output.outputs[0].token_ids)
-            if total_generated != max_tokens:
+        driven = {}
+        for rid, sub in by_id.items():
+            final_output = final_outputs.get(rid)
+            prefill_done = t_prefill_done.get(rid)
+            if prefill_done is not None and final_output is not None:
                 print(
-                    f"[proposer.run_turn] DIAGNOSTIC: request {request_id!r} "
-                    f"generated {total_generated} tokens total (expected "
-                    f"{max_tokens}"
-                    + ("" if query_source == "prompt_tail"
-                       else f" = 1 bootstrap + {look_ahead_cnt} lookahead")
-                    + f", query_source={query_source!r}), finish_reason="
-                    f"{final_output.outputs[0].finish_reason!r}, "
-                    f"ignore_eos={ignore_eos} -- if finish_reason is 'stop' "
-                    f"despite ignore_eos=True, ignore_eos isn't reaching "
-                    f"SamplingParams as intended; if 'length', something is "
-                    f"capping max_tokens/max_model_len below what was "
-                    f"requested."
+                    f"[proposer.run_turn] {rid!r}: lookahead speculation done "
+                    f"in {t_decode_done - prefill_done:.2f}s "
+                    f"({len(final_output.outputs[0].token_ids) - 1} lookahead "
+                    f"steps, total turn so far "
+                    f"{t_decode_done - sub.t_start:.2f}s)"
                 )
 
-        # The prefill/lookahead split is already computed above for the log
-        # lines; return it too rather than only printing it. `predict_scbench`
-        # can then record per-stage LATENCY the way it already records
-        # per-stage FLOPs -- see timing_model.py for why the two being
-        # asymmetric hid the result that matters.
-        #
-        # `t_prefill_done is None` means no output was ever seen (the request
-        # produced nothing), so there is no boundary to split on; charge the
-        # whole span to prefill rather than inventing a lookahead figure.
-        if t_prefill_done is None:
-            stage_seconds = {
-                "spec_prefill": t_decode_done - t_start,
-                "spec_lookahead": 0.0,
-            }
-        else:
-            stage_seconds = {
-                "spec_prefill": t_prefill_done - t_start,
-                "spec_lookahead": t_decode_done - t_prefill_done,
-            }
-        return request_id, num_cached_tokens, t_start, stage_seconds
+            # Diagnostic, not a hard assertion -- still worth surfacing if
+            # generation itself stopped short of the requested length
+            # (distinct from end_capture's own decode-step count, which is now
+            # expected to match generation length exactly since capture timing
+            # is no longer the limiting factor -- see
+            # speculator_worker.py::end_capture).
+            if final_output is not None:
+                total_generated = len(final_output.outputs[0].token_ids)
+                if total_generated != sub.max_tokens:
+                    print(
+                        f"[proposer.run_turn] DIAGNOSTIC: request {rid!r} "
+                        f"generated {total_generated} tokens total (expected "
+                        f"{sub.max_tokens}"
+                        + ("" if sub.query_source == "prompt_tail"
+                           else f" = 1 bootstrap + {sub.look_ahead_cnt} lookahead")
+                        + f", query_source={sub.query_source!r}), finish_reason="
+                        f"{final_output.outputs[0].finish_reason!r}, "
+                        f"ignore_eos={sub.ignore_eos} -- if finish_reason is "
+                        f"'stop' despite ignore_eos=True, ignore_eos isn't "
+                        f"reaching SamplingParams as intended; if 'length', "
+                        f"something is capping max_tokens/max_model_len below "
+                        f"what was requested."
+                    )
+
+            # The prefill/lookahead split is already computed above for the log
+            # lines; return it too rather than only printing it.
+            # `predict_scbench` can then record per-stage LATENCY the way it
+            # already records per-stage FLOPs -- see timing_model.py for why
+            # the two being asymmetric hid the result that matters.
+            #
+            # `prefill_done is None` means no output was ever seen (the request
+            # produced nothing), so there is no boundary to split on; charge
+            # the whole span to prefill rather than inventing a lookahead
+            # figure.
+            #
+            # **At N > 1 these per-request spans OVERLAP** and must not be
+            # summed into a per-turn breakdown: every request in the wave
+            # shares one `t_decode_done`, and their prefills run concurrently.
+            # They stay honest at N == 1; `predict_scbench.py` stops feeding
+            # them to `timing_model` once batching is on and reports wave-level
+            # engine-busy time instead.
+            if prefill_done is None:
+                stage_seconds = {
+                    "spec_prefill": t_decode_done - sub.t_start,
+                    "spec_lookahead": 0.0,
+                }
+            else:
+                stage_seconds = {
+                    "spec_prefill": prefill_done - sub.t_start,
+                    "spec_lookahead": t_decode_done - prefill_done,
+                }
+            driven[rid] = _DrivenRequest(
+                request_id=rid,
+                num_cached_tokens=num_cached[rid],
+                t_start=sub.t_start,
+                stage_seconds=stage_seconds,
+                final_output=final_output,
+            )
+        return driven
+
+    def _submit_and_drive_turn(
+        self,
+        conversation_salt: str,
+        turn_idx: int,
+        full_sequence_token_ids: List[int],
+        look_ahead_cnt: int,
+        ignore_eos: bool,
+        query_source: str = "lookahead",
+        prompt_tail_n: int = 8,
+    ) -> Tuple[str, int, float, dict]:
+        """Submit and drive ONE speculator turn -- a one-element wrapper over
+        `_begin_and_submit_turn` + `_drive_speculator_requests`, kept so
+        `run_turn`, `run_turn_and_score`, the diagnostic variants,
+        `validate_proposer.py` and every `diagnose_*.py` are unchanged.
+
+        Returns `(request_id, num_cached_tokens, t_start, stage_seconds)` --
+        `t_start` handed back so callers' own post-driving timing logs report
+        a "total turn" figure that includes submission/driving, not just their
+        own retrieval step."""
+        sub = self._begin_and_submit_turn(
+            conversation_salt, turn_idx, full_sequence_token_ids,
+            look_ahead_cnt, ignore_eos, query_source, prompt_tail_n,
+        )
+        driven = self._drive_speculator_requests([sub])[sub.request_id]
+        return (driven.request_id, driven.num_cached_tokens, driven.t_start,
+                driven.stage_seconds)
 
     def retrieve_keys(
         self, conversation_salt: str, local_positions: List[int]

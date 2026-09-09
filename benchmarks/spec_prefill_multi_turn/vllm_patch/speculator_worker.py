@@ -876,6 +876,40 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         )
         return kept_local_indices, actual_look_ahead_cnt
 
+    def end_capture_and_score_many(self, specs):
+        """`end_capture_and_score` for a WAVE of requests, in ONE RPC.
+
+        `specs` is a list of argument tuples in `end_capture_and_score`'s own
+        positional order; returns one `(kept_local_indices,
+        actual_look_ahead_cnt)` per spec, in the same order.
+
+        **What this does and does not buy.** It removes N-1 `collective_rpc`
+        round trips across the driver/EngineCore process boundary -- that is
+        the whole win, and it is a real one at wave sizes where the round trip
+        is a non-trivial share of a short turn.
+
+        It does NOT make the scoring compute faster, and deliberately does not
+        pretend to: it loops `end_capture_and_score` in-process. A genuinely
+        batched scoring pass is not available here, because the samples are
+        RAGGED in both dimensions that would have to be stacked. Each request
+        has its own context length (so `key_buffer` rows differ) and its own
+        `actual_look_ahead_cnt` (a request that hit EOS early has fewer
+        captured lookahead steps than one that did not), so combining them
+        into one `[num_samples, look_ahead, hidden]` query tensor would mean
+        padding to the maxima -- at this pipeline's context lengths, padding a
+        30k-token sample out to a 130k-token one wastes far more than the
+        Python-level per-sample loop it would remove. `scoring.py`'s
+        multi-sample entry points iterate samples in Python anyway
+        (`compute_attention_score` unbinds the sample dim;
+        `chunk_select_from_smoothed_attention` loops), so there is no kernel
+        being left on the table.
+
+        A `score_and_select_indices_multi` wrapper was considered and NOT
+        added for exactly this reason: it would have looked like batched math
+        while looping, which is worse than an honest loop.
+        """
+        return [self.end_capture_and_score(*spec) for spec in specs]
+
     def end_capture_and_sliding_window_diagnostics(
         self,
         request_id: str,
@@ -1268,6 +1302,20 @@ class SpeculatorWorker(Worker):
             keep_kwargs, score_aggregation, score_layers, score_head_set,
             mask_sliding_window,
         )
+
+    def end_capture_and_score_many(self, specs):
+        """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
+        end_capture_and_score_many`'s docstring for what batching here does
+        and does not buy.
+
+        Same signature-tracking hazard as `end_capture_and_score` above:
+        `collective_rpc` dispatches by name to THIS class, so a parameter
+        added only to the runner method surfaces as a `TypeError` at the first
+        scored turn, minutes into a run, not at import. This one takes a
+        single opaque list precisely to keep that surface as narrow as
+        possible -- the per-spec tuples are validated by the runner method's
+        own call into `end_capture_and_score`."""
+        return self.model_runner.end_capture_and_score_many(specs)
 
     def end_capture_and_head_diagnostics(
         self,

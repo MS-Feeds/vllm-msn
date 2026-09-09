@@ -253,3 +253,42 @@ def load_tokenizer(model_path: str, **kwargs):
         kwargs.setdefault("extra_special_tokens", {})
 
     return AutoTokenizer.from_pretrained(model_path, **kwargs)
+
+
+def image_marker_str(processor) -> str:
+    """The image placeholder marker STRING a caller must put in prompt text.
+
+    A VLM processor does not inject this for you: the caller writes the marker
+    into the text and the processor EXPANDS it into the model's real
+    placeholder run. Omit it and the processor raises ("Found [0] <|image|>
+    tokens and [1] images per sample") -- a caller error, not a model
+    property.
+
+    Different families name it differently (Gemma's `<image_soft_token>`,
+    Llama-Vision's `<|image|>`, ...), so this probes the several places it can
+    live. Lives here beside `has_multimodal_tower` so the prep packer and the
+    driver resolve it identically -- a second copy that drifted would put
+    markers in the text that the processor did not expand, and the token
+    counts the packer budgeted would stop matching what the driver submits.
+
+    `validate_mm_token_alignment.py` reports the resolved marker for a given
+    checkpoint pair, and deliberately keeps its own copy of this logic so it
+    can run before anything else in the pipeline works.
+    """
+    for attr in ("image_token", "boi_token"):
+        val = getattr(processor, attr, None)
+        if isinstance(val, str) and val:
+            return val
+
+    tok = getattr(processor, "tokenizer", None)
+    if tok is not None:
+        unk = getattr(tok, "unk_token_id", None)
+        for literal in ("<image_soft_token>", "<image>", "<|image|>", "<image_placeholder>"):
+            tid = tok.convert_tokens_to_ids(literal)
+            if isinstance(tid, int) and tid >= 0 and tid != unk:
+                return literal
+
+    raise RuntimeError(
+        "could not resolve this processor's image marker string. Run "
+        "validate_mm_token_alignment.py, which reports it for the checkpoint."
+    )

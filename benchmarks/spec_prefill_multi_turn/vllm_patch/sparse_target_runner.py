@@ -181,13 +181,35 @@ is where these should be checked first, before trusting any real sweep:
    -- not independently re-verified here. If a backend uses a different
    field name, this module's `_gather_fields_for_layer` will raise a clear
    `AttributeError`-derived message rather than silently doing nothing.
-2. **Single KV-cache-group, batch-size-1 assumption.** Mirrors
-   `speculator_worker.py`'s own documented "single KV-cache-group"
-   assumption (reasonable for Llama-3.1-8B, dense/uniform attention) and
-   this pipeline's own established "one in-flight request at a time"
-   scope -- this module does not attempt the general multi-request virtual-
-   batch reconstruction `make_local_attention_virtual_batches` implements,
-   only a single-row, single-group in-place patch.
+2. **Single KV-cache-group assumption.** Mirrors `speculator_worker.py`'s
+   own documented "single KV-cache-group" assumption; enforced rather than
+   hoped for -- `_gatherable_group_block_size` raises `NotImplementedError`
+   if the gathered full-attention layers span more than one group. This
+   module does not attempt the general virtual-batch reconstruction
+   `make_local_attention_virtual_batches` implements, only an in-place
+   per-row patch.
+
+   **This is NO LONGER a batch-size-1 assumption** (it was, and this entry
+   used to say so). The override path is per-request throughout:
+   `_apply_sparse_attention_overrides` loops `for req_idx in
+   range(num_reqs)`, every registry read is by `req_id`
+   (`sparse_selection_registry.get_with_generation` returns one atomic
+   snapshot per request), every per-turn cache is keyed by `req_id`, the
+   post-loop `max_seq_len` recompute spans all requests, the `seq_lens`
+   privatisation is latched to run ONCE PER STEP rather than once per
+   patched request (see `_apply_gathered_view`'s `privatise` argument), and
+   `_padded_block_table_row`'s shared GPU scratch row is safe by stream
+   ordering (both the write into it and the write out of it are device ops
+   on the same stream).
+
+   The one genuine batch hazard lived in
+   `kv_cache_utils._pinned_index_tensor` -- a single module-level pinned
+   host buffer, always sliced from offset 0, whose HOST write for request B
+   could land before request A's enqueued async H2D had executed, so A
+   gathered B's block indices and read the wrong physical KV blocks
+   silently. Fixed by `_PinnedIndexStager`, a ring of slots each guarded by
+   the CUDA event recorded after the copy that consumed it; see that class's
+   docstring for why a ring rather than a synchronous copy.
 3. **Block occupancy at the gather boundary.** The gathered view's
    `seq_lens` value must account for the LAST included block possibly
    being only PARTIALLY filled (the request's own most-recently-written
@@ -844,6 +866,10 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             # the right quantity to compare against -- everything below
             # needs `step_seq_len` instead, see the comment further down.
             is_prefill = num_computed < num_prompt
+            # Preemption watch runs for EVERY registered request, on both
+            # scopes and on both phases -- it is the one signal that does not
+            # depend on the gather having had a chance to notice.
+            self._note_num_computed(req_id, num_computed)
             if is_prefill and prefill_turn_start is None:
                 self._accumulate_override_timing(
                     req_id, time.time() - t_override_start)
@@ -873,6 +899,27 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
             if is_prefill and not self._prefill_gather_applies(
                 prefill_turn_start, num_computed, step_seq_len
             ):
+                # Which of the two bail-outs fired. `prefill_before_turn_start`
+                # is the preemption signature and is the one worth alarming
+                # on; `prefill_no_tail` is an ordinary chunk-boundary case.
+                self._accumulate_dense_fallback(
+                    req_id,
+                    "prefill_before_turn_start"
+                    if num_computed < prefill_turn_start else "prefill_no_tail",
+                )
+                # **Charge this chunk its real cost.** This `continue` used to
+                # jump past `_accumulate_prefill_step` below, so a bailed-out
+                # chunk left NO entry in `prefill_steps` at all -- and an empty
+                # `prefill_steps` makes the driver fall back to the analytic
+                # `target_prefill_flops(prompt_len=resident+delta,
+                # num_cached=resident)`, i.e. it billed a full history
+                # RECOMPUTE as though it were a small delta prefill. That is a
+                # wrong number, not merely an optimistic one. Recording it here
+                # keeps the measured path in charge whenever the scope is on.
+                # Fires zero times in the steady state, so no already-published
+                # row moves.
+                self._accumulate_prefill_step(
+                    req_id, step_seq_len - num_computed, step_seq_len)
                 self._accumulate_override_timing(
                     req_id, time.time() - t_override_start)
                 continue
@@ -922,6 +969,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 if gathered is None:
                     # Same reasoning as the decode branch below: a dense
                     # chunk still paid for the override that decided so.
+                    self._accumulate_dense_fallback(req_id, "prefill_degenerate")
                     self._accumulate_override_timing(
                         req_id, time.time() - t_override_start)
                     continue
@@ -978,6 +1026,7 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
                 # while measuring +5.2% per token against the dense
                 # baseline. The stage carrying the entire unexplained cost
                 # was the stage the accumulator declined to time.
+                self._accumulate_dense_fallback(req_id, "decode_degenerate")
                 self._accumulate_override_timing(
                     req_id, time.time() - t_override_start)
                 continue
@@ -1408,6 +1457,74 @@ class SparseTargetGPUModelRunner(GPUModelRunner):
         """
         return self._prefill_steps_accum().pop(request_id, [])
 
+    def _dense_fallback_accum(self) -> Dict[str, Dict[str, int]]:
+        """Per-request tally of steps that ran DENSE despite a registered
+        selection. Lazily created, same as every other per-turn accumulator
+        here, and keyed by `request_id` so it is batch-safe by construction.
+
+        Why this exists: a dense fallback is always a CORRECT answer, just a
+        more expensive one, so nothing upstream fails when one happens. That
+        is precisely the problem -- a run that quietly stopped exercising the
+        sparse path still produces a row labelled as a sparse result. Under
+        batching this stops being hypothetical: N concurrent sessions multiply
+        the resident KV, and vLLM relieves KV pressure by preempting and
+        recomputing, which trips the `prefill_before_turn_start` bail-out for
+        the whole recomputed history.
+
+        Keys, and what each means:
+
+        - `prefill_before_turn_start` -- **the preemption signature.** The
+          engine is recomputing tokens from before this turn began, so the
+          gather is skipped to avoid poisoning the persistent cache. See
+          `_prefill_gather_applies`.
+        - `prefill_no_tail` -- the chunk contains nothing of this turn yet, so
+          there is no force-kept tail for the causal argument to stand on.
+        - `prefill_degenerate` / `decode_degenerate` -- the selection already
+          covers the whole resident cache, so gathering would be a no-op.
+          Legitimate and expected at keep_rate=1.0, which is exactly why it is
+          counted separately from the two above rather than lumped in.
+        - `num_computed_regressions` -- see `_note_num_computed`.
+        """
+        if not hasattr(self, "_sparse_dense_fallback_accum"):
+            self._sparse_dense_fallback_accum: Dict[str, Dict[str, int]] = {}
+        return self._sparse_dense_fallback_accum
+
+    def _accumulate_dense_fallback(self, request_id: str, kind: str) -> None:
+        counts = self._dense_fallback_accum().setdefault(request_id, {})
+        counts[kind] = counts.get(kind, 0) + 1
+
+    def _note_num_computed(self, request_id: str, num_computed: int) -> None:
+        """Detect scheduler preemption independently of whether the gather
+        happened to notice it.
+
+        vLLM V1 preempts by freeing a request's blocks and resetting its
+        `num_computed_tokens`, so a value BELOW this request's own high-water
+        mark is a preempt-and-recompute, full stop -- no interpretation
+        needed. Costs one dict lookup and an int compare per request per step,
+        which is well inside the ~0.43 ms of genuine host work this override
+        path does.
+
+        Worth having in addition to `prefill_before_turn_start`: that flag
+        only fires while a `prefill_turn_start` is registered (i.e. under
+        `--sparse-prefill`), whereas preemption distorts the decode-only scope
+        too."""
+        marks = getattr(self, "_sparse_num_computed_high_water", None)
+        if marks is None:
+            marks = self._sparse_num_computed_high_water = {}
+        previous = marks.get(request_id)
+        if previous is not None and num_computed < previous:
+            self._accumulate_dense_fallback(request_id, "num_computed_regressions")
+        marks[request_id] = max(num_computed, previous or 0)
+
+    def pop_dense_fallbacks(self, request_id: str) -> Dict[str, int]:
+        """This turn's dense-fallback tally for `request_id`, then resets it.
+
+        Returns `{}` in the healthy steady state, which is what the driver
+        expects -- any non-empty result is worth surfacing, and
+        `prefill_before_turn_start`/`num_computed_regressions` specifically
+        mean the row did not measure what its name says."""
+        return self._dense_fallback_accum().pop(request_id, {})
+
     def _override_timing_accum(self) -> Dict[str, tuple]:
         # Lazily-initialized, same reasoning as _base_block_indices_cache
         # above. Keyed by req_id -> (total_elapsed_seconds, num_steps) --
@@ -1694,3 +1811,12 @@ class SparseTargetWorker(Worker):
         """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
         pop_prefill_steps`'s docstring for what this measures and why."""
         return self.model_runner.pop_prefill_steps(request_id)
+
+    def pop_dense_fallbacks(self, request_id: str) -> Dict[str, int]:
+        """RPC-callable wrapper -- see `SparseTargetGPUModelRunner.
+        pop_dense_fallbacks`'s docstring for what each counter means.
+
+        The driver pops this every turn, not only when it suspects trouble:
+        a dense fallback raises no error and changes no output, so the ONLY
+        way a degraded run becomes visible is by asking every time."""
+        return self.model_runner.pop_dense_fallbacks(request_id)

@@ -513,39 +513,150 @@ def compute_sparse_gather_view(
     return gathered_block_table_row, gathered_seq_len
 
 
-_PINNED_INDEX_BUFFER = None
+#: Slots in `_PinnedIndexStager`'s ring. Comfortably above any plausible
+#: `--batch-conversations`, and each slot holds a few hundred int64s at the
+#: selection sizes this pipeline produces, so depth is essentially free.
+#: What it must exceed is the number of stages issued before the OLDEST
+#: outstanding H2D drains -- one stage per patched request per step, so a
+#: depth of 8 covers several full steps at any batch size this driver can
+#: physically run.
+_PINNED_RING_DEPTH = 8
+
+
+class _PinnedIndexStager:
+    """A ring of host staging slots, each guarded by the CUDA event recorded
+    after the H2D copy that consumed it.
+
+    **The confirmed bug this replaces.** The previous implementation kept ONE
+    module-level pinned buffer and always handed out `buf[:needed]`, i.e. a
+    view starting at offset 0. The write into it (`view.copy_(...)`) is a
+    HOST-side memcpy; the transfer out of it (`view.to(device,
+    non_blocking=True)`) only ENQUEUES a copy on the current stream. With two
+    requests patched in the same step -- which is exactly what batching means
+    -- request B's host write could land before request A's enqueued copy had
+    executed, so A's `full_block_table_row[...]` gather indexed with B's
+    block ids and read ANOTHER REQUEST'S physical KV blocks. Silently: no
+    exception, no shape mismatch, just wrong attention output. The overlap
+    was guaranteed rather than probabilistic, since every caller got the same
+    offset-0 view.
+
+    It was latent even at batch 1 (the CPU runs ahead of the GPU across decode
+    steps); what masked it was the implicit scalar H2D sync at
+    `sparse_target_runner._patch_layer_metadata`'s `seq_lens[req_idx] =
+    gathered_seq_len`, which drained the stream 62 times a step.
+
+    **Why a ring and not simply a synchronous copy.** Dropping
+    `non_blocking=True` would be correct and one line. It would also make the
+    host wait on everything already enqueued on the stream -- the previous
+    step's entire replay -- once PER PATCHED REQUEST per step. That is the
+    ~32 ms stall `sparse_target_runner`'s own phase-split probe attributed to
+    GPU wait rather than host work, and that module's comment on the
+    per-layer write cost is explicit about the stakes: "33 of 38 ms consumes
+    87% of the overlap budget, so any GPU-side speedup -- batching, a better
+    kernel -- would make the CPU the bottleneck immediately." Batching IS
+    that speedup, so paying a stream sync per request is precisely the wrong
+    trade. The ring costs one `cudaEventQuery` (~1-2 us) per stage in the
+    steady state, against the ~0.43 ms of genuine host work in this path.
+
+    **The CPU path goes through the ring too**, with null events and ordinary
+    (unpinned) slots. The old code short-circuited to `torch.tensor(...)` on
+    CPU, which is why the bug was not reachable from a CPU-only test at all.
+    Routing CPU through the same slot-selection policy makes "a tensor staged
+    for A is unaffected by a later stage for B" a real, CPU-checkable
+    property -- see `test_vllm_patch.py`'s stager tests, which are the
+    regression tests for the bug above.
+
+    `event_factory`/`buffer_factory` exist ONLY so that policy is testable
+    without a GPU; production passes neither.
+    """
+
+    def __init__(self, depth: int = _PINNED_RING_DEPTH, event_factory=None,
+                 buffer_factory=None) -> None:
+        if depth < 1:
+            raise ValueError(f"ring depth must be >= 1, got {depth}")
+        self._depth = depth
+        self._event_factory = event_factory
+        self._buffer_factory = buffer_factory
+        self._buffers: List = [None] * depth
+        self._events: List = [None] * depth
+        self._next = 0
+
+    def _alloc(self, needed: int, device) -> "torch.Tensor":
+        if self._buffer_factory is not None:
+            return self._buffer_factory(needed, device)
+        if device.type == "cuda":
+            return torch.empty(needed, dtype=torch.int64, pin_memory=True)
+        # Pinning is meaningless off CUDA, but the slot still has to exist so
+        # the ring's aliasing behaviour is identical on both paths.
+        return torch.empty(needed, dtype=torch.int64)
+
+    def _new_event(self):
+        if self._event_factory is not None:
+            return self._event_factory()
+        if torch.cuda.is_available():
+            return torch.cuda.Event()
+        return None
+
+    def stage(self, indices: List[int], device) -> "torch.Tensor":
+        """`indices` as an int64 tensor on `device`, staged through the next
+        ring slot. The returned tensor is valid until this slot comes round
+        again, which the event guard prevents from happening early."""
+        slot = self._next % self._depth
+        self._next += 1
+
+        event = self._events[slot]
+        if event is not None and not event.query():
+            # The ring wrapped before this slot's own copy drained. Rare
+            # enough to be invisible in the steady state, and the ONLY point
+            # at which correctness requires the host to wait.
+            event.synchronize()
+            self._events[slot] = None
+
+        needed = len(indices)
+        buf = self._buffers[slot]
+        if buf is None or buf.numel() < needed:
+            # Slots only ever grow, so the steady state does no allocation.
+            buf = self._alloc(needed, device)
+            self._buffers[slot] = buf
+        view = buf[:needed]
+        # The small pageable host tensor here is cheap; what mattered was the
+        # DEVICE transfer, which is pinned and async rather than pageable and
+        # synchronous.
+        view.copy_(torch.tensor(indices, dtype=torch.int64))
+
+        if device.type != "cuda":
+            # No transfer to guard: the slot view IS the result, which is what
+            # makes the aliasing property CPU-observable.
+            return view
+
+        out = view.to(device, non_blocking=True)
+        event = self._new_event()
+        if event is not None:
+            # Recorded AFTER the .to() enqueue, so it completes exactly when
+            # this slot's host bytes have been read.
+            event.record()
+            self._events[slot] = event
+        return out
+
+
+_STAGER: Optional[_PinnedIndexStager] = None
+
+
+def reset_pinned_index_stager(stager: Optional[_PinnedIndexStager] = None) -> None:
+    """Replace the process-wide stager. Tests only -- production never calls
+    this, and the lazy construction in `_pinned_index_tensor` is what runs."""
+    global _STAGER
+    _STAGER = stager
 
 
 def _pinned_index_tensor(indices: List[int], device) -> torch.Tensor:
-    """`indices` as an int64 tensor on `device`, staged through a REUSED
-    pinned host buffer.
-
-    Replaces a per-decode-step `torch.tensor(indices, device=cuda)`, which
-    allocated a fresh pageable host tensor and copied it synchronously.
-    Pageable copies cannot overlap with compute and force the runtime to
-    stage through an internal buffer; pinned memory removes both costs and
-    lets the copy be issued async.
-
-    The buffer only ever grows, and is sized by the largest selection seen,
-    so the steady state has no host allocation at all. Falls back to the
-    plain constructor on CPU, where pinning is meaningless -- which is also
-    what keeps this unit-testable without a GPU.
-    """
-    if device.type != "cuda":
-        return torch.tensor(indices, dtype=torch.int64, device=device)
-
-    global _PINNED_INDEX_BUFFER
-    needed = len(indices)
-    buf = _PINNED_INDEX_BUFFER
-    if buf is None or buf.numel() < needed:
-        buf = torch.empty(needed, dtype=torch.int64, pin_memory=True)
-        _PINNED_INDEX_BUFFER = buf
-    view = buf[:needed]
-    # The small host tensor here is cheap; what mattered was the DEVICE
-    # transfer, which is now pinned and async rather than pageable and
-    # synchronous.
-    view.copy_(torch.tensor(indices, dtype=torch.int64))
-    return view.to(device, non_blocking=True)
+    """`indices` as an int64 tensor on `device`, staged through a reused
+    pinned host buffer. See `_PinnedIndexStager` for the batch-safety bug
+    this indirection exists to fix."""
+    global _STAGER
+    if _STAGER is None:
+        _STAGER = _PinnedIndexStager()
+    return _STAGER.stage(indices, device)
 
 
 @dataclass

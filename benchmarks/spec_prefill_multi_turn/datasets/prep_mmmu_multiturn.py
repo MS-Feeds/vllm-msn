@@ -508,12 +508,41 @@ def main() -> int:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    per_turn = [t["query_tokens"] for r in rows for t in r["turns"]]
+    per_turn = sorted(t["query_tokens"] for r in rows for t in r["turns"])
     n_images = [t["n_images"] for r in rows for t in r["turns"]]
+    resident = sorted(r["resident_len_at_last_turn"] for r in rows)
+    med_d = per_turn[len(per_turn) // 2]
     print(f"[prep_mmmu] wrote {len(rows)} conversations -> {args.output}")
-    print(f"[prep_mmmu] per-turn d: min={min(per_turn)} "
-          f"median={sorted(per_turn)[len(per_turn) // 2]} max={max(per_turn)}")
+    print(f"[prep_mmmu] per-turn d: min={per_turn[0]} median={med_d} max={per_turn[-1]}")
     print(f"[prep_mmmu] images per turn: min={min(n_images)} max={max(n_images)}")
+
+    # How wrong would a per-image constant have been? Distinct COSTS is the
+    # informative number -- distinct SHAPES only says how often the cache
+    # missed. On MMMU's arbitrary textbook dimensions the shape cache barely
+    # helps, but that is exactly why the cost has to be measured per image.
+    costs = sorted(set(coster._cache.values()))
+    print(f"[prep_mmmu] distinct per-image COSTS: {len(costs)} "
+          f"(range {costs[0]}..{costs[-1]}) over {len(coster._cache)} shapes")
+
+    # L is the number that decides whether the sparse mechanism has anything
+    # to bite on, and it is NOT visible from `d` alone. The published sweep
+    # runs at 77k-124k; a conversation that ends far below that will be
+    # dominated by fixed overheads no matter how favourable its d:o ratio.
+    print(f"[prep_mmmu] resident L at last turn: min={resident[0]} "
+          f"median={resident[len(resident) // 2]} max={resident[-1]}")
+    if resident[len(resident) // 2] < 20000:
+        print("[prep_mmmu] WARNING: median resident L is far below the 77k-124k the "
+              "published sweep runs at. This file is usable as a multimodal "
+              "CORRECTNESS check, but the sparse mechanism has little to prune at "
+              "this length. For a latency-capable file raise --turns-per-conv and "
+              "lower --max-tokens (MC answers need a letter, not 512 tokens).")
+
+    # The wall-clock win condition, stated against this file's own numbers so
+    # a bad --max-tokens is caught here rather than after a sweep.
+    need = 0.45 * args.max_tokens + 5.5
+    frac = sum(1 for d in per_turn if d > need) / len(per_turn)
+    print(f"[prep_mmmu] wall-clock condition at o={args.max_tokens}: need d > {need:.0f}; "
+          f"{frac:.0%} of turns clear it (median d={med_d})")
     print(f"[prep_mmmu] NOTE: add '{CONFIG_NAME}': multiple_choice_letter to "
           "grade_scbench.py's _METRIC_BY_CONFIG before grading.")
     return 0

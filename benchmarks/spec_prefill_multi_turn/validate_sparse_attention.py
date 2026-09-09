@@ -154,6 +154,68 @@ def run_one_probe(llm_engine, tok, request_id, context_ids, question_text, sampl
     return last_output.outputs[0].text
 
 
+def run_concurrent_probes(llm_engine, tok, probes, block_size):
+    """Drive N sparse probes CONCURRENTLY, each with its own registered
+    selection, and return `{request_id: text}`.
+
+    **What this is for.** It is the end-to-end detector for the batch-safety
+    bug `kv_cache_utils._PinnedIndexStager` fixes. The old implementation
+    staged every request's gathered block indices through ONE module-level
+    pinned host buffer, always sliced from offset 0, and shipped it to the
+    device with a non-blocking copy. With two requests patched in the same
+    step, request B's host write could land before request A's copy drained,
+    so A indexed its block table with B's indices and read B's physical KV.
+
+    Run at batch 1 that is invisible. Run this way, the symptom is concrete
+    and unmistakable: **A answers with B's needle.** No exception is raised
+    and no shape mismatches -- which is exactly why a functional probe, not an
+    assertion inside the runner, is what catches it.
+
+    `probes` is a list of `(request_id, context_ids, question_text,
+    selected_block_indices)`. Every registration is issued BEFORE any
+    `add_request`, per `sparse_selection_registry.py`'s documented ordering
+    requirement -- and, at N>1, so that no request can begin decoding against
+    a registry that is still being populated for its batch-mates.
+
+    Note the drive loop here is the plain `has_unfinished_requests()` shape:
+    these are ordinary one-shot requests, not resumable sessions.
+    """
+    from vllm.inputs import TokensPrompt
+    from vllm import SamplingParams
+
+    sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
+
+    for request_id, _ctx, _q, selected_block_indices in probes:
+        representative_positions = [idx * block_size for idx in selected_block_indices]
+        llm_engine.collective_rpc(
+            "register_sparse_selection", args=(request_id, representative_positions)
+        )
+
+    for request_id, context_ids, question_text, _sel in probes:
+        question_ids = tok.encode(question_text, add_special_tokens=False)
+        prompt = TokensPrompt(prompt_token_ids=context_ids + question_ids)
+        real_id = llm_engine.add_request(request_id, prompt, sampling_params)
+        assert real_id == request_id, (
+            f"expected request_id={request_id!r} verbatim, got {real_id!r} -- "
+            f"VLLM_DISABLE_REQUEST_ID_RANDOMIZATION must be set."
+        )
+
+    outputs = {}
+    wanted = {pid for pid, _c, _q, _s in probes}
+    while llm_engine.has_unfinished_requests():
+        for output in llm_engine.step():
+            if output.request_id in wanted:
+                outputs[output.request_id] = output
+
+    for request_id, _c, _q, _s in probes:
+        llm_engine.collective_rpc("discard_sparse_selection", args=(request_id,))
+
+    return {
+        rid: (out.outputs[0].text if out is not None else None)
+        for rid, out in outputs.items()
+    }
+
+
 def _str2bool(v: str) -> bool:
     if v.lower() in ("true", "1", "yes"):
         return True

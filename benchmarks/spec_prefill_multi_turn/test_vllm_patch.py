@@ -90,10 +90,13 @@ from predict_scbench import (
     CSV_FIELDS,
     EXPERIMENTS,
     LedgerToTargetPositionMap,
+    _encode_multimodal_turn,
     _flop_summary_fields,
     _num_decode_steps,
     _time_summary_fields,
     build_turn_delta_ids,
+    load_turn_images,
+    render_turn_query,
 )
 from flops_model import (
     FlopBreakdown,
@@ -1639,7 +1642,20 @@ def test_apply_overrides_leaves_prefill_dense_while_recomputing_older_tokens():
     from BEFORE this turn -- a session resumption that missed the prefix
     cache. Their KV is being written for the first time, so restricting
     them would poison the cache, and the tail-contiguity invariant does not
-    hold for them either. Dense is the only safe answer."""
+    hold for them either. Dense is the only safe answer.
+
+    The chunk must still be CHARGED, though, and at its real length. This
+    branch used to `continue` past `_accumulate_prefill_step` entirely,
+    leaving `prefill_steps` empty -- which makes the driver fall back to the
+    analytic `target_prefill_flops(prompt_len=resident+delta,
+    num_cached=resident)` and bill a full history recompute as a small delta
+    prefill. That is a wrong number, not an optimistic one, and it is exactly
+    the failure a preempted batched run would produce.
+
+    It is also counted, as `prefill_before_turn_start` -- the preemption
+    signature. A dense fallback raises nothing and changes no output, so
+    counting is the only way a degraded run becomes visible instead of being
+    reported as a clean sparse result."""
     runner_module = _load_sparse_target_runner()
     block_size = 16
     runner, attn_metadata = _make_prefill_runner(
@@ -1659,7 +1675,12 @@ def test_apply_overrides_leaves_prefill_dense_while_recomputing_older_tokens():
         old_bt, old_sl = before[name]
         assert torch.equal(layer.block_table, old_bt), name
         assert torch.equal(layer.seq_lens, old_sl), name
-    assert runner.pop_prefill_steps("r0") == []
+    # num_computed=64, step_seq_len=96 -> 32 query tokens over a 96-token
+    # dense view. Charged in full, not skipped.
+    assert runner.pop_prefill_steps("r0") == [(96 - 64, 96)]
+    assert runner.pop_dense_fallbacks("r0") == {"prefill_before_turn_start": 1}
+    # Popping is destructive, same contract as every other accumulator here.
+    assert runner.pop_dense_fallbacks("r0") == {}
 
 
 def test_prefill_base_view_cache_invalidates_on_the_generation_counter():
@@ -2867,6 +2888,16 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         early_scorer_gpu_memory_utilization=0.3,
         max_tokens=64, reps=1, peak_tflops=None,
         sparse_prefill=False,
+        # Mirrors the flag's own default (--no-force-keep-query is a
+        # store_true), so these stub runs exercise the published behaviour.
+        no_force_keep_query=False,
+        # Serial defaults: these stub runs must exercise the path every
+        # published row was measured on.
+        batch_conversations=1, no_batch_refill=False,
+        # Already RESOLVED ("auto" is resolved in main(), not here), and "on"
+        # is what auto resolves to at batch_conversations=1 -- i.e. vLLM's own
+        # default, which is what every published M000 row ran under.
+        baseline_async_scheduling="on",
         output_suffix="", head_set_from=None,
     )
     for k, v in arg_overrides.items():
@@ -5466,6 +5497,932 @@ def test_flop_configs_describe_themselves_serialisably():
     flat = model_flop_config(Llama()).describe()
     json.dumps(flat)
     assert flat["kind"] == "ModelFlopConfig" and flat["num_layers"] == 32
+
+
+# ---------------------------------------------------------------------------
+# Multimodal turn rendering (step 4 of the multimodal port)
+# ---------------------------------------------------------------------------
+
+
+class _FakeMMTokenizer:
+    """Minimal tokenizer: 1 token per whitespace-delimited word."""
+
+    bos_token_id = 1
+
+    def encode(self, text, add_special_tokens=True):
+        ids = [10 + (len(w) % 50) for w in text.split()]
+        return ([self.bos_token_id] + ids) if add_special_tokens else ids
+
+
+class _FakeMMProcessor:
+    """Expands each marker into `per_image` placeholder ids, like a real one."""
+
+    image_token = "<|image|>"
+
+    def __init__(self, per_image=258, prepend_bos=False, accept_ast=True):
+        self.per_image = per_image
+        self.prepend_bos = prepend_bos
+        self.accept_ast = accept_ast
+        self.tokenizer = _FakeMMTokenizer()
+
+    def __call__(self, text=None, images=None, return_tensors=None,
+                 add_special_tokens=None):
+        if add_special_tokens is not None and not self.accept_ast:
+            raise TypeError("unexpected keyword argument 'add_special_tokens'")
+        body = text[0]
+        n = body.count(self.image_token)
+        ids = [7] * len(body.split()) + [99] * (n * self.per_image)
+        if self.prepend_bos:
+            ids = [_FakeMMTokenizer.bos_token_id] + ids
+        return {"input_ids": [ids]}
+
+
+def test_render_turn_query_without_images_is_unchanged():
+    """The text-only path must stay byte-identical -- every published row
+    and both prep packers depend on it."""
+    tok = _FakeMMTokenizer()
+    turn = {"input": "what colour is the sky"}
+    baseline = render_turn_query(tok, 0, turn)
+    assert render_turn_query(tok, 0, turn, processor=None, images=None) == baseline
+    assert render_turn_query(tok, 0, turn, processor=_FakeMMProcessor(),
+                             images=[]) == baseline
+    assert tok.bos_token_id not in baseline, "a turn delta must not carry BOS"
+
+
+def test_render_turn_query_expands_image_markers():
+    tok = _FakeMMTokenizer()
+    proc = _FakeMMProcessor(per_image=258)
+    turn = {"input": "compare <image 1> and <image 2> please"}
+    ids = render_turn_query(tok, 3, turn, processor=proc, images=["A", "B"])
+    # Both images' placeholder runs are present, so the ledger reserves room.
+    assert ids.count(99) == 2 * 258
+    assert len(ids) > 2 * 258
+
+
+def test_render_turn_query_with_images_needs_a_processor():
+    """A tokenizer would emit ONE token per marker and the ledger would
+    reserve no room for the image -- the silent-corruption case."""
+    try:
+        render_turn_query(_FakeMMTokenizer(), 0, {"input": "<image 1>"},
+                          processor=None, images=["A"])
+    except ValueError as exc:
+        assert "no processor" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_encode_multimodal_turn_rejects_marker_image_mismatch():
+    tok, proc = _FakeMMTokenizer(), _FakeMMProcessor()
+    for text, images in [("<image 1> only", ["A", "B"]), ("<image 1> <image 2>", ["A"])]:
+        try:
+            _encode_multimodal_turn(proc, tok, text, images)
+        except ValueError as exc:
+            assert "marker" in str(exc)
+        else:
+            raise AssertionError(f"expected ValueError for {text!r}/{len(images)}")
+
+
+def test_encode_multimodal_turn_rejects_prepended_bos():
+    """A delta that opens the stream would shift every later position."""
+    tok = _FakeMMTokenizer()
+    proc = _FakeMMProcessor(prepend_bos=True)
+    try:
+        _encode_multimodal_turn(proc, tok, "see <image 1>", ["A"])
+    except ValueError as exc:
+        assert "BOS" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_encode_multimodal_turn_survives_processor_without_add_special_tokens():
+    """Some processors do not forward the kwarg; fall back, do not crash."""
+    tok = _FakeMMTokenizer()
+    proc = _FakeMMProcessor(accept_ast=False)
+    ids = _encode_multimodal_turn(proc, tok, "see <image 1>", ["A"])
+    assert ids.count(99) == 258
+
+
+def test_encode_multimodal_turn_detects_non_expansion():
+    """A wrong marker string can leave the marker as literal text rather than
+    raising -- the turn would then be submitted with images the token stream
+    reserved no room for."""
+    tok = _FakeMMTokenizer()
+    proc = _FakeMMProcessor(per_image=0)
+    try:
+        _encode_multimodal_turn(proc, tok, "a b c d e f <image 1>", ["A"])
+    except ValueError as exc:
+        assert "expand" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_load_turn_images_is_empty_for_text_only_turns():
+    """Every existing text-only sample file lacks the field entirely."""
+    assert load_turn_images({"input": "x"}, Path(".")) == []
+    assert load_turn_images({"input": "x", "images": []}, Path(".")) == []
+
+
+def test_load_turn_images_reports_a_missing_file_with_its_resolved_path():
+    try:
+        load_turn_images({"images": ["nope/missing.png"]}, Path("."))
+    except FileNotFoundError as exc:
+        assert "missing.png" in str(exc)
+    else:
+        raise AssertionError("expected FileNotFoundError")
+
+
+def test_image_marker_str_resolves_and_reports_failure():
+    from vllm_patch.model_structure import image_marker_str
+
+    assert image_marker_str(_FakeMMProcessor()) == "<|image|>"
+
+    class _NoMarker:
+        tokenizer = None
+
+    try:
+        image_marker_str(_NoMarker())
+    except RuntimeError as exc:
+        assert "validate_mm_token_alignment" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+
+#: The CSV columns as of the last PUBLISHED sweep, frozen as a literal on
+#: purpose. Deriving this from `CSV_FIELDS` itself would be circular and
+#: could not catch the thing it exists to catch. Extend it only when a set
+#: of columns has itself been published and should join the frozen prefix.
+_PUBLISHED_CSV_PREFIX = (
+    'ts',
+    'exp_id',
+    'label',
+    'mode',
+    'scbench_config',
+    'keep_mode',
+    'keep_percentage',
+    'kv_granularity',
+    'chunk_size',
+    'look_ahead_cnt',
+    'pool_kernel_size',
+    'target_gpu_memory_utilization',
+    'speculator_gpu_memory_utilization',
+    'target_max_num_batched_tokens',
+    'rep',
+    'seed',
+    'max_tokens',
+    'num_conversations_loaded',
+    'num_conversations',
+    'num_turns',
+    'num_skipped_too_large',
+    'elapsed_time',
+    'turns_per_second',
+    'seconds_per_conversation',
+    'seconds_per_turn_mean',
+    'seconds_per_turn_excl_turn0_mean',
+    'actual_keep_rate_mean',
+    'ttft_mean_ms',
+    'ttft_p50_ms',
+    'ttft_p90_ms',
+    'num_cached_tokens_speculator_mean',
+    'out_len_mean',
+    'out_len_stdev',
+    'out_tokens_per_second',
+    'finish_stop',
+    'finish_length',
+    'finish_other',
+    'spec_prefill_tflops_per_turn_mean',
+    'spec_lookahead_tflops_per_turn_mean',
+    'spec_scoring_tflops_per_turn_mean',
+    'target_prefill_tflops_per_turn_mean',
+    'target_decode_tflops_per_turn_mean',
+    'total_tflops_per_turn_mean',
+    'total_tflops',
+    'speculator_flops_fraction',
+    'spec_prefill_share_of_speculator',
+    'achieved_tflops_per_s',
+    'mfu',
+    'spec_prefill_tflops_per_turn_excl_turn0_mean',
+    'spec_lookahead_tflops_per_turn_excl_turn0_mean',
+    'spec_scoring_tflops_per_turn_excl_turn0_mean',
+    'target_prefill_tflops_per_turn_excl_turn0_mean',
+    'target_decode_tflops_per_turn_excl_turn0_mean',
+    'total_tflops_per_turn_excl_turn0_mean',
+    'speculator_flops_fraction_excl_turn0',
+    'spec_prefill_share_of_speculator_excl_turn0',
+    'spec_prefill_seconds_per_turn_mean',
+    'spec_lookahead_seconds_per_turn_mean',
+    'spec_scoring_seconds_per_turn_mean',
+    'target_prefill_seconds_per_turn_mean',
+    'target_decode_seconds_per_turn_mean',
+    'driver_overhead_seconds_per_turn_mean',
+    'speculator_seconds_fraction',
+    'spec_prefill_seconds_per_turn_excl_turn0_mean',
+    'spec_lookahead_seconds_per_turn_excl_turn0_mean',
+    'spec_scoring_seconds_per_turn_excl_turn0_mean',
+    'target_prefill_seconds_per_turn_excl_turn0_mean',
+    'target_decode_seconds_per_turn_excl_turn0_mean',
+    'driver_overhead_seconds_per_turn_excl_turn0_mean',
+    'speculator_seconds_fraction_excl_turn0',
+)
+
+
+def test_csv_fields_are_append_only():
+    """`CSV_FIELDS` must only ever GROW AT THE END.
+
+    `_migrate_csv_header` rewrites an existing `results/all_runs.csv` header
+    by NAME, so a new column is added to old files safely. But every row is
+    written POSITIONALLY (`csv.writer.writerow` over `CSV_FIELDS`), so
+    inserting or reordering a column silently shifts every value in every
+    previously-written row -- `mfu` values landing under
+    `achieved_tflops_per_s`, and so on, with nothing to indicate it. That
+    corruption is invisible in the file and permanent once analysis has been
+    run against it.
+
+    This locks the invariant the migration depends on."""
+    from predict_scbench import CSV_FIELDS
+
+    assert tuple(CSV_FIELDS[:len(_PUBLISHED_CSV_PREFIX)]) == _PUBLISHED_CSV_PREFIX, (
+        "CSV_FIELDS no longer starts with the published column sequence -- a "
+        "column was inserted, removed or reordered. New columns must be "
+        "APPENDED; see CSV_FIELDS' own append-only comment."
+    )
+    assert len(set(CSV_FIELDS)) == len(CSV_FIELDS), "duplicate column name"
+
+
+def test_pinned_index_stager_gives_concurrent_requests_distinct_buffers():
+    """THE regression test for the confirmed batch-safety bug.
+
+    The old implementation kept one module-level pinned buffer and always
+    handed out `buf[:needed]` from offset 0. Staging request B's indices
+    overwrote the host bytes request A's still-enqueued async H2D had not yet
+    read, so A gathered B's block indices and silently read another request's
+    physical KV blocks.
+
+    On CPU the stager returns the slot view itself, which is what makes the
+    aliasing directly observable without a GPU -- the old code short-circuited
+    CPU to a fresh `torch.tensor`, which is precisely why this bug could not
+    be reached from a CPU test."""
+    from vllm_patch import kv_cache_utils as kv
+
+    stager = kv._PinnedIndexStager(depth=4)
+    cpu = torch.device("cpu")
+
+    a = stager.stage([1, 2, 3], cpu)
+    b = stager.stage([9, 9, 9], cpu)
+
+    assert a.tolist() == [1, 2, 3], (
+        f"staging for a second request clobbered the first's buffer: {a.tolist()} "
+        "-- this is the batch-safety bug _PinnedIndexStager exists to fix"
+    )
+    assert b.tolist() == [9, 9, 9]
+    assert a.data_ptr() != b.data_ptr(), "concurrent stages must not alias"
+    assert a.dtype == torch.int64 and b.dtype == torch.int64
+
+
+def test_pinned_index_stager_waits_for_an_outstanding_event_before_reuse():
+    """A slot may only be rewritten once its own copy has drained.
+
+    The ring makes reuse rare, not impossible -- so the EVENT GUARD, not the
+    depth, is what carries correctness. Depth only decides how often the
+    guard actually has to block.
+
+    Driven with a fake CUDA device and a fake buffer rather than by patching
+    `torch.Tensor.to`: the point under test is the stager's slot-and-event
+    policy, and nothing global should have to be mutated to reach it."""
+    from vllm_patch import kv_cache_utils as kv
+
+    events = []
+
+    class _FakeEvent:
+        def __init__(self):
+            self.drained = False
+            self.synchronized = 0
+            events.append(self)
+
+        def record(self):
+            pass
+
+        def query(self):
+            return self.drained
+
+        def synchronize(self):
+            self.synchronized += 1
+            self.drained = True
+
+    class _FakeView:
+        def __init__(self, buf, n):
+            self.buf, self.n = buf, n
+
+        def copy_(self, src):
+            self.buf.contents[:self.n] = src.tolist()
+
+        def to(self, device, non_blocking=False):
+            # Stands in for the enqueued H2D; returns something identifiable.
+            return list(self.buf.contents[:self.n])
+
+    class _FakeBuffer:
+        def __init__(self, n):
+            self.contents = [0] * n
+
+        def numel(self):
+            return len(self.contents)
+
+        def __getitem__(self, sl):
+            return _FakeView(self, sl.stop)
+
+    class _FakeCudaDevice:
+        type = "cuda"
+
+    stager = kv._PinnedIndexStager(
+        depth=2,
+        event_factory=_FakeEvent,
+        buffer_factory=lambda n, device: _FakeBuffer(max(n, 8)),
+    )
+    device = _FakeCudaDevice()
+
+    stager.stage([1], device)   # slot 0
+    stager.stage([2], device)   # slot 1
+    assert len(events) == 2
+    assert all(e.synchronized == 0 for e in events), "no slot reused yet"
+
+    stager.stage([3], device)   # wraps onto slot 0, whose copy is outstanding
+
+    assert events[0].synchronized == 1, (
+        "slot 0 was rewritten without awaiting its own outstanding copy -- "
+        "exactly the hazard the ring exists to close"
+    )
+    assert events[1].synchronized == 0, "slot 1 was not reused and must not block"
+
+    # A slot whose event HAS drained must be reused without blocking.
+    events[1].drained = True
+    stager.stage([4], device)   # slot 1 again
+    assert events[1].synchronized == 0
+
+
+def test_pinned_index_stager_grows_and_reuses_without_reallocating():
+    """Slots only ever grow, so the steady state allocates nothing.
+
+    That is the whole reason the previous implementation used a persistent
+    buffer at all; the ring must not give it up to fix the aliasing."""
+    from vllm_patch import kv_cache_utils as kv
+
+    allocated = []
+    stager = kv._PinnedIndexStager(
+        depth=1,
+        buffer_factory=lambda n, device: (
+            allocated.append(n) or torch.empty(n, dtype=torch.int64)),
+    )
+    cpu = torch.device("cpu")
+
+    stager.stage([1, 2, 3], cpu)
+    assert allocated == [3]
+    stager.stage([4, 5], cpu)          # smaller -- must reuse
+    assert allocated == [3], "a shorter selection must not reallocate"
+    out = stager.stage([1, 2, 3, 4, 5], cpu)   # larger -- must grow once
+    assert allocated == [3, 5]
+    assert out.tolist() == [1, 2, 3, 4, 5]
+
+
+def test_pinned_index_tensor_uses_the_process_wide_stager():
+    """`_pinned_index_tensor` stays the call site's public name, and
+    `reset_pinned_index_stager` is what lets a test control the ring behind
+    it without reaching into module globals."""
+    from vllm_patch import kv_cache_utils as kv
+
+    try:
+        kv.reset_pinned_index_stager(kv._PinnedIndexStager(depth=3))
+        a = kv._pinned_index_tensor([7, 8], torch.device("cpu"))
+        b = kv._pinned_index_tensor([1, 1], torch.device("cpu"))
+        assert a.tolist() == [7, 8] and b.tolist() == [1, 1]
+        assert a.data_ptr() != b.data_ptr()
+    finally:
+        kv.reset_pinned_index_stager(None)
+
+
+
+class _FakeCompletion:
+    def __init__(self, finish_reason=None, token_ids=()):
+        self.finish_reason = finish_reason
+        self.token_ids = list(token_ids)
+
+
+class _FakeRequestOutput:
+    def __init__(self, request_id, finish_reason=None, token_ids=()):
+        self.request_id = request_id
+        self.outputs = [_FakeCompletion(finish_reason, token_ids)]
+
+
+class _FakeSessionEngine:
+    """An engine whose `has_unfinished_requests()` NEVER goes False.
+
+    That is not a contrivance -- it is the real behaviour of a resumable
+    session: a turn-level stop parks the request in
+    `WAITING_FOR_STREAMING_REQ` and re-enqueues it rather than finishing it.
+    A drive loop that terminates on `has_unfinished_requests()` therefore
+    spins forever here, which is precisely what
+    `drive_session_turns_to_completion` must not do."""
+
+    def __init__(self, script, unfinished=True):
+        self._script = list(script)
+        self._unfinished = unfinished
+        self.steps = 0
+
+    def step(self):
+        self.steps += 1
+        if not self._script:
+            return []
+        return self._script.pop(0)
+
+    def has_unfinished_requests(self):
+        return self._unfinished if self._script else self._unfinished
+
+
+def test_drive_session_turns_to_completion_keys_by_original_request_id():
+    """Outputs are correlated by the caller-supplied id, and a foreign
+    request in the same step is left alone rather than mis-attributed.
+
+    `predict_longbench_v2.py` records the production consequence of getting
+    this wrong: keying by `add_request()`'s rewritten id lost 100% of
+    outputs on real hardware."""
+    from predict_scbench import drive_session_turns_to_completion
+
+    engine = _FakeSessionEngine([
+        [_FakeRequestOutput("A", None, [1]),
+         _FakeRequestOutput("someone-elses-request", "stop", [9])],
+        [_FakeRequestOutput("B", None, [2])],
+        [_FakeRequestOutput("A", "stop", [1, 1])],
+        [_FakeRequestOutput("B", "length", [2, 2])],
+    ])
+    outputs, stages = drive_session_turns_to_completion(engine, {"A", "B"})
+
+    assert set(outputs) == {"A", "B"}, "a foreign request must not be adopted"
+    assert outputs["A"].outputs[0].finish_reason == "stop"
+    assert outputs["B"].outputs[0].finish_reason == "length"
+    assert outputs["A"].outputs[0].token_ids == [1, 1], "must keep the LAST output"
+    for rid in ("A", "B"):
+        assert set(stages[rid]) == {"target_prefill", "target_decode"}
+        assert stages[rid]["target_prefill"] >= 0.0
+        assert stages[rid]["target_decode"] >= 0.0
+
+
+def test_drive_session_turns_to_completion_does_not_gate_on_has_unfinished_requests():
+    """The terminator is each id's own `finish_reason`, never the engine's
+    unfinished flag -- which for parked resumable sessions is permanently
+    True. A loop shaped like `drive_engine_to_completion`'s would hang here
+    instead of returning."""
+    from predict_scbench import drive_session_turns_to_completion
+
+    engine = _FakeSessionEngine(
+        [[_FakeRequestOutput("A", "stop", [1])]], unfinished=True)
+    outputs, _ = drive_session_turns_to_completion(engine, {"A"})
+    assert outputs["A"].outputs[0].finish_reason == "stop"
+    assert engine.steps == 1, "must stop stepping the instant the wave is done"
+
+
+def test_drive_session_turns_to_completion_raises_when_a_request_vanishes():
+    """A quiescent engine with ids still outstanding means no output will
+    ever arrive for them. That is a hang; raising beats spinning."""
+    from predict_scbench import drive_session_turns_to_completion
+
+    engine = _FakeSessionEngine([[]], unfinished=False)
+    try:
+        drive_session_turns_to_completion(engine, {"A"})
+    except RuntimeError as exc:
+        assert "'A'" in str(exc) and "finish_reason" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError for a dropped request")
+
+
+def test_drive_session_turns_to_completion_records_a_finish_on_the_last_step():
+    """The watchdog is checked AFTER a step's outputs are drained, so a
+    request that finishes on the very step that empties the engine is
+    recorded rather than mistaken for a dropped one."""
+    from predict_scbench import drive_session_turns_to_completion
+
+    engine = _FakeSessionEngine(
+        [[_FakeRequestOutput("A", "stop", [1])]], unfinished=False)
+    outputs, _ = drive_session_turns_to_completion(engine, {"A"})
+    assert outputs["A"].outputs[0].finish_reason == "stop"
+
+
+def test_drive_one_turn_of_session_matches_the_multi_request_loop_for_one_id():
+    """The single-request helper is a delegation, not a second loop. This is
+    what makes it safe for `run_sparse_attention` to keep calling it at N=1
+    while the batched path uses the general one."""
+    from predict_scbench import (
+        drive_one_turn_of_session, drive_session_turns_to_completion)
+
+    script = [
+        [_FakeRequestOutput("A", None, [1])],
+        [_FakeRequestOutput("A", "stop", [1, 2])],
+    ]
+    one_out, one_stages = drive_one_turn_of_session(
+        _FakeSessionEngine([list(s) for s in script]), "A")
+    many_out, many_stages = drive_session_turns_to_completion(
+        _FakeSessionEngine([list(s) for s in script]), {"A"})
+
+    assert one_out.outputs[0].token_ids == many_out["A"].outputs[0].token_ids
+    assert one_out.outputs[0].finish_reason == many_out["A"].outputs[0].finish_reason
+    assert set(one_stages) == set(many_stages["A"])
+
+
+def test_drive_session_turns_to_completion_is_a_noop_for_an_empty_wave():
+    """An all-retired wave submits nothing, so it must not step the engine
+    at all -- stepping an idle engine is what the watchdog would flag."""
+    from predict_scbench import drive_session_turns_to_completion
+
+    engine = _FakeSessionEngine([], unfinished=False)
+    outputs, stages = drive_session_turns_to_completion(engine, set())
+    assert outputs == {} and stages == {}
+    assert engine.steps == 0
+
+
+
+class _RecordingProposer:
+    """Records the wave it was handed and returns a deterministic selection
+    per conversation, so `compute_pruned_turns` can be tested without an
+    engine."""
+
+    def __init__(self, kept_by_salt=None):
+        self.waves = []
+        self._kept_by_salt = kept_by_salt or {}
+
+    def run_turns_and_score(self, specs):
+        self.waves.append(specs)
+        out = []
+        for spec in specs:
+            salt = spec["conversation_salt"]
+            kept = self._kept_by_salt.get(salt)
+            out.append((kept, 4, 11, {"spec_prefill": 1.0, "spec_lookahead": 0.5}))
+        return out
+
+
+def _conversation_state(conv_id, context_ids):
+    from vllm_patch.conversation_state import ConversationState
+
+    return ConversationState(conv_id, list(context_ids), "keep")
+
+
+def test_compute_pruned_turns_scores_a_whole_wave_in_one_speculator_pass():
+    """The batch axis is ACROSS conversations, and one wave is one call.
+
+    Turns within a conversation can never be batched -- turn N+1's candidate
+    pool depends on turn N's own outcome. Conversations have no such
+    dependency, which is the entire reason this is the available axis."""
+    from vllm_patch.pruner import compute_pruned_turns
+
+    proposer = _RecordingProposer(kept_by_salt={"convA": [0, 2], "convB": [1]})
+    spec_config = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 50})
+
+    a = _conversation_state("convA", [10, 11, 12])
+    b = _conversation_state("convB", [20, 21])
+    results = compute_pruned_turns(
+        proposer, spec_config, [(a, [90, 91]), (b, [80])])
+
+    assert len(proposer.waves) == 1, "a wave must be ONE speculator pass, not N"
+    wave = proposer.waves[0]
+    assert [spec["conversation_salt"] for spec in wave] == ["convA", "convB"]
+    assert len(results) == 2
+    # Results come back in submission order, not completion order.
+    assert results[0].num_cached_tokens == 11
+    assert results[0].orig_len == 5 and results[1].orig_len == 3
+
+
+def test_compute_pruned_turn_delegates_to_the_wave_version():
+    """The single-conversation entry point is a one-element wrapper, which is
+    what makes `--batch-conversations 1` reproduce the serial path rather
+    than merely resemble it."""
+    from vllm_patch.pruner import compute_pruned_turn, compute_pruned_turns
+
+    spec_config = SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 50})
+
+    one = compute_pruned_turn(
+        _RecordingProposer(kept_by_salt={"c": [0]}), spec_config,
+        _conversation_state("c", [1, 2, 3]), [7, 8])
+    many = compute_pruned_turns(
+        _RecordingProposer(kept_by_salt={"c": [0]}), spec_config,
+        [(_conversation_state("c", [1, 2, 3]), [7, 8])])[0]
+
+    assert one.pruned_token_ids == many.pruned_token_ids
+    assert one.kept_positions == many.kept_positions
+    assert one.orig_len == many.orig_len
+    assert one.kept_history_pairs == many.kept_history_pairs
+
+
+def test_compute_pruned_turns_threads_force_keep_query_per_wave():
+    """`--no-force-keep-query` must reach the wave path identically. It is
+    applied per conversation in stage 3, after the shared scoring call, so a
+    wave cannot smear one conversation's setting onto another."""
+    from vllm_patch.pruner import compute_pruned_turns
+
+    kept = {"c": [0]}
+    on = compute_pruned_turns(
+        _RecordingProposer(kept_by_salt=kept),
+        SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 50},
+                   force_keep_query=True),
+        [(_conversation_state("c", [1, 2, 3]), [7, 8])])[0]
+    off = compute_pruned_turns(
+        _RecordingProposer(kept_by_salt=kept),
+        SpecConfig(keep_strategy="percentage", keep_kwargs={"percentage": 50},
+                   force_keep_query=False),
+        [(_conversation_state("c", [1, 2, 3]), [7, 8])])[0]
+
+    assert len(on.kept_positions) > len(off.kept_positions), (
+        "force_keep_query=True must append the turn's own query positions"
+    )
+
+
+def test_compute_pruned_turns_is_a_noop_for_an_empty_wave():
+    """An all-retired wave must not touch the speculator engine at all."""
+    from vllm_patch.pruner import compute_pruned_turns
+
+    proposer = _RecordingProposer()
+    assert compute_pruned_turns(
+        proposer, SpecConfig(keep_strategy="percentage",
+                             keep_kwargs={"percentage": 50}), []) == []
+    assert proposer.waves == []
+
+
+
+class _WaveStub:
+    """Minimal stand-in for `SparseSession` -- `plan_wave` only ever reads
+    `.retired`, which is the point of keeping it pure."""
+
+    def __init__(self, name, retired=False):
+        self.name = name
+        self.retired = retired
+
+    def __repr__(self):
+        return f"<{self.name}{' retired' if self.retired else ''}>"
+
+
+def test_plan_wave_refills_retired_slots_from_the_queue():
+    """The default: a retired conversation is replaced immediately, so the
+    engine never runs a partially-empty wave while work is queued."""
+    from predict_scbench import plan_wave
+
+    a, b = _WaveStub("a", retired=True), _WaveStub("b")
+    queue = [_WaveStub("c"), _WaveStub("d")]
+    active, retired = plan_wave([a, b], queue, batch_size=2)
+
+    assert [s.name for s in retired] == ["a"]
+    assert [s.name for s in active] == ["b", "c"]
+    assert [s.name for s in queue] == ["d"], "queue must be consumed in order"
+
+
+def test_plan_wave_drain_mode_holds_membership_until_the_wave_empties():
+    """`--no-batch-refill`. Occupancy varies under refill, which confounds a
+    comparison whose independent variable IS the batch size; draining trades
+    idle slots for a strictly-constant-N window."""
+    from predict_scbench import plan_wave
+
+    a, b = _WaveStub("a", retired=True), _WaveStub("b")
+    queue = [_WaveStub("c")]
+    active, retired = plan_wave([a, b], queue, batch_size=2, refill=False)
+
+    assert [s.name for s in retired] == ["a"]
+    assert [s.name for s in active] == ["b"], "no refill while the wave lives"
+    assert [s.name for s in queue] == ["c"]
+
+    # ...but a FULLY drained wave must restart, or the run would deadlock
+    # with work still queued.
+    b.retired = True
+    active, retired = plan_wave(active, queue, batch_size=2, refill=False)
+    assert [s.name for s in retired] == ["b"]
+    assert [s.name for s in active] == ["c"]
+
+
+def test_plan_wave_terminates_when_everything_is_done():
+    """The loop's own exit condition: no active sessions and an empty queue."""
+    from predict_scbench import plan_wave
+
+    active, retired = plan_wave([_WaveStub("a", retired=True)], [], batch_size=4)
+    assert active == [] and [s.name for s in retired] == ["a"]
+
+
+def test_plan_wave_never_exceeds_the_batch_size():
+    from predict_scbench import plan_wave
+
+    queue = [_WaveStub(str(i)) for i in range(10)]
+    active, _ = plan_wave([], queue, batch_size=3)
+    assert len(active) == 3 and len(queue) == 7
+
+
+def test_wave_summary_fields_are_none_without_a_wave_structure():
+    """A run that recorded no waves blanks every MEASURED column -- an
+    invented number sitting in the CSV beside measured ones is worse than a
+    blank, the same convention as `_flop_summary_fields`/
+    `_time_summary_fields`.
+
+    `batch_conversations` is the exception, and deliberately so: it is
+    CONFIGURATION rather than measurement, and a reader needs to know what was
+    requested even when nothing was measured. Callers pass 1 for a mode that
+    ignores the flag, so it can never claim a configuration the row did not
+    apply."""
+    from predict_scbench import _WAVE_FIELDS, _wave_summary_fields
+
+    fields = _wave_summary_fields({}, batch_conversations=4, elapsed=12.0)
+    assert set(fields) == set(_WAVE_FIELDS)
+    assert fields["batch_conversations"] == 4
+    measured = {k: v for k, v in fields.items() if k != "batch_conversations"}
+    assert all(v is None for v in measured.values()), measured
+
+
+def test_wave_summary_fields_report_occupancy_not_the_requested_batch_size():
+    """A row nominally at N=2 whose conversations kept retiring really ran at
+    something lower. Dividing throughput by the nominal N would overstate
+    per-sequence cost; `batch_occupancy_mean` is what makes that visible."""
+    from predict_scbench import _wave_summary_fields
+
+    stats = {
+        "wave_seconds": [2.0, 2.0], "wave_occupancy": [2, 1],
+        "spec_engine_seconds": [0.5, 0.5], "target_engine_seconds": [1.0, 1.0],
+        "spec_prefill_engine_seconds": [0.0, 0.0],
+        "spec_lookahead_engine_seconds": [0.0, 0.0],
+        "spec_scoring_engine_seconds": [0.0, 0.0],
+        "target_prefill_engine_seconds": [0.0, 0.0],
+        "target_decode_engine_seconds": [0.0, 0.0],
+    }
+    fields = _wave_summary_fields(stats, batch_conversations=2, elapsed=10.0)
+    assert fields["batch_conversations"] == 2
+    assert fields["batch_occupancy_mean"] == 1.5
+    assert fields["num_waves"] == 2
+    # Exhaustive by construction: elapsed minus both engines' busy windows.
+    assert fields["driver_overhead_seconds"] == 10.0 - (1.0 + 2.0)
+
+
+def test_wave_summary_fields_surface_the_preemption_signature():
+    """`prefill_before_turn_start` and `num_computed_regressions` mean the row
+    did not measure the sparse path. They must reach the CSV, not just a log
+    line that scrolls past during an hours-long run."""
+    from predict_scbench import _wave_summary_fields
+
+    stats = {
+        "wave_seconds": [1.0], "wave_occupancy": [2],
+        "spec_engine_seconds": [0.0], "target_engine_seconds": [0.0],
+        "spec_prefill_engine_seconds": [0.0],
+        "spec_lookahead_engine_seconds": [0.0],
+        "spec_scoring_engine_seconds": [0.0],
+        "target_prefill_engine_seconds": [0.0],
+        "target_decode_engine_seconds": [0.0],
+        "dense_fallbacks": {
+            "prefill_before_turn_start": 7, "prefill_no_tail": 2,
+            "prefill_degenerate": 1, "decode_degenerate": 40,
+            "num_computed_regressions": 3,
+        },
+        "session_cache_misses": 2,
+    }
+    fields = _wave_summary_fields(stats, batch_conversations=2, elapsed=1.0)
+    assert fields["num_dense_fallback_prefill_before_turn_start"] == 7
+    # The two benign prefill cases are summed separately from the alarming one.
+    assert fields["num_dense_fallback_prefill_other"] == 3
+    assert fields["num_dense_fallback_decode_steps"] == 40
+    assert fields["num_preempted_turns"] == 3
+    assert fields["num_session_cache_misses"] == 2
+
+
+def test_time_summary_fields_are_empty_when_no_turn_was_timed():
+    """The mechanism by which batching switches per-turn attribution off:
+    `run_sparse_attention` simply stops appending to `turn_times` at N>1, and
+    every per-stage time column follows. Reported as blank rather than as a
+    negative residual -- which is what overlapping turns would produce, and
+    which would destroy that signal's meaning for the N==1 rows where it is
+    genuinely diagnostic."""
+    from predict_scbench import _TIME_FIELDS, _time_summary_fields
+
+    fields = _time_summary_fields([])
+    assert set(fields) == set(_TIME_FIELDS)
+    assert all(v is None for v in fields.values())
+
+
+
+class _FakeCacheEngine:
+    """Just enough of an engine to expose `vllm_config.cache_config`."""
+
+    def __init__(self, num_gpu_blocks, block_size=16):
+        class _CC:
+            pass
+        cc = _CC()
+        cc.num_gpu_blocks = num_gpu_blocks
+        cc.block_size = block_size
+
+        class _VC:
+            pass
+        vc = _VC()
+        vc.cache_config = cc
+        self.vllm_config = vc
+
+
+class _FakeLLMWithCache:
+    def __init__(self, engine):
+        self.llm_engine = engine
+
+
+class _FakeProposerWithCache:
+    def __init__(self, engine):
+        self.llm_engine = engine
+
+
+def test_preflight_batch_kv_capacity_is_a_noop_at_batch_one():
+    """The serial path's capacity is whatever it has always been. This check
+    must not be able to start rejecting runs that already work."""
+    from predict_scbench import preflight_batch_kv_capacity
+
+    tiny = _FakeLLMWithCache(_FakeCacheEngine(num_gpu_blocks=1))
+    preflight_batch_kv_capacity(
+        tiny, None, batch_conversations=1,
+        target_max_num_batched_tokens=130560, max_tokens=512,
+        speculator_max_num_batched_tokens=131063,
+    )  # must not raise
+
+
+def test_preflight_batch_kv_capacity_refuses_a_batch_that_cannot_fit():
+    """Refused, not warned about, because the failure is SILENT: vLLM would
+    relieve the pressure by preempting, the recomputed history would run
+    dense, and the run would finish and report a sparse-labelled row that
+    largely measured dense attention."""
+    from predict_scbench import preflight_batch_kv_capacity
+
+    # 8192 blocks x 16 = 131,072 tokens: exactly one session's worth.
+    llm = _FakeLLMWithCache(_FakeCacheEngine(num_gpu_blocks=8192, block_size=16))
+    try:
+        preflight_batch_kv_capacity(
+            llm, None, batch_conversations=2,
+            target_max_num_batched_tokens=130560, max_tokens=512,
+            speculator_max_num_batched_tokens=None,
+        )
+    except SystemExit as exc:
+        msg = str(exc)
+        assert "--batch-conversations=2" in msg
+        assert "doc-budget-tokens" in msg, "must name the re-prep escape hatch"
+    else:
+        raise AssertionError("expected SystemExit for an over-committed batch")
+
+
+def test_preflight_batch_kv_capacity_checks_the_speculator_too():
+    """The ceiling is two-sided. The speculator must hold N concurrent full
+    candidate-pool prompts at its own (low, 0.2) memory budget -- an
+    independent limit that is easy to forget because it is the cheap
+    engine."""
+    from predict_scbench import preflight_batch_kv_capacity
+
+    roomy_target = _FakeLLMWithCache(
+        _FakeCacheEngine(num_gpu_blocks=100000, block_size=16))
+    cramped_scorer = _FakeProposerWithCache(
+        _FakeCacheEngine(num_gpu_blocks=1000, block_size=16))
+    try:
+        preflight_batch_kv_capacity(
+            roomy_target, cramped_scorer, batch_conversations=2,
+            target_max_num_batched_tokens=130560, max_tokens=512,
+            speculator_max_num_batched_tokens=131063,
+        )
+    except SystemExit as exc:
+        assert "speculator" in str(exc)
+        assert "--speculator-gpu-memory-utilization" in str(exc)
+    else:
+        raise AssertionError("expected the speculator ceiling to be enforced")
+
+
+def test_preflight_batch_kv_capacity_warns_rather_than_dies_when_unreadable():
+    """Killing an otherwise-valid run because a vLLM field moved would be a
+    worse failure than the one this guard prevents."""
+    from predict_scbench import preflight_batch_kv_capacity
+
+    class _Opaque:
+        pass
+
+    opaque = _FakeLLMWithCache(_Opaque())
+    preflight_batch_kv_capacity(
+        opaque, None, batch_conversations=4,
+        target_max_num_batched_tokens=1000, max_tokens=10,
+        speculator_max_num_batched_tokens=None,
+    )  # must not raise
+
+
+def test_batched_run_writes_wave_columns_and_blanks_per_turn_time():
+    """End-to-end through `run_experiment`'s stubs: a batched row must carry
+    the wave columns, blank every per-turn TIME column, and be tagged so it
+    cannot be mistaken for a serial row."""
+    sparse = _run_experiment_with_stubs("SPARSE-k20-g32", batch_conversations=3)
+    row = sparse["row"]
+
+    assert row["batch_conversations"] == 3
+    assert "[batch=3]" in row["label"]
+    from predict_scbench import _TIME_FIELDS
+    for field in _TIME_FIELDS:
+        assert row[field] is None, f"{field} must be blank on a batched row"
+    assert row["seconds_per_turn_mean"] is None
+
+
+def test_serial_run_keeps_per_turn_time_and_carries_no_batch_tag():
+    """The default must stay indistinguishable from the pre-batching path in
+    everything a published row is read on."""
+    sparse = _run_experiment_with_stubs("SPARSE-k20-g32")
+    row = sparse["row"]
+
+    assert row["batch_conversations"] is None or row["batch_conversations"] == 1
+    assert "[batch=" not in row["label"]
+
 
 
 if __name__ == "__main__":

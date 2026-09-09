@@ -133,10 +133,12 @@ import shutil
 import gc
 import json
 import os
+import re
 import statistics
 import sys
 import time
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -211,6 +213,23 @@ _FLOP_FIELDS = (
        "spec_prefill_share_of_speculator_excl_turn0"]
 )
 
+#: The wave-level columns, named once so `_wave_summary_fields`'s "all None
+#: when there is no wave structure" path cannot drift from `CSV_FIELDS`.
+#: Mirrors `_TIME_FIELDS`/`_FLOP_FIELDS`'s own reason for existing.
+_WAVE_FIELDS = (
+    "batch_conversations", "batch_occupancy_mean", "num_waves",
+    "seconds_per_wave_mean",
+    "speculator_engine_seconds", "target_engine_seconds",
+    "spec_prefill_engine_seconds", "spec_lookahead_engine_seconds",
+    "spec_scoring_engine_seconds",
+    "target_prefill_engine_seconds", "target_decode_engine_seconds",
+    "driver_overhead_seconds",
+    "num_dense_fallback_prefill_before_turn_start",
+    "num_dense_fallback_prefill_other",
+    "num_dense_fallback_decode_steps",
+    "num_preempted_turns", "num_session_cache_misses",
+)
+
 CSV_FIELDS = [
     # `scbench_config` is not derivable from anything else in the row: the
     # same exp_id run against two different --scbench-config values
@@ -252,7 +271,115 @@ CSV_FIELDS = [
     # decides whether a cheaper scorer or a shorter lookahead is the lever.
     *_FLOP_FIELDS,
     *_TIME_FIELDS,
+    # --- appended 2026-09-09, batching pass ---------------------------------
+    # APPEND-ONLY. `_migrate_csv_header` rewrites an existing all_runs.csv by
+    # NAME, but every row is written positionally (`writerow` over
+    # `CSV_FIELDS`), so inserting a column anywhere but the end silently
+    # shifts every value in every previously-written row -- see the comment
+    # on `_migrate_csv_header` itself. `test_csv_fields_are_append_only`
+    # locks this.
+    #
+    # Engine-configuration provenance. Neither was recorded before, so a
+    # published SPARSE row and a `--target-async-scheduling` re-run of it are
+    # indistinguishable in the CSV. That was tolerable while the flag was a
+    # constant; it stops being tolerable under batching, where async
+    # scheduling overlaps request B's scheduling with request A's execution
+    # and its effect therefore SCALES with the batch size (see
+    # `run_experiment`'s async_scheduling block and `--baseline-async-
+    # scheduling`). Blank for historical rows, which is honest: they were run
+    # at the defaults, but nothing recorded it at the time.
+    "target_async_scheduling", "target_cudagraph_mode",
+    # Wave-level throughput accounting. Empty on every non-batched run mode
+    # (M000/M-k*), which have no wave structure to report.
+    #
+    # These REPLACE the per-turn time columns at N>1 rather than supplementing
+    # them: `seconds_per_turn_mean` and every `*_seconds_per_turn_*` entry come
+    # back empty there, because concurrent turns overlap and
+    # `timing_model.breakdown_with_residual` would produce negative residuals
+    # by construction -- destroying the meaning of a signal that is genuinely
+    # diagnostic at N==1. See `run_sparse_attention`'s docstring.
+    #
+    # Each `*_engine_seconds` figure is a sum over waves of a window during
+    # which ONE engine did exactly one wave of work and nothing else, so unlike
+    # the per-turn spans they do not double-count. `driver_overhead_seconds` is
+    # the run-level residual, keeping `timing_model`'s exhaustive-by-
+    # construction discipline at the granularity where it is still honest: a
+    # negative value here still means a real instrumentation bug.
+    "batch_conversations", "batch_occupancy_mean", "num_waves",
+    "seconds_per_wave_mean",
+    "speculator_engine_seconds", "target_engine_seconds",
+    "spec_prefill_engine_seconds", "spec_lookahead_engine_seconds",
+    "spec_scoring_engine_seconds",
+    "target_prefill_engine_seconds", "target_decode_engine_seconds",
+    "driver_overhead_seconds",
+    # Degradation counters. A dense fallback raises nothing and changes no
+    # output, so without these a run that stopped exercising the sparse path
+    # is indistinguishable from one that did. `num_preempted_turns` and
+    # `num_dense_fallback_prefill_before_turn_start` are the preemption
+    # signature -- non-zero means the row did not measure what it says.
+    "num_dense_fallback_prefill_before_turn_start",
+    "num_dense_fallback_prefill_other",
+    "num_dense_fallback_decode_steps",
+    "num_preempted_turns", "num_session_cache_misses",
 ]
+
+
+def _wave_summary_fields(stats: dict, batch_conversations: int, elapsed: float) -> dict:
+    """The wave-level half of a run's summary row.
+
+    Returns all-None for a mode that has no wave structure (`run_baseline`,
+    `run_specprefill`), the same "absent rather than approximated" convention
+    `_flop_summary_fields`/`_time_summary_fields` already use -- an invented
+    number sitting in the CSV next to measured ones is worse than a blank.
+    """
+    waves = stats.get("wave_seconds")
+    if not waves:
+        # No wave structure was recorded. Every MEASURED column blanks out --
+        # but `batch_conversations` is CONFIGURATION, not measurement, so it is
+        # still reported: a reader needs to know what was requested even when
+        # the run produced nothing to measure. Callers pass 1 for a mode that
+        # ignores the flag (`run_specprefill`), so this can never claim a
+        # configuration the row did not apply.
+        fields = {f: None for f in _WAVE_FIELDS}
+        fields["batch_conversations"] = batch_conversations
+        return fields
+
+    fallbacks = stats.get("dense_fallbacks") or {}
+    spec_engine = sum(stats["spec_engine_seconds"])
+    target_engine = sum(stats["target_engine_seconds"])
+    return {
+        "batch_conversations": batch_conversations,
+        # The batch size the run ACTUALLY held, not the one requested. A
+        # conversation that retires mid-run shrinks the wave, so a row
+        # nominally at N=2 can spend most of its waves at 1 -- dividing a
+        # throughput figure by a nominal N the run never held is exactly the
+        # mistake this column exists to make visible.
+        "batch_occupancy_mean": statistics.mean(stats["wave_occupancy"]),
+        "num_waves": len(waves),
+        "seconds_per_wave_mean": statistics.mean(waves),
+        "speculator_engine_seconds": spec_engine,
+        "target_engine_seconds": target_engine,
+        "spec_prefill_engine_seconds": sum(stats["spec_prefill_engine_seconds"]),
+        "spec_lookahead_engine_seconds": sum(stats["spec_lookahead_engine_seconds"]),
+        "spec_scoring_engine_seconds": sum(stats["spec_scoring_engine_seconds"]),
+        "target_prefill_engine_seconds": sum(stats["target_prefill_engine_seconds"]),
+        "target_decode_engine_seconds": sum(stats["target_decode_engine_seconds"]),
+        # Run-level residual: everything not inside either engine's own busy
+        # window -- RPC round trips, msgpack serialization of the selection,
+        # position translation, request construction. Exhaustive by
+        # construction, and NEGATIVE STILL MEANS A BUG (two windows that
+        # overlapped, i.e. something is double-counted), which is why it is
+        # not clamped here any more than `timing_model` clamps its own.
+        "driver_overhead_seconds": elapsed - (spec_engine + target_engine),
+        "num_dense_fallback_prefill_before_turn_start": fallbacks.get(
+            "prefill_before_turn_start", 0),
+        "num_dense_fallback_prefill_other": (
+            fallbacks.get("prefill_no_tail", 0)
+            + fallbacks.get("prefill_degenerate", 0)),
+        "num_dense_fallback_decode_steps": fallbacks.get("decode_degenerate", 0),
+        "num_preempted_turns": fallbacks.get("num_computed_regressions", 0),
+        "num_session_cache_misses": stats.get("session_cache_misses", 0),
+    }
 
 # See EXPERIMENT_PLAN.md's "SpecPrefill settings" -- algorithm hyperparameters
 # shared across the whole keep-rate/granularity sweep, not swept themselves
@@ -904,7 +1031,121 @@ def build_conversation_state(context: str, tok, keep_mode: str, conversation_id:
     return ConversationState(conversation_id, context_ids, keep_mode)
 
 
-def render_turn_query(tok, turn_idx: int, turn: dict) -> list[int]:
+#: `<image N>` markers, as `datasets/prep_mmmu_multiturn.py` writes them into
+#: `turns[i]["input"]`. Renumbered by that packer so the K-th marker in the
+#: text is the K-th entry of `turns[i]["images"]`.
+_IMAGE_MARKER_RE = re.compile(r"<image\s+(\d+)\s*>")
+
+#: Floor for "did the marker actually expand?", far below any real vision
+#: tower (the Gemma 4 pair measures 258-268 per image), so the check fires
+#: only on genuine non-expansion rather than on a small-image edge case.
+_MIN_TOKENS_PER_IMAGE = 16
+
+
+def load_turn_images(turn: dict, base_dir: Path) -> list:
+    """PIL images for one turn, or `[]` for a text-only turn.
+
+    Paths in the sample file are relative to the JSONL's own directory so the
+    dataset stays portable; `base_dir` is that directory.
+
+    Returns `[]` rather than raising when the field is absent: every existing
+    text-only sample file lacks it, and those must keep working untouched.
+    """
+    paths = turn.get("images") or []
+    if not paths:
+        return []
+    from PIL import Image
+
+    images = []
+    for rel in paths:
+        path = (base_dir / rel).resolve()
+        if not path.exists():
+            raise FileNotFoundError(
+                f"turn references image {rel!r} which does not exist at {path}. "
+                f"Image paths are resolved relative to the samples file's own "
+                f"directory ({base_dir})."
+            )
+        with Image.open(path) as im:
+            images.append(im.convert("RGB"))
+    return images
+
+
+def _encode_multimodal_turn(processor, tok, text: str, images: list) -> list[int]:
+    """Token ids for one turn's text with its image markers EXPANDED.
+
+    The whole multimodal port rests on this returning ordinary
+    `list[int]` with the image placeholder runs already in place: once it
+    does, `build_turn_delta_ids` concatenates as before, the
+    `conversation_state.py` ledger numbers positions as before, the budget
+    pre-flights measure the real length, and the block gather sees image KV as
+    ordinary KV. Nothing downstream needs to know an image was involved.
+
+    Two hazards it guards:
+
+    **Special tokens.** The text-only path is `tok.encode(...,
+    add_special_tokens=False)` because a turn DELTA must never carry BOS --
+    only turn 0's `chat_before` opens the stream. Processors default to adding
+    them, so this asks for them off and, if the processor will not take the
+    kwarg, verifies no BOS was prepended rather than trusting it.
+
+    **Silent non-expansion.** If the marker string is wrong for this
+    checkpoint the processor may leave it as literal text instead of raising,
+    and the turn would be submitted with images the token stream never
+    reserved room for. The post-check catches that: after expansion the ids
+    must be LONGER than the marker text alone implies.
+    """
+    from vllm_patch.model_structure import image_marker_str
+
+    marker = image_marker_str(processor)
+    expanded_text = _IMAGE_MARKER_RE.sub(lambda _m: marker, text)
+
+    n_markers = expanded_text.count(marker)
+    if n_markers != len(images):
+        raise ValueError(
+            f"turn has {n_markers} image marker(s) but {len(images)} image(s). "
+            f"The processor requires these to match exactly. This means the "
+            f"samples file's `input` text and `images` list disagree -- "
+            f"re-run the prep packer."
+        )
+
+    try:
+        out = processor(text=[expanded_text], images=list(images),
+                        return_tensors="pt", add_special_tokens=False)
+    except TypeError:
+        # Processor does not forward `add_special_tokens`; fall back and
+        # verify below instead of assuming.
+        out = processor(text=[expanded_text], images=list(images),
+                        return_tensors="pt")
+
+    ids = [int(t) for t in out["input_ids"][0]]
+
+    bos = getattr(tok, "bos_token_id", None)
+    if bos is not None and ids and ids[0] == bos:
+        raise ValueError(
+            "the processor prepended BOS to a turn delta. A delta must not open "
+            "the stream -- only turn 0's chat_before does. Strip it here, or "
+            "pass add_special_tokens=False through this processor."
+        )
+
+    # Expansion actually happened. Measured against the SAME text tokenized
+    # plainly: if the markers expanded, the processor's output must exceed it
+    # by at least a floor-per-image; if a marker survived as literal text the
+    # two lengths are within a token or two of each other. The floor is
+    # deliberately far below any real vision tower (the Gemma 4 pair measures
+    # 258-268) so this only ever fires on genuine non-expansion.
+    plain_len = len(tok.encode(expanded_text, add_special_tokens=False))
+    if len(ids) < plain_len + n_markers * _MIN_TOKENS_PER_IMAGE:
+        raise ValueError(
+            f"image markers do not appear to have expanded: {len(ids)} ids vs "
+            f"{plain_len} for the same text tokenized plainly, with {n_markers} "
+            f"image(s). The resolved marker {marker!r} is probably wrong for this "
+            f"checkpoint -- run validate_mm_token_alignment.py, which reports it."
+        )
+    return ids
+
+
+def render_turn_query(tok, turn_idx: int, turn: dict, processor=None,
+                      images: Optional[list] = None) -> list[int]:
     """This turn's own force-kept region. The `Question N:`/`Answer N:`
     plain-text framing is kept for EVERY path, including the two that now
     use real chat-template turn boundaries (`run_baseline`,
@@ -912,9 +1153,24 @@ def render_turn_query(tok, turn_idx: int, turn: dict) -> list[int]:
     substitute for turn structure, and dropping it would change the task
     text itself rather than just the rendering. See module docstring #3 for
     which paths wrap it in real `<|eot_id|>` turns and which keep the whole
-    conversation inside one flattened chat message."""
+    conversation inside one flattened chat message.
+
+    `processor`/`images` are the multimodal opt-in and default to the text-only
+    behaviour EXACTLY: with no images this is byte-for-byte the call it always
+    was, so every published row and every text-only caller (including
+    `datasets/prep_longbench_v2_multiturn.py`, which imports this to make its
+    token counts the driver's token counts) is untouched."""
     question_text = f"\n\nQuestion {turn_idx + 1}: {turn['input']}\nAnswer {turn_idx + 1}:"
-    return tok.encode(question_text, add_special_tokens=False)
+    if not images:
+        return tok.encode(question_text, add_special_tokens=False)
+    if processor is None:
+        raise ValueError(
+            f"turn {turn_idx} carries {len(images)} image(s) but no processor was "
+            "passed. Image markers can only be expanded by the model's own "
+            "processor; a tokenizer would emit one token per marker and the "
+            "ledger would reserve no room for the image."
+        )
+    return _encode_multimodal_turn(processor, tok, question_text, images)
 
 
 def render_golden_answer(tok, turn: dict) -> list[int]:
@@ -1031,69 +1287,176 @@ def drive_single_request_to_completion(llm_engine, request_id: str):
     noticeably higher, that's the metadata-patch overhead (also now
     directly measured, see `sparse_target_runner.py::pop_override_timing`)
     showing up on top of the same shared floor."""
-    latest_output = None
+    outputs, stage_seconds = drive_requests_to_completion(
+        llm_engine, {request_id})
+    return outputs.get(request_id), stage_seconds[request_id]
+
+
+def drive_requests_to_completion(llm_engine, request_ids):
+    """Drive N concurrent ORDINARY (non-resumable) requests to completion.
+    Returns `(outputs_by_id, stage_seconds_by_id)`.
+
+    The baseline counterpart of `drive_session_turns_to_completion`, and the
+    two differ in exactly one load-bearing way: **their terminator**. These
+    requests really finish, so `has_unfinished_requests()` going False is the
+    correct, complete signal -- the same discipline as
+    `../spec_prefill_llama/predict_longbench_v2.py::drive_engine_to_completion`.
+    A resumable SESSION never satisfies that condition (it parks in
+    `WAITING_FOR_STREAMING_REQ` and re-enqueues), which is why that path needs
+    its own loop watching `finish_reason` instead. Keeping both rather than
+    forcing one shape onto both is deliberate: each is correct for its own
+    request kind and wrong for the other.
+
+    Correlation is by `output.request_id`, the ORIGINAL caller-supplied id --
+    see `drive_session_turns_to_completion` for the confirmed production bug
+    that discipline prevents.
+
+    Never breaks early, never aborts.
+    """
+    outstanding = set(request_ids)
+    if not outstanding:
+        return {}, {}
+    outputs: dict = {}
     t_start = time.time()
-    t_prefill_done = None
+    t_first_out: dict = {}
+    t_done: dict = {}
+
     while llm_engine.has_unfinished_requests():
         for output in llm_engine.step():
-            if output.request_id == request_id:
-                if latest_output is None:
-                    t_prefill_done = time.time()
-                    print(
-                        f"[predict_scbench] {request_id!r}: target prefill "
-                        f"done in {t_prefill_done - t_start:.2f}s"
-                    )
-                latest_output = output
-    t_done = time.time()
-    if t_prefill_done is not None and latest_output is not None:
+            rid = output.request_id
+            if rid not in outstanding:
+                continue
+            if rid not in t_first_out:
+                t_first_out[rid] = time.time()
+                print(
+                    f"[predict_scbench] {rid!r}: target prefill done in "
+                    f"{t_first_out[rid] - t_start:.2f}s"
+                )
+            outputs[rid] = output
+            if output.outputs[0].finish_reason is not None:
+                t_done.setdefault(rid, time.time())
+
+    now = time.time()
+    for rid, output in outputs.items():
         print(
-            f"[predict_scbench] {request_id!r}: target decode done in "
-            f"{t_done - t_prefill_done:.2f}s "
-            f"({len(latest_output.outputs[0].token_ids)} tokens generated)"
+            f"[predict_scbench] {rid!r}: target decode done in "
+            f"{t_done.get(rid, now) - t_first_out[rid]:.2f}s "
+            f"({len(output.outputs[0].token_ids)} tokens generated)"
         )
-    return latest_output, _target_stage_seconds(t_start, t_prefill_done, t_done)
+    stage_seconds = {
+        rid: _target_stage_seconds(
+            t_start, t_first_out.get(rid), t_done.get(rid, now))
+        for rid in request_ids
+    }
+    return outputs, stage_seconds
+
+
+def drive_session_turns_to_completion(llm_engine, request_ids):
+    """Drive ONE turn each for N concurrent resumable sessions. Returns
+    `(outputs_by_id, stage_seconds_by_id)`.
+
+    The generalisation of `drive_one_turn_of_session` (which now delegates
+    here); `--batch-conversations` is what makes N > 1 reachable.
+
+    **Why this cannot use `has_unfinished_requests()` as its terminator**,
+    unlike `../spec_prefill_llama/predict_longbench_v2.py::drive_engine_to_
+    completion`: a resumable request's turn-level stop does NOT finish it.
+    It parks in `RequestStatus.WAITING_FOR_STREAMING_REQ` and re-enqueues
+    (confirmed on real hardware by `validate_resumable_session.py`), so once
+    every session in the wave has parked, `has_unfinished_requests()` is
+    still True -- forever. The loop therefore watches each id's own
+    `finish_reason` and exits when the outstanding set empties.
+
+    `has_unfinished_requests()` is still used, but as a WATCHDOG rather than
+    a terminator: an engine with nothing left to do while ids are still
+    outstanding means no output will ever arrive for them, which is a
+    hang, and raising beats spinning. (The check is deliberately made AFTER
+    draining a step's outputs, so a request that finishes on the very step
+    that empties the engine is recorded rather than mistaken for a hang.)
+
+    **Correlation is by `output.request_id` -- the ORIGINAL, caller-supplied
+    id, never `add_request()`'s return value.** `predict_longbench_v2.py`'s
+    own comments record what happens otherwise: keying by the rewritten id
+    lost 100% of outputs on real hardware. This driver sets
+    `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION=1` (see `proposer.py`'s import-time
+    `os.environ.setdefault`), which makes the two equal -- so the callers
+    assert that equality at `add_request` time rather than assuming it here.
+
+    Never breaks early, never aborts mid-flight. Both are confirmed real
+    hazards, not defensive habits.
+
+    Per-id stage split, same convention as `drive_single_request_to_
+    completion`: prefill runs to that id's FIRST output, decode from there
+    to its finish. "Prefill" here means the DELTA (this turn's new tokens)
+    only -- everything earlier is already resident in the session's own
+    persistent cache.
+
+    **The per-id split is honest at N=1 and only indicative at N>1**, since
+    concurrent sessions overlap by construction: two sessions' prefill and
+    decode windows genuinely coincide, so their per-id spans sum to more
+    than the wall clock. `run_sparse_attention` therefore stops feeding
+    these into `timing_model.breakdown_with_residual` once batching is on,
+    and reports wave-level engine-busy time instead -- see that function.
+    """
+    outstanding = set(request_ids)
+    if not outstanding:
+        return {}, {}
+    outputs: dict = {}
+    t_start = time.time()
+    t_first_out: dict = {}
+    t_done: dict = {}
+
+    while outstanding:
+        step_outputs = llm_engine.step()
+        for output in step_outputs:
+            rid = output.request_id
+            if rid not in outstanding:
+                # Another wave member already finished this step, or a
+                # request this call was not asked about. Either way it is
+                # not ours to drive; whoever submitted it owns it.
+                continue
+            if rid not in t_first_out:
+                t_first_out[rid] = time.time()
+                print(
+                    f"[predict_scbench] {rid!r}: target delta-prefill done "
+                    f"in {t_first_out[rid] - t_start:.2f}s"
+                )
+            outputs[rid] = output
+            if output.outputs[0].finish_reason is not None:
+                t_done[rid] = time.time()
+                print(
+                    f"[predict_scbench] {rid!r}: target decode done in "
+                    f"{t_done[rid] - t_first_out[rid]:.2f}s"
+                )
+                outstanding.discard(rid)
+        if outstanding and not llm_engine.has_unfinished_requests():
+            raise RuntimeError(
+                f"engine has no unfinished requests but "
+                f"{sorted(outstanding)} never reported a finish_reason -- "
+                f"they were dropped rather than parked. Stepping further "
+                f"would spin forever."
+            )
+
+    now = time.time()
+    stage_seconds = {
+        rid: _target_stage_seconds(
+            t_start, t_first_out.get(rid), t_done.get(rid, now))
+        for rid in request_ids
+    }
+    return outputs, stage_seconds
 
 
 def drive_one_turn_of_session(llm_engine, request_id: str):
-    """Same helper as `validate_resumable_session.py`'s own
-    `drive_one_turn_of_session` -- confirmed on real hardware there that a
-    resumable request's own turn-level stop does NOT make
-    `has_unfinished_requests()` go False (it parks in `RequestStatus.
-    WAITING_FOR_STREAMING_REQ` and re-enqueues, not finishes), so this
-    watches `output.outputs[0].finish_reason` directly instead of relying
-    on `drive_single_request_to_completion`'s "loop until nothing's left"
-    shape, which would spin forever here.
+    """One turn of ONE resumable session. Delegates to
+    `drive_session_turns_to_completion` rather than keeping a second copy of
+    the loop -- two loops over the same subtle parking semantics is exactly
+    the drift hazard this module keeps running into.
 
-    Logs the prefill/decode split -- "prefill" here means the DELTA
-    (this turn's new tokens) only, since everything earlier is already
-    resident in the session's own persistent cache, not a full-context
-    prefill -- see `drive_single_request_to_completion`'s own docstring
-    for why this split exists (checking the shared-decode-floor /
-    sparse-specific-overhead theory against real numbers)."""
-    last_output = None
-    t_start = time.time()
-    t_prefill_done = None
-    while llm_engine.has_unfinished_requests():
-        for output in llm_engine.step():
-            if output.request_id != request_id:
-                continue
-            if last_output is None:
-                t_prefill_done = time.time()
-                print(
-                    f"[predict_scbench] {request_id!r}: target delta-prefill "
-                    f"done in {t_prefill_done - t_start:.2f}s"
-                )
-            last_output = output
-            if output.outputs[0].finish_reason is not None:
-                t_done = time.time()
-                if t_prefill_done is not None:
-                    print(
-                        f"[predict_scbench] {request_id!r}: target decode "
-                        f"done in {t_done - t_prefill_done:.2f}s"
-                    )
-                return last_output, _target_stage_seconds(
-                    t_start, t_prefill_done, t_done)
-    return last_output, _target_stage_seconds(t_start, t_prefill_done, time.time())
+    Returns `(output_or_None, stage_seconds)`, the shape every existing
+    caller already expects."""
+    outputs, stage_seconds = drive_session_turns_to_completion(
+        llm_engine, {request_id})
+    return outputs.get(request_id), stage_seconds[request_id]
 
 
 def build_sparse_session_request(llm_engine, request_id, prompt_token_ids, sampling_params, resumable=True):
@@ -1461,7 +1824,8 @@ def _num_decode_steps(out_len: int) -> int:
 
 def run_baseline(
     llm, tok, conversations, max_tokens, target_max_num_batched_tokens,
-    target_min_tokens: int = 0,
+    target_min_tokens: int = 0, processor=None, samples_dir: Optional[Path] = None,
+    batch_conversations: int = 1, batch_refill: bool = True,
 ) -> tuple[list[dict], dict]:
     """M000: plain add_request per turn, no worker_cls/proposer/pruning --
     keeps every token of the conversation unconditionally.
@@ -1526,6 +1890,25 @@ def run_baseline(
     is too large every later turn in the same conversation will be too;
     skipping the rest of that conversation rather than checking turn by
     turn avoids paying for tokenization + a doomed size check repeatedly.
+
+
+    **Batching (`--batch-conversations`, default 1)** uses the same lockstep
+    wave schedule and the same `plan_wave` helper as `run_sparse_attention`,
+    for one reason that is not about this function at all: a batched
+    SPARSE-vs-M000 throughput comparison is only readable if BOTH arms are
+    batched the same way. Comparing a batched sparse row against a serial
+    dense row would attribute the whole of batching's benefit to the sparse
+    mechanism.
+
+    The drive loop is NOT the sparse path's. Baseline turns are ordinary
+    one-shot requests that genuinely finish, so
+    `drive_requests_to_completion`'s `has_unfinished_requests()` terminator is
+    correct here and the session path's `finish_reason` watch is not needed --
+    see those two functions' docstrings.
+
+    Per-turn wall-clock columns are suppressed at N > 1 here too, for the
+    same reason: concurrent turns overlap, so `breakdown_with_residual` would
+    be double-counting rather than merely noisy.
     """
     from vllm import SamplingParams
     from vllm.inputs import TokensPrompt
@@ -1542,34 +1925,72 @@ def run_baseline(
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
               "num_skipped_too_large": 0, "turn_elapsed": [], "flops": [],
-              "turn_times": []}
+              "turn_times": [],
+              # Wave accounting, same shape as run_sparse_attention's so the
+              # two arms' rows are directly comparable. M000 has no
+              # speculator, so its spec_* windows are zero by construction --
+              # the same convention its FLOP breakdown already uses.
+              "wave_seconds": [], "wave_occupancy": [],
+              "spec_engine_seconds": [], "target_engine_seconds": [],
+              "spec_prefill_engine_seconds": [], "spec_lookahead_engine_seconds": [],
+              "spec_scoring_engine_seconds": [],
+              "target_prefill_engine_seconds": [], "target_decode_engine_seconds": [],
+              "dense_fallbacks": {}, "session_cache_misses": 0}
     target_flop_cfg = _target_flop_config(llm)
 
+    batched = batch_conversations > 1
+    desc = "M000 baseline"
+    if batched:
+        desc += f" batch={batch_conversations}"
+    queue = [
+        BaselineSession(
+            conv=conv,
+            context_ids=tok.encode(conv["context"], add_special_tokens=False),
+            chat_ids=[],
+            conv_images=[],
+        )
+        for conv in conversations
+    ]
+    active: list = []
     t_loop_start = time.time()
     conversations_processed = 0
-    progress = tqdm(conversations, desc="M000 baseline", unit="conv")
-    for conv in progress:
-        progress.set_postfix(_progress_postfix(predictions, stats, t_loop_start, conversations_processed))
-        turns_before = len(predictions)
-        # The real submitted token stream, grown in place exactly as
-        # `run_sparse_attention` grows its persistent session: turn 0
-        # contributes `chat_before + context + query + chat_after`, every
-        # later turn contributes `turn_boundary + query + chat_after`, and
-        # each turn's own generated tokens land in between. This IS the
-        # prompt -- there is no separate ledger to keep in sync (see this
-        # function's docstring).
-        context_ids = tok.encode(conv["context"], add_special_tokens=False)
-        chat_ids: list[int] = []
-        for turn_idx, turn in enumerate(conv["turns"]):
+    progress = tqdm(total=len(conversations), desc=desc, unit="conv")
+
+    while True:
+        active, retired = plan_wave(active, queue, batch_conversations, batch_refill)
+        for session in retired:
+            if session.turns_emitted > 0:
+                conversations_processed += 1
+            progress.update(1)
+        if not active:
+            break
+        progress.set_postfix(_progress_postfix(
+            predictions, stats, t_loop_start, conversations_processed))
+        t_wave_start = time.time()
+
+        # ---- PHASE 1: plan. Build each session's delta and check it fits.
+        for session in active:
+            session.pending = None
             t_turn_start = time.time()
-            query_ids = render_turn_query(tok, turn_idx, turn)
+            conv = session.conv
+            turn_idx = session.turn_idx
+            turn = conv["turns"][turn_idx]
+            # Baseline resubmits the WHOLE accumulated prompt every turn, so
+            # it needs every image seen so far -- unlike the sparse path,
+            # whose persistent session already holds the earlier turns' image
+            # KV and receives only this turn's delta.
+            turn_images = (load_turn_images(turn, samples_dir)
+                           if samples_dir is not None else [])
+            session.conv_images.extend(turn_images)
+            query_ids = render_turn_query(tok, turn_idx, turn,
+                                          processor=processor, images=turn_images)
 
             delta_ids = build_turn_delta_ids(
                 turn_idx=turn_idx, query_ids=query_ids,
-                chat_before_ids=chat_before_ids, context_ids=context_ids,
+                chat_before_ids=chat_before_ids, context_ids=session.context_ids,
                 chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
             )
-            prospective_len = len(chat_ids) + len(delta_ids)
+            prospective_len = len(session.chat_ids) + len(delta_ids)
             if prospective_len > target_max_num_batched_tokens:
                 progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
@@ -1580,24 +2001,53 @@ def run_baseline(
                     f"whole conversation to fit, no pruning to shrink it."
                 )
                 stats["num_skipped_too_large"] += 1
-                break
+                session.retired = True
+                session.retire_reason = "too_large_target"
+                continue
 
-            chat_ids = chat_ids + delta_ids
-            prompt_ids = chat_ids
+            session.chat_ids = session.chat_ids + delta_ids
+            session.pending = {
+                "turn_idx": turn_idx,
+                "prompt_ids": session.chat_ids,
+                "request_id": f"{conv['id']}::turn{turn_idx}",
+                "t_turn_start": t_turn_start,
+            }
 
-            request_id = f"{conv['id']}::turn{turn_idx}"
-            sampling_params = _target_sampling_params(
-                max_tokens, target_min_tokens)
-            prompt = TokensPrompt(prompt_token_ids=prompt_ids)
-            t_gen_start = time.time()
-            llm.llm_engine.add_request(request_id, prompt, sampling_params)
-            output, target_stage_seconds = drive_single_request_to_completion(
-                llm.llm_engine, request_id)
-            progress.write(
-                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
-                f"generation done in {time.time() - t_gen_start:.2f}s "
-                f"({len(prompt_ids)} prompt tokens)"
-            )
+        running = [s for s in active if s.pending is not None]
+        if not running:
+            continue
+
+        # ---- PHASE 2: submit the whole wave.
+        sampling_params = _target_sampling_params(max_tokens, target_min_tokens)
+        for session in running:
+            prompt_ids = session.pending["prompt_ids"]
+            prompt = (TokensPrompt(prompt_token_ids=prompt_ids,
+                                   multi_modal_data={"image": list(session.conv_images)})
+                      if session.conv_images else
+                      TokensPrompt(prompt_token_ids=prompt_ids))
+            llm.llm_engine.add_request(
+                session.pending["request_id"], prompt, sampling_params)
+
+        # ---- PHASE 3: drive it.
+        t_gen_start = time.time()
+        outputs, target_stage_by_id = drive_requests_to_completion(
+            llm.llm_engine, {s.pending["request_id"] for s in running})
+        target_wave_seconds = time.time() - t_gen_start
+        progress.write(
+            f"[predict_scbench] wave of {len(running)}: target generation "
+            f"done in {target_wave_seconds:.2f}s ("
+            + ", ".join(str(len(s.pending["prompt_ids"])) for s in running)
+            + " prompt tokens)"
+        )
+
+        # ---- PHASE 4: harvest.
+        for session in running:
+            conv = session.conv
+            turn_idx = session.pending["turn_idx"]
+            prompt_ids = session.pending["prompt_ids"]
+            request_id = session.pending["request_id"]
+            output = outputs.get(request_id)
+            target_stage_seconds = target_stage_by_id[request_id]
 
             actual_output_ids: list[int] = []
             if output is not None:
@@ -1653,13 +2103,16 @@ def run_baseline(
                 if output.metrics is not None and output.metrics.first_token_latency:
                     stats["ttfts"].append(output.metrics.first_token_latency * 1000)
                 stats["actual_keep_rates"].append(1.0)
-                # M000 has no speculator, so its spec_* stages are zero by
-                # construction -- the same convention the FLOP breakdown uses.
-                spec_stage_seconds = {}
-                turn_seconds = time.time() - t_turn_start
-                stats["turn_elapsed"].append((turn_idx, turn_seconds))
-                stats["turn_times"].append((turn_idx, breakdown_with_residual(
-                    turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
+                if not batched:
+                    # M000 has no speculator, so its spec_* stages are zero by
+                    # construction -- the same convention the FLOP breakdown
+                    # uses. Suppressed entirely at N>1: see this function's
+                    # docstring.
+                    spec_stage_seconds = {}
+                    turn_seconds = time.time() - session.pending["t_turn_start"]
+                    stats["turn_elapsed"].append((turn_idx, turn_seconds))
+                    stats["turn_times"].append((turn_idx, breakdown_with_residual(
+                        turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
 
                 # M000 pays no speculator cost at all -- every spec_* stage
                 # stays zero, which is exactly what makes this row the
@@ -1704,16 +2157,45 @@ def run_baseline(
                     "config": conv["config"], "pred": completion.text,
                     **flop_fields,
                 })
+                session.turns_emitted += 1
 
             # Append this turn's own output to the conversation, so the
             # next turn's `turn_boundary_ids` closes a real assistant turn.
             # Empty when `output is None` (nothing generated), which just
             # leaves the stream where it was.
-            chat_ids = chat_ids + actual_output_ids
+            session.chat_ids = session.chat_ids + actual_output_ids
+            session.pending = None
+            session.turn_idx += 1
+            if session.turn_idx >= len(conv["turns"]):
+                session.retired = True
+                session.retire_reason = "exhausted"
 
-        if len(predictions) > turns_before:
-            conversations_processed += 1
+        # ---- Wave accounting. M000's speculator windows are zero, so the
+        # run-level `driver_overhead_seconds` residual is elapsed minus the
+        # target's own busy time -- which for this row is the cleanest
+        # possible statement of "everything that was not the model".
+        stats["wave_seconds"].append(time.time() - t_wave_start)
+        stats["wave_occupancy"].append(len(running))
+        stats["spec_engine_seconds"].append(0.0)
+        stats["spec_prefill_engine_seconds"].append(0.0)
+        stats["spec_lookahead_engine_seconds"].append(0.0)
+        stats["spec_scoring_engine_seconds"].append(0.0)
+        stats["target_engine_seconds"].append(target_wave_seconds)
+        # Read from `target_stage_by_id`, NOT from `session.pending` -- harvest
+        # clears `pending`, so anything reaching back through it here would
+        # silently read nothing and report a zero-length prefill window.
+        # Split the window at the point by which EVERY request in the wave had
+        # produced its first token: before it the engine was still prefilling
+        # for someone, after it everyone was decoding. The two parts sum
+        # exactly to the window.
+        wave_target_prefill = max(
+            (v["target_prefill"] for v in target_stage_by_id.values()),
+            default=0.0)
+        stats["target_prefill_engine_seconds"].append(wave_target_prefill)
+        stats["target_decode_engine_seconds"].append(
+            max(0.0, target_wave_seconds - wave_target_prefill))
 
+    progress.close()
     return predictions, stats
 
 
@@ -1949,6 +2431,133 @@ def run_specprefill(
     return predictions, stats
 
 
+@dataclass
+class BaselineSession:
+    """One conversation's in-flight state for `run_baseline`.
+
+    Much smaller than `SparseSession`, and the difference is the point: M000
+    keeps no ledger, no position map and no persistent session. Its entire
+    state IS `chat_ids`, the real submitted token stream, grown in place --
+    see `run_baseline`'s docstring on why keeping a parallel ledger nothing
+    reads was removed."""
+
+    conv: dict
+    context_ids: list
+    chat_ids: list
+    conv_images: list
+    turn_idx: int = 0
+    turns_emitted: int = 0
+    retired: bool = False
+    retire_reason: Optional[str] = None
+    pending: Optional[dict] = None
+
+
+@dataclass
+class PendingTurn:
+    """One session's scratch between a wave's SUBMIT and HARVEST phases.
+
+    Scoped to a single wave on purpose: everything here is derived from this
+    turn's scoring result and becomes meaningless once the turn is harvested,
+    so it lives in a field that is cleared rather than alongside the state in
+    `SparseSession` that genuinely persists across turns."""
+
+    turn_idx: int
+    query_ids: list
+    result: object                 # PrunedTurnResult
+    delta_ids: list
+    translated_positions: list
+    t_turn_start: float
+
+
+@dataclass
+class SparseSession:
+    """One conversation's in-flight state on the target's persistent session.
+
+    Every field here used to be a per-conversation LOCAL in
+    `run_sparse_attention`'s outer `for conv in conversations:` body. They are
+    collected into an object for exactly one reason: with N conversations in
+    flight (`--batch-conversations`), "the current conversation's
+    `position_map`" stops being a well-defined thing.
+
+    At N == 1 exactly one of these exists at a time and every field holds what
+    the corresponding local held, which is what makes the default path a
+    refactor rather than a behaviour change.
+    """
+
+    conv: dict
+    context_ids: list
+    state: object                  # ConversationState
+    position_map: LedgerToTargetPositionMap
+    target_request_id: str
+    turn_idx: int = 0
+    session_started: bool = False
+    turns_emitted: int = 0
+
+    #: `RequestOutput.outputs[0].token_ids`/`.text` are CUMULATIVE for the
+    #: WHOLE request's lifetime under this engine's default (non-DELTA)
+    #: output_kind -- confirmed by reading output_processor.py's
+    #: RequestState/_new_completion_output (token_ids = self.detokenizer.
+    #: output_token_ids when not delta) and detokenizer.py's
+    #: IncrementalDetokenizer (self.output_text += ...) -- NEITHER is reset by
+    #: apply_streaming_update/`_update_request_as_session` on a session
+    #: resumption, so turn 2's `output` already contains turn 1's tokens/text
+    #: prepended, turn 3's contains turns 1+2's, etc. Track how many output
+    #: tokens existed before THIS turn so each turn's genuinely NEW tokens can
+    #: be sliced out -- real hardware evidence this matters (not a theoretical
+    #: concern): feeding the raw cumulative slice into state.complete_turn
+    #: re-appended every prior turn's output to the ledger each turn, a
+    #: compounding drift that crashed sparse_target_runner.py's block-index
+    #: bounds check a few turns into a real SCBench conversation
+    #: (kept_positions translated to a target position far beyond anything
+    #: actually computed).
+    prev_cumulative_output_len: int = 0
+
+    #: Target-side resident KV length, for FLOP accounting only. Tracked
+    #: explicitly rather than read from `RequestOutput.num_cached_tokens`
+    #: because this path is a resumable SESSION, not a fresh request per turn:
+    #: the prior history is already resident in the session's own KV, which is
+    #: a different thing from a prefix-cache hit, and the two are not
+    #: interchangeable in `num_cached_tokens`. This is the `n_cached` that
+    #: `delta_ids`' prefill attention runs against.
+    target_resident_len: int = 0
+
+    retired: bool = False
+    #: "exhausted" | "too_large_speculator" | "too_large_target"
+    retire_reason: Optional[str] = None
+    pending: Optional[PendingTurn] = None
+
+
+def plan_wave(active, queue, batch_size, refill=True):
+    """Advance a wave's membership: drop retired sessions, then top `active`
+    back up from `queue`. Returns `(active, retired)`.
+
+    Deliberately PURE -- no engine, no tokenizer, no I/O -- so the policy that
+    decides what "a batch of N" actually means over a whole run can be
+    unit-tested without a GPU. The engine-touching phases stay in
+    `run_sparse_attention`.
+
+    **Effective batch size varies over a run**, which is why `retired` is
+    returned rather than swallowed. A conversation that fails a pre-flight
+    budget check retires mid-run, so a row nominally at N=2 can spend much of
+    its time at 1. `run_sparse_attention` records mean occupancy for exactly
+    this reason: a throughput number divided by a batch size the run never
+    actually held is worse than no number at all.
+
+    `refill=False` (`--no-batch-refill`) drains instead -- no new conversation
+    joins a partially-drained wave -- giving a strictly-constant-N window at
+    the cost of idle slots. Useful when the batch size is itself the
+    independent variable and occupancy variation would confound it. The
+    `or not active` clause means a fully-drained wave still restarts, so
+    draining never deadlocks with work left in the queue.
+    """
+    retired = [s for s in active if s.retired]
+    active = [s for s in active if not s.retired]
+    if refill or not active:
+        while len(active) < batch_size and queue:
+            active.append(queue.pop(0))
+    return active, retired
+
+
 def run_sparse_attention(
     llm,
     tok,
@@ -1961,6 +2570,8 @@ def run_sparse_attention(
     target_max_num_batched_tokens,
     sparse_prefill: bool = False,
     target_min_tokens: int = 0,
+    batch_conversations: int = 1,
+    batch_refill: bool = True,
 ) -> tuple[list[dict], dict]:
     """SPARSE-k*-g* **and ORACLE-k***: persistent full-KV-cache target
     session, scorer-selected sparse attention over it during decode (see
@@ -2073,10 +2684,45 @@ def run_sparse_attention(
     `kept_positions` below, so there's only one place tracking "how many
     wrapper tokens are actually resident so far," not two that can drift
     apart.
+
+
+    **Batching (`--batch-conversations`, default 1).** N conversations are
+    advanced together in LOCKSTEP WAVES: every active session takes one turn,
+    all of them scored in a single speculator pass and driven in a single
+    target pass, before any of them takes its next turn. Turns WITHIN a
+    conversation still cannot be reordered (turn N+1's candidate pool depends
+    on turn N's own outcome and on the ledger), so conversations are the only
+    available batch axis -- which is what this driver's module docstring #1
+    flagged as the natural follow-up once correctness was confirmed.
+
+    Lockstep rather than free-running is a measurement decision, not a
+    scheduling accident. Letting session B start its next turn while A still
+    decodes would use the GPU better, but it destroys the denominator: the
+    `pop_*` accumulators are per-request and per-turn, and with turns
+    straddling arbitrary wall-clock windows there is no interval containing
+    exactly N turns of work to divide by. Since the whole point of batching
+    here is to produce a THROUGHPUT number, a clean denominator is worth more
+    than the last few percent of utilisation. Free-running is a deliberate
+    non-goal, in the same spirit as `proposer.py`'s own declared scope.
+
+    At N == 1 a wave holds exactly one session and every operation happens in
+    the same order, with the same arguments, as the pre-batching loop -- which
+    is what lets `--batch-conversations 1` reproduce published rows rather
+    than merely approximate them.
+
+    **Per-turn wall-clock attribution is switched OFF at N > 1**, rather than
+    reported wrong. `timing_model.breakdown_with_residual` makes stages sum
+    exactly to a turn's wall clock and deliberately does not clamp a negative
+    residual, because negative MEANS double-counting. Concurrent turns overlap
+    by construction, so at N > 1 the residual would go negative routinely and
+    destroy that signal's diagnostic value for the N == 1 rows where it still
+    works. Instead the run reports wave-level ENGINE-BUSY time (windows during
+    which the engine did exactly one wave of work and nothing else), and
+    `seconds_per_turn_mean` and the per-stage time columns come back empty.
     """
     from vllm import SamplingParams
     from vllm_patch.conversation_state import ConversationState
-    from vllm_patch.pruner import compute_pruned_turn
+    from vllm_patch.pruner import compute_pruned_turns
 
     chat_before, chat_after = chat_wrapper_pieces(tok)
     chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
@@ -2087,7 +2733,21 @@ def run_sparse_attention(
     stats = {"ttfts": [], "out_lens": [], "finish": {"stop": 0, "length": 0, "other": 0},
               "actual_keep_rates": [], "num_cached_tokens_speculator": [],
               "num_skipped_too_large": 0, "turn_elapsed": [], "flops": [],
-              "turn_times": []}
+              "turn_times": [],
+              # Wave-level accounting -- see this function's docstring for why
+              # per-turn wall clock is not usable once N > 1. Populated at
+              # every N (including 1, where it is a cross-check on the
+              # per-turn numbers rather than a replacement for them).
+              "wave_seconds": [], "wave_occupancy": [],
+              "spec_engine_seconds": [], "target_engine_seconds": [],
+              "spec_prefill_engine_seconds": [], "spec_lookahead_engine_seconds": [],
+              "spec_scoring_engine_seconds": [],
+              "target_prefill_engine_seconds": [], "target_decode_engine_seconds": [],
+              # Degradation counters -- a batched run under KV pressure can
+              # silently fall back to dense attention (see
+              # sparse_target_runner._prefill_gather_applies) and would
+              # otherwise be reported as a clean sparse row.
+              "dense_fallbacks": {}, "session_cache_misses": 0}
 
     target_flop_cfg = _target_flop_config(llm)
     spec_flop_cfg = _speculator_flop_config(proposer)
@@ -2101,50 +2761,69 @@ def run_sparse_attention(
         getattr(proposer.llm_engine.vllm_config.model_config, "model", None) or "scorer"
     ).name
     desc = f"Sparse attention keep={keep_pct} scorer={scorer_name}"
+    if batch_conversations > 1:
+        desc += f" batch={batch_conversations}"
+
+    batched = batch_conversations > 1
+    def _new_session(conv):
+        # Encode the context ONCE and hand the same list to both the session
+        # and its ledger. The pre-batching code encoded it once into a local
+        # and passed that local to `ConversationState`; a comprehension that
+        # called `tok.encode` twice would be two sources of truth for the same
+        # token stream -- exactly the drift hazard `LedgerToTargetPositionMap`
+        # warns about, and needless tokenizer work on a long context.
+        context_ids = tok.encode(conv["context"], add_special_tokens=False)
+        return SparseSession(
+            conv=conv,
+            context_ids=context_ids,
+            state=ConversationState(conv["id"], context_ids, keep_mode),
+            position_map=LedgerToTargetPositionMap(
+                initial_offset=len(chat_before_ids)),
+            target_request_id=f"{conv['id']}::sparse-session",
+        )
+
+    queue = [_new_session(conv) for conv in conversations]
+    active: list = []
     t_loop_start = time.time()
     conversations_processed = 0
-    progress = tqdm(conversations, desc=desc, unit="conv")
-    for conv in progress:
-        progress.set_postfix(_progress_postfix(predictions, stats, t_loop_start, conversations_processed))
-        turns_before = len(predictions)
+    progress = tqdm(total=len(conversations), desc=desc, unit="conv")
 
-        context_ids = tok.encode(conv["context"], add_special_tokens=False)
-        state = ConversationState(conv["id"], context_ids, keep_mode)
-        position_map = LedgerToTargetPositionMap(initial_offset=len(chat_before_ids))
-        target_request_id = f"{conv['id']}::sparse-session"
-        session_started = False
-        # RequestOutput.outputs[0].token_ids/.text are CUMULATIVE for the
-        # WHOLE request's lifetime under this engine's default (non-DELTA)
-        # output_kind -- confirmed by reading output_processor.py's
-        # RequestState/_new_completion_output (token_ids = self.detokenizer.
-        # output_token_ids when not delta) and detokenizer.py's
-        # IncrementalDetokenizer (self.output_text += ...) -- NEITHER is
-        # reset by apply_streaming_update/`_update_request_as_session` on a
-        # session resumption, so turn 2's `output` already contains turn 1's
-        # tokens/text prepended, turn 3's contains turns 1+2's, etc. Track
-        # how many output tokens existed before THIS turn so each turn's
-        # genuinely NEW tokens can be sliced out -- real hardware evidence
-        # this matters (not a theoretical concern): feeding the raw
-        # cumulative slice into state.complete_turn re-appended every prior
-        # turn's output to the ledger each turn, a compounding drift that
-        # crashed sparse_target_runner.py's block-index bounds check a few
-        # turns into a real SCBench conversation (kept_positions translated
-        # to a target position far beyond anything actually computed).
-        prev_cumulative_output_len = 0
-        # Target-side resident KV length, for FLOP accounting only. Tracked
-        # explicitly rather than read from `RequestOutput.num_cached_tokens`
-        # because this path is a resumable SESSION, not a fresh request per
-        # turn: the prior history is already resident in the session's own
-        # KV, which is a different thing from a prefix-cache hit, and the
-        # two are not interchangeable in `num_cached_tokens`. This is the
-        # `n_cached` that `delta_ids`' prefill attention runs against.
-        target_resident_len = 0
+    def _teardown(session):
+        """Release a retired session's resources on BOTH engines.
 
-        for turn_idx, turn in enumerate(conv["turns"]):
+        `abort_request` is gated on `session_started` because a session that
+        never got past its own pre-flight check has no request to abort --
+        aborting an unknown id is not free, and on some engine versions it
+        logs alarmingly."""
+        proposer.discard_conversation(session.conv["id"])
+        if session.session_started:
+            llm.llm_engine.abort_request([session.target_request_id])
+        nonlocal conversations_processed
+        if session.turns_emitted > 0:
+            conversations_processed += 1
+        progress.update(1)
+
+    while True:
+        active, retired = plan_wave(active, queue, batch_conversations, batch_refill)
+        for session in retired:
+            _teardown(session)
+        if not active:
+            break
+        progress.set_postfix(_progress_postfix(
+            predictions, stats, t_loop_start, conversations_processed))
+        t_wave_start = time.time()
+
+        # ---- PHASE 1: plan. Pre-flight only; no engine work, so a session
+        # that fails here has submitted nothing and can retire immediately.
+        for session in active:
+            session.pending = None
             t_turn_start = time.time()
+            turn_idx = session.turn_idx
+            conv = session.conv
+            turn = conv["turns"][turn_idx]
             query_ids = render_turn_query(tok, turn_idx, turn)
 
-            prospective_speculator_len = state.total_len + len(query_ids)
+            prospective_speculator_len = session.state.total_len + len(query_ids)
             if prospective_speculator_len > speculator_max_num_batched_tokens:
                 progress.write(
                     f"[predict_scbench] SKIP conversation id={conv['id']!r} "
@@ -2155,7 +2834,9 @@ def run_sparse_attention(
                     f"must process the whole thing to score it."
                 )
                 stats["num_skipped_too_large"] += 1
-                break
+                session.retired = True
+                session.retire_reason = "too_large_speculator"
+                continue
             # position_map.translate(state.total_len) gives the REAL target-
             # stream position of "everything resident so far" (context +
             # every prior turn's query/output, PLUS every prior turn's own
@@ -2167,7 +2848,7 @@ def run_sparse_attention(
             # turn_boundary_ids (turn_idx > 0 only) + this turn's query +
             # chat_after_ids, mirroring delta_ids's own construction below.
             prospective_target_len = (
-                position_map.translate(state.total_len)
+                session.position_map.translate(session.state.total_len)
                 + (len(turn_boundary_ids) if turn_idx > 0 else 0)
                 + len(query_ids)
                 + len(chat_after_ids)
@@ -2184,19 +2865,56 @@ def run_sparse_attention(
                     f"physically, same as the baseline."
                 )
                 stats["num_skipped_too_large"] += 1
-                break
+                session.retired = True
+                session.retire_reason = "too_large_target"
+                continue
 
-            t_scoring_start = time.time()
-            result = compute_pruned_turn(proposer, spec_config, state, query_ids)
+            session.pending = PendingTurn(
+                turn_idx=turn_idx, query_ids=query_ids, result=None,
+                delta_ids=None, translated_positions=None,
+                t_turn_start=t_turn_start,
+            )
+
+        running = [s for s in active if s.pending is not None]
+        if not running:
+            # Every session in this wave retired on pre-flight. Loop round;
+            # the top of the loop tears them down and refills.
+            continue
+
+        # ---- PHASE 2: speculator, one pass for the whole wave.
+        t_spec_start = time.time()
+        results = compute_pruned_turns(
+            proposer, spec_config,
+            [(s.state, s.pending.query_ids) for s in running],
+        )
+        spec_wave_seconds = time.time() - t_spec_start
+        for session, result in zip(running, results):
+            session.pending.result = result
             progress.write(
-                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: speculator "
-                f"scoring done in {time.time() - t_scoring_start:.2f}s "
+                f"[predict_scbench] {session.conv['id']!r} turn "
+                f"{session.pending.turn_idx}: speculator scoring done "
                 f"(kept {len(result.kept_positions)}/{result.orig_len})"
             )
-            query_start_ledger_pos = result.orig_len - len(query_ids)
+        progress.write(
+            f"[predict_scbench] wave of {len(running)}: speculator scoring "
+            f"done in {spec_wave_seconds:.2f}s"
+        )
+
+        # ---- PHASE 3: register the selection, then submit. Per session, in
+        # order. `register_sparse_selection` must precede its OWN
+        # `add_request` (collective_rpc is blocking, so adjacency guarantees
+        # it); it is safe for it to land while a DIFFERENT session is mid
+        # decode, because the worker takes one atomic per-request snapshot of
+        # the registry per step (sparse_selection_registry.get_with_generation).
+        sampling_params = _target_sampling_params(max_tokens, target_min_tokens)
+        for session in running:
+            result = session.pending.result
+            turn_idx = session.pending.turn_idx
+            query_start_ledger_pos = result.orig_len - len(session.pending.query_ids)
 
             if turn_idx > 0:
-                position_map.add_wrapper(query_start_ledger_pos, len(turn_boundary_ids))
+                session.position_map.add_wrapper(
+                    query_start_ledger_pos, len(turn_boundary_ids))
 
             # Record THIS turn's own chat_after_ids BEFORE translating, not
             # after. Safe -- a breakpoint at `result.orig_len` only shifts
@@ -2210,7 +2928,7 @@ def run_sparse_attention(
             # `wrapper_target_positions()` when the selection is registered
             # a few lines down -- registering after would leave this turn's
             # own assistant generation header unattendable.
-            position_map.add_wrapper(result.orig_len, len(chat_after_ids))
+            session.position_map.add_wrapper(result.orig_len, len(chat_after_ids))
 
             # Union the speculator's own selection with every chat-template
             # wrapper span -- see `LedgerToTargetPositionMap.wrapper_target_
@@ -2220,8 +2938,8 @@ def run_sparse_attention(
             # attention at every keep rate). Mirrors `run_specprefill`'s own
             # `full_kept_positions`, which has always done this explicitly.
             translated_positions = sorted(
-                set(position_map.translate(p) for p in result.kept_positions)
-                | set(position_map.wrapper_target_positions())
+                set(session.position_map.translate(p) for p in result.kept_positions)
+                | set(session.position_map.wrapper_target_positions())
             )
             # `target_resident_len` is exactly the absolute position at
             # which this turn's delta begins -- the same quantity the FLOP
@@ -2233,40 +2951,63 @@ def run_sparse_attention(
             llm.llm_engine.collective_rpc(
                 "register_sparse_selection",
                 args=(
-                    target_request_id,
+                    session.target_request_id,
                     translated_positions,
-                    target_resident_len if sparse_prefill else None,
+                    session.target_resident_len if sparse_prefill else None,
                 ),
             )
 
             # Shared with `run_baseline` so M000 and SPARSE submit the same
             # token stream -- see `build_turn_delta_ids`'s docstring.
             delta_ids = build_turn_delta_ids(
-                turn_idx=turn_idx, query_ids=query_ids,
-                chat_before_ids=chat_before_ids, context_ids=context_ids,
+                turn_idx=turn_idx, query_ids=session.pending.query_ids,
+                chat_before_ids=chat_before_ids, context_ids=session.context_ids,
                 chat_after_ids=chat_after_ids, turn_boundary_ids=turn_boundary_ids,
             )
-
-            sampling_params = _target_sampling_params(
-                max_tokens, target_min_tokens)
             prompt = build_sparse_session_request(
-                llm.llm_engine, target_request_id, delta_ids, sampling_params, resumable=True,
+                llm.llm_engine, session.target_request_id, delta_ids,
+                sampling_params, resumable=True,
             )
-            t_gen_start = time.time()
-            real_id = llm.llm_engine.add_request(target_request_id, prompt, sampling_params)
-            assert real_id == target_request_id, (
-                f"expected request_id={target_request_id!r} verbatim, got "
-                f"{real_id!r} -- VLLM_DISABLE_REQUEST_ID_RANDOMIZATION must "
-                f"be set (proposer.py sets this at import time)."
+            real_id = llm.llm_engine.add_request(
+                session.target_request_id, prompt, sampling_params)
+            assert real_id == session.target_request_id, (
+                f"expected request_id={session.target_request_id!r} verbatim, "
+                f"got {real_id!r} -- VLLM_DISABLE_REQUEST_ID_RANDOMIZATION "
+                f"must be set (proposer.py sets this at import time)."
             )
-            session_started = True
-            output, target_stage_seconds = drive_one_turn_of_session(
-                llm.llm_engine, target_request_id)
-            progress.write(
-                f"[predict_scbench] {conv['id']!r} turn {turn_idx}: target "
-                f"generation done in {time.time() - t_gen_start:.2f}s "
-                f"({len(delta_ids)} new delta tokens submitted)"
-            )
+            session.session_started = True
+            session.pending.delta_ids = delta_ids
+            session.pending.translated_positions = translated_positions
+
+        # ---- PHASE 4: drive the whole wave.
+        t_gen_start = time.time()
+        outputs, target_stage_by_id = drive_session_turns_to_completion(
+            llm.llm_engine, {s.target_request_id for s in running})
+        target_wave_seconds = time.time() - t_gen_start
+        progress.write(
+            f"[predict_scbench] wave of {len(running)}: target generation "
+            f"done in {target_wave_seconds:.2f}s ("
+            + ", ".join(f"{len(s.pending.delta_ids)}" for s in running)
+            + " new delta tokens submitted)"
+        )
+
+        # ---- PHASE 5: harvest, per session. Every pop and the discard happen
+        # only after the WHOLE wave has quiesced. That is stronger than
+        # strictly required (the accumulators and the registry are both
+        # per-request-id), and deliberately so: under
+        # `--target-async-scheduling` a pipelined phantom step for a session
+        # can still execute after the driver observes its stop -- the race
+        # documented in `run_experiment`'s async_scheduling block -- and
+        # discarding its selection while that is in flight would silently run
+        # a DENSE decode step. Quiescing first removes the question.
+        for session in running:
+            conv = session.conv
+            turn_idx = session.pending.turn_idx
+            result = session.pending.result
+            delta_ids = session.pending.delta_ids
+            output = outputs.get(session.target_request_id)
+            target_stage_seconds = target_stage_by_id[session.target_request_id]
+
             # Direct measurement of the per-layer metadata-patch bookkeeping
             # cost hypothesized (and discussed at length interactively) as
             # sparse's own extra decode-step overhead on top of the
@@ -2275,7 +3016,7 @@ def run_sparse_attention(
             # for exactly what this measures (CPU-side dispatch time, not
             # confirmed GPU execution time) and why.
             override_total, override_steps = llm.llm_engine.collective_rpc(
-                "pop_override_timing", args=(target_request_id,),
+                "pop_override_timing", args=(session.target_request_id,),
             )[0]
             if override_steps > 0:
                 override_msg = (
@@ -2296,7 +3037,7 @@ def run_sparse_attention(
             # keyed by request_id and independent of the registry. See
             # sparse_target_runner.py::pop_attended_lens.
             attended_lens = llm.llm_engine.collective_rpc(
-                "pop_attended_lens", args=(target_request_id,),
+                "pop_attended_lens", args=(session.target_request_id,),
             )[0]
             # Per-prefill-chunk (num_query_tokens, attended_len), the
             # prefill counterpart of attended_lens. Always popped, not
@@ -2307,8 +3048,40 @@ def run_sparse_attention(
             # into a later turn if the scope is ever toggled mid-run.
             # See sparse_target_runner.py::pop_prefill_steps.
             prefill_steps = llm.llm_engine.collective_rpc(
-                "pop_prefill_steps", args=(target_request_id,),
+                "pop_prefill_steps", args=(session.target_request_id,),
             )[0]
+            # Dense-fallback counters. A batched run under KV pressure can be
+            # preempted, and a preempted session's recomputed history is
+            # forced dense by `_prefill_gather_applies` -- correct, but it
+            # means the row is no longer measuring what its name says. Popped
+            # here so a degenerate run is visible in the output rather than
+            # silently reported as a clean sparse result.
+            fallbacks = llm.llm_engine.collective_rpc(
+                "pop_dense_fallbacks", args=(session.target_request_id,),
+            )[0]
+            if fallbacks:
+                for key, count in fallbacks.items():
+                    stats["dense_fallbacks"][key] = (
+                        stats["dense_fallbacks"].get(key, 0) + count)
+                if fallbacks.get("prefill_before_turn_start") or fallbacks.get(
+                        "num_computed_regressions"):
+                    progress.write(
+                        f"[predict_scbench] WARNING {conv['id']!r} turn "
+                        f"{turn_idx}: sparse attention fell back to DENSE for "
+                        f"{fallbacks} -- this is the preemption signature. The "
+                        f"turn's result is still correct, but it did not "
+                        f"measure the sparse path. Check KV headroom against "
+                        f"--batch-conversations."
+                    )
+            # `num_cached_tokens` below the length already resident in this
+            # session's KV means the resumption missed the prefix cache and
+            # earlier history had to be recomputed -- the driver-side
+            # complement of `prefill_before_turn_start`, needing no worker
+            # cooperation at all.
+            if (output is not None and session.target_resident_len > 0
+                    and getattr(output, "num_cached_tokens", None) is not None
+                    and output.num_cached_tokens < session.target_resident_len):
+                stats["session_cache_misses"] += 1
             # attended_lens (+ prefill_steps, when the prefill scope is on)
             # is recorded on a strict SUPERSET of the steps override timing
             # is: both are appended before the `gathered is None`
@@ -2330,18 +3103,19 @@ def run_sparse_attention(
                     f"FLOPs for this turn are under-counted."
                 )
             llm.llm_engine.collective_rpc(
-                "discard_sparse_selection", args=(target_request_id,),
+                "discard_sparse_selection", args=(session.target_request_id,),
             )
 
             actual_output_ids: list[int] = []
             if output is not None:
                 completion = output.outputs[0]
                 # Slice out just THIS turn's new tokens from the cumulative
-                # list -- see prev_cumulative_output_len's own comment above
-                # for why the raw list can't be used directly.
+                # list -- see SparseSession.prev_cumulative_output_len's own
+                # comment for why the raw list can't be used directly.
                 cumulative_output_ids = list(completion.token_ids)
-                new_output_ids = cumulative_output_ids[prev_cumulative_output_len:]
-                prev_cumulative_output_len = len(cumulative_output_ids)
+                new_output_ids = cumulative_output_ids[
+                    session.prev_cumulative_output_len:]
+                session.prev_cumulative_output_len = len(cumulative_output_ids)
 
                 # Drop the last generated token before feeding the ledger --
                 # `_update_request_as_session` (vllm/v1/core/sched/
@@ -2360,13 +3134,19 @@ def run_sparse_attention(
                 if output.metrics is not None and output.metrics.first_token_latency:
                     stats["ttfts"].append(output.metrics.first_token_latency * 1000)
                 if result.orig_len > 0:
-                    stats["actual_keep_rates"].append(len(result.kept_positions) / result.orig_len)
+                    stats["actual_keep_rates"].append(
+                        len(result.kept_positions) / result.orig_len)
                 stats["num_cached_tokens_speculator"].append(result.num_cached_tokens)
-                spec_stage_seconds = result.stage_seconds
-                turn_seconds = time.time() - t_turn_start
-                stats["turn_elapsed"].append((turn_idx, turn_seconds))
-                stats["turn_times"].append((turn_idx, breakdown_with_residual(
-                    turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
+                if not batched:
+                    # Per-turn wall clock is only meaningful while one turn
+                    # owns the whole interval. At N > 1 the wave-level
+                    # accounting below replaces it -- see this function's
+                    # docstring on why a wrong number is worse than none.
+                    spec_stage_seconds = result.stage_seconds
+                    turn_seconds = time.time() - session.pending.t_turn_start
+                    stats["turn_elapsed"].append((turn_idx, turn_seconds))
+                    stats["turn_times"].append((turn_idx, breakdown_with_residual(
+                        turn_seconds, **target_stage_seconds, **spec_stage_seconds)))
                 # completion.text is ALSO cumulative for the same reason --
                 # re-decode just this turn's own new tokens rather than use
                 # it directly.
@@ -2411,8 +3191,8 @@ def run_sparse_attention(
                     else:
                         bd.target_prefill = target_prefill_flops(
                             target_flop_cfg,
-                            prompt_len=target_resident_len + len(delta_ids),
-                            num_cached=target_resident_len,
+                            prompt_len=session.target_resident_len + len(delta_ids),
+                            num_cached=session.target_resident_len,
                         )
                     # Measured per step, not derived -- these are the
                     # block-padded lengths the kernel was actually handed.
@@ -2422,7 +3202,7 @@ def run_sparse_attention(
                         spec_pool_len=result.orig_len,
                         spec_cached_tokens=result.num_cached_tokens,
                         spec_look_ahead=result.actual_look_ahead_cnt,
-                        target_resident_len=target_resident_len,
+                        target_resident_len=session.target_resident_len,
                         target_delta_len=len(delta_ids),
                         sparse_prefill=sparse_prefill,
                         prefill_chunks=len(prefill_steps),
@@ -2440,6 +3220,7 @@ def run_sparse_attention(
                     "config": conv["config"], "pred": pred_text,
                     **flop_fields,
                 })
+                session.turns_emitted += 1
 
             # Advance the resident-length tracker by exactly what this turn
             # added to the session's KV: the submitted delta, plus every
@@ -2448,17 +3229,161 @@ def run_sparse_attention(
             # token was never fed back through the model, so it has no KV,
             # which is the same reason it's dropped before feeding the
             # ledger a few lines above.
-            target_resident_len += len(delta_ids) + len(actual_output_ids)
+            session.target_resident_len += len(delta_ids) + len(actual_output_ids)
 
-            state.complete_turn(result.kept_history_pairs, actual_output_ids)
+            session.state.complete_turn(result.kept_history_pairs, actual_output_ids)
+            session.pending = None
+            session.turn_idx += 1
+            if session.turn_idx >= len(conv["turns"]):
+                session.retired = True
+                session.retire_reason = "exhausted"
 
-        proposer.discard_conversation(conv["id"])
-        if session_started:
-            llm.llm_engine.abort_request([target_request_id])
-        if len(predictions) > turns_before:
-            conversations_processed += 1
+        # ---- Wave accounting. Each window below is one during which exactly
+        # one engine did exactly this wave's work and nothing else, so unlike
+        # the per-turn spans these do not double-count at N > 1.
+        stats["wave_seconds"].append(time.time() - t_wave_start)
+        stats["wave_occupancy"].append(len(running))
+        stats["spec_engine_seconds"].append(spec_wave_seconds)
+        stats["target_engine_seconds"].append(target_wave_seconds)
+        # Split each window the only way it can be split from outside the
+        # engine: at the point by which EVERY request in the wave had produced
+        # its first token. Before that the engine was still prefilling for
+        # someone; after it, everyone was decoding. The two parts sum exactly
+        # to the window, keeping `timing_model`'s exhaustive-by-construction
+        # discipline at wave granularity.
+        wave_target_prefill = max(
+            (v["target_prefill"] for v in target_stage_by_id.values()),
+            default=0.0)
+        stats["target_prefill_engine_seconds"].append(wave_target_prefill)
+        stats["target_decode_engine_seconds"].append(
+            max(0.0, target_wave_seconds - wave_target_prefill))
+        # Read from `results`, NOT from `session.pending` -- harvest clears
+        # `pending`, so reaching back through it here would silently read
+        # nothing and report a zero-length speculator prefill window.
+        wave_spec_prefill = max(
+            (r.stage_seconds.get("spec_prefill", 0.0) for r in results),
+            default=0.0)
+        # `spec_scoring` is recorded ONCE for the whole wave (on its first
+        # member) rather than per request -- the scoring RPC covers the wave,
+        # so summing per-request copies would N-times-overcount it. See
+        # `proposer.run_turns_and_score`.
+        wave_spec_scoring = sum(
+            r.stage_seconds.get("spec_scoring", 0.0) for r in results)
+        stats["spec_prefill_engine_seconds"].append(wave_spec_prefill)
+        stats["spec_scoring_engine_seconds"].append(wave_spec_scoring)
+        stats["spec_lookahead_engine_seconds"].append(
+            max(0.0, spec_wave_seconds - wave_spec_prefill - wave_spec_scoring))
 
+    progress.close()
     return predictions, stats
+
+
+def _kv_token_capacity(holder) -> Optional[int]:
+    """How many tokens of KV `holder`'s engine can hold at once, or None if
+    that is not readable.
+
+    Takes the LLM/proposer wrapper rather than the engine, so that even the
+    `.llm_engine` hop happens inside the guard -- a scorer object that does
+    not expose one must degrade to "cannot check", not crash the pre-flight
+    that exists to prevent a bad run.
+
+    Guarded end to end, and returning None rather than raising, on purpose:
+    this feeds a pre-flight WARNING/refusal, and killing an otherwise-valid
+    run because a vLLM field moved would be a worse failure than the one it is
+    trying to prevent. The caller says so out loud when it cannot check."""
+    try:
+        cache_config = holder.llm_engine.vllm_config.cache_config
+        num_blocks = getattr(cache_config, "num_gpu_blocks", None)
+        block_size = getattr(cache_config, "block_size", None)
+        if not num_blocks or not block_size:
+            return None
+        return int(num_blocks) * int(block_size)
+    except Exception:
+        return None
+
+
+def preflight_batch_kv_capacity(
+    llm, proposer, batch_conversations: int,
+    target_max_num_batched_tokens: int, max_tokens: int,
+    speculator_max_num_batched_tokens: Optional[int],
+) -> None:
+    """Refuse a batch size that cannot physically fit, BEFORE the run starts.
+
+    The single highest-value guard for batching on this dataset.
+    `prep_longbench_v2_multiturn.py` sizes every conversation to FILL
+    `--target-max-num-batched-tokens`, so N concurrent sessions need N times
+    that much resident KV. Without this check the failure mode is not a clean
+    crash: vLLM relieves KV pressure by PREEMPTING and recomputing, and a
+    preempted session's recomputed history is forced dense
+    (`sparse_target_runner._prefill_gather_applies`). The run then completes,
+    produces plausible numbers, and reports a row labelled as a sparse result
+    that spent much of its time dense. Hours of GPU time for a measurement of
+    the wrong thing.
+
+    **The ceiling is two-sided.** The speculator engine must ALSO hold N
+    concurrent full candidate-pool prompts, at `--speculator-gpu-memory-
+    utilization` (default 0.2) on a small model -- an independent limit that
+    is easy to forget because the speculator is the cheap one.
+
+    No-ops at `batch_conversations == 1`: the serial path's capacity is
+    whatever it always was, and this must not be able to start rejecting runs
+    that have been working.
+    """
+    if batch_conversations <= 1:
+        return
+
+    checks = [
+        ("target", _kv_token_capacity(llm),
+         batch_conversations * (target_max_num_batched_tokens + max_tokens),
+         "--target-gpu-memory-utilization"),
+    ]
+    if proposer is not None and speculator_max_num_batched_tokens:
+        checks.append((
+            "speculator", _kv_token_capacity(proposer),
+            batch_conversations * speculator_max_num_batched_tokens,
+            "--speculator-gpu-memory-utilization",
+        ))
+
+    for name, capacity, needed, util_flag in checks:
+        if capacity is None:
+            print(
+                f"[predict_scbench] WARNING: could not read the {name} "
+                f"engine's KV capacity, so --batch-conversations="
+                f"{batch_conversations} is UNCHECKED. If the run is preempted, "
+                f"num_preempted_turns and "
+                f"num_dense_fallback_prefill_before_turn_start will be "
+                f"non-zero and the row must not be read as a sparse result."
+            )
+            continue
+        print(
+            f"[predict_scbench] KV pre-flight ({name}): need "
+            f"{needed:,} tokens for {batch_conversations} concurrent "
+            f"sessions, have {capacity:,}."
+        )
+        if needed > capacity:
+            raise SystemExit(
+                f"--batch-conversations={batch_conversations} does not fit in "
+                f"the {name} engine's KV cache: {batch_conversations} x "
+                f"{needed // batch_conversations:,} = {needed:,} tokens "
+                f"needed, {capacity:,} available "
+                f"({capacity // (needed // batch_conversations)} sessions fit). "
+                f"\n"
+                f"This is refused rather than warned about because the "
+                f"failure mode is silent: vLLM would relieve the pressure by "
+                f"preempting and recomputing, the recomputed history would "
+                f"run DENSE, and the run would finish and report a "
+                f"sparse-labelled row that largely measured dense attention."
+                f"\n"
+                f"Options: lower --batch-conversations; raise {util_flag}; or "
+                f"-- on a prep_longbench_v2_multiturn.py dataset, where each "
+                f"conversation is deliberately sized to fill the whole "
+                f"budget -- re-prep at a smaller --doc-budget-tokens/"
+                f"--target-max-num-batched-tokens and pass the SAME "
+                f"--target-max-num-batched-tokens here. Note that shrinking "
+                f"documents also shrinks `d`, so run an N=1 control on the "
+                f"re-prepped file or the batch effect and the length effect "
+                f"cannot be separated."
+            )
 
 
 def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
@@ -2634,6 +3559,16 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         print(f"[predict_scbench] target cudagraph_mode="
               f"{args.target_cudagraph_mode} with compilation mode=NONE")
 
+    # One processor per run, built only when images are actually enabled. It
+    # is the ONLY thing that can expand `<image N>` markers into the model's
+    # real placeholder run, so `render_turn_query` needs it -- but a text-only
+    # run must not pay for loading it, nor require it to exist.
+    mm_processor = None
+    # Tolerate a synthetic Namespace with no `samples` (test_vllm_patch.py
+    # builds one), same reason as `limit_mm_images` below.
+    samples_dir = (Path(args.samples).resolve().parent
+                   if getattr(args, "samples", None) else None)
+
     # `getattr`, not `args.limit_mm_images`: `run_experiment` is called with a
     # synthetic `Namespace` by `test_vllm_patch.py` and by any programmatic
     # caller written before this flag existed. Those must keep the text-only
@@ -2653,6 +3588,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             "audio": 0,
         }
         if limit_mm_images:
+            from transformers import AutoProcessor
+
+            mm_processor = AutoProcessor.from_pretrained(
+                args.target_model, trust_remote_code=True)
             print(f"[predict_scbench] target is multimodal; image limit="
                   f"{limit_mm_images} (encoder cache RESERVED -- expect less KV)")
         else:
@@ -2741,6 +3680,16 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # over M000, five times the entire cost of the gather itself
         # (+2.1%). This flag is the main suspect for that gap.
         llm_kwargs["async_scheduling"] = bool(args.target_async_scheduling)
+    elif mode == "baseline":
+        # Explicit rather than inherited. M000 previously took no branch here
+        # at all and simply got vLLM's default (pipelined), which is why the
+        # two arms silently disagreed -- see `--baseline-async-scheduling`.
+        # At --batch-conversations 1 the resolved value is "on", i.e. exactly
+        # that same default, so every published M000 row still reproduces;
+        # setting it explicitly only removes the ability for the two arms to
+        # differ WITHOUT it being a deliberate choice recorded in the CSV.
+        llm_kwargs["async_scheduling"] = (
+            args.baseline_async_scheduling == "on")
     elif mode != "baseline":
         llm_kwargs["worker_cls"] = "vllm_patch.worker.SpecPrefillWorker"
 
@@ -3087,6 +4036,15 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             **proposer_kwargs,
         )
 
+    # Both engines exist by here (the scorer is built last), and nothing has
+    # been submitted yet -- the only point at which a batch size that cannot
+    # fit can still be refused cheaply.
+    preflight_batch_kv_capacity(
+        llm, proposer, args.batch_conversations,
+        target_max_num_batched_tokens, args.max_tokens,
+        speculator_max_num_batched_tokens,
+    )
+
     try:
         for rep in range(1, args.reps + 1):
             t0 = time.time()
@@ -3095,6 +4053,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     llm, tok, conversations, args.max_tokens,
                     target_max_num_batched_tokens,
                     target_min_tokens=args.target_min_tokens,
+                    processor=mm_processor,
+                    samples_dir=samples_dir if mm_processor else None,
+                    batch_conversations=args.batch_conversations,
+                    batch_refill=not args.no_batch_refill,
                 )
             elif mode in SPARSE_ARCH_MODES:
                 predictions, stats = run_sparse_attention(
@@ -3102,6 +4064,8 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     speculator_max_num_batched_tokens, target_max_num_batched_tokens,
                     sparse_prefill=args.sparse_prefill,
                     target_min_tokens=args.target_min_tokens,
+                    batch_conversations=args.batch_conversations,
+                    batch_refill=not args.no_batch_refill,
                 )
             else:
                 predictions, stats = run_specprefill(
@@ -3198,6 +4162,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             # does not exist.
             if getattr(args, "no_force_keep_query", False) and mode != "baseline":
                 scope_tag += " [force_keep=off]"
+            # Same convention once more. `batch_conversations` has its own
+            # column (it is a real grouping key), but the tag is what a human
+            # scanning all_runs.csv sees -- and a batched row must never be
+            # mistaken for a serial one, because its per-turn TIME columns are
+            # deliberately empty rather than merely different.
+            if args.batch_conversations > 1:
+                scope_tag += f" [batch={args.batch_conversations}]"
             row = {
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "exp_id": exp_id,
@@ -3293,6 +4264,33 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 "finish_other": stats["finish"]["other"],
                 **_flop_summary_fields(stats["flops"], elapsed, args.peak_tflops),
                 **_time_summary_fields(stats["turn_times"]),
+                # Engine-configuration provenance -- see CSV_FIELDS' own
+                # append-only block for why these are recorded at all.
+                # Records what the engine ACTUALLY ran with, per mode, not
+                # what a flag said. The sparse modes take
+                # --target-async-scheduling; baseline takes the resolved
+                # --baseline-async-scheduling (see that flag for why the two
+                # were silently different before, and why it matters once N>1
+                # makes the difference scale). run_specprefill sets neither
+                # and runs at vLLM's own default, so echoing a flag there
+                # would claim a configuration that row never applied.
+                "target_async_scheduling": (
+                    bool(args.target_async_scheduling)
+                    if mode in SPARSE_ARCH_MODES
+                    else (args.baseline_async_scheduling == "on"
+                          if mode == "baseline" else None)
+                ),
+                "target_cudagraph_mode": args.target_cudagraph_mode,
+                # Effective, not requested: `--batch-conversations` is
+                # honoured by run_baseline and run_sparse_attention only.
+                # run_specprefill has no wave loop, so reporting the flag for
+                # an M-k* row would claim a configuration it never applied --
+                # the same reasoning as `target_async_scheduling` above.
+                **_wave_summary_fields(
+                    stats,
+                    args.batch_conversations
+                    if mode == "baseline" or mode in SPARSE_ARCH_MODES else 1,
+                    elapsed),
             }
             append_csv_row(row)
             spc = row["seconds_per_conversation"]
@@ -3596,6 +4594,58 @@ def main() -> None:
              "rather than guessed from the device name -- an MFU against the "
              "wrong peak is worse than no MFU. Does not affect any FLOP count.",
     )
+    parser.add_argument(
+        "--batch-conversations", type=int, default=1,
+        help="How many conversations to advance CONCURRENTLY, as lockstep "
+             "waves: every active session takes one turn -- all scored in a "
+             "single speculator pass and driven in a single target pass -- "
+             "before any takes its next. Conversations are the only available "
+             "batch axis; turns within one are strictly ordered (turn N+1's "
+             "candidate pool depends on turn N's outcome). "
+             "DEFAULT 1 REPRODUCES THE SERIAL PATH EXACTLY, which is what "
+             "every published row was measured on. "
+             "At N>1 the per-turn wall-clock columns "
+             "(seconds_per_turn_mean and the per-stage time split) come back "
+             "EMPTY -- concurrent turns overlap, so a per-turn breakdown "
+             "would be double-counted rather than merely noisy; read the "
+             "*_engine_seconds and turns_per_second columns instead. "
+             "N is capped by KV capacity on BOTH engines and is pre-flighted "
+             "at startup. On a dataset built by "
+             "prep_longbench_v2_multiturn.py, each conversation is sized to "
+             "FILL --target-max-num-batched-tokens, so the ceiling is about "
+             "2; unlocking a higher N means re-prepping at a smaller "
+             "--doc-budget-tokens, not changing code.",
+    )
+    parser.add_argument(
+        "--baseline-async-scheduling", choices=("auto", "on", "off"),
+        default="auto",
+        help="Whether M000 runs with vLLM's pipelined async scheduling. "
+             "This exists because the two arms have NEVER agreed: "
+             "run_experiment sets async_scheduling only for SPARSE_ARCH_MODES "
+             "(default off, for a confirmed resumable-session race), so M000 "
+             "has always run PIPELINED while every SPARSE row ran serialized. "
+             "Serially that was a constant offset. Under batching it is not: "
+             "async scheduling overlaps request B's scheduling with request "
+             "A's execution -- the exact thing batching exists to exploit -- "
+             "so the offset SCALES with N and a batched M000-vs-SPARSE "
+             "throughput comparison stops being interpretable. "
+             "'auto' (default) keeps vLLM's default ON at "
+             "--batch-conversations 1, reproducing every published M000 row, "
+             "and matches --target-async-scheduling at N>1. 'on'/'off' force "
+             "it. A mismatch at N>1 is a startup error, not a warning.",
+    )
+    parser.add_argument(
+        "--no-batch-refill", action="store_true",
+        help="Drain each wave instead of topping it back up. By default a "
+             "conversation that finishes (or retires on a pre-flight budget "
+             "check) is immediately replaced from the queue, which keeps the "
+             "GPU busy but makes the effective batch size vary over the run "
+             "(reported as batch_occupancy_mean). This flag holds the wave "
+             "membership fixed until every member is done, giving a "
+             "strictly-constant-N window at the cost of idle slots -- use it "
+             "when batch size is the independent variable and occupancy "
+             "variation would confound the comparison.",
+    )
     parser.add_argument("--max-conversations", type=int, default=-1)
     parser.add_argument(
         "--chunk-size", default=None,
@@ -3612,6 +4662,36 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
+
+    # Resolve --baseline-async-scheduling before anything is built, so a
+    # mismatched pair fails in the first second rather than after hours of
+    # producing a comparison nobody can read.
+    if args.baseline_async_scheduling == "auto":
+        args.baseline_async_scheduling = (
+            "on" if args.batch_conversations == 1
+            else ("on" if args.target_async_scheduling else "off")
+        )
+    elif args.batch_conversations > 1:
+        target_on = bool(args.target_async_scheduling)
+        if (args.baseline_async_scheduling == "on") != target_on:
+            raise SystemExit(
+                f"--baseline-async-scheduling="
+                f"{args.baseline_async_scheduling!r} contradicts "
+                f"--target-async-scheduling={target_on} at "
+                f"--batch-conversations={args.batch_conversations}. Async "
+                f"scheduling overlaps one request's scheduling with another's "
+                f"execution, so its effect grows with the batch size -- with "
+                f"the arms set differently, a batched M000-vs-SPARSE "
+                f"throughput comparison measures the scheduler difference as "
+                f"much as the attention one. Set both the same, or drop to "
+                f"--batch-conversations 1 where the offset is constant."
+            )
+
+    if args.batch_conversations < 1:
+        raise SystemExit(
+            f"--batch-conversations must be >= 1, got "
+            f"{args.batch_conversations}. 1 is the serial path."
+        )
 
     if args.list:
         for exp_id, cfg in EXPERIMENTS.items():

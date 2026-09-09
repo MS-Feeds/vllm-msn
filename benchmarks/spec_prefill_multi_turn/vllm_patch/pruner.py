@@ -210,7 +210,7 @@ def compute_pruned_turn(
     """Runs one turn of the speculator-based pruning path: asks
     `conversation_state` for this turn's candidate pool (KEEP/DISCARD, see
     that module), submits it to the speculator via
-    `SpecPrefillProposer.run_turn_and_score`, which does K retrieval AND
+    `SpecPrefillProposer.run_turns_and_score`, which does K retrieval AND
     scoring IN-PROCESS inside the speculator's own worker (see that
     method's docstring, and `speculator_worker.py::end_capture_and_score`'s,
     for why: a first real run measured the OLD design -- ship Q back here,
@@ -224,7 +224,12 @@ def compute_pruned_turn(
     `SamplingParams.ignore_eos`, not any id passed around out-of-band; see
     `proposer.py::run_turn`'s docstring for the real-hardware finding this
     fixes). Early stopping is instead controlled by `spec_config.ignore_eos`
-    directly, threaded straight into `proposer.run_turn_and_score`.
+    directly, threaded straight into `proposer.run_turns_and_score`.
+
+    A one-element wrapper over `compute_pruned_turns` below -- everything
+    described here is that function's behaviour at wave size 1. Kept as its
+    own name because it is what every non-batched caller uses and what
+    `--batch-conversations 1` must reproduce exactly.
 
     Does NOT call `conversation_state.complete_turn` -- the caller
     (`predict_scbench.py`) must do that itself once it also knows this
@@ -237,43 +242,97 @@ def compute_pruned_turn(
     check the kept-token count against a budget before committing to
     `add_request`, same as `predict_longbench_v2.py`'s `submit_pruned_requests`).
     """
-    candidate_pool, force_keep_query = conversation_state.begin_turn(query_token_ids)
-    full_sequence = candidate_pool + force_keep_query
-    full_token_ids = [tid for tid, _ in full_sequence]
+    return compute_pruned_turns(
+        proposer, spec_config, [(conversation_state, query_token_ids)]
+    )[0]
 
-    (kept_local_indices, actual_look_ahead_cnt, num_cached_tokens,
-     stage_seconds) = proposer.run_turn_and_score(
-        conversation_salt=conversation_state.conversation_id,
-        turn_idx=conversation_state.turn_idx,
-        full_sequence_token_ids=full_token_ids,
-        look_ahead_cnt=spec_config.look_ahead_cnt,
-        pool_kernel_size=spec_config.pool_kernel_size,
-        keep_kwargs=spec_config.keep_kwargs,
-        ignore_eos=spec_config.ignore_eos,
-        # Scoring variants (ACCURACY_IMPROVEMENTS.md §1) -- threaded from the
-        # driver's SpecConfig because the speculator's worker process has no
-        # access to it, same reason `keep_kwargs`/`pool_kernel_size` are
-        # passed rather than read.
-        score_aggregation=spec_config.score_aggregation,
-        score_layers=spec_config.score_layers,
-        score_head_set=spec_config.score_head_set,
-        mask_sliding_window=spec_config.mask_sliding_window,
-    )
 
-    pruned_token_ids, kept_positions, orig_len, kept_history_pairs = _positions_from_kept_indices(
-        candidate_pool, force_keep_query, kept_local_indices,
-        force_keep=spec_config.force_keep_query,
-    )
+def compute_pruned_turns(
+    proposer: SpecPrefillProposer,
+    spec_config: SpecConfig,
+    work: List[Tuple[ConversationState, List[int]]],
+) -> List[PrunedTurnResult]:
+    """`compute_pruned_turn` for a WAVE of conversations, scored in one
+    speculator pass. Returns one `PrunedTurnResult` per `(state, query)` pair,
+    in the order given.
 
-    return PrunedTurnResult(
-        pruned_token_ids=pruned_token_ids,
-        kept_positions=kept_positions,
-        orig_len=orig_len,
-        kept_history_pairs=kept_history_pairs,
-        actual_look_ahead_cnt=actual_look_ahead_cnt,
-        num_cached_tokens=num_cached_tokens,
-        stage_seconds=stage_seconds,
-    )
+    This is what `predict_scbench.py`'s `--batch-conversations` calls;
+    `compute_pruned_turn` is now a one-element wrapper over it, so the
+    single-conversation path and the batched one cannot drift.
+
+    Three stages, and the split matters:
+
+    1. **`begin_turn` for every conversation first.** Pure ledger bookkeeping
+       inside each `ConversationState` -- no engine involved, no shared state
+       between conversations, so doing all of them up front is safe and keeps
+       the engine-touching stage contiguous.
+    2. **One `proposer.run_turns_and_score` call** for the whole wave. This is
+       the only stage that touches the speculator engine, and the only one
+       that batching actually speeds up.
+    3. **`_positions_from_kept_indices` per conversation**, unchanged --
+       including the `force_keep=spec_config.force_keep_query` behaviour that
+       `--no-force-keep-query` switches off.
+
+    Conversations in a wave are independent by construction: a turn's scoring
+    depends on its OWN prior turns (which is why turns within a conversation
+    can never be batched), never on another conversation's. That is the whole
+    reason the batch axis is across conversations rather than across turns.
+    """
+    if not work:
+        return []
+
+    prepared = []
+    for conversation_state, query_token_ids in work:
+        candidate_pool, force_keep_query = conversation_state.begin_turn(query_token_ids)
+        full_sequence = candidate_pool + force_keep_query
+        prepared.append((
+            conversation_state,
+            candidate_pool,
+            force_keep_query,
+            [tid for tid, _ in full_sequence],
+        ))
+
+    scored = proposer.run_turns_and_score([
+        {
+            "conversation_salt": state.conversation_id,
+            "turn_idx": state.turn_idx,
+            "full_sequence_token_ids": full_token_ids,
+            "look_ahead_cnt": spec_config.look_ahead_cnt,
+            "pool_kernel_size": spec_config.pool_kernel_size,
+            "keep_kwargs": spec_config.keep_kwargs,
+            "ignore_eos": spec_config.ignore_eos,
+            # Scoring variants (ACCURACY_IMPROVEMENTS.md section 1) -- threaded
+            # from the driver's SpecConfig because the speculator's worker
+            # process has no access to it, the same reason `keep_kwargs`/
+            # `pool_kernel_size` are passed rather than read.
+            "score_aggregation": spec_config.score_aggregation,
+            "score_layers": spec_config.score_layers,
+            "score_head_set": spec_config.score_head_set,
+            "mask_sliding_window": spec_config.mask_sliding_window,
+        }
+        for state, _pool, _fkq, full_token_ids in prepared
+    ])
+
+    results = []
+    for (_state, candidate_pool, force_keep_query, _ids), (
+        kept_local_indices, actual_look_ahead_cnt, num_cached_tokens,
+        stage_seconds,
+    ) in zip(prepared, scored):
+        (pruned_token_ids, kept_positions, orig_len,
+         kept_history_pairs) = _positions_from_kept_indices(
+            candidate_pool, force_keep_query, kept_local_indices,
+            force_keep=spec_config.force_keep_query,
+        )
+        results.append(PrunedTurnResult(
+            pruned_token_ids=pruned_token_ids,
+            kept_positions=kept_positions,
+            orig_len=orig_len,
+            kept_history_pairs=kept_history_pairs,
+            actual_look_ahead_cnt=actual_look_ahead_cnt,
+            num_cached_tokens=num_cached_tokens,
+            stage_seconds=stage_seconds,
+        ))
+    return results
 
 
 def prune_and_add_turn(
