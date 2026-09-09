@@ -2634,10 +2634,40 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         print(f"[predict_scbench] target cudagraph_mode="
               f"{args.target_cudagraph_mode} with compilation mode=NONE")
 
+    # `getattr`, not `args.limit_mm_images`: `run_experiment` is called with a
+    # synthetic `Namespace` by `test_vllm_patch.py` and by any programmatic
+    # caller written before this flag existed. Those must keep the text-only
+    # default rather than raising AttributeError.
+    limit_mm_images = getattr(args, "limit_mm_images", 0)
     if has_multimodal_tower(args.target_model):
-        llm_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0, "audio": 0}
-        print("[predict_scbench] target is multimodal; zeroing modality limits "
-              "(text-only workload, avoids the encoder-cache reservation)")
+        # `--limit-mm-images` defaults to 0, which reproduces every published
+        # text-only row byte-identically: all-zero limits leave
+        # `active_modalities` empty, so nothing is profiled and nothing is
+        # reserved (see the traced explanation above). A non-zero value is the
+        # multimodal port's opt-in, and it is NOT free -- it re-enables both
+        # the encoder-cache reservation and its profiling run, so expect less
+        # KV budget and re-check the per-conversation length ceilings.
+        llm_kwargs["limit_mm_per_prompt"] = {
+            "image": limit_mm_images,
+            "video": 0,
+            "audio": 0,
+        }
+        if limit_mm_images:
+            print(f"[predict_scbench] target is multimodal; image limit="
+                  f"{limit_mm_images} (encoder cache RESERVED -- expect less KV)")
+        else:
+            print("[predict_scbench] target is multimodal; zeroing modality limits "
+                  "(text-only workload, avoids the encoder-cache reservation)")
+    elif limit_mm_images:
+        # Fail loudly rather than no-op: the branch above is the ONLY place
+        # the limit is applied, so a non-zero flag against a text-only
+        # checkpoint would silently run a text-only sweep and look like it
+        # had honoured the request.
+        raise SystemExit(
+            f"--limit-mm-images={limit_mm_images} but the target checkpoint "
+            f"{args.target_model} has no vision/audio tower, so images could never "
+            "reach the model. This is a misconfiguration, not a no-op."
+        )
     if mode in SPARSE_ARCH_MODES:
         # The hybrid KV cache manager stays ENABLED here, deliberately.
         #
@@ -3022,6 +3052,31 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         proposer_kwargs = {}
         if scorer_num_layers:
             proposer_kwargs["hf_overrides"] = {"num_hidden_layers": scorer_num_layers}
+        if limit_mm_images:
+            # The speculator's engine zeroes modality limits on its own
+            # (`proposer.py`'s `setdefault`), which would leave it rejecting
+            # the very prompts the target accepts. `SpecPrefillProposer`
+            # applies `extra_llm_kwargs` AFTER that setdefault, so this wins.
+            #
+            # Both engines MUST carry the SAME limit. The gate
+            # (`validate_mm_token_alignment.py`) establishes that the pair
+            # expands an image into the same number of POSITIONS; a mismatched
+            # limit breaks the pair a different way -- one engine refusing a
+            # prompt the other already accepted, mid-conversation, after the
+            # resident cache has been built.
+            if not has_multimodal_tower(scorer_model):
+                raise SystemExit(
+                    f"--limit-mm-images={limit_mm_images} requires a speculator with a "
+                    f"vision tower, but {scorer_model} has none. The speculator scores the "
+                    "candidate pool that the target prunes against; if it cannot see the "
+                    "image tokens the target holds, pruner.py's local->absolute position "
+                    "translation silently corrupts. Run validate_mm_token_alignment.py."
+                )
+            proposer_kwargs["limit_mm_per_prompt"] = {
+                "image": limit_mm_images,
+                "video": 0,
+                "audio": 0,
+            }
         proposer = SpecPrefillProposer(
             speculator_model_path=scorer_model,
             device=speculator_device,
@@ -3490,6 +3545,16 @@ def main() -> None:
              "the same device slot.",
     )
     parser.add_argument("--target-max-num-batched-tokens", type=int, default=131072)
+    parser.add_argument(
+        "--limit-mm-images", type=int, default=0,
+        help="Max images per prompt, applied to BOTH engines. Default 0 keeps "
+             "the pipeline text-only and reproduces every published row "
+             "byte-identically (all-zero modality limits skip the encoder-cache "
+             "reservation and its profiling run entirely). Set >0 only for a "
+             "multimodal target/speculator pair that has PASSED "
+             "validate_mm_token_alignment.py -- an unverified pair corrupts "
+             "pruner.py's position translation silently. Costs KV budget.",
+    )
     parser.add_argument(
         "--speculator-max-num-batched-tokens", type=int, default=131072,
         help="Clamped down to the speculator checkpoint's own native "

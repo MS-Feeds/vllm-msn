@@ -387,7 +387,7 @@ def main() -> None:
 
     print("\n=== B. The gate: per-image token cost, target vs speculator ===")
     print(f"{'size':>12}  {'target':>17}  {'speculator':>17}  verdict")
-    mismatches, errors, marginals_t, all_spans_ok = [], [], [], True
+    mismatches, errors, probes_ok, all_spans_ok = [], [], [], True
     for (w, h) in sizes:
         label = f"{w}x{h}"
         try:
@@ -406,7 +406,7 @@ def main() -> None:
         print(f"{label:>12}  {_fmt(rt):>17}  {_fmt(rs):>17}  {'OK' if ok else 'MISMATCH'}")
         if not ok:
             mismatches.append((label, f"target {rt['marginal']} vs speculator {rs['marginal']}"))
-        marginals_t.append(rt["marginal"])
+        probes_ok.append(((w, h), rt["marginal"]))
         for who, r in (("target", rt), ("speculator", rs)):
             if r["spans"] and len(r["spans"]) != 1:
                 all_spans_ok = False
@@ -417,7 +417,7 @@ def main() -> None:
     print("\n=== C. Contiguity (force-keep-whole-image assumption) ===")
     if tid_t is None or tid_s is None:
         print("[SKIP] placeholder token id unresolved.")
-    elif not marginals_t:
+    elif not probes_ok:
         print("[SKIP] no successful probes.")
     elif all_spans_ok:
         print("[OK]   every image expands to exactly ONE contiguous run of placeholders; "
@@ -426,17 +426,43 @@ def main() -> None:
         print("[WARN] at least one image expands to MULTIPLE disjoint runs. Step 5's "
               "force-keep needs a list of intervals per image, not one span.")
 
-    print("\n=== D. Resolution dependence (budget arithmetic) ===")
-    distinct = sorted(set(marginals_t))
-    if len(distinct) == 1:
+    print("\n=== D. What drives per-image cost (budget arithmetic) ===")
+    by_cost = {}
+    for (size, cost) in probes_ok:
+        by_cost.setdefault(cost, []).append(size)
+    distinct = sorted(by_cost)
+    if not distinct:
+        print("[SKIP] no successful probes.")
+    elif len(distinct) == 1:
         print(f"[OK]   constant {distinct[0]} tokens per image across all probes -- the "
               "sample-schema budget can use a single per-image constant.")
-    elif not distinct:
-        print("[SKIP] no successful probes.")
     else:
-        print(f"[WARN] per-image token cost VARIES with resolution: {distinct}. The prep-time "
-              "budget must compute per-image cost from the actual image rather than a "
-              "constant; see datasets/prep_longbench_v2_multiturn.py's Budget.")
+        print(f"[WARN] per-image token cost is NOT constant: {distinct}.")
+        for cost in distinct:
+            sizes_at = by_cost[cost]
+            ratios = sorted({round(w / h, 3) for (w, h) in sizes_at})
+            areas = sorted({w * h for (w, h) in sizes_at})
+            print(f"         {cost:>4} tokens: "
+                  f"{', '.join(f'{w}x{h}' for (w, h) in sizes_at)}")
+            print(f"                      aspect {ratios}  area range "
+                  f"{areas[0]}..{areas[-1]}")
+        # Separate the two candidate explanations rather than asserting one.
+        # If every group is aspect-homogeneous while areas overlap wildly
+        # within a group, the driver is SHAPE, not size -- and a budget that
+        # keys off pixel count would be wrong in both directions.
+        aspect_pure = all(
+            len({round(w / h, 3) for (w, h) in v}) == 1 for v in by_cost.values()
+        )
+        spans_area = any(
+            len({w * h for (w, h) in v}) > 1 for v in by_cost.values()
+        )
+        if aspect_pure and spans_area:
+            print("         -> each cost group is aspect-ratio-pure while spanning a wide "
+                  "area range, so the driver is the image's SHAPE, not its size. A budget "
+                  "keyed off pixel count or longest edge would be wrong.")
+        print("         The prep-time budget must MEASURE each image's real token cost by "
+              "running the processor, not infer it. See "
+              "datasets/prep_longbench_v2_multiturn.py's Budget.")
 
     print("\n=== Verdict ===")
     if mismatches:
@@ -446,7 +472,7 @@ def main() -> None:
         print("       Do NOT proceed with the multimodal port using this model pair. The "
               "local->absolute position translation in pruner.py would corrupt silently.")
         sys.exit(EXIT_FAIL)
-    if errors or not marginals_t:
+    if errors or not probes_ok:
         print("[INCONCLUSIVE] no resolution produced a comparable pair of counts:")
         for (label, why) in errors:
             print(f"         {label}: {why}")
@@ -454,7 +480,7 @@ def main() -> None:
               "disagree. The gate has not been evaluated.")
         sys.exit(EXIT_INCONCLUSIVE)
     print("[PASS] GATE PASSED -- both models expand an image into the same number of "
-          f"positions at every probed resolution ({len(marginals_t)}/{len(sizes)} probes).")
+          f"positions at every probed shape ({len(probes_ok)}/{len(sizes)} probes).")
     print("       Safe to proceed to step 2 (un-zero limit_mm_per_prompt).")
 
 

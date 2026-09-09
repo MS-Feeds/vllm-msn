@@ -192,6 +192,19 @@ _METRIC_BY_CONFIG = {
     # answer", not "low overlap" -- averages across a mix of these configs would
     # not be meaningful, which is why the report breaks down by config.
     "longbench_v2_mc": multiple_choice_letter,
+    # Synthetic multi-turn MMMU (datasets/prep_mmmu_multiturn.py). Same
+    # discrete letter match as longbench_v2_mc.
+    #
+    # Read this row with care: MMMU items are mutually INDEPENDENT, so every
+    # turn's answer lives entirely in that turn's own force-kept question and
+    # images, and nothing an earlier turn contributed is ever needed again. A
+    # flat score across the whole keep-rate grid is therefore the EXPECTED
+    # null result, not evidence that sparsity is harmless -- the same trap as
+    # the flat scbench_summary row. What a DROP here means is real: the sparse
+    # path has broken something structural in the multimodal mechanism (a
+    # partially-kept image span, a slipped position translation, image KV the
+    # gather mishandled). Regression test, not selection quality.
+    "mmmu_mc": multiple_choice_letter,
 }
 
 
