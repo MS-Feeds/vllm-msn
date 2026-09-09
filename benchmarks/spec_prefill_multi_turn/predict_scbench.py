@@ -3306,6 +3306,8 @@ def preflight_batch_kv_capacity(
     llm, proposer, batch_conversations: int,
     target_max_num_batched_tokens: int, max_tokens: int,
     speculator_max_num_batched_tokens: Optional[int],
+    target_model: Optional[str] = None,
+    speculator_model: Optional[str] = None,
 ) -> None:
     """Refuse a batch size that cannot physically fit, BEFORE the run starts.
 
@@ -3325,6 +3327,19 @@ def preflight_batch_kv_capacity(
     utilization` (default 0.2) on a small model -- an independent limit that
     is easy to forget because the speculator is the cheap one.
 
+    **`num_gpu_blocks * block_size` is only a FACT on a uniform
+    full-attention model.** On an interleaved one -- Gemma 4, run with the
+    hybrid KV cache manager this pipeline deliberately leaves enabled -- the
+    sliding layers keep only their own window and sit in their own KV cache
+    group, with a block size that `unify_kv_cache_spec_page_size` may have
+    changed from the configured one (see
+    `sparse_target_runner._gatherable_group_block_size`). Blocks are then
+    consumed at different rates per group and the product stops describing a
+    per-sequence capacity. So on such a model this REPORTS the estimate and
+    warns, but does NOT refuse: wrongly blocking a Gemma 4 run that would
+    have fit is a worse outcome than the silent degradation this guards
+    against, which the dense-fallback counters catch anyway.
+
     No-ops at `batch_conversations == 1`: the serial path's capacity is
     whatever it always was, and this must not be able to start rejecting runs
     that have been working.
@@ -3332,19 +3347,23 @@ def preflight_batch_kv_capacity(
     if batch_conversations <= 1:
         return
 
+    from vllm_patch.model_structure import has_sliding_window_layers
+
     checks = [
         ("target", _kv_token_capacity(llm),
          batch_conversations * (target_max_num_batched_tokens + max_tokens),
-         "--target-gpu-memory-utilization"),
+         "--target-gpu-memory-utilization", target_model),
     ]
     if proposer is not None and speculator_max_num_batched_tokens:
         checks.append((
             "speculator", _kv_token_capacity(proposer),
             batch_conversations * speculator_max_num_batched_tokens,
-            "--speculator-gpu-memory-utilization",
+            "--speculator-gpu-memory-utilization", speculator_model,
         ))
 
-    for name, capacity, needed, util_flag in checks:
+    for name, capacity, needed, util_flag, model_path in checks:
+        interleaved = (
+            has_sliding_window_layers(model_path) if model_path else None)
         if capacity is None:
             print(
                 f"[predict_scbench] WARNING: could not read the {name} "
@@ -3358,8 +3377,36 @@ def preflight_batch_kv_capacity(
         print(
             f"[predict_scbench] KV pre-flight ({name}): need "
             f"{needed:,} tokens for {batch_conversations} concurrent "
-            f"sessions, have {capacity:,}."
+            f"sessions, have {capacity:,}"
+            + (" (ESTIMATE -- interleaved attention, see below)"
+               if interleaved else "")
+            + "."
         )
+        if needed > capacity and interleaved is not False:
+            # Interleaved (Gemma 4) or undetermined: the arithmetic above is
+            # not a per-sequence capacity, so warn rather than refuse. Blocking
+            # a run that would have fit is worse than the degradation this
+            # guards against -- and that degradation is separately detectable
+            # in the output, which a wrongly-refused run is not.
+            print(
+                f"[predict_scbench] WARNING: {name} KV looks too small for "
+                f"--batch-conversations={batch_conversations} "
+                f"({needed:,} needed vs {capacity:,} estimated), but "
+                + ("this model interleaves sliding-window and full attention, "
+                   "so its sliding layers keep only their own window in their "
+                   "own KV cache group and 'num_gpu_blocks x block_size' is "
+                   "not its real per-sequence capacity"
+                   if interleaved else
+                   "whether it interleaves attention could not be determined")
+                + f". NOT refusing on an estimate. Watch "
+                f"num_preempted_turns and "
+                f"num_dense_fallback_prefill_before_turn_start in the output "
+                f"row -- if either is non-zero the run was preempted, its "
+                f"recomputed history ran DENSE, and the row must not be read "
+                f"as a sparse result. Lower --batch-conversations or raise "
+                f"{util_flag} if so."
+            )
+            continue
         if needed > capacity:
             raise SystemExit(
                 f"--batch-conversations={batch_conversations} does not fit in "
@@ -4043,6 +4090,8 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         llm, proposer, args.batch_conversations,
         target_max_num_batched_tokens, args.max_tokens,
         speculator_max_num_batched_tokens,
+        target_model=args.target_model,
+        speculator_model=scorer_model,
     )
 
     try:

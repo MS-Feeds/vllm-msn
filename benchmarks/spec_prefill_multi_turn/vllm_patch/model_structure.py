@@ -17,7 +17,7 @@ does not raise -- it hooks nothing, and the first symptom is an all-empty
 query buffer scoring as NaN several steps later.
 """
 
-from typing import List
+from typing import List, Optional
 
 
 def unwrap_text_stack(model):
@@ -200,6 +200,59 @@ def native_context_length(model_path: str):
         config.get_text_config() if hasattr(config, "get_text_config") else config
     )
     return getattr(text_config, "max_position_embeddings", None)
+
+
+def has_sliding_window_layers(model_path: str) -> Optional[bool]:
+    """Whether this checkpoint interleaves sliding-window attention with full
+    attention. `None` when it cannot be determined.
+
+    Not a curiosity: it decides whether "tokens of KV that fit" is even a
+    well-defined quantity. On a uniform full-attention model (Llama) every
+    layer stores the whole context, so
+    `num_gpu_blocks * block_size` really is the per-sequence capacity. On an
+    interleaved model (Gemma 4) run with the hybrid KV cache manager -- which
+    this pipeline deliberately leaves ENABLED, see `predict_scbench.py`'s
+    engine-construction block -- the sliding layers keep only their own window
+    and live in their own KV cache group with its own block size. Blocks are
+    then consumed at different rates per group, and that product stops
+    describing anything. `preflight_batch_kv_capacity` uses this to decide
+    whether its arithmetic is a fact or an estimate.
+
+    Three signals, in order of reliability, all read off the TEXT config for
+    the same reason `native_context_length` does (a multimodal wrapper has
+    none of these attributes):
+
+    1. `layer_types` -- Transformers' explicit per-layer list, present on
+       Gemma 3/4 and the most direct statement available.
+    2. `sliding_window_pattern`/`interleaved_sliding_window` -- the older
+       spelling of the same idea.
+    3. A bare `sliding_window` that is set, with no pattern -- every layer
+       slides, so there is still only one regime and the product holds; this
+       returns False, since what matters here is whether layers DIFFER.
+
+    Returns None rather than guessing if the config cannot be loaded at all --
+    the caller degrades to "cannot check" instead of refusing a run.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        text_config = (
+            config.get_text_config() if hasattr(config, "get_text_config") else config
+        )
+    except Exception:
+        return None
+
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types:
+        return len(set(layer_types)) > 1
+
+    for attr in ("sliding_window_pattern", "interleaved_sliding_window"):
+        value = getattr(text_config, attr, None)
+        if value:
+            return True
+
+    return False
 
 
 def load_tokenizer(model_path: str, **kwargs):

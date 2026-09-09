@@ -6336,27 +6336,96 @@ def test_preflight_batch_kv_capacity_is_a_noop_at_batch_one():
     )  # must not raise
 
 
-def test_preflight_batch_kv_capacity_refuses_a_batch_that_cannot_fit():
-    """Refused, not warned about, because the failure is SILENT: vLLM would
-    relieve the pressure by preempting, the recomputed history would run
+class _PatchedSlidingWindowDetection:
+    """Force `has_sliding_window_layers`'s answer for the duration of a test.
+
+    The pre-flight imports it inside the function body, so replacing the
+    module attribute is enough -- and it means these tests never touch a real
+    checkpoint."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        from vllm_patch import model_structure
+
+        self.module = model_structure
+        self.original = model_structure.has_sliding_window_layers
+        model_structure.has_sliding_window_layers = lambda path: self.value
+        return self
+
+    def __exit__(self, *exc):
+        self.module.has_sliding_window_layers = self.original
+        return False
+
+
+def test_preflight_batch_kv_capacity_refuses_on_a_uniform_attention_model():
+    """On a uniform full-attention model (Llama) every layer stores the whole
+    context, so `num_gpu_blocks * block_size` really is the per-sequence
+    capacity and an over-commit is a FACT, not an estimate.
+
+    Refused rather than warned about, because the failure is SILENT: vLLM
+    would relieve the pressure by preempting, the recomputed history would run
     dense, and the run would finish and report a sparse-labelled row that
     largely measured dense attention."""
     from predict_scbench import preflight_batch_kv_capacity
 
     # 8192 blocks x 16 = 131,072 tokens: exactly one session's worth.
     llm = _FakeLLMWithCache(_FakeCacheEngine(num_gpu_blocks=8192, block_size=16))
-    try:
+    with _PatchedSlidingWindowDetection(False):
+        try:
+            preflight_batch_kv_capacity(
+                llm, None, batch_conversations=2,
+                target_max_num_batched_tokens=130560, max_tokens=512,
+                speculator_max_num_batched_tokens=None,
+                target_model="/ckpt/Llama-3.1-8B-Instruct",
+            )
+        except SystemExit as exc:
+            msg = str(exc)
+            assert "--batch-conversations=2" in msg
+            assert "doc-budget-tokens" in msg, "must name the re-prep escape hatch"
+        else:
+            raise AssertionError("expected SystemExit for an over-committed batch")
+
+
+def test_preflight_batch_kv_capacity_only_warns_on_an_interleaved_model():
+    """Gemma 4 interleaves sliding-window and full attention, and this
+    pipeline deliberately leaves the hybrid KV cache manager ENABLED -- so its
+    sliding layers keep only their own window, in their own KV cache group,
+    at a block size `unify_kv_cache_spec_page_size` may have changed. Blocks
+    are consumed at different rates per group and the product stops being a
+    per-sequence capacity.
+
+    Refusing on that arithmetic would block Gemma 4 runs that fit. Since the
+    degradation it guards against IS separately detectable in the output
+    (`num_preempted_turns`, `num_dense_fallback_prefill_before_turn_start`)
+    while a wrongly-refused run is not, this warns instead."""
+    from predict_scbench import preflight_batch_kv_capacity
+
+    llm = _FakeLLMWithCache(_FakeCacheEngine(num_gpu_blocks=8192, block_size=16))
+    with _PatchedSlidingWindowDetection(True):
         preflight_batch_kv_capacity(
             llm, None, batch_conversations=2,
             target_max_num_batched_tokens=130560, max_tokens=512,
             speculator_max_num_batched_tokens=None,
-        )
-    except SystemExit as exc:
-        msg = str(exc)
-        assert "--batch-conversations=2" in msg
-        assert "doc-budget-tokens" in msg, "must name the re-prep escape hatch"
-    else:
-        raise AssertionError("expected SystemExit for an over-committed batch")
+            target_model="/ckpt/gemma-4-31b",
+        )  # must NOT raise
+
+
+def test_preflight_batch_kv_capacity_does_not_refuse_when_the_regime_is_unknown():
+    """`has_sliding_window_layers` returns None when the config cannot be
+    loaded. An unloadable config is not evidence of an over-commit, so this
+    degrades to the same warning rather than killing the run."""
+    from predict_scbench import preflight_batch_kv_capacity
+
+    llm = _FakeLLMWithCache(_FakeCacheEngine(num_gpu_blocks=8192, block_size=16))
+    with _PatchedSlidingWindowDetection(None):
+        preflight_batch_kv_capacity(
+            llm, None, batch_conversations=2,
+            target_max_num_batched_tokens=130560, max_tokens=512,
+            speculator_max_num_batched_tokens=None,
+            target_model="/ckpt/mystery",
+        )  # must NOT raise
 
 
 def test_preflight_batch_kv_capacity_checks_the_speculator_too():
@@ -6370,17 +6439,20 @@ def test_preflight_batch_kv_capacity_checks_the_speculator_too():
         _FakeCacheEngine(num_gpu_blocks=100000, block_size=16))
     cramped_scorer = _FakeProposerWithCache(
         _FakeCacheEngine(num_gpu_blocks=1000, block_size=16))
-    try:
-        preflight_batch_kv_capacity(
-            roomy_target, cramped_scorer, batch_conversations=2,
-            target_max_num_batched_tokens=130560, max_tokens=512,
-            speculator_max_num_batched_tokens=131063,
-        )
-    except SystemExit as exc:
-        assert "speculator" in str(exc)
-        assert "--speculator-gpu-memory-utilization" in str(exc)
-    else:
-        raise AssertionError("expected the speculator ceiling to be enforced")
+    with _PatchedSlidingWindowDetection(False):
+        try:
+            preflight_batch_kv_capacity(
+                roomy_target, cramped_scorer, batch_conversations=2,
+                target_max_num_batched_tokens=130560, max_tokens=512,
+                speculator_max_num_batched_tokens=131063,
+                target_model="/ckpt/Llama-3.1-8B-Instruct",
+                speculator_model="/ckpt/Llama-3.2-1B-Instruct",
+            )
+        except SystemExit as exc:
+            assert "speculator" in str(exc)
+            assert "--speculator-gpu-memory-utilization" in str(exc)
+        else:
+            raise AssertionError("expected the speculator ceiling to be enforced")
 
 
 def test_preflight_batch_kv_capacity_warns_rather_than_dies_when_unreadable():
@@ -6422,6 +6494,69 @@ def test_serial_run_keeps_per_turn_time_and_carries_no_batch_tag():
 
     assert row["batch_conversations"] is None or row["batch_conversations"] == 1
     assert "[batch=" not in row["label"]
+
+
+
+def test_has_sliding_window_layers_distinguishes_the_two_kv_regimes():
+    """Whether a checkpoint interleaves attention decides whether
+    `num_gpu_blocks * block_size` is a per-sequence capacity or a meaningless
+    product -- which is what `preflight_batch_kv_capacity` keys its
+    refuse-vs-warn behaviour on.
+
+    Reads the TEXT config, for the same reason `native_context_length` does:
+    a multimodal wrapper (Gemma 4 loads as `Gemma4ForConditionalGeneration`)
+    carries none of these attributes."""
+    import transformers
+    from vllm_patch.model_structure import has_sliding_window_layers
+
+    class _TextConfig:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class _Wrapper:
+        def __init__(self, text):
+            self._text = text
+
+        def get_text_config(self):
+            return self._text
+
+    saved = transformers.AutoConfig.from_pretrained
+    try:
+        def _serve(cfg):
+            transformers.AutoConfig.from_pretrained = staticmethod(
+                lambda *a, **k: cfg)
+
+        # Gemma-4 shape: explicit per-layer list with two regimes, behind the
+        # multimodal wrapper.
+        _serve(_Wrapper(_TextConfig(
+            layer_types=["sliding_attention"] * 5 + ["full_attention"])))
+        assert has_sliding_window_layers("/ckpt/gemma-4-31b") is True
+
+        # Llama shape: uniform full attention.
+        _serve(_TextConfig(layer_types=["full_attention"] * 32))
+        assert has_sliding_window_layers("/ckpt/llama") is False
+
+        # Older spelling of the same idea.
+        _serve(_TextConfig(sliding_window_pattern=6))
+        assert has_sliding_window_layers("/ckpt/gemma-3") is True
+
+        # A bare sliding_window with no pattern: EVERY layer slides, so there
+        # is still only one regime and the product still holds.
+        _serve(_TextConfig(sliding_window=4096))
+        assert has_sliding_window_layers("/ckpt/uniform-sliding") is False
+
+        # No signal at all.
+        _serve(_TextConfig())
+        assert has_sliding_window_layers("/ckpt/plain") is False
+
+        # Unloadable config -> None, so the caller degrades to "cannot check"
+        # rather than refusing a run it has no evidence against.
+        def _raise(*a, **k):
+            raise OSError("no such checkpoint")
+        transformers.AutoConfig.from_pretrained = staticmethod(_raise)
+        assert has_sliding_window_layers("/ckpt/missing") is None
+    finally:
+        transformers.AutoConfig.from_pretrained = saved
 
 
 
