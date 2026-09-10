@@ -2897,7 +2897,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         # Already RESOLVED ("auto" is resolved in main(), not here), and "on"
         # is what auto resolves to at batch_conversations=1 -- i.e. vLLM's own
         # default, which is what every published M000 row ran under.
-        baseline_async_scheduling="on",
+        baseline_async_scheduling="auto",
         output_suffix="", head_set_from=None,
     )
     for k, v in arg_overrides.items():
@@ -6557,6 +6557,35 @@ def test_has_sliding_window_layers_distinguishes_the_two_kv_regimes():
         assert has_sliding_window_layers("/ckpt/missing") is None
     finally:
         transformers.AutoConfig.from_pretrained = saved
+
+
+
+def test_auto_baseline_async_scheduling_leaves_the_engine_kwarg_unset():
+    """`auto` at batch 1 must NOT pass `async_scheduling` at all.
+
+    `SchedulerConfig.async_scheduling` defaults to None, and vLLM treats None
+    ("decide for me") and True ("I require this") differently: every
+    incompatibility degrades gracefully to False under None and RAISES under
+    True. Forcing True -- even to the value vLLM would have picked anyway --
+    converts a future graceful degradation into a hard startup failure on the
+    baseline row, which is the one that must never stop reproducing."""
+    baseline = _run_experiment_with_stubs("M000")
+    kwargs = baseline["llm_kwargs"]
+    assert "async_scheduling" not in kwargs, (
+        f"auto must leave the kwarg unset, got "
+        f"{kwargs.get('async_scheduling')!r}"
+    )
+    assert baseline["row"]["target_async_scheduling"] is None, (
+        "the CSV must record 'vLLM decided', not a value this run never set"
+    )
+
+
+def test_explicit_baseline_async_scheduling_is_passed_through():
+    """An explicit choice IS forwarded, and recorded, so a deliberate
+    departure from the default is visible in the row afterwards."""
+    baseline = _run_experiment_with_stubs("M000", baseline_async_scheduling="off")
+    assert baseline["llm_kwargs"]["async_scheduling"] is False
+    assert baseline["row"]["target_async_scheduling"] is False
 
 
 

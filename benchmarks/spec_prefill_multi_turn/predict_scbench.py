@@ -3727,14 +3727,24 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         # over M000, five times the entire cost of the gather itself
         # (+2.1%). This flag is the main suspect for that gap.
         llm_kwargs["async_scheduling"] = bool(args.target_async_scheduling)
-    elif mode == "baseline":
-        # Explicit rather than inherited. M000 previously took no branch here
-        # at all and simply got vLLM's default (pipelined), which is why the
-        # two arms silently disagreed -- see `--baseline-async-scheduling`.
-        # At --batch-conversations 1 the resolved value is "on", i.e. exactly
-        # that same default, so every published M000 row still reproduces;
-        # setting it explicitly only removes the ability for the two arms to
-        # differ WITHOUT it being a deliberate choice recorded in the CSV.
+    elif mode == "baseline" and args.baseline_async_scheduling != "auto":
+        # Set ONLY when the user asked for a specific value. `auto` leaves the
+        # kwarg UNSET so vLLM resolves it exactly as it always has for M000.
+        #
+        # This distinction is load-bearing, not stylistic. `SchedulerConfig.
+        # async_scheduling` defaults to None, and vLLM's resolution has two
+        # different modes (vllm/config/vllm.py): passing None means "decide for
+        # me", and every incompatibility (pooling runner, non-eagle spec
+        # decode, an executor that does not support it) DEGRADES GRACEFULLY to
+        # False with a warning. Passing True explicitly means "I require this",
+        # and the same incompatibilities RAISE instead.
+        #
+        # An earlier version of this branch mapped `auto` to a literal True at
+        # batch 1, reasoning that True is what vLLM picks anyway. That happens
+        # to be right for the current executors (both Multiproc and Uniproc
+        # report supports_async_scheduling() == True), but it converts a
+        # future graceful degradation into a hard startup failure -- on the
+        # BASELINE row, which is the one that must never stop reproducing.
         llm_kwargs["async_scheduling"] = (
             args.baseline_async_scheduling == "on")
     elif mode != "baseline":
@@ -4327,7 +4337,9 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     bool(args.target_async_scheduling)
                     if mode in SPARSE_ARCH_MODES
                     else (args.baseline_async_scheduling == "on"
-                          if mode == "baseline" else None)
+                          if mode == "baseline"
+                          and args.baseline_async_scheduling != "auto"
+                          else None)
                 ),
                 "target_cudagraph_mode": args.target_cudagraph_mode,
                 # Effective, not requested: `--batch-conversations` is
@@ -4716,10 +4728,13 @@ def main() -> None:
     # mismatched pair fails in the first second rather than after hours of
     # producing a comparison nobody can read.
     if args.baseline_async_scheduling == "auto":
-        args.baseline_async_scheduling = (
-            "on" if args.batch_conversations == 1
-            else ("on" if args.target_async_scheduling else "off")
-        )
+        # Left as "auto" at batch 1 ON PURPOSE: run_experiment then omits the
+        # engine kwarg entirely and vLLM resolves it as it always has for
+        # M000. Only at N>1, where the two arms must provably agree, is a
+        # concrete value forced.
+        if args.batch_conversations > 1:
+            args.baseline_async_scheduling = (
+                "on" if args.target_async_scheduling else "off")
     elif args.batch_conversations > 1:
         target_on = bool(args.target_async_scheduling)
         if (args.baseline_async_scheduling == "on") != target_on:
