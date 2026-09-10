@@ -61,11 +61,11 @@ export TORCHDYNAMO_DISABLE=1
 # TODO: fill in with this node's real path (gated HF repo -- request access
 # and export HF_TOKEN before downloading, see REPRODUCE.md step 2).
 #   ls -la /scratch/hf_cache/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/*/
-export LLAMA31_8B_MODEL_PATH=/scratch/hf_cache/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659
+export LLAMA31_8B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659
 
 # Speculator model (Llama-3.2-1B-Instruct). Same "fill in once downloaded"
 # caveat as above (also gated on Hugging Face).
-export LLAMA32_1B_MODEL_PATH=/scratch/hf_cache/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6
+export LLAMA32_1B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/9213176726f574b556790deb65791e0c5aa438b6
 
 # Mid-size scorer (Llama-3.2-3B-Instruct) -- NOT part of the published
 # experiment matrix. It exists for the scorer-capacity probe in

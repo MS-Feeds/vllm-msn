@@ -6270,15 +6270,17 @@ def test_wave_summary_fields_surface_the_preemption_signature():
             "prefill_degenerate": 1, "decode_degenerate": 40,
             "num_computed_regressions": 3,
         },
-        "session_cache_misses": 2,
     }
     fields = _wave_summary_fields(stats, batch_conversations=2, elapsed=1.0)
     assert fields["num_dense_fallback_prefill_before_turn_start"] == 7
-    # The two benign prefill cases are summed separately from the alarming one.
-    assert fields["num_dense_fallback_prefill_other"] == 3
-    assert fields["num_dense_fallback_decode_steps"] == 40
     assert fields["num_preempted_turns"] == 3
-    assert fields["num_session_cache_misses"] == 2
+    # The benign cases are reported SEPARATELY from the defect signal, and
+    # separately from each other. Lumping them produced a large, alarming
+    # number on a healthy run: `degenerate` fires whenever the selection
+    # already covers the whole resident cache, which is normal on early turns.
+    assert fields["num_dense_fallback_prefill_no_tail"] == 2
+    assert fields["num_dense_fallback_prefill_degenerate"] == 1
+    assert fields["num_dense_fallback_decode_steps"] == 40
 
 
 def test_time_summary_fields_are_empty_when_no_turn_was_timed():

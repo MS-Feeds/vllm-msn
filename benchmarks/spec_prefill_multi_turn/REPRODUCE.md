@@ -73,11 +73,43 @@ source benchmarks/spec_prefill_multi_turn/.env_exports.sh
 
 Same two gated Hugging Face checkpoints as `../spec_prefill_llama/`
 (`meta-llama/Llama-3.1-8B-Instruct` target, `meta-llama/Llama-3.2-1B-Instruct`
-speculator) — see that directory's `REPRODUCE.md` step 3 for the full
-download/verification instructions (request access on each model's HF page
-first; verify `*.safetensors` actually landed, not just tokenizer/config
-files). If you already downloaded these for `../spec_prefill_llama/`, reuse
-the same snapshot paths in this pipeline's `.env_exports.sh`.
+speculator). **Request access on each model's Hugging Face page first**
+(approval is usually near-instant for an account in good standing) and export
+`HF_TOKEN` before downloading. If you already pulled these for
+`../spec_prefill_llama/`, reuse the same snapshot paths in this pipeline's
+`.env_exports.sh` rather than downloading again.
+
+```bash
+export HF_TOKEN=<your token>
+hf download meta-llama/Llama-3.1-8B-Instruct --exclude "original/*"
+hf download meta-llama/Llama-3.2-1B-Instruct --exclude "original/*"
+```
+
+Then fill in the real snapshot paths in `.env_exports.sh`'s
+`LLAMA31_8B_MODEL_PATH` / `LLAMA32_1B_MODEL_PATH` (both ship as
+placeholders):
+
+```bash
+ls -la $HF_HOME/hub/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/*/
+ls -la $HF_HOME/hub/models--meta-llama--Llama-3.2-1B-Instruct/snapshots/*/
+du -sh $HF_HOME/hub/models--meta-llama--Llama-3.1-8B-Instruct/
+```
+
+**Verify `*.safetensors` and `model.safetensors.index.json` actually landed**,
+not just the config/tokenizer files. `AutoTokenizer.from_pretrained()` and
+`AutoConfig.from_pretrained()` both succeed against a weightless snapshot, so
+a partial download surfaces much later as a confusing load failure rather
+than as a missing-file error (this exact gotcha is in
+`../evaluation_pipeline/REPRODUCE.md`'s troubleshooting table). `du -sh`
+should read roughly 15 GB for the 8B and 2.5 GB for the 1B.
+
+`--exclude "original/*"` skips the duplicate `original/consolidated.*`
+weights, which vLLM never reads — about 15 GB saved on the 8B alone.
+
+The `hub/` path segment comes from `HF_HOME` (see the note at the end of this
+section); on nodes where these were downloaded with an explicit
+`--cache-dir /scratch/hf_cache` they sit one level up, WITHOUT `hub/`. Check
+`echo $HF_HOME` if a path does not resolve.
 
 **Optional third checkpoint**: `meta-llama/Llama-3.2-3B-Instruct`
 (`LLAMA32_3B_MODEL_PATH`), gated the same way. Not needed for any row of the

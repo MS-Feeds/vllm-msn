@@ -225,9 +225,10 @@ _WAVE_FIELDS = (
     "target_prefill_engine_seconds", "target_decode_engine_seconds",
     "driver_overhead_seconds",
     "num_dense_fallback_prefill_before_turn_start",
-    "num_dense_fallback_prefill_other",
+    "num_dense_fallback_prefill_no_tail",
+    "num_dense_fallback_prefill_degenerate",
     "num_dense_fallback_decode_steps",
-    "num_preempted_turns", "num_session_cache_misses",
+    "num_preempted_turns",
 )
 
 CSV_FIELDS = [
@@ -317,10 +318,17 @@ CSV_FIELDS = [
     # is indistinguishable from one that did. `num_preempted_turns` and
     # `num_dense_fallback_prefill_before_turn_start` are the preemption
     # signature -- non-zero means the row did not measure what it says.
+    # Split rather than lumped: the first is a DEFECT signal (preemption),
+    # while `no_tail` and `degenerate` are both legitimate and expected --
+    # `degenerate` in particular fires whenever the selection already covers
+    # the whole resident cache, which is normal on early turns with a short
+    # history and universal at keep_rate=1.0. Summing them produced a
+    # frightening-looking number with no way to tell which kind it was.
     "num_dense_fallback_prefill_before_turn_start",
-    "num_dense_fallback_prefill_other",
+    "num_dense_fallback_prefill_no_tail",
+    "num_dense_fallback_prefill_degenerate",
     "num_dense_fallback_decode_steps",
-    "num_preempted_turns", "num_session_cache_misses",
+    "num_preempted_turns",
 ]
 
 
@@ -373,12 +381,11 @@ def _wave_summary_fields(stats: dict, batch_conversations: int, elapsed: float) 
         "driver_overhead_seconds": elapsed - (spec_engine + target_engine),
         "num_dense_fallback_prefill_before_turn_start": fallbacks.get(
             "prefill_before_turn_start", 0),
-        "num_dense_fallback_prefill_other": (
-            fallbacks.get("prefill_no_tail", 0)
-            + fallbacks.get("prefill_degenerate", 0)),
+        "num_dense_fallback_prefill_no_tail": fallbacks.get("prefill_no_tail", 0),
+        "num_dense_fallback_prefill_degenerate": fallbacks.get(
+            "prefill_degenerate", 0),
         "num_dense_fallback_decode_steps": fallbacks.get("decode_degenerate", 0),
         "num_preempted_turns": fallbacks.get("num_computed_regressions", 0),
-        "num_session_cache_misses": stats.get("session_cache_misses", 0),
     }
 
 # See EXPERIMENT_PLAN.md's "SpecPrefill settings" -- algorithm hyperparameters
@@ -1935,7 +1942,7 @@ def run_baseline(
               "spec_prefill_engine_seconds": [], "spec_lookahead_engine_seconds": [],
               "spec_scoring_engine_seconds": [],
               "target_prefill_engine_seconds": [], "target_decode_engine_seconds": [],
-              "dense_fallbacks": {}, "session_cache_misses": 0}
+              "dense_fallbacks": {}}
     target_flop_cfg = _target_flop_config(llm)
 
     batched = batch_conversations > 1
@@ -2747,7 +2754,7 @@ def run_sparse_attention(
               # silently fall back to dense attention (see
               # sparse_target_runner._prefill_gather_applies) and would
               # otherwise be reported as a clean sparse row.
-              "dense_fallbacks": {}, "session_cache_misses": 0}
+              "dense_fallbacks": {}}
 
     target_flop_cfg = _target_flop_config(llm)
     spec_flop_cfg = _speculator_flop_config(proposer)
@@ -3063,6 +3070,8 @@ def run_sparse_attention(
                 for key, count in fallbacks.items():
                     stats["dense_fallbacks"][key] = (
                         stats["dense_fallbacks"].get(key, 0) + count)
+                # Only the two DEFECT keys warn. `no_tail`/`degenerate` are
+                # expected and would otherwise cry wolf on every early turn.
                 if fallbacks.get("prefill_before_turn_start") or fallbacks.get(
                         "num_computed_regressions"):
                     progress.write(
@@ -3073,15 +3082,25 @@ def run_sparse_attention(
                         f"measure the sparse path. Check KV headroom against "
                         f"--batch-conversations."
                     )
-            # `num_cached_tokens` below the length already resident in this
-            # session's KV means the resumption missed the prefix cache and
-            # earlier history had to be recomputed -- the driver-side
-            # complement of `prefill_before_turn_start`, needing no worker
-            # cooperation at all.
-            if (output is not None and session.target_resident_len > 0
-                    and getattr(output, "num_cached_tokens", None) is not None
-                    and output.num_cached_tokens < session.target_resident_len):
-                stats["session_cache_misses"] += 1
+            # NO driver-side prefix-cache-miss check here, deliberately.
+            #
+            # An earlier version compared `output.num_cached_tokens` against
+            # `session.target_resident_len` and counted a "session cache miss"
+            # whenever it was smaller. That was wrong, and wrong in a way this
+            # file already warned about: `target_resident_len`'s own comment
+            # says the session's resident KV and a prefix-cache hit "are not
+            # interchangeable in `num_cached_tokens`". A resumable session
+            # submits only the TURN'S DELTA, so `num_cached_tokens` describes
+            # that small submission while `target_resident_len` describes the
+            # whole conversation -- the first is below the second on every turn
+            # after turn 0, by construction.
+            #
+            # It fired on exactly 60 of 75 turns in the first real batched run
+            # (75 turns - 15 turn-0s = 60): a metric that is a rename of
+            # "turn_idx > 0", reported as a degradation warning. Preemption is
+            # detected properly worker-side instead, by
+            # `prefill_before_turn_start` and the `num_computed` high-water
+            # mark -- both of which read the quantities that actually mean it.
             # attended_lens (+ prefill_steps, when the prefill scope is on)
             # is recorded on a strict SUPERSET of the steps override timing
             # is: both are appended before the `gathered is None`
