@@ -77,13 +77,73 @@ dependency-free) and no vLLM. It does have one module-scope side effect:
 `OUT_DIR.mkdir(exist_ok=True)`, i.e. it creates `results/` relative to the
 current working directory.
 
-Usage:
+## Long-document variant: 3 turns of ~40-43k tokens
+
+`--min-doc-tokens` adds a FLOOR to the existing ceiling, so a conversation can
+be built from a narrow band of long documents instead of everything that fits.
+The intended configuration is 3 turns per conversation, each turn one LongBench
+v2 document of 40,000-42,981 rendered tokens:
+
+  - **Why ~43k and not 45k.** The ceiling is the SCORER, not the target. Both
+    scorers in use (Gemma-4-E2B, Llama-3.2-1B) have a 131,072-token native
+    context, and the scorer must see the WHOLE conversation to score it --
+    `Budget.spec_check` is `C + sum(Q) + (T-1)*O`. At 3 turns that caps a
+    turn at ~42,991 (scorer) / ~42,981 (target at 131,072), and 45,000/turn
+    would need 137,097 tokens. Gemma-4-31B's own 262,144-token window does not
+    help, because the scorer is the binding side. (An `EARLY-*` scorer, which
+    is the target's own first N layers, inherits 262,144 and would lift this.)
+
+  - **What it buys.** A higher d:o ratio (~84:1 against the 5-turn file's
+    ~49:1), so decode -- and with it the output-length confound that dominated
+    every LongBench timing comparison so far -- is a smaller share of each
+    turn. And each question is posed over a single long document.
+
+  - **What it costs -- read this before choosing it for a SPEED measurement.**
+    Sparse prefill can only remove attention to PRIOR turns. A turn's own
+    tokens are the contiguous force-kept tail and are always attended densely,
+    and turn 0 has no prior at all. With turn `i` of length `d` attending
+    `i*d` prior tokens, the removable share of prefill attention is
+    `(T-1)/T` -- 80% at 5 turns, 67% at 3 -- and at a FIXED total conversation
+    length `D` the removable attention is `(T-1)/(2T) * D^2`: 0.400 D^2 at 5
+    turns, 0.333 D^2 at 3. **Fewer, longer turns give sparse prefill ~17% LESS
+    to save at the same length.** The dataset is well suited to studying long
+    single-document questions and to shrinking the decode confound; it is a
+    harder test for the speed claim, not an easier one.
+
+  - **Yield is the practical risk.** A 3k-token-wide band holds few
+    documents -- on the Gemma tokenizer, the `short` bucket's 70th and 80th
+    percentiles are ~39.7k and ~46.9k -- so `--lengths short,medium` is
+    required, and the run prints how many documents landed in the band before
+    grouping. Check it before spending GPU time.
+
+  - **Per-model token counts select different documents.** Lengths are
+    measured with `--tokenizer`, which must be the TARGET's. Llama-3's
+    tokenizer is less efficient on English than Gemma's, so a Llama prep of the
+    same band picks a different, smaller set of documents. Gemma and Llama rows
+    built this way do not answer the same questions.
+
+`--id-prefix` keeps this file's conversation ids distinct from the 5-turn
+file's. The id is the prefix-cache salt, the speculator's slot-history key and
+the grader's join key, so two sample files sharing `lbv2mt-0000` would let a
+predictions file grade silently against the wrong questions.
+
+Usage (the original 5-turn file):
     python3 datasets/prep_longbench_v2_multiturn.py \\
         --tokenizer $GEMMA4_31B_MODEL_PATH \\
         --target-max-num-batched-tokens 130560 \\
         --speculator-max-num-batched-tokens 131063 \\
         --max-tokens 512 --seed 42 \\
         --output datasets/longbench_v2_multiturn.jsonl
+
+Usage (3 turns x 40-43k):
+    python3 datasets/prep_longbench_v2_multiturn.py \\
+        --tokenizer $GEMMA4_31B_MODEL_PATH \\
+        --target-max-num-batched-tokens 131072 \\
+        --speculator-max-num-batched-tokens 131063 \\
+        --max-tokens 512 --turns-per-conv 3 \\
+        --lengths short,medium --min-doc-tokens 40000 \\
+        --id-prefix lbv2mt3 --seed 42 \\
+        --output datasets/longbench_v2_multiturn_3x40k.jsonl
 """
 
 from __future__ import annotations
@@ -318,6 +378,38 @@ def _histogram(values: list[int], label: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def select_length_band(docs, min_doc_tokens: int, max_doc_tokens: int):
+    """Split `docs` into those at or above the floor, and a count of those
+    below it. Returns `(in_band, dropped_too_small)`.
+
+    Only the FLOOR is applied here. The ceiling stays where it always was, in
+    `group_into_conversations`, so the existing drop accounting and the
+    size-banded windowing are untouched; a document above the ceiling is still
+    reported as `dropped_doc_too_large` by that function.
+
+    Raises if the band is empty by construction. `max_doc_tokens` is derived
+    from the budget (`doc_budget // turns_per_conv`), so asking for a floor
+    above it -- e.g. `--min-doc-tokens 45000` at 3 turns, where the scorer's
+    131,072-token context caps a turn near 43k -- would otherwise surface as
+    "no conversations formed", which blames the documents for what is
+    actually a budget contradiction.
+
+    A floor of 0 (the default) keeps every document, which is what makes the
+    5-turn file reproduce exactly.
+    """
+    if min_doc_tokens > max_doc_tokens:
+        raise ValueError(
+            f"--min-doc-tokens {min_doc_tokens:,} is above the per-turn ceiling "
+            f"{max_doc_tokens:,} (= document budget // --turns-per-conv), so no "
+            f"document can be in band. The ceiling is set by whichever engine "
+            f"budget binds -- usually the scorer's native context, which must "
+            f"hold the whole conversation. Lower the floor, use fewer turns, "
+            f"or lower --max-tokens."
+        )
+    in_band = [d for d in docs if d["query_tokens"] >= min_doc_tokens]
+    return in_band, len(docs) - len(in_band)
+
+
 def group_into_conversations(docs, budget: Budget, max_doc_tokens, rng,
                              turns_per_conv) -> tuple[list[list[dict]], int]:
     """Size-banded grouping: documents of similar length share a conversation.
@@ -388,13 +480,14 @@ def verify_conversations(conversations, budget: Budget, tok) -> tuple[list[list[
 # ---------------------------------------------------------------------------
 
 
-def build_rows(conversations, budget: Budget, config_name, preamble) -> list[dict]:
+def build_rows(conversations, budget: Budget, config_name, preamble,
+               id_prefix: str = "lbv2mt") -> list[dict]:
     rows = []
     for n, conv in enumerate(conversations):
         query_lens = [d["query_tokens"] for d in conv]
         rows.append(
             {
-                "id": f"lbv2mt-{n:04d}",
+                "id": f"{id_prefix}-{n:04d}",
                 "config": config_name,
                 "context": preamble,
                 "turns": [
@@ -460,6 +553,19 @@ def main() -> int:
                         help="-1 derives it as doc_budget // turns-per-conv. "
                              "Documents above this are DROPPED, never truncated.")
     parser.add_argument("--safety-tokens", type=int, default=512)
+    parser.add_argument("--min-doc-tokens", type=int, default=0,
+                        help="Documents BELOW this rendered length are dropped, "
+                             "so every turn is drawn from a band [floor, "
+                             "ceiling]. 0 (default) keeps everything and "
+                             "reproduces the 5-turn file exactly. For the "
+                             "3-turn long-document variant use 40000 with "
+                             "--lengths short,medium; see the module docstring "
+                             "for why the ceiling there is ~43k, not 45k.")
+    parser.add_argument("--id-prefix", default="lbv2mt",
+                        help="Conversation id prefix. Give each sample file its "
+                             "own: the id is the grader's join key, so two "
+                             "files sharing ids can grade a predictions file "
+                             "against the wrong questions without error.")
     parser.add_argument("--max-conversations", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--preamble", default=DEFAULT_PREAMBLE)
@@ -509,6 +615,21 @@ def main() -> int:
 
     print(_histogram([d["query_tokens"] for d in docs], "rendered query tokens (all kept docs)"))
 
+    try:
+        docs, dropped_too_small = select_length_band(
+            docs, args.min_doc_tokens, max_doc_tokens)
+    except ValueError as exc:
+        print(f"[prep_lbv2_mt] ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.min_doc_tokens > 0:
+        in_band = sum(1 for d in docs if d["query_tokens"] <= max_doc_tokens)
+        # The number that decides whether this variant is worth running, printed
+        # BEFORE grouping so a thin band is visible even when grouping succeeds.
+        print(f"[prep_lbv2_mt] band [{args.min_doc_tokens:,}, {max_doc_tokens:,}]: "
+              f"{in_band} documents in band -> at most "
+              f"{in_band // args.turns_per_conv} conversations "
+              f"({dropped_too_small} below the floor)")
+
     rng = random.Random(args.seed)
     conversations, dropped_too_large = group_into_conversations(
         docs, budget, max_doc_tokens, rng, args.turns_per_conv
@@ -519,13 +640,16 @@ def main() -> int:
         conversations = conversations[:args.max_conversations]
 
     if not conversations:
-        print("[prep_lbv2_mt] ERROR: no conversations formed. Every document "
-              f"exceeded --max-doc-tokens ({max_doc_tokens:,}), or the budget "
-              "is too tight. Try a smaller --max-tokens, or add a shorter "
-              "length bucket via --lengths.", file=sys.stderr)
+        print("[prep_lbv2_mt] ERROR: no conversations formed. Too few "
+              f"documents fall in [{args.min_doc_tokens:,}, {max_doc_tokens:,}] "
+              f"to fill {args.turns_per_conv}-turn conversations. Widen the band "
+              "(lower --min-doc-tokens), add a bucket via --lengths (e.g. "
+              "short,medium), or use a smaller --max-tokens to raise the "
+              "ceiling.", file=sys.stderr)
         return 2
 
-    out_rows = build_rows(conversations, budget, args.config_name, args.preamble)
+    out_rows = build_rows(conversations, budget, args.config_name, args.preamble,
+                          id_prefix=args.id_prefix)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as f:
         for row in out_rows:
@@ -535,6 +659,7 @@ def main() -> int:
     resident = [r["resident_len_at_last_turn"] for r in out_rows]
     print(f"[prep_lbv2_mt] conversations={len(out_rows)} "
           f"turns={len(per_turn)} "
+          f"dropped_doc_too_small={dropped_too_small} "
           f"dropped_doc_too_large={dropped_too_large} "
           f"dropped_failed_verify={dropped_verify}")
     print(_histogram(per_turn, "per-turn d (rendered query tokens)"))

@@ -6591,5 +6591,118 @@ def test_explicit_baseline_async_scheduling_is_passed_through():
 
 
 
+def _load_lbv2_prep():
+    """The LongBench v2 multi-turn prep, loaded by path the same way
+    `prep_mmmu_multiturn.py` loads it (it is a script, not a package module).
+    CPU-only: it imports `predict_scbench` and `model_structure`, neither of
+    which pulls in vLLM."""
+    import importlib.util
+    path = Path(__file__).resolve().parent / "datasets" / "prep_longbench_v2_multiturn.py"
+    spec = importlib.util.spec_from_file_location("_lbv2mt_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _gemma_like_budget(prep, turns, target=131072, spec=131063, max_tokens=512):
+    # Wrapper sizes are the ones the real Gemma prep printed
+    # ("Wb=4 Wa=9 Wt=5", preamble 40), so the ceilings below are the real ones.
+    return prep.Budget(
+        target_budget=target, spec_budget=spec, turns_per_conv=turns,
+        max_tokens=max_tokens, safety_tokens=512, wrapper_before=4,
+        wrapper_after=9, turn_boundary=5, preamble_len=40)
+
+
+def _doc(i, n):
+    return {"doc_id": f"d{i:03d}", "query_tokens": n, "input": f"doc {i}",
+            "answer": "A", "options": [], "domain": "x", "sub_domain": "y",
+            "difficulty": "easy", "length": "short"}
+
+
+def test_length_band_floor_of_zero_keeps_every_document():
+    """The default must be a no-op, which is what lets the existing 5-turn
+    file be rebuilt byte-for-byte after this change."""
+    prep = _load_lbv2_prep()
+    docs = [_doc(i, n) for i, n in enumerate((10_253, 25_000, 60_000))]
+    in_band, too_small = prep.select_length_band(docs, 0, 25_475)
+    assert in_band == docs and too_small == 0
+
+
+def test_length_band_applies_only_the_floor():
+    """Below-floor documents are removed and counted; the CEILING is left to
+    `group_into_conversations`, so the existing too-large accounting and the
+    size-banded windowing stay exactly as they were."""
+    prep = _load_lbv2_prep()
+    docs = [_doc(i, n) for i, n in enumerate((30_000, 39_999, 40_000, 42_000, 50_000))]
+    in_band, too_small = prep.select_length_band(docs, 40_000, 42_981)
+    assert [d["query_tokens"] for d in in_band] == [40_000, 42_000, 50_000]
+    assert too_small == 2
+
+
+def test_length_band_refuses_a_floor_above_the_ceiling():
+    """At 3 turns the SCORER's 131,072-token context caps a turn near 43k, so
+    asking for 45k is a budget contradiction. It must say so, rather than
+    surface later as "no conversations formed" -- which blames the documents."""
+    prep = _load_lbv2_prep()
+    try:
+        prep.select_length_band([_doc(0, 44_000)], 45_000, 42_981)
+    except ValueError as exc:
+        assert "45,000" in str(exc) and "42,981" in str(exc)
+        assert "scorer" in str(exc), "must name the binding side"
+    else:
+        raise AssertionError("expected ValueError for an empty band")
+
+
+def test_three_turn_ceiling_is_set_by_the_scorer_not_the_target():
+    """Documents the design claim the variant rests on. Gemma-4-31B's own
+    window is 262,144, but the scorer must hold the whole conversation, so the
+    per-turn ceiling at 3 turns is ~43k -- and 45k/turn cannot fit."""
+    prep = _load_lbv2_prep()
+    budget = _gemma_like_budget(prep, turns=3)
+    ceiling = budget.doc_budget // 3
+    assert 42_900 <= ceiling <= 43_000, ceiling
+    assert not budget.fits([45_000, 45_000, 45_000])
+    assert budget.fits([42_900, 42_900, 42_900])
+
+
+def test_three_turn_band_groups_into_conversations_that_fit():
+    """End to end over the pure pieces: a band of long documents forms
+    3-turn conversations, every one of which passes the driver's own
+    pre-flight arithmetic."""
+    import random
+    prep = _load_lbv2_prep()
+    budget = _gemma_like_budget(prep, turns=3)
+    ceiling = budget.doc_budget // 3
+    lengths = [40_100, 40_900, 41_500, 42_000, 42_300, 42_800, 30_000, 55_000, 41_200]
+    docs = [_doc(i, n) for i, n in enumerate(lengths)]
+
+    in_band, too_small = prep.select_length_band(docs, 40_000, ceiling)
+    assert too_small == 1                          # the 30k document
+    convs, too_large = prep.group_into_conversations(
+        in_band, budget, ceiling, random.Random(42), 3)
+    assert too_large == 1                          # the 55k document
+    assert len(convs) == 2 and all(len(c) == 3 for c in convs)
+    for conv in convs:
+        q = [d["query_tokens"] for d in conv]
+        assert all(40_000 <= n <= ceiling for n in q)
+        assert budget.fits(q), q
+
+
+def test_build_rows_default_id_prefix_is_unchanged():
+    """Existing sample files, predictions and graded results all key on
+    `lbv2mt-NNNN`. The default must keep producing exactly that."""
+    prep = _load_lbv2_prep()
+    budget = _gemma_like_budget(prep, turns=3)
+    conv = [_doc(i, 41_000) for i in range(3)]
+    rows = prep.build_rows([conv], budget, "longbench_v2_mc", "preamble")
+    assert rows[0]["id"] == "lbv2mt-0000"
+    custom = prep.build_rows([conv], budget, "longbench_v2_mc", "preamble",
+                             id_prefix="lbv2mt3")
+    assert custom[0]["id"] == "lbv2mt3-0000"
+    # The config name is the grader's metric key and must not change with it.
+    assert custom[0]["config"] == "longbench_v2_mc"
+
+
+
 if __name__ == "__main__":
     _run_all()
