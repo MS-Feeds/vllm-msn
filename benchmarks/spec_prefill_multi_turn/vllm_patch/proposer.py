@@ -134,6 +134,43 @@ os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
+def scorer_visible_devices(device_index: int, parent_cvd: Optional[str]) -> str:
+    """The `CUDA_VISIBLE_DEVICES` value that places the scorer's child engine
+    on `cuda:<device_index>` AS THIS PROCESS SEES IT.
+
+    **The bug this fixes.** The scorer used to be placed with
+    `os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)`. CUDA masks do not
+    compose: the child engine reads that string fresh and interprets it as a
+    PHYSICAL device ordinal. So under a job allocated
+    `CUDA_VISIBLE_DEVICES=3,4,5`, `--speculator-device cuda:2` put the scorer
+    on physical GPU 2 -- not physical 5, the third card this process was given.
+    `predict_scbench.scorer_placement_error` has always documented the
+    intended meaning ("on a job allocated CUDA_VISIBLE_DEVICES=2,3, 'cuda:1'
+    means the second of those two"), and validated the index against that
+    meaning; only the placement disagreed.
+
+    It never showed up because every run so far had no parent mask, where the
+    two readings coincide. It surfaces the moment two runs share a node: the
+    second run's scorer lands on the FIRST run's scorer card, both reserve
+    their `gpu_memory_utilization` fraction of it, and the result is an OOM
+    in an activation kernel -- or worse, no OOM and silently contended timing.
+
+    With no parent mask the index IS the physical ordinal, exactly as before,
+    so every existing run places identically.
+    """
+    if not parent_cvd:
+        return str(device_index)
+    visible = [d.strip() for d in parent_cvd.split(",") if d.strip()]
+    if not 0 <= device_index < len(visible):
+        raise ValueError(
+            f"scorer device index {device_index} is outside this process's "
+            f"visible devices CUDA_VISIBLE_DEVICES={parent_cvd!r} "
+            f"({len(visible)} device(s)). The index is relative to what this "
+            f"process can see."
+        )
+    return visible[device_index]
+
+
 @dataclass
 class _SpeculatorSubmission:
     """One submitted-but-not-yet-driven speculator request.
@@ -297,7 +334,10 @@ class SpecPrefillProposer:
             self.llm = LLM(**llm_kwargs)
         else:
             prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(device_index)
+            # Translate through the parent's mask -- see
+            # `scorer_visible_devices` for the misplacement this prevents.
+            os.environ["CUDA_VISIBLE_DEVICES"] = scorer_visible_devices(
+                device_index, prev_cvd)
             try:
                 self.llm = LLM(**llm_kwargs)
             finally:

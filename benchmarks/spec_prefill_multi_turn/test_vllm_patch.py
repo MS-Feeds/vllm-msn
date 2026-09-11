@@ -6704,5 +6704,266 @@ def test_build_rows_default_id_prefix_is_unchanged():
 
 
 
+def test_scorer_placement_is_unchanged_without_a_parent_mask():
+    """Every run so far had no CUDA_VISIBLE_DEVICES in the parent. There the
+    index IS the physical ordinal, and placement must not move."""
+    from vllm_patch.proposer import scorer_visible_devices
+    assert scorer_visible_devices(2, None) == "2"
+    assert scorer_visible_devices(2, "") == "2"
+
+
+def test_scorer_placement_translates_through_the_parent_mask():
+    """Under CUDA_VISIBLE_DEVICES=3,4,5, `cuda:2` is this process's THIRD
+    card -- physical 5. The old code returned "2", which the child reads as
+    physical GPU 2: the other run's scorer card, on a shared node."""
+    from vllm_patch.proposer import scorer_visible_devices
+    assert scorer_visible_devices(2, "3,4,5") == "5"
+    assert scorer_visible_devices(0, "3,4,5") == "3"
+    assert scorer_visible_devices(1, " 6 , 7 ") == "7", "whitespace-tolerant"
+    # UUID masks are also legal CUDA_VISIBLE_DEVICES values.
+    assert scorer_visible_devices(0, "GPU-abc,GPU-def") == "GPU-abc"
+
+
+def test_scorer_placement_refuses_an_index_outside_the_mask():
+    from vllm_patch.proposer import scorer_visible_devices
+    try:
+        scorer_visible_devices(3, "3,4,5")
+    except ValueError as exc:
+        assert "3,4,5" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an out-of-mask index")
+
+
+
+def _pack_doc(i, context_tokens, key=None):
+    """A document for the packing tests. `query_tokens` models the rendered
+    standalone block as its context plus a fixed template overhead."""
+    return {"doc_id": f"d{i:03d}", "doc_key": key or f"k{i:03d}",
+            "context": f"<doc {i}>", "question": f"q{i}?",
+            "options": ["a", "b", "c", "d"], "answer": "A",
+            "context_tokens": context_tokens, "query_tokens": context_tokens + 60,
+            "domain": "x", "sub_domain": "y", "difficulty": "easy", "length": "short"}
+
+
+SEP = 6
+
+def _fake_render(target, order):
+    # A structure, not a string: `measure` below reads it. pack_turn treats
+    # both as opaque, which is what makes the policy testable without a
+    # tokenizer.
+    return {"target": target, "order": order}
+
+def _fake_measure(block):
+    # Template overhead once (via the target's query_tokens), plus a header
+    # per document, plus every OTHER document's context.
+    target = block["target"]
+    return (target["query_tokens"] + SEP * len(block["order"])
+            + sum(d["context_tokens"] for d in block["order"] if d is not target))
+
+
+def test_pack_turn_lands_in_band_with_at_least_one_distractor():
+    import random
+    prep = _load_lbv2_prep()
+    target = _pack_doc(0, 15_000)
+    pool = [target] + [_pack_doc(i, n) for i, n in
+                       enumerate((10_000, 12_000, 18_000, 25_000, 30_000), start=1)]
+    packed = prep.pack_turn(target, pool, set(), 40_000, 42_981,
+                            random.Random(0), _fake_measure, _fake_render, SEP)
+    assert packed is not None
+    assert 40_000 <= packed["query_tokens"] <= 42_981
+    assert len(packed["distractors"]) >= 1
+    assert 0 <= packed["position"] <= len(packed["distractors"])
+    assert packed["num_docs"] == len(packed["distractors"]) + 1
+
+
+def test_pack_turn_never_uses_the_target_or_an_already_used_document():
+    """A target must not get its own document back as a "distractor" -- which
+    content-keying catches even when two questions share a document -- and a
+    document already shown in this conversation must not reappear."""
+    import random
+    prep = _load_lbv2_prep()
+    target = _pack_doc(0, 15_000, key="SHARED")
+    same_doc_other_question = _pack_doc(1, 26_000, key="SHARED")
+    used = _pack_doc(2, 26_000, key="USED")
+    ok = _pack_doc(3, 26_000)
+    for seed in range(20):
+        packed = prep.pack_turn(target, [target, same_doc_other_question, used, ok],
+                                {"USED"}, 40_000, 42_981, random.Random(seed),
+                                _fake_measure, _fake_render, SEP)
+        assert packed is not None
+        keys = {d["doc_key"] for d in packed["distractors"]}
+        assert keys == {"k003"}, keys
+
+
+def test_pack_turn_drops_a_target_too_long_to_admit_any_distractor():
+    """Every packed turn is multi-document. A target already near the ceiling
+    is dropped rather than asked alone, so turns don't mix two task types."""
+    import random
+    prep = _load_lbv2_prep()
+    target = _pack_doc(0, 41_000)
+    pool = [target, _pack_doc(1, 10_000)]
+    assert prep.pack_turn(target, pool, set(), 40_000, 42_981, random.Random(0),
+                          _fake_measure, _fake_render, SEP) is None
+
+
+def test_pack_turn_retries_when_the_measured_length_misses_the_band():
+    """The distractor choice is an ESTIMATE; the rendered length is what
+    counts. A measure that disagrees with the estimate must cause a retry,
+    never an out-of-band turn."""
+    import random
+    prep = _load_lbv2_prep()
+    target = _pack_doc(0, 15_000)
+    pool = [target] + [_pack_doc(i, 26_000) for i in range(1, 6)]
+    calls = []
+
+    def lying_then_honest(block):
+        calls.append(1)
+        n = _fake_measure(block)
+        return n + 5_000 if len(calls) == 1 else n     # first render overshoots
+
+    packed = prep.pack_turn(target, pool, set(), 40_000, 42_981, random.Random(0),
+                            lying_then_honest, _fake_render, SEP)
+    assert packed is not None and len(calls) >= 2
+    assert 40_000 <= packed["query_tokens"] <= 42_981
+
+
+def test_group_packed_conversations_never_repeats_a_document_within_one():
+    """Each conversation is one persistent session. A document shown earlier
+    in it is already resident in its KV cache, so reusing it -- as a later
+    distractor or a later turn's own document -- would leak. Across
+    conversations reuse is fine and is what gives packing its yield."""
+    import random
+    prep = _load_lbv2_prep()
+    budget = _gemma_like_budget(prep, turns=3)
+    ceiling = budget.doc_budget // 3
+    sizes = [10_000, 11_000, 12_000, 14_000, 15_000, 16_000, 18_000, 20_000,
+             22_000, 24_000, 25_000, 26_000, 27_000, 28_000, 30_000]
+    docs = [_pack_doc(i, n) for i, n in enumerate(sizes)]
+
+    convs, _unpackable = prep.group_packed_conversations(
+        docs, budget, 40_000, ceiling, random.Random(7), 3,
+        _fake_measure, _fake_render, SEP)
+
+    assert convs, "packing should form conversations from short documents"
+    asked = []
+    for conv in convs:
+        assert len(conv) == 3
+        seen = []
+        for turn in conv:
+            assert 40_000 <= turn["query_tokens"] <= ceiling
+            assert turn["num_docs"] >= 2
+            seen.append(turn["doc_key"])
+            seen += [f"k{int(d[1:]):03d}" for d in turn["distractor_doc_ids"]]
+            asked.append(turn["doc_id"])
+        assert len(seen) == len(set(seen)), f"document repeated within a conversation: {seen}"
+        assert budget.fits([t["query_tokens"] for t in conv])
+    assert len(asked) == len(set(asked)), "a question was asked twice"
+
+
+def test_build_rows_emits_packing_fields_only_on_packed_turns():
+    """The unpacked path must gain no keys, or every row of the existing
+    5-turn file would change."""
+    prep = _load_lbv2_prep()
+    budget = _gemma_like_budget(prep, turns=3)
+    plain = [_doc(i, 41_000) for i in range(3)]
+    row = prep.build_rows([plain], budget, "longbench_v2_mc", "p")[0]
+    assert not any(k in row["turns"][0] for k in prep.PACK_FIELDS)
+
+    packed = [dict(_doc(i, 41_000), num_docs=3, target_doc_position=1,
+                   distractor_doc_ids=["d900", "d901"]) for i in range(3)]
+    row = prep.build_rows([packed], budget, "longbench_v2_mc", "p")[0]
+    assert row["turns"][0]["num_docs"] == 3
+    assert row["turns"][0]["target_doc_position"] == 1
+    assert row["turns"][0]["distractor_doc_ids"] == ["d900", "d901"]
+
+
+def test_render_packed_block_numbers_documents_and_poses_the_targets_question():
+    prep = _load_lbv2_prep()
+    template = "CTX:{context}|Q:{question}|{choice_A}{choice_B}{choice_C}{choice_D}"
+    target = dict(_pack_doc(1, 100), context="TARGET", question="which?",
+                  options=["w", "x", "y", "z"])
+    other = dict(_pack_doc(2, 100), context="OTHER")
+    block = prep.render_packed_block(template, ["A", "B", "C", "D"], target, [other, target])
+    assert block == "CTX:Document 1:\nOTHER\n\nDocument 2:\nTARGET|Q:which?|wxyz"
+
+
+
+def _run_lbv2_prep_main(extra_args):
+    """Drive the prep's real `main()` over a synthetic dataset and a
+    whitespace tokenizer. The unit tests cover the pure pieces; this covers
+    the wiring -- `main()` and the `_finish()` tail it shares between the
+    single-document and packed paths -- which is where a refactor breaks."""
+    import json, random, sys, tempfile, types
+    prep = _load_lbv2_prep()
+
+    class _Tok:
+        def encode(self, text, add_special_tokens=False):
+            return text.split()
+
+    rng = random.Random(1)
+    rows = [{"_id": f"id{i}", "length": "short", "domain": "d", "sub_domain": "s",
+             "difficulty": "easy", "question": f"what {i}?", "answer": "B",
+             "choice_A": "a", "choice_B": "b", "choice_C": "c", "choice_D": "d",
+             "context": " ".join([f"w{i}"] * rng.randint(800, 5200))}
+            for i in range(60)]
+    sibling = types.SimpleNamespace(
+        _PROMPT_TEMPLATE="Read.\n\n{context}\n\nQuestion: {question}\n(A) {choice_A}\n"
+                         "(B) {choice_B}\n(C) {choice_C}\n(D) {choice_D}\n\nAnswer.",
+        CHOICE_LETTERS=["A", "B", "C", "D"],
+        _resolve_hf_token=lambda x: None,
+        load_longbench_v2_rows=lambda cache_dir, tok: rows,
+    )
+    prep._load_sibling_prep = lambda: sibling
+    prep.load_tokenizer = lambda path: _Tok()
+    prep.chat_wrapper_pieces = lambda tok: ("<s>", "</s>")
+    prep.chat_turn_boundary_pieces = lambda tok: "<t>"
+    prep.render_turn_query = lambda tok, n, turn, **kw: tok.encode(
+        f"Question {n + 1}: {turn['input']} Answer {n + 1}:")
+
+    out = Path(tempfile.mkdtemp()) / "out.jsonl"
+    saved_argv = sys.argv
+    try:
+        sys.argv = ["prep", "--tokenizer", "x",
+                    "--target-max-num-batched-tokens", "13500",
+                    "--speculator-max-num-batched-tokens", "13500",
+                    "--max-tokens", "50", "--safety-tokens", "10",
+                    "--turns-per-conv", "3", "--min-doc-tokens", "3000",
+                    "--id-prefix", "lbv2mtT", "--output", str(out), *extra_args]
+        rc = prep.main()
+    finally:
+        sys.argv = saved_argv
+    return rc, [json.loads(line) for line in open(out)], prep
+
+
+def test_prep_main_packed_path_end_to_end():
+    rc, rows, prep = _run_lbv2_prep_main(["--pack-distractors"])
+    assert rc == 0 and rows
+    for row in rows:
+        assert row["id"].startswith("lbv2mtT-")
+        assert len(row["turns"]) == 3
+        for turn in row["turns"]:
+            assert turn["num_docs"] >= 2
+            assert 0 <= turn["target_doc_position"] < turn["num_docs"]
+            assert len(turn["distractor_doc_ids"]) == turn["num_docs"] - 1
+
+
+def test_prep_main_single_document_path_is_unchanged_by_packing_support():
+    """Same inputs without `--pack-distractors`: the original path, whose
+    rows must carry none of the packing fields."""
+    rc, rows, prep = _run_lbv2_prep_main([])
+    assert rc == 0 and rows
+    for row in rows:
+        for turn in row["turns"]:
+            assert not any(k in turn for k in prep.PACK_FIELDS)
+
+
+def test_prep_main_packing_forms_more_conversations_than_single_documents():
+    """The reason the mode exists, checked on the same synthetic pool."""
+    _, packed, _ = _run_lbv2_prep_main(["--pack-distractors"])
+    _, single, _ = _run_lbv2_prep_main([])
+    assert len(packed) > len(single), (len(packed), len(single))
+
+
+
 if __name__ == "__main__":
     _run_all()

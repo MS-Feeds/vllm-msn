@@ -110,11 +110,15 @@ v2 document of 40,000-42,981 rendered tokens:
     single-document questions and to shrinking the decode confound; it is a
     harder test for the speed claim, not an easier one.
 
-  - **Yield is the practical risk.** A 3k-token-wide band holds few
-    documents -- on the Gemma tokenizer, the `short` bucket's 70th and 80th
-    percentiles are ~39.7k and ~46.9k -- so `--lengths short,medium` is
-    required, and the run prints how many documents landed in the band before
-    grouping. Check it before spending GPU time.
+  - **Single documents can't fill it -- use `--pack-distractors`.** Measured
+    on Gemma-4-31B's tokenizer over `short,medium`: 260 of 395 documents are
+    longer than the ~43k ceiling (the median is 79.6k), and only 6 fall in
+    [40,000, 42,981] -- 2 conversations. `--pack-distractors` instead builds
+    each turn from ONE question and its document plus other questions'
+    documents as distractors, packed into the band. Any document short enough
+    to take at least one distractor can be a question, so yield is set by the
+    ~100 documents under ~32k rather than the 6 inside the band. It changes the
+    task to finding the relevant document among several; see `pack_turn`.
 
   - **Per-model token counts select different documents.** Lengths are
     measured with `--tokenizer`, which must be the TARGET's. Llama-3's
@@ -135,20 +139,21 @@ Usage (the original 5-turn file):
         --max-tokens 512 --seed 42 \\
         --output datasets/longbench_v2_multiturn.jsonl
 
-Usage (3 turns x 40-43k):
+Usage (3 turns x 40-43k, packed with distractors):
     python3 datasets/prep_longbench_v2_multiturn.py \\
         --tokenizer $GEMMA4_31B_MODEL_PATH \\
         --target-max-num-batched-tokens 131072 \\
         --speculator-max-num-batched-tokens 131063 \\
         --max-tokens 512 --turns-per-conv 3 \\
         --lengths short,medium --min-doc-tokens 40000 \\
-        --id-prefix lbv2mt3 --seed 42 \\
-        --output datasets/longbench_v2_multiturn_3x40k.jsonl
+        --pack-distractors --id-prefix lbv2mt3p --seed 42 \\
+        --output datasets/longbench_v2_multiturn_3x40k_packed.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import random
@@ -340,6 +345,17 @@ def build_documents(rows, prep, tok, lengths, verbose_every=200) -> list[dict]:
         docs.append(
             {
                 "doc_id": str(row.get("_id")),
+                # Raw fields, kept in memory for `--pack-distractors`, which
+                # re-renders a turn around several documents. Never emitted:
+                # `build_rows` copies an explicit field list, so the 5-turn
+                # file's output is byte-identical with or without these.
+                "context": context,
+                "question": question,
+                # Identity by CONTENT, not row id: two LongBench v2 questions
+                # can share a document, and packing must never hand a target
+                # its own document as a "distractor", nor show one document
+                # twice within a conversation.
+                "doc_key": hashlib.sha1(context.encode("utf-8")).hexdigest()[:16],
                 "domain": row.get("domain"),
                 "sub_domain": row.get("sub_domain"),
                 "difficulty": row.get("difficulty"),
@@ -449,6 +465,151 @@ def group_into_conversations(docs, budget: Budget, max_doc_tokens, rng,
     return conversations, dropped_too_large
 
 
+#: How packed documents are delimited inside the template's single
+#: `{context}` slot. Numbered so a question can be answered by locating "the
+#: relevant document" without the prompt ever saying which one it is.
+PACK_DOC_HEADER = "Document {n}:\n"
+PACK_DOC_JOINER = "\n\n"
+
+#: Fields `--pack-distractors` adds to a turn. Emitted only when present, so
+#: the unpacked path's rows gain no keys -- see `build_rows`.
+PACK_FIELDS = ("num_docs", "target_doc_position", "distractor_doc_ids")
+
+
+def render_packed_block(template, choice_letters, target, docs_in_order) -> str:
+    """One turn's prompt block: `target`'s question and choices, posed over
+    every document in `docs_in_order` (which includes the target's own)."""
+    context = PACK_DOC_JOINER.join(
+        PACK_DOC_HEADER.format(n=i + 1) + d["context"]
+        for i, d in enumerate(docs_in_order)
+    )
+    choices = {f"choice_{letter}": text
+               for letter, text in zip(choice_letters, target["options"])}
+    return template.format(context=context, question=target["question"], **choices)
+
+
+def pack_turn(target, pool, used_keys, floor, ceiling, rng, measure, render,
+              sep_tokens, max_attempts=25):
+    """Pack `target` with at least one distractor document so the rendered
+    turn lands in `[floor, ceiling]`. Returns a dict, or None if it can't.
+
+    **Why this exists.** LongBench v2 cannot supply 3-turn conversations of
+    long single documents: the per-turn ceiling is pinned near 43k by the
+    SCORER's 131,072-token context (it must hold the whole conversation), and
+    260 of the 395 short+medium documents are longer than that. A 40k floor
+    left 6 documents -- 2 conversations. Packing decouples turn length from
+    document supply: any document under the ceiling can be a question, and
+    other questions' documents fill the turn to length.
+
+    **Always at least one distractor**, so every turn poses the same task --
+    find the relevant document among several -- rather than mixing single-
+    and multi-document turns, which would add per-turn variance to accuracy.
+    A target too long to admit any distractor is dropped, not asked alone.
+
+    Distractor choice is estimate-then-verify. `context_tokens` sums are
+    close to, but not exactly, the rendered length (headers, boundary merges),
+    so each candidate is rendered and re-measured with `measure` -- the
+    driver's own renderer, same as every other length in this file -- and
+    retried if it misses the band.
+
+    The target's position among the documents is drawn uniformly and recorded,
+    so position effects ("lost in the middle") can be checked afterwards
+    rather than silently biasing the result.
+
+    `measure` and `render` are injected so the policy is testable without a
+    tokenizer.
+    """
+    base = target["query_tokens"] + sep_tokens      # target gets a header too
+    gap_min, gap_max = floor - base, ceiling - base
+    candidates = [
+        d for d in pool
+        if d["doc_key"] not in used_keys
+        and d["doc_key"] != target["doc_key"]
+        and d["context_tokens"] + sep_tokens <= gap_max
+    ]
+    if not candidates:
+        return None
+
+    for _ in range(max_attempts):
+        rng.shuffle(candidates)
+        chosen, total = [], 0
+        for d in candidates:
+            cost = d["context_tokens"] + sep_tokens
+            if total + cost > gap_max:
+                continue
+            chosen.append(d)
+            total += cost
+            if total >= gap_min:
+                break
+        if not chosen or total < gap_min:
+            continue
+        position = rng.randrange(len(chosen) + 1)
+        order = chosen[:position] + [target] + chosen[position:]
+        block = render(target, order)
+        n = measure(block)
+        if floor <= n <= ceiling:
+            return {"input": block, "query_tokens": n, "distractors": chosen,
+                    "position": position, "num_docs": len(order)}
+    return None
+
+
+def group_packed_conversations(docs, budget: Budget, floor, ceiling, rng,
+                               turns_per_conv, measure, render, sep_tokens):
+    """Build `turns_per_conv`-turn conversations of packed turns. Returns
+    `(conversations, dropped_unpackable)`.
+
+    Two reuse rules, and they differ on purpose:
+
+      - **Each question is asked at most once** across the whole file, so no
+        answer is graded twice.
+      - **Distractors may be reused ACROSS conversations but never WITHIN
+        one.** Each conversation is its own persistent session; a document
+        that appeared earlier in the SAME session would already be resident
+        in its KV cache, so reusing it -- as a later distractor or as a later
+        turn's own document -- would leak. Across sessions there is nothing to
+        leak into.
+
+    Size banding, which `group_into_conversations` needs to keep per-turn `d`
+    homogeneous, is unnecessary here: every packed turn is already inside a
+    ~3k-token band by construction.
+    """
+    queue = list(docs)
+    rng.shuffle(queue)
+    conversations: list[list[dict]] = []
+    dropped_unpackable = 0
+
+    while len(queue) >= turns_per_conv:
+        used: set = set()
+        turns: list[dict] = []
+        i = 0
+        while len(turns) < turns_per_conv and i < len(queue):
+            target = queue[i]
+            if target["doc_key"] in used:
+                i += 1              # leave it for a later conversation
+                continue
+            packed = pack_turn(target, docs, used, floor, ceiling, rng,
+                               measure, render, sep_tokens)
+            queue.pop(i)            # asked at most once, packed or not
+            if packed is None:
+                dropped_unpackable += 1
+                continue
+            used.add(target["doc_key"])
+            used.update(d["doc_key"] for d in packed["distractors"])
+            turn = dict(target)
+            turn["input"] = packed["input"]
+            turn["query_tokens"] = packed["query_tokens"]
+            turn["num_docs"] = packed["num_docs"]
+            turn["target_doc_position"] = packed["position"]
+            turn["distractor_doc_ids"] = [d["doc_id"] for d in packed["distractors"]]
+            turns.append(turn)
+        if len(turns) < turns_per_conv:
+            break                   # the queue can no longer fill a conversation
+        if budget.fits([t["query_tokens"] for t in turns]):
+            conversations.append(turns)
+
+    return conversations, dropped_unpackable
+
+
 def verify_conversations(conversations, budget: Budget, tok) -> tuple[list[list[dict]], int]:
     """Re-measures every turn at its TRUE slot index and applies the driver's
     exact pre-flight formula, dropping any conversation that would fail.
@@ -501,6 +662,10 @@ def build_rows(conversations, budget: Budget, config_name, preamble,
                         "difficulty": d["difficulty"],
                         "length": d["length"],
                         "query_tokens": d["query_tokens"],
+                        # Packing metadata, only on packed turns. Adding the
+                        # keys unconditionally would change every row of the
+                        # 5-turn file.
+                        **{k: d[k] for k in PACK_FIELDS if k in d},
                     }
                     for d in conv
                 ],
@@ -561,6 +726,16 @@ def main() -> int:
                              "3-turn long-document variant use 40000 with "
                              "--lengths short,medium; see the module docstring "
                              "for why the ceiling there is ~43k, not 45k.")
+    parser.add_argument("--pack-distractors", action="store_true",
+                        help="Build every turn from ONE LongBench v2 question "
+                             "and its document, plus other questions' "
+                             "documents as distractors, packed until the turn "
+                             "lands in [--min-doc-tokens, ceiling]. Use when "
+                             "too few single documents fall in the band -- on "
+                             "3 turns x 40k, single documents gave 2 "
+                             "conversations. Changes the task to finding the "
+                             "relevant document among several; accuracy is not "
+                             "comparable to standard LongBench v2.")
     parser.add_argument("--id-prefix", default="lbv2mt",
                         help="Conversation id prefix. Give each sample file its "
                              "own: the id is the grader's join key, so two "
@@ -615,6 +790,44 @@ def main() -> int:
 
     print(_histogram([d["query_tokens"] for d in docs], "rendered query tokens (all kept docs)"))
 
+    dropped_unpackable = 0
+    if args.pack_distractors:
+        if args.min_doc_tokens <= 0:
+            print("[prep_lbv2_mt] ERROR: --pack-distractors needs "
+                  "--min-doc-tokens > 0 -- it is the length each turn is "
+                  "packed UP to.", file=sys.stderr)
+            return 2
+        try:
+            select_length_band([], args.min_doc_tokens, max_doc_tokens)
+        except ValueError as exc:
+            print(f"[prep_lbv2_mt] ERROR: {exc}", file=sys.stderr)
+            return 2
+        eligible = [d for d in docs if d["query_tokens"] <= max_doc_tokens]
+        dropped_too_large = len(docs) - len(eligible)
+        dropped_too_small = 0
+        for d in eligible:
+            d["context_tokens"] = len(tok.encode(d["context"], add_special_tokens=False))
+        sep_tokens = len(tok.encode(PACK_DOC_HEADER.format(n=10) + PACK_DOC_JOINER,
+                                    add_special_tokens=False))
+
+        def measure(block):
+            return len(render_turn_query(tok, 0, {"input": block}))
+
+        def render(target, order):
+            return render_packed_block(prep._PROMPT_TEMPLATE, prep.CHOICE_LETTERS,
+                                       target, order)
+
+        print(f"[prep_lbv2_mt] packing: {len(eligible)} documents under the "
+              f"{max_doc_tokens:,} ceiling are candidate questions AND "
+              f"distractors; each turn packed to [{args.min_doc_tokens:,}, "
+              f"{max_doc_tokens:,}]", flush=True)
+        conversations, dropped_unpackable = group_packed_conversations(
+            eligible, budget, args.min_doc_tokens, max_doc_tokens,
+            random.Random(args.seed), args.turns_per_conv, measure, render,
+            sep_tokens)
+        return _finish(args, budget, tok, conversations, dropped_too_small,
+                       dropped_too_large, dropped_unpackable, max_doc_tokens)
+
     try:
         docs, dropped_too_small = select_length_band(
             docs, args.min_doc_tokens, max_doc_tokens)
@@ -634,6 +847,14 @@ def main() -> int:
     conversations, dropped_too_large = group_into_conversations(
         docs, budget, max_doc_tokens, rng, args.turns_per_conv
     )
+    return _finish(args, budget, tok, conversations, dropped_too_small,
+                   dropped_too_large, dropped_unpackable, max_doc_tokens)
+
+
+def _finish(args, budget, tok, conversations, dropped_too_small,
+            dropped_too_large, dropped_unpackable, max_doc_tokens) -> int:
+    """Verify, emit and report -- shared by the single-document and packed
+    paths, so both write and describe their output identically."""
     conversations, dropped_verify = verify_conversations(conversations, budget, tok)
 
     if args.max_conversations >= 0:
@@ -661,8 +882,17 @@ def main() -> int:
           f"turns={len(per_turn)} "
           f"dropped_doc_too_small={dropped_too_small} "
           f"dropped_doc_too_large={dropped_too_large} "
+          f"dropped_unpackable={dropped_unpackable} "
           f"dropped_failed_verify={dropped_verify}")
     print(_histogram(per_turn, "per-turn d (rendered query tokens)"))
+    if args.pack_distractors:
+        packed_turns = [t for r in out_rows for t in r["turns"]]
+        ndocs = [t["num_docs"] for t in packed_turns]
+        pos = [t["target_doc_position"] for t in packed_turns]
+        print(f"  documents per turn: min={min(ndocs)} "
+              f"mean={statistics.mean(ndocs):.1f} max={max(ndocs)}")
+        print(f"  target position (0-based) counts: "
+              + ", ".join(f"{k}:{pos.count(k)}" for k in sorted(set(pos))))
     print(_histogram(resident, "resident len at last turn"))
 
     # Report BOTH engines' headroom, and say which one is actually binding.
