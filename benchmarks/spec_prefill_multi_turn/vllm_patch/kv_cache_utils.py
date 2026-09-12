@@ -102,6 +102,15 @@ def shared_layer_specs_to_backfill(
     return backfill
 
 
+#: Pairwise-distinct sentinel sizes for `_find_kv_split_dim`'s layout probe.
+#: None is 2 and none is a plausible real `block_size`, so no probed dim can
+#: alias the K/V split. Primes, so a backend that MULTIPLIES two parameters
+#: into one dim cannot land on 2 either.
+_KV_PROBE_NUM_BLOCKS = 10007
+_KV_PROBE_NUM_KV_HEADS = 10009
+_KV_PROBE_HEAD_SIZE = 10037
+
+
 def _find_kv_split_dim(
     attn_backend,
     kv_cache: torch.Tensor,
@@ -111,6 +120,31 @@ def _find_kv_split_dim(
 ) -> int:
     """Find which dim of `kv_cache` is the K/V-split dim (size 2), using the
     backend's own declared shape rather than hardcoding a layout per backend.
+
+    **The dim is located by PROBING the backend's layout with sentinel
+    parameter values, not by searching the real shape for a 2.** Searching
+    the real shape is ambiguous the moment any other parameter is also 2, and
+    that is not hypothetical: it is exactly what a tensor-parallel speculator
+    produces. Confirmed on real hardware -- a Llama-3.2-1B scorer at
+    `--speculator-tensor-parallel-size 4` shards its 8 KV heads down to 2 per
+    rank, giving FlashAttention the shape
+
+        (2, 64683, 16, 2, 64)
+         ^                ^
+         K/V split        num_kv_heads, now also 2
+
+    and the old search returned candidates `[0, 3]` and raised. Excluding
+    `block_dim` alone was never enough; `head_size` or `block_size` could
+    collide the same way on another configuration.
+
+    The probe is exact rather than heuristic: `get_kv_cache_shape` is a pure
+    layout function (both FlashAttention and TritonAttention only validate
+    `block_size % 16`, then build a tuple), so calling it with parameter
+    values that are pairwise distinct and none equal to 2 leaves exactly one
+    dim of size 2 -- the split. `block_size` is passed THROUGH unchanged,
+    precisely because it is the one parameter backends validate; it can never
+    alias 2 anyway, being required to be a multiple of 16. The same
+    sentinel-probe idiom the backends' own `get_kv_cache_block_dim` uses.
     """
     block_dim = attn_backend.get_kv_cache_block_dim(block_size, num_kv_heads, head_size)
     num_blocks = kv_cache.shape[block_dim]
@@ -125,13 +159,34 @@ def _find_kv_split_dim(
             f"head_size={head_size} -- backend may use a non-generic layout "
             f"not handled by this reader."
         )
-    split_dims = [i for i, s in enumerate(expected_shape) if s == 2 and i != block_dim]
+    probe_shape = attn_backend.get_kv_cache_shape(
+        _KV_PROBE_NUM_BLOCKS, block_size, _KV_PROBE_NUM_KV_HEADS, _KV_PROBE_HEAD_SIZE
+    )
+    if len(probe_shape) != len(expected_shape):
+        raise ValueError(
+            f"{attn_backend.get_name()}'s declared shape changes RANK with "
+            f"its parameters ({len(expected_shape)} dims for the real values, "
+            f"{len(probe_shape)} for the layout probe) -- this reader cannot "
+            f"locate the K/V split dim in a layout that is not positional."
+        )
+    split_dims = [i for i, s in enumerate(probe_shape) if s == 2]
     if len(split_dims) != 1:
         raise ValueError(
-            f"Could not uniquely locate the K/V split dim in shape "
-            f"{expected_shape} (block_dim={block_dim}, candidates={split_dims})."
+            f"Could not uniquely locate the K/V split dim in "
+            f"{attn_backend.get_name()}'s layout: probing with "
+            f"{probe_shape} (from num_blocks={_KV_PROBE_NUM_BLOCKS}, "
+            f"block_size={block_size}, num_kv_heads={_KV_PROBE_NUM_KV_HEADS}, "
+            f"head_size={_KV_PROBE_HEAD_SIZE}, none of which is 2) left "
+            f"candidates={split_dims}. The real shape is {expected_shape}."
         )
-    return split_dims[0]
+    split_dim = split_dims[0]
+    if expected_shape[split_dim] != 2:
+        raise ValueError(
+            f"{attn_backend.get_name()}'s layout puts the K/V split at dim "
+            f"{split_dim} (probe {probe_shape}), but the real shape "
+            f"{expected_shape} has {expected_shape[split_dim]} there, not 2."
+        )
+    return split_dim
 
 
 def read_layer_keys(

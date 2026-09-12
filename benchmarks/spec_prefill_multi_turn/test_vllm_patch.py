@@ -51,6 +51,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import types
+
 import torch
 
 from vllm_patch.config import SpecConfig
@@ -58,6 +60,7 @@ from vllm_patch.conversation_state import ConversationState
 from vllm_patch.kv_cache_utils import (
     prompt_tail_subslice,
     _find_kv_split_dim,
+    read_layer_keys,
     block_indices_from_positions,
     compute_base_gather_view,
     compute_prefill_base_view,
@@ -331,6 +334,104 @@ def test_kv_split_dim_triton_layout():
     kv_cache = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_size)
     split_dim = _find_kv_split_dim(FakeTritonBackend, kv_cache, block_size, num_kv_heads, head_size)
     assert split_dim == 1
+
+
+class _FakeFlashBackend:
+    """FlashAttention's real layout: (2, num_blocks, block_size, heads, dim)."""
+
+    @staticmethod
+    def get_name():
+        return "FLASH_ATTN"
+
+    @staticmethod
+    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size,
+                           cache_dtype_str="auto"):
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
+
+    @classmethod
+    def get_kv_cache_block_dim(cls, block_size, num_kv_heads, head_size,
+                               cache_dtype_str="auto"):
+        _S = 1234567
+        return cls.get_kv_cache_shape(_S, block_size, num_kv_heads, head_size).index(_S)
+
+
+def test_kv_split_dim_survives_a_tensor_parallel_shard_that_aliases_the_split():
+    """**Regression test for a confirmed real-hardware failure.**
+
+    A Llama-3.2-1B scorer at `--speculator-tensor-parallel-size 4` shards its
+    8 KV heads down to 2 per rank, so FlashAttention's cache comes out as
+    `(2, 64683, 16, 2, 64)` -- the K/V split and `num_kv_heads` are BOTH 2.
+    The old detector searched the real shape for a dim of size 2, excluding
+    only `block_dim`, found candidates `[0, 3]`, and raised:
+
+        ValueError: Could not uniquely locate the K/V split dim in shape
+        (2, 64683, 16, 2, 64) (block_dim=1, candidates=[0, 3]).
+
+    Probing the backend's layout with non-2 sentinels resolves it exactly.
+    """
+    block_size, num_kv_heads, head_size, num_blocks = 16, 2, 64, 64683
+    kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_size)
+    split_dim = _find_kv_split_dim(
+        _FakeFlashBackend, kv_cache, block_size, num_kv_heads, head_size)
+    assert split_dim == 0
+
+
+def test_kv_split_dim_survives_a_head_size_of_two():
+    """The same aliasing through a different parameter. `num_kv_heads` is the
+    one TP shrinks, but nothing about the old search was specific to it --
+    which is why the fix probes every parameter rather than special-casing
+    heads."""
+    block_size, num_kv_heads, head_size, num_blocks = 16, 8, 2, 41
+    kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_size)
+    assert _find_kv_split_dim(
+        _FakeFlashBackend, kv_cache, block_size, num_kv_heads, head_size) == 0
+
+
+def test_kv_split_dim_unsharded_flash_layout_is_unchanged():
+    """The single-GPU speculator every published row was measured under."""
+    block_size, num_kv_heads, head_size, num_blocks = 16, 8, 64, 100
+    kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_size)
+    assert _find_kv_split_dim(
+        _FakeFlashBackend, kv_cache, block_size, num_kv_heads, head_size) == 0
+
+
+def test_kv_split_dim_still_rejects_a_cache_that_contradicts_the_backend():
+    """The shape check that catches a non-generic layout must survive the
+    probe rewrite -- reading K out of a layout this module does not
+    understand would return silently wrong keys."""
+    block_size, num_kv_heads, head_size, num_blocks = 16, 2, 64, 41
+    wrong = torch.zeros(num_blocks, 2, block_size, num_kv_heads, head_size)
+    try:
+        _find_kv_split_dim(_FakeFlashBackend, wrong, block_size, num_kv_heads, head_size)
+    except ValueError as exc:
+        assert "does not match" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a mismatched cache shape")
+
+
+def test_read_layer_keys_slot_order_under_a_tp_sharded_cache():
+    """End-to-end past the split: a flat slot axis of
+    `block_id * block_size + offset`, with this rank's 2 KV heads intact.
+    Guards against the split dim being found correctly but unbound wrongly."""
+    block_size, num_kv_heads, head_size, num_blocks = 16, 2, 64, 8
+    k = torch.arange(
+        num_blocks * block_size * num_kv_heads * head_size, dtype=torch.float32
+    ).reshape(num_blocks, block_size, num_kv_heads, head_size)
+    v = torch.full_like(k, -1.0)
+    kv_cache = torch.stack([k, v], dim=0)
+
+    layer = types.SimpleNamespace(kv_cache=kv_cache, attn_backend=_FakeFlashBackend)
+    flat = read_layer_keys(layer, block_size, num_kv_heads, head_size)
+
+    assert flat.shape == (num_blocks * block_size, num_kv_heads, head_size)
+    # V is all -1; if the unbind picked the wrong half this would be -1 too.
+    assert flat.min() >= 0.0
+    for block_id, offset in ((0, 0), (3, 7), (num_blocks - 1, block_size - 1)):
+        assert torch.equal(
+            flat[block_id * block_size + offset], k[block_id, offset]
+        )
 
 
 def test_tensor_wire_roundtrip_preserves_shape_dtype_values():
