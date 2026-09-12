@@ -786,6 +786,84 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         return cached
 
 
+    def _tp_shard_reducer(self, spec_config):
+        """The all-reduce that turns this rank's PARTIAL (layer, head)
+        collapse into the global one, or `None` when the speculator runs on
+        a single GPU.
+
+        **Why this is needed at all.** `proposer.py` may now build the
+        speculator engine with `tensor_parallel_size > 1`, because the
+        scorer's cost is dominated by full-context attention prefill and the
+        wave loop leaves every other GPU idle while it runs. Under TP, vLLM
+        shards the ATTENTION HEAD axis: this rank's `end_capture` returns
+        only its own heads' Q, its own `attn.kv_cache` holds only its own
+        heads' K, and so `scoring.py`'s collapse over `(layer, head)` sees
+        `num_layers * (num_heads // tp_size)` rows instead of all of them.
+
+        Without this reduction `proposer.py`'s long-standing
+        `collective_rpc(...)[0]` unwrap would return a selection scored on
+        `1/tp_size` of the attention heads -- no exception, no warning, a
+        perfectly plausible keep rate, and a quietly worse selection. That is
+        precisely the failure mode this pipeline's other confirmed bugs
+        (stale `scheduler_metadata`, `id()`-keyed caches) shared, so it gets
+        the same treatment: make the sharded path produce the unsharded
+        answer, rather than teaching every caller about shards.
+
+        **Why an all-reduce and not a gather to the driver.** After this,
+        every rank holds the identical combined tensor and therefore reaches
+        the identical `chunk_select_from_smoothed_attention` result, so
+        `[0]` is not merely still-valid but exactly right, and no Q/K/score
+        tensor crosses the process boundary -- the property
+        `end_capture_and_score`'s docstring exists to protect. The reduced
+        tensor is `[look_ahead_cnt, context_len]` (~4 MB at 8 x 130k in
+        fp32), against the ~2 GB of K it is derived from.
+
+        See `scoring.SHARD_REDUCE_OPS` for why each aggregation mode
+        recombines exactly, and `scoring.collapse_attention_score` for why
+        this must land BEFORE the mean over lookahead steps.
+        """
+        import torch.distributed as dist
+
+        from vllm.distributed.parallel_state import get_tp_group
+
+        from .scoring import shard_reduce_op
+
+        group = get_tp_group()
+        world_size = group.world_size
+        if world_size == 1:
+            # The single-GPU speculator every published row was measured
+            # under. Returning None keeps `score_and_select_indices` on its
+            # pre-existing code path rather than an all-reduce that would be
+            # a no-op with extra steps.
+            return None
+
+        if spec_config.score_head_set is not None:
+            raise ValueError(
+                "score_head_set cannot be combined with a tensor-parallel "
+                f"speculator (tensor_parallel_size={world_size}): those "
+                "indices are into the FULL flattened layer*head axis, and TP "
+                "shards exactly that axis, so rank-local row r is not global "
+                "row r. Re-derive the head list per rank, or score with "
+                "tensor_parallel_size=1."
+            )
+
+        op = shard_reduce_op(spec_config.score_aggregation)
+        reduce_op = dist.ReduceOp.MAX if op == "max" else dist.ReduceOp.SUM
+        process_group = group.device_group
+
+        def reduce_shard(collapsed):
+            # `all_reduce` is in-place and needs a contiguous buffer; the
+            # collapse's output is a reduction result and already owns its
+            # storage, but `.contiguous()` is cheap insurance against a view
+            # arriving here from some future collapse mode.
+            out = collapsed.contiguous()
+            dist.all_reduce(out, op=reduce_op, group=process_group)
+            if op == "sum":
+                out = out / world_size
+            return out
+
+        return reduce_shard
+
     def end_capture_and_score(
         self,
         request_id: str,
@@ -873,6 +951,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             actual_look_ahead_cnt,
             spec_config,
             self.layer_geometry(),
+            self._tp_shard_reducer(spec_config),
         )
         return kept_local_indices, actual_look_ahead_cnt
 

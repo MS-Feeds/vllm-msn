@@ -470,53 +470,106 @@ def _collapse_layer_head(attn: torch.Tensor, score_aggregation: str) -> torch.Te
     raise ValueError(f"unknown score_aggregation: {score_aggregation!r}")
 
 
-def aggregate_attention_score(
+#: How a given `score_aggregation`'s collapse over the (layer, head) axis
+#: recombines when that axis is SPLIT across tensor-parallel shards -- the
+#: torch.distributed reduction that makes the combined result identical to
+#: the one a single unsharded rank would have produced.
+#:
+#: Every mode `_collapse_layer_head` supports is exactly reducible, but not
+#: for the same reason, and the difference is worth stating because getting
+#: it wrong is silent:
+#:
+#: - `max` is exact unconditionally -- `max` is associative, so the max over
+#:   ranks of per-rank maxima IS the global max, whatever the shards' sizes.
+#: - `mean` is exact only when every rank collapses the SAME NUMBER of rows,
+#:   since a mean of means is otherwise mis-weighted. That holds here by
+#:   construction, not by luck: vLLM's TP requires `num_heads % tp_size == 0`
+#:   and shards the head axis only, so every rank holds every layer and
+#:   exactly `num_layers * (num_heads // tp_size)` rows.
+#: - `zmean` z-scores each row over the CONTEXT axis before averaging. That
+#:   normalization is per-row and independent of every other row, so it is
+#:   unaffected by which rank a row lives on, and what remains reduces
+#:   exactly like `mean` under the same equal-count condition.
+SHARD_REDUCE_OPS = {"max": "max", "mean": "sum", "zmean": "sum"}
+
+
+def shard_reduce_op(score_aggregation: str) -> str:
+    """The reduction `SHARD_REDUCE_OPS` prescribes, or raise.
+
+    Pure string logic with no torch and no distributed group, so the policy
+    is unit-testable on CPU -- same reason `scoring_layer_indices` and
+    `model_truncation.keep_weight_for_layer_range` are separable.
+    """
+    try:
+        return SHARD_REDUCE_OPS[score_aggregation]
+    except KeyError:
+        raise ValueError(
+            f"score_aggregation={score_aggregation!r} has no defined "
+            f"tensor-parallel shard reduction. Known: "
+            f"{sorted(SHARD_REDUCE_OPS)}."
+        ) from None
+
+
+def combine_score_shards(
+    shards: List[torch.Tensor], score_aggregation: str
+) -> torch.Tensor:
+    """Combine per-shard `collapse_attention_score` outputs into the tensor
+    an unsharded rank would have produced.
+
+    The CPU-checkable twin of the NCCL all-reduce
+    `speculator_worker.py::_tp_shard_reducer` performs in the real path.
+    Production does NOT call this -- an all-reduce leaves the result on every
+    rank without gathering shards anywhere -- but the two must agree, and an
+    equivalence a test can assert beats a comment claiming it.
+
+    `mean`/`zmean` divide by the shard count, which is the mean-of-means step
+    that `SHARD_REDUCE_OPS` documents as exact only for equal-sized shards.
+    """
+    if not shards:
+        raise ValueError("combine_score_shards needs at least one shard")
+    op = shard_reduce_op(score_aggregation)
+    shapes = {tuple(t.shape) for t in shards}
+    if len(shapes) != 1:
+        raise ValueError(
+            f"shards disagree on shape ({sorted(shapes)}) -- every rank "
+            f"collapses to the same [look_ahead_cnt, context_len], so a "
+            f"mismatch means the ranks scored different requests."
+        )
+    stacked = torch.stack(shards, dim=0)
+    if op == "max":
+        return stacked.max(0)[0]
+    return stacked.sum(0) / len(shards)
+
+
+def collapse_attention_score(
     attn_scores: List[torch.Tensor],
     spec_config: SpecConfig,
     geometry: Optional[LayerGeometry] = None,
     winning_layers: Optional[list] = None,
 ) -> List[torch.Tensor]:
-    """Algorithm line 14: A <- aggregate_attention_score(A).
+    """`aggregate_attention_score` WITHOUT its final mean over lookahead
+    steps: per-sample `[look_ahead_cnt, context_len]` instead of
+    `[context_len]`.
 
-    softmax -> optional smoothing pool -> collapse (layer, head) -> mean over
-    lookahead steps, producing one importance score per prompt token.
+    Exists because that last `.mean(0)` is the one step that does NOT
+    commute with combining tensor-parallel shards, and the speculator is
+    now allowed to run with `tensor_parallel_size > 1` (see
+    `speculator_worker.py::_tp_shard_reducer`). Under TP each rank holds a
+    slice of the attention heads, so its `_collapse_layer_head` produces a
+    PARTIAL collapse over its own rows. Combining those partials is exact
+    -- but only at this point in the pipeline:
 
-    The collapse step is `max` by default -- the reference implementation's
-    behavior, so an unconfigured run reproduces every already-published row
-    exactly -- and `spec_config.score_aggregation` /
-    `spec_config.score_layers` select the alternatives (`mean`, `zmean`, and
-    late-layer-only voting). Those exist because ORACLE-k20 attributed 17.0
-    of `scbench_kv`'s 25.0-point degradation to the speculator's estimation
-    error, against 8.0 for the sparse-decode mechanism, while this whole
-    function costs ~0.007% of a turn's FLOPs. See ACCURACY_IMPROVEMENTS.md.
+        max_ranks(mean_lookahead(max_heads(x)))  !=  mean_lookahead(max_heads(x))
+        mean_lookahead(max_ranks(max_heads(x)))  ==  mean_lookahead(max_heads(x))
 
-    Args:
-        attn_scores: per-sample [num_layer, num_head, look_ahead_cnt, context_len]
-            tensors, as returned by compute_attention_score.
-        spec_config: supplies `pool_kernel_size`, `score_aggregation`,
-            `score_layers`, `score_head_set`.
-        geometry: optional per-layer `layer_types`/`kv_shared`, consumed by
-            `scoring_layer_indices`. None reproduces the reference behavior.
-        winning_layers: optional list to APPEND per-sample winner tensors to,
-            one `[look_ahead_cnt, context_len]` int tensor per sample giving
-            the ORIGINAL layer index whose head won the `max` at each
-            (lookahead step, context position).
+    Reducing the finished `[context_len]` importance vectors instead would
+    be silently, subtly wrong -- a plausible-looking selection scored in
+    the wrong order -- which is why the split is a named function with this
+    docstring rather than an inline `keepdim` trick at the call site.
 
-            Production throws this away -- `attn.max(0)` keeps `.values` and
-            discards `.indices`. It is collected here, inside the real
-            function, rather than in a diagnostic that reimplements these
-            steps: a copy of an aggregation pipeline drifts from the pipeline
-            it copied, and a diagnostic that silently measures something
-            other than production is worse than no diagnostic. Indices are
-            mapped back through `layer_indices`, so a restricted selection
-            (`global_only`) still reports true layer numbers.
-
-            Requires `score_aggregation="max"` (there is no argmax to report
-            for `mean`/`zmean`) and is incompatible with `score_head_set`,
-            which renumbers the head axis this maps through.
-
-    Returns:
-        Per-sample 1D [context_len] token-importance tensors.
+    `aggregate_attention_score` is this plus `.mean(0)` and remains the
+    entry point for everything single-process; nothing about its behavior
+    changes.
     """
     layer_types = geometry.layer_types if geometry is not None else None
     kv_shared = geometry.kv_shared if geometry is not None else None
@@ -612,11 +665,61 @@ def aggregate_attention_score(
             attn = values
         else:
             attn = _collapse_layer_head(attn, spec_config.score_aggregation)
-        attn = attn.mean(0)  # mean over lookahead steps
-
         token_importance.append(attn)
 
     return token_importance
+
+
+def aggregate_attention_score(
+    attn_scores: List[torch.Tensor],
+    spec_config: SpecConfig,
+    geometry: Optional[LayerGeometry] = None,
+    winning_layers: Optional[list] = None,
+) -> List[torch.Tensor]:
+    """Algorithm line 14: A <- aggregate_attention_score(A).
+
+    softmax -> optional smoothing pool -> collapse (layer, head) -> mean over
+    lookahead steps, producing one importance score per prompt token.
+
+    The collapse step is `max` by default -- the reference implementation's
+    behavior, so an unconfigured run reproduces every already-published row
+    exactly -- and `spec_config.score_aggregation` /
+    `spec_config.score_layers` select the alternatives (`mean`, `zmean`, and
+    late-layer-only voting). Those exist because ORACLE-k20 attributed 17.0
+    of `scbench_kv`'s 25.0-point degradation to the speculator's estimation
+    error, against 8.0 for the sparse-decode mechanism, while this whole
+    function costs ~0.007% of a turn's FLOPs. See ACCURACY_IMPROVEMENTS.md.
+
+    Args:
+        attn_scores: per-sample [num_layer, num_head, look_ahead_cnt, context_len]
+            tensors, as returned by compute_attention_score.
+        spec_config: supplies `pool_kernel_size`, `score_aggregation`,
+            `score_layers`, `score_head_set`.
+        geometry: optional per-layer `layer_types`/`kv_shared`, consumed by
+            `scoring_layer_indices`. None reproduces the reference behavior.
+        winning_layers: optional list to APPEND per-sample winner tensors to,
+            one `[look_ahead_cnt, context_len]` int tensor per sample giving
+            the ORIGINAL layer index whose head won the `max` at each
+            (lookahead step, context position).
+
+            Production throws this away -- `attn.max(0)` keeps `.values` and
+            discards `.indices`. It is collected here, inside the real
+            function, rather than in a diagnostic that reimplements these
+            steps: a copy of an aggregation pipeline drifts from the pipeline
+            it copied, and a diagnostic that silently measures something
+            other than production is worse than no diagnostic. Indices are
+            mapped back through `layer_indices`, so a restricted selection
+            (`global_only`) still reports true layer numbers.
+
+            Requires `score_aggregation="max"` (there is no argmax to report
+            for `mean`/`zmean`) and is incompatible with `score_head_set`,
+            which renumbers the head axis this maps through.
+
+    Returns:
+        Per-sample 1D [context_len] token-importance tensors.
+    """
+    return [collapsed.mean(0) for collapsed in collapse_attention_score(
+        attn_scores, spec_config, geometry, winning_layers)]
 
 
 def phantom_vote_counts(
@@ -792,6 +895,7 @@ def score_and_select_indices(
     actual_look_ahead_cnt: int,
     spec_config: SpecConfig,
     geometry: Optional[LayerGeometry] = None,
+    shard_reducer=None,
 ) -> List[int]:
     """One-sample convenience wrapper chaining lines 12/14/16 above
     (`compute_attention_score` -> `aggregate_attention_score` ->
@@ -810,12 +914,32 @@ def score_and_select_indices(
 
     Caller must not call this with `actual_look_ahead_cnt == 0` (aggregating
     over zero lookahead steps produces silent NaN, not an error -- both
-    real callers already guard this themselves before calling in)."""
+    real callers already guard this themselves before calling in).
+
+    `shard_reducer`, when given, is applied to each sample's collapsed
+    `[look_ahead_cnt, context_len]` tensor before the mean over lookahead
+    steps. It exists for a tensor-parallel speculator, where this function
+    runs on every rank over that rank's OWN slice of the attention heads and
+    the slices must be combined -- see `collapse_attention_score` for why
+    that combination is only exact at this point, and
+    `speculator_worker.py::_tp_shard_reducer` for the all-reduce that
+    implements it. `None` (the default, and every pre-existing caller) leaves
+    this function exactly as it was."""
     key_buffer = [[k] for k in key_buffer_per_layer]  # one sample
     attn_scores = compute_attention_score(
         query_buffer, key_buffer, [actual_look_ahead_cnt], geometry,
         spec_config.mask_sliding_window,
     )
-    token_importance = aggregate_attention_score(attn_scores, spec_config, geometry)
+    # Collapse and mean are spelled out rather than left as one
+    # `aggregate_attention_score` call so `shard_reducer` can land BETWEEN
+    # them -- the only point at which combining tensor-parallel shards is
+    # exact. See `collapse_attention_score`'s docstring for the
+    # non-commutation this respects. With `shard_reducer=None` (every
+    # existing caller) this is `aggregate_attention_score` inlined, step for
+    # step, and produces bit-identical results.
+    collapsed = collapse_attention_score(attn_scores, spec_config, geometry)
+    if shard_reducer is not None:
+        collapsed = [shard_reducer(c) for c in collapsed]
+    token_importance = [c.mean(0) for c in collapsed]
     kept_local_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
     return kept_local_indices.tolist()

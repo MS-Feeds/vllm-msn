@@ -134,7 +134,9 @@ os.environ.setdefault("VLLM_DISABLE_REQUEST_ID_RANDOMIZATION", "1")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 
-def scorer_visible_devices(device_index: int, parent_cvd: Optional[str]) -> str:
+def scorer_visible_devices(
+    device_index: int, parent_cvd: Optional[str], tensor_parallel_size: int = 1
+) -> str:
     """The `CUDA_VISIBLE_DEVICES` value that places the scorer's child engine
     on `cuda:<device_index>` AS THIS PROCESS SEES IT.
 
@@ -157,9 +159,26 @@ def scorer_visible_devices(device_index: int, parent_cvd: Optional[str]) -> str:
 
     With no parent mask the index IS the physical ordinal, exactly as before,
     so every existing run places identically.
+
+    **`tensor_parallel_size > 1` claims that many CONSECUTIVE devices**,
+    starting at `device_index`, and returns them in order so the scorer's
+    rank *i* lands on visible device `device_index + i`. Sharing those cards
+    with a tensor-parallel target is the intended arrangement, not an abuse:
+    `predict_scbench.py`'s wave loop runs the speculator and the target in
+    strict lockstep, so while the scorer works the target's cards are idle,
+    and the scorer's small `--speculator-gpu-memory-utilization` is reserved
+    once at engine init and never grows. `tensor_parallel_size=1` returns a
+    single device exactly as before -- one entry, no commas -- so every
+    already-measured row places identically.
     """
+    if tensor_parallel_size < 1:
+        raise ValueError(
+            f"tensor_parallel_size must be >= 1, got {tensor_parallel_size}"
+        )
     if not parent_cvd:
-        return str(device_index)
+        return ",".join(
+            str(device_index + i) for i in range(tensor_parallel_size)
+        )
     visible = [d.strip() for d in parent_cvd.split(",") if d.strip()]
     if not 0 <= device_index < len(visible):
         raise ValueError(
@@ -168,7 +187,19 @@ def scorer_visible_devices(device_index: int, parent_cvd: Optional[str]) -> str:
             f"({len(visible)} device(s)). The index is relative to what this "
             f"process can see."
         )
-    return visible[device_index]
+    if device_index + tensor_parallel_size > len(visible):
+        raise ValueError(
+            f"a tensor_parallel_size={tensor_parallel_size} scorer starting "
+            f"at device index {device_index} needs visible devices "
+            f"{device_index}..{device_index + tensor_parallel_size - 1}, but "
+            f"this process can see only {len(visible)} "
+            f"(CUDA_VISIBLE_DEVICES={parent_cvd!r}). Lower "
+            f"--speculator-device, or lower "
+            f"--speculator-tensor-parallel-size."
+        )
+    return ",".join(
+        visible[device_index + i] for i in range(tensor_parallel_size)
+    )
 
 
 @dataclass
@@ -208,6 +239,7 @@ class SpecPrefillProposer:
         speculator_model_path: str,
         device: torch.device,
         gpu_memory_utilization: float = 0.2,
+        tensor_parallel_size: int = 1,
         **extra_llm_kwargs,
     ) -> None:
         """Builds the persistent speculator engine. `gpu_memory_utilization`
@@ -253,9 +285,14 @@ class SpecPrefillProposer:
         from vllm import LLM
 
         self.device = device
+        # Recorded so the driver-side entry points that return a RANK-LOCAL
+        # view (`run_turn`'s `end_capture`, `retrieve_keys`) can refuse
+        # rather than hand back a silent shard -- see their own guards.
+        self.tensor_parallel_size = tensor_parallel_size
         llm_kwargs = dict(
             model=speculator_model_path,
             trust_remote_code=True,
+            tensor_parallel_size=tensor_parallel_size,
             worker_cls="vllm_patch.speculator_worker.SpeculatorWorker",
             enable_prefix_caching=True,
             enforce_eager=True,
@@ -337,7 +374,7 @@ class SpecPrefillProposer:
             # Translate through the parent's mask -- see
             # `scorer_visible_devices` for the misplacement this prevents.
             os.environ["CUDA_VISIBLE_DEVICES"] = scorer_visible_devices(
-                device_index, prev_cvd)
+                device_index, prev_cvd, tensor_parallel_size)
             try:
                 self.llm = LLM(**llm_kwargs)
             finally:
@@ -399,8 +436,13 @@ class SpecPrefillProposer:
             conversation_salt, turn_idx, full_sequence_token_ids, look_ahead_cnt, ignore_eos
         )
 
-        # collective_rpc returns one result per worker (TP ranks) -- this
-        # pipeline is TP=1 only (see module docstring), so unwrap index 0.
+        # collective_rpc returns one result per worker (TP rank), so unwrap
+        # index 0. This is the RAW captured Q, which under a tensor-parallel
+        # speculator is rank 0's HEAD SHARD and not the whole thing -- hence
+        # the `_refuse_rank_local` guard above rather than a silent shard.
+        # The scoring entry points are the ones that stay correct under TP,
+        # because their ranks all-reduce before selecting
+        # (`speculator_worker.py::_tp_shard_reducer`).
         # SpeculatorWorker.end_capture now returns raw torch.Tensor objects
         # directly -- this module's own VLLM_ALLOW_INSECURE_SERIALIZATION=1
         # setting (see top of file) makes collective_rpc's UtilityResult
@@ -414,6 +456,7 @@ class SpecPrefillProposer:
         # lands on CPU (an IPC buffer reconstruction, not a CUDA-IPC share),
         # same as the old path.
         t_before_end_capture = time.time()
+        self._refuse_rank_local("end_capture")
         query_buffer_cpu = self.llm_engine.collective_rpc("end_capture", args=(request_id,))[0]
         query_buffer = [q.to(self.device) for q in query_buffer_cpu]
         actual_look_ahead_cnt = query_buffer[0].shape[1] if query_buffer else 0
@@ -570,6 +613,12 @@ class SpecPrefillProposer:
             )
             for spec, sub in zip(specs, submissions)
         ]
+        # `[0]` is correct even at speculator tensor_parallel_size > 1, and
+        # not by luck: each rank scores its own head shard but all-reduces the
+        # collapsed scores before selecting
+        # (`speculator_worker.py::_tp_shard_reducer`), so every rank returns
+        # the SAME index list. Contrast `end_capture`/`retrieve_keys`, which
+        # return the raw sharded tensors and are guarded instead.
         scored = self.llm_engine.collective_rpc(
             "end_capture_and_score_many", args=(score_args,),
         )[0]
@@ -929,6 +978,32 @@ class SpecPrefillProposer:
         return (driven.request_id, driven.num_cached_tokens, driven.t_start,
                 driven.stage_seconds)
 
+    def _refuse_rank_local(self, what: str) -> None:
+        """Raise if this engine is tensor-parallel, for the entry points that
+        return ONE RANK'S view of a head-sharded tensor.
+
+        `collective_rpc` returns one result per TP rank and this module
+        unwraps `[0]`. For `end_capture_and_score*` that is exactly right --
+        `speculator_worker.py::_tp_shard_reducer` all-reduces before the
+        selection, so every rank returns the same answer. For raw Q
+        (`end_capture`) and raw K (`retrieve_keys`) it is NOT: those are the
+        sharded tensors themselves, and `[0]` would silently return
+        `1/tp_size` of the heads. Nothing in the `sparse`/`oracle` scoring
+        path calls these -- they serve `run_turn` and the `diagnose_*.py`
+        scripts -- so refusing is strictly better than gathering machinery
+        no measured path exercises.
+        """
+        if getattr(self, "tensor_parallel_size", 1) > 1:
+            raise NotImplementedError(
+                f"{what} returns ONE tensor-parallel rank's shard of the "
+                f"attention heads, and this speculator engine was built with "
+                f"tensor_parallel_size={self.tensor_parallel_size}. Scoring "
+                f"(`run_turn_and_score` / `run_turns_and_score`) is "
+                f"TP-correct because the ranks all-reduce before selecting; "
+                f"this entry point is not. Re-run it with "
+                f"--speculator-tensor-parallel-size 1."
+            )
+
     def retrieve_keys(
         self, conversation_salt: str, local_positions: List[int]
     ) -> List[torch.Tensor]:
@@ -957,6 +1032,7 @@ class SpecPrefillProposer:
         real hardware past this change (re-run `validate_proposer.py`,
         which already exercises this exact method in its Step C)."""
         t_start = time.time()
+        self._refuse_rank_local("retrieve_keys")
         keys_cpu = self.llm_engine.collective_rpc(
             "retrieve_keys", args=(conversation_salt, local_positions)
         )[0]

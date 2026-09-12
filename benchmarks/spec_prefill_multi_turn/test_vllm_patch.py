@@ -2877,6 +2877,7 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         # TP=1: the single-card default, so these stub runs keep
         # exercising the pre-TP placement behaviour.
         target_tensor_parallel_size=1,
+        speculator_tensor_parallel_size=1,
         speculator_gpu_memory_utilization=0.2,
         target_max_num_batched_tokens=131072,
         speculator_max_num_batched_tokens=131072,
@@ -6962,6 +6963,224 @@ def test_prep_main_packing_forms_more_conversations_than_single_documents():
     _, packed, _ = _run_lbv2_prep_main(["--pack-distractors"])
     _, single, _ = _run_lbv2_prep_main([])
     assert len(packed) > len(single), (len(packed), len(single))
+
+
+
+# ---------------------------------------------------------------------------
+# Tensor-parallel scorer. The speculator may now run with
+# `--speculator-tensor-parallel-size > 1`, which shards the ATTENTION HEAD
+# axis -- exactly the axis `scoring.py` collapses over. These tests exist
+# because the failure mode is silent: without `_tp_shard_reducer`,
+# `proposer.py`'s `collective_rpc(...)[0]` returns a selection scored on
+# 1/tp_size of the heads, with no error and a normal-looking keep rate.
+# ---------------------------------------------------------------------------
+
+
+def _shard_qk(query_buffer, key_buffer_per_layer, head_dim, tp, rank):
+    """This rank's slice of a `score_and_select_indices`-shaped Q/K pair.
+
+    Mirrors how vLLM actually shards: a CONTIGUOUS block of query heads and
+    the corresponding contiguous block of KV heads. `compute_attention_score`
+    reads Q as `q.view(look_ahead, num_heads, head_dim)` (head-major) and
+    expands KV with `repeat_interleave`, so KV head j serves query heads
+    `[j*ratio, (j+1)*ratio)` -- which is what makes the two contiguous slices
+    line up rather than merely being the same size.
+    """
+    q_shard, k_shard = [], []
+    for q, k in zip(query_buffer, key_buffer_per_layer):
+        samples, look_ahead, hidden = q.shape
+        num_heads = hidden // head_dim
+        per_rank = num_heads // tp
+        q4 = q.view(samples, look_ahead, num_heads, head_dim)
+        q_shard.append(
+            q4[:, :, rank * per_rank:(rank + 1) * per_rank, :]
+            .reshape(samples, look_ahead, per_rank * head_dim).contiguous()
+        )
+        kv_per_rank = k.shape[1] // tp
+        k_shard.append(
+            k[:, rank * kv_per_rank:(rank + 1) * kv_per_rank, :].contiguous()
+        )
+    return q_shard, k_shard
+
+
+def _tp_scoring_case(aggregation, tp=2, seed=0):
+    torch.manual_seed(seed)
+    num_layers, num_heads, num_kv_heads, head_dim, look_ahead, ctx_len = (
+        4, 8, 4, 8, 3, 64,
+    )
+    query_buffer = [
+        torch.randn(1, look_ahead, num_heads * head_dim) for _ in range(num_layers)
+    ]
+    key_buffer = [
+        torch.randn(ctx_len, num_kv_heads, head_dim) for _ in range(num_layers)
+    ]
+    cfg = SpecConfig(
+        keep_strategy="percentage",
+        keep_kwargs={"chunk": True, "chunk_size": 8, "percentage": 0.5},
+        look_ahead_cnt=look_ahead,
+        pool_kernel_size=13,
+        score_aggregation=aggregation,
+    )
+    return query_buffer, key_buffer, cfg, head_dim, look_ahead, tp
+
+
+def test_collapse_then_mean_reproduces_aggregate_attention_score():
+    """`aggregate_attention_score` was SPLIT to expose the pre-mean tensor;
+    the split must be a refactor and nothing else."""
+    from vllm_patch.scoring import collapse_attention_score
+
+    query_buffer, key_buffer, cfg, _, look_ahead, _ = _tp_scoring_case("max")
+    attn = compute_attention_score(
+        query_buffer, [[k] for k in key_buffer], [look_ahead])
+    collapsed = collapse_attention_score(attn, cfg)
+    assert collapsed[0].shape == (look_ahead, key_buffer[0].shape[0])
+    expected = aggregate_attention_score(attn, cfg)
+    assert torch.equal(collapsed[0].mean(0), expected[0])
+
+
+def test_shard_reduce_op_names_an_exact_reduction_for_every_aggregation():
+    """Every mode `_collapse_layer_head` supports must have one, or a
+    tensor-parallel scorer would reach the all-reduce undefined."""
+    from vllm_patch.scoring import SHARD_REDUCE_OPS, shard_reduce_op
+
+    assert shard_reduce_op("max") == "max"
+    assert shard_reduce_op("mean") == "sum"
+    assert shard_reduce_op("zmean") == "sum"
+    for mode in ("max", "mean", "zmean"):
+        assert mode in SHARD_REDUCE_OPS
+    try:
+        shard_reduce_op("median")
+    except ValueError as exc:
+        assert "median" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for an unknown aggregation")
+
+
+def test_combine_score_shards_refuses_shards_of_different_shapes():
+    from vllm_patch.scoring import combine_score_shards
+
+    try:
+        combine_score_shards([torch.zeros(3, 8), torch.zeros(3, 9)], "max")
+    except ValueError as exc:
+        assert "shape" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for mismatched shard shapes")
+
+
+def test_sharded_collapse_recombines_to_the_unsharded_collapse():
+    """The arithmetic claim `SHARD_REDUCE_OPS` documents, checked per mode.
+
+    `max` is exact because max is associative; `mean`/`zmean` are exact
+    because every rank collapses the same number of rows (vLLM requires
+    `num_heads % tp == 0` and shards only the head axis, so every rank keeps
+    every layer).
+    """
+    from vllm_patch.scoring import collapse_attention_score, combine_score_shards
+
+    for aggregation in ("max", "mean", "zmean"):
+        qb, kb, cfg, head_dim, look_ahead, tp = _tp_scoring_case(aggregation)
+        whole = collapse_attention_score(
+            compute_attention_score(qb, [[k] for k in kb], [look_ahead]), cfg)[0]
+        shards = []
+        for rank in range(tp):
+            q_r, k_r = _shard_qk(qb, kb, head_dim, tp, rank)
+            shards.append(collapse_attention_score(
+                compute_attention_score(q_r, [[k] for k in k_r], [look_ahead]),
+                cfg)[0])
+        combined = combine_score_shards(shards, aggregation)
+        assert torch.allclose(combined, whole, atol=1e-5), aggregation
+
+
+def test_tensor_parallel_scorer_selects_exactly_what_one_gpu_would_have():
+    """**The regression test for the silent-shard bug.**
+
+    Drives the REAL entry point the speculator worker calls
+    (`score_and_select_indices`) on rank 0's shard, with a `shard_reducer`
+    standing in for `_tp_shard_reducer`'s all-reduce, and asserts the kept
+    indices are identical to the single-GPU run. The final assertion checks
+    that rank 0 ALONE selects something different, so the test fails if the
+    reducer is ever quietly dropped from the call chain.
+    """
+    from vllm_patch.scoring import collapse_attention_score, combine_score_shards
+
+    for aggregation in ("max", "mean", "zmean"):
+        qb, kb, cfg, head_dim, look_ahead, tp = _tp_scoring_case(aggregation)
+        unsharded = score_and_select_indices(qb, kb, look_ahead, cfg)
+
+        per_rank = [_shard_qk(qb, kb, head_dim, tp, r) for r in range(tp)]
+        others = []
+        for rank in range(1, tp):
+            q_r, k_r = per_rank[rank]
+            others.append(collapse_attention_score(
+                compute_attention_score(q_r, [[k] for k in k_r], [look_ahead]),
+                cfg)[0])
+
+        q0, k0 = per_rank[0]
+        sharded = score_and_select_indices(
+            q0, k0, look_ahead, cfg,
+            shard_reducer=lambda mine: combine_score_shards(
+                [mine] + others, aggregation),
+        )
+        assert sharded == unsharded, aggregation
+
+        rank0_only = score_and_select_indices(q0, k0, look_ahead, cfg)
+        assert rank0_only != unsharded, (
+            f"{aggregation}: rank 0's own heads happened to select the same "
+            f"tokens, so this case cannot detect a dropped reduction"
+        )
+
+
+def test_scorer_placement_is_unchanged_when_the_scorer_is_not_sharded():
+    """Default tensor_parallel_size=1 must place exactly as before -- one
+    device, no comma -- or every published row moves."""
+    from vllm_patch.proposer import scorer_visible_devices
+
+    assert scorer_visible_devices(2, None) == "2"
+    assert scorer_visible_devices(2, None, 1) == "2"
+    assert scorer_visible_devices(2, "3,4,5") == "5"
+    assert scorer_visible_devices(2, "3,4,5", 1) == "5"
+
+
+def test_sharded_scorer_claims_consecutive_devices_from_its_index():
+    from vllm_patch.proposer import scorer_visible_devices
+
+    # The 4-GPU case this exists for: target TP=4 on 0-3, scorer TP=4
+    # deliberately sharing the same four cards.
+    assert scorer_visible_devices(0, None, 4) == "0,1,2,3"
+    assert scorer_visible_devices(1, None, 2) == "1,2"
+    # Still translated through a parent mask, in order, so rank i lands on
+    # the i'th visible device from the index.
+    assert scorer_visible_devices(1, "4,5,6,7", 2) == "5,6"
+    assert scorer_visible_devices(0, "GPU-a,GPU-b", 2) == "GPU-a,GPU-b"
+
+
+def test_sharded_scorer_refuses_to_run_off_the_end_of_the_visible_devices():
+    from vllm_patch.proposer import scorer_visible_devices
+
+    try:
+        scorer_visible_devices(2, "4,5,6,7", 4)
+    except ValueError as exc:
+        assert "speculator-tensor-parallel-size" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a shard past the end")
+
+
+def test_placement_preflight_catches_a_sharded_scorer_that_cannot_fit():
+    """Same discipline as the existing scorer-placement checks: fail at
+    startup, not inside `LLM()` minutes later with a message that cannot
+    name which engine ran out of devices."""
+    from predict_scbench import scorer_placement_error
+
+    # 4 visible GPUs, target TP=4, scorer TP=4 starting at 0 -- the intended
+    # shared-card arrangement, and legal.
+    assert scorer_placement_error(0, 4, 4, None, 4) is None
+    # Starting at 2 it would need devices 2..5.
+    err = scorer_placement_error(2, 4, 4, None, 4)
+    assert err and "speculator-tensor-parallel-size" in err
+    # Unsharded: unchanged, including via the default argument -- the
+    # signature gained a parameter and every existing caller passes four.
+    assert scorer_placement_error(0, 1, 2, None) is None
+    assert scorer_placement_error(0, 1, 2, None, 1) is None
 
 
 

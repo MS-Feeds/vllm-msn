@@ -483,7 +483,8 @@ SPARSE_ARCH_MODES = ("sparse", "oracle", "early")
 # default, so the comparison is three rows measured the same way rather than
 # two rows against a historical figure.
 def scorer_placement_error(
-    scorer_device_index, target_tp: int, device_count: int, cuda_visible_devices
+    scorer_device_index, target_tp: int, device_count: int, cuda_visible_devices,
+    scorer_tp: int = 1,
 ):
     """Why this scorer/target GPU placement cannot work, or None if it can.
 
@@ -518,6 +519,19 @@ def scorer_placement_error(
             f"process can already see, not against physical GPU ids -- on a "
             f"job allocated e.g. CUDA_VISIBLE_DEVICES=2,3, 'cuda:1' means the "
             f"second of those two."
+        )
+    if device_count and scorer_device_index + scorer_tp > device_count:
+        # A sharded scorer claims `scorer_tp` CONSECUTIVE devices starting at
+        # its index (`proposer.scorer_visible_devices`). Running off the end
+        # is caught here, at startup, rather than inside `LLM()` minutes
+        # later with a message that cannot name which engine ran out.
+        return (
+            f"--speculator-tensor-parallel-size {scorer_tp} starting at "
+            f"scorer device index {scorer_device_index} needs devices "
+            f"{scorer_device_index}..{scorer_device_index + scorer_tp - 1}, "
+            f"but torch.cuda.device_count() is {device_count} "
+            f"(CUDA_VISIBLE_DEVICES={cuda_visible_devices!r}). Lower "
+            f"--speculator-device or --speculator-tensor-parallel-size."
         )
     return None
 
@@ -3907,6 +3921,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         placement_error = scorer_placement_error(
             scorer_device_index, target_tp, device_count,
             os.environ.get("CUDA_VISIBLE_DEVICES"),
+            args.speculator_tensor_parallel_size,
         )
         if placement_error:
             raise RuntimeError(f"{exp_id}: {placement_error}")
@@ -4106,6 +4121,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             speculator_model_path=scorer_model,
             device=speculator_device,
             gpu_memory_utilization=scorer_gpu_memory_utilization,
+            tensor_parallel_size=args.speculator_tensor_parallel_size,
             max_num_batched_tokens=scorer_engine_batch_tokens,
             enable_chunked_prefill=True,
             max_model_len=speculator_max_model_len,
@@ -4478,11 +4494,27 @@ def main() -> None:
                              "0.85 -- not enough for a long context, and less "
                              "than it looks because the sparse path retains KV "
                              "outside the sliding window. TP=2 halves the "
-                             "weights per card. The speculator is always TP=1 "
-                             "(it is small, and sharding it would complicate "
-                             "the query capture for no benefit). Ranks take "
-                             "the first N visible devices, so "
-                             "--speculator-device must be N or higher.")
+                             "weights per card. Ranks take the first N "
+                             "visible devices. See "
+                             "--speculator-tensor-parallel-size for sharding "
+                             "the scorer, which may deliberately SHARE those "
+                             "same cards.")
+    parser.add_argument(
+        "--speculator-tensor-parallel-size", type=int, default=1,
+        help="Shard the SCORER across this many GPUs, starting at "
+             "--speculator-device. Default 1 reproduces every published row. "
+             "This is a LATENCY flag, not a capacity one: the speculator's "
+             "cost is dominated by full-context attention prefill, and the "
+             "wave loop runs the scorer and the target in strict lockstep, so "
+             "the target's other cards are idle for the whole scoring phase. "
+             "Sharing them is the intended use -- each rank reserves only "
+             "--speculator-gpu-memory-utilization, once, at engine init. "
+             "Scoring stays exact under sharding because the ranks all-reduce "
+             "their partial (layer, head) collapse before selecting (see "
+             "speculator_worker.py::_tp_shard_reducer); the entry points that "
+             "return a raw per-rank tensor (run_turn, retrieve_keys) refuse "
+             "instead of returning a shard. Incompatible with a "
+             "score_head_set, whose indices TP renumbers.")
     parser.add_argument("--target-gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument(
         "--target-async-scheduling", action="store_true",
