@@ -3,11 +3,20 @@
 Evaluates whether **SpecPrefill** (draft-model-based prefill token
 preselection) generalizes from single-shot long-context QA to long, growing
 **multi-turn conversations**, where context/prompt size is the serving
-bottleneck across every turn, not just once. Target: Llama-3.1-8B-Instruct.
-Speculator: Llama-3.2-1B-Instruct. Dataset: SCBench (3 configs:
-`scbench_qa_eng`/`scbench_kv`/`scbench_summary`). Grid: keep-rate x
-KV-entry-granularity, plus an oracle upper bound, at the protocol's `KEEP`
-history-retention setting first.
+bottleneck across every turn, not just once.
+
+**The paper's configuration** (authoritative — see `EXPERIMENT_PLAN.md`'s
+header table): two pairs, Llama-3.1-**70B**-Instruct + Llama-3.2-1B-Instruct
+and Gemma-4-31B-it + Gemma-4-E2B-it, both at **TP=4 on four GPUs**; dataset
+**LongBench-v2-MC** recast as 5-turn conversations (~25K tokens/turn, ~130K
+budget); keep-rate sweep {20, 40, 60, 80}% plus a 100% control and a dense
+baseline, at granularity 64; `KEEP` history retention, sparse-prefill on.
+
+Much of the rest of this README documents earlier work on a **Llama-3.1-8B
+target against SCBench** — the ORACLE upper bound, the granularity grid, the
+FLOP model, and the debugging trail. That work is real and worth keeping, but
+it is not what the paper reports. Sections that are not paper results say so
+inline.
 
 ## Contents
 
@@ -150,7 +159,9 @@ Three things to know before running one:
   That prep sizes every conversation to *fill* `--target-max-num-batched-tokens`
   (130,560), so N sessions need N times that much resident KV. Reaching the
   batch size at which the decode-side saving could pay for itself (~13 on
-  2×A100, from `step = W + N·K` with W ≈ 29.4 ms and K ≈ 0.63 ms) needs a
+  2×A100 — measured on the earlier 8B setup, not the paper's 4-GPU one, so
+  treat the absolute figure as indicative; from `step = W + N·K` with
+  W ≈ 29.4 ms and K ≈ 0.63 ms) needs a
   re-prep at a smaller `--doc-budget-tokens`, not a code change. Note that
   shrinking documents also shrinks `d` — the very quantity that dataset exists
   to make large — so run an N=1 control on the re-prepped file or the batch
@@ -383,6 +394,13 @@ implementation — reading the attention out of the target's own first n layers
 mid-prefill — removes that entirely. The grid measures the pessimistic bound.
 
 ## Results: full SCBench graded sweep (M000 + all 12 SPARSE-k\*-g\* configs)
+
+> **Not the paper's results.** These are genuine measurements on a superseded
+> benchmark and a smaller model pair. The paper reports LongBench-v2-MC on
+> Llama-3.1-70B and Gemma-4-31B at TP=4 — turns-1+ latency −25.2% (Llama @ 20%
+> keep) and −26.9% (Gemma @ 20%, decode excluded), accuracy flat within noise.
+> Keep this section for the debugging trail it documents; cite the paper for
+> results.
 
 The current, most complete real results: M000 baseline plus the full
 `SPARSE-k{20,40,60,80}-g{16,32,64}` grid (12 configs), graded by
@@ -863,6 +881,14 @@ cross-check exists in this checkout yet.
 
 ## Benchmark
 
+> **The paper evaluates on LongBench-v2-MC only** — 5-turn conversations,
+> one ~25K-token document per turn, ~130K budget, on Llama-3.1-70B/Llama-3.2-1B
+> and Gemma-4-31B/Gemma-4-E2B at TP=4 across four GPUs, granularity 64. SCBench
+> below is real and was genuinely measured, but it was superseded (its
+> steady-state `d ~ 70` against `o = 512` puts the saving in decode, where this
+> pipeline does not convert it to seconds) and is **not** a paper result.
+> See `EXPERIMENT_PLAN.md`'s header table for the authoritative configuration.
+
 **SCBench** (arXiv:2412.10319, `microsoft/SCBench` on Hugging Face) --
 `scbench_qa_eng` (semantic retrieval / free-form QA), `scbench_kv` (string /
 exact retrieval), `scbench_summary` (global-information / summarization).
@@ -872,6 +898,49 @@ across all 3 MVP configs (not the HF dataset card's stated "2-4"). Metrics:
 `scbench_qa_eng`, a dependency-free LCS-based ROUGE-L reimplementation for
 `scbench_summary` — all ported from `microsoft/MInference/scbench/
 eval_utils.py`.
+
+### SWE-bench agent trajectories (`swebench_agent`) — built, never run
+
+**Not a paper experiment, and no result from it exists.** The paper evaluates
+on LongBench-v2-MC only (5 turns, ~25K tokens/turn, ~130K budget, Llama-3.1-70B
+and Gemma-4-31B at TP=4). The code below is written and unit-tested but has
+never been on hardware. Do not cite it.
+
+The code-agent workload, in two phases that answer two different claims. See
+`EXPERIMENT_PLAN.md`'s Benchmark section for the full reasoning and
+`REPRODUCE.md` §3b for the commands.
+
+- **Phase 1 — replay.** Trajectories recorded once with the dense target are
+  replayed as fixed turns, one action-cycle per turn
+  (`datasets/normalize_swebench_trajs.py` →
+  `datasets/prep_swebench_agent_replay.py`). Every arm sees the identical
+  conversation, so the keep-rate sweep is paired and the
+  `(config, turn_idx)` breakdown is meaningful. Metric:
+  `agent_action_match`, exact match on the bash action.
+  **This is action agreement under teacher forcing, not a SWE-bench resolve
+  rate, and is not comparable to any published SWE-bench number.**
+- **Phase 2 — live (`--agentic`).** The model's action is executed in that
+  instance's container and the output becomes the next turn. This is the row
+  that supports "works with coding agents"; Phase 1 only picks its operating
+  point. It is not a third driving loop — `agentic.py::AgenticTurns` is
+  swapped in behind the two reads that used to say `conv["turns"][turn_idx]`,
+  so it inherits the sparse path's hard-won fixes instead of re-acquiring
+  them. Endpoints live in `results/<exp_id>_agentic.csv`: wall clock,
+  throughput vs. context length, and the exit-reason mix first; resolve rate
+  last, and only as a collapse detector.
+
+Why this dataset and not another: it is the only one here with genuine
+cross-turn dependence (turn 12's action follows from turn 3's file read), and
+its per-turn delta clears `SPECULATION_ECONOMICS.md`'s win condition while
+allowing a large `T` — removable prefill attention is `(T-1)/T`, ~94% at T=16
+against 80% at the paper's T=5.
+
+What it would *not* show is a bigger speedup. The paper's saving comes from a
+~25K-token turn attending ~100K of history, and only the history-scaling term
+shrinks with keep-rate; agent turns are one to two orders of magnitude
+smaller, so the absolute per-turn saving is much smaller even though the
+removable share is higher. The question it answers is whether selection
+quality survives a long dependent conversation.
 
 ---
 

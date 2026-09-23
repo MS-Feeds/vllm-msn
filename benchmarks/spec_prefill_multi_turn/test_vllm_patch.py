@@ -7285,5 +7285,409 @@ def test_placement_preflight_catches_a_sharded_scorer_that_cannot_fit():
 
 
 
+# ---------------------------------------------------------------------------
+# SWE-bench agent trajectories: replay packing, action grading, and the live
+# turn source. All CPU-only -- no Docker, no GPU, no tokenizer download. The
+# live control flow is reachable because `AgenticTurns` takes a
+# `sandbox_factory`; see that parameter's comment.
+# ---------------------------------------------------------------------------
+
+
+class _FakeTok:
+    """Invertible stand-in for a real tokenizer: one token per character.
+
+    Invertible on purpose -- the truncation test checks that a middle-out cut
+    keeps exactly `max_observation_tokens` tokens, which is only meaningful if
+    decode(encode(x)) == x.
+    """
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(i) for i in ids)
+
+
+class _FakeSandbox:
+    def __init__(self, returncode=0, output="ok"):
+        self.returncode = returncode
+        self.output = output
+        self.commands = []
+        self.stopped = False
+
+    def execute(self, command):
+        self.commands.append(command)
+        return self.returncode, self.output
+
+    def get_patch(self):
+        return "diff --git a/x b/x\n"
+
+    def stop(self):
+        self.stopped = True
+
+
+def _bash(command):
+    return f"THOUGHT: doing a thing\n\n```bash\n{command}\n```"
+
+
+def _agentic(**kwargs):
+    from agentic import AgenticTurns
+
+    params = dict(
+        max_turns=4,
+        max_observation_tokens=1000,
+        instances_by_id={"inst-1": {"instance_id": "inst-1"}},
+        sandbox_factory=lambda instance: _FakeSandbox(),
+    )
+    params.update(kwargs)
+    return AgenticTurns(_FakeTok(), **params)
+
+
+def _conv():
+    return {"id": "swea-0000", "instance_id": "inst-1", "config": "swebench_agent",
+            "context": "system prompt", "turns": [{"input": "the issue", "answer": ""}]}
+
+
+# -- grading ---------------------------------------------------------------
+
+
+def test_agent_action_match_is_exact_on_the_command():
+    from grade_scbench import agent_action_match
+
+    assert agent_action_match(_bash("ls -la"), _bash("ls -la")) == 1.0
+    assert agent_action_match(_bash("ls -la"), _bash("ls -l")) == 0.0
+    # Differing prose around an identical command still matches: the action is
+    # what executes, and the THOUGHT is not scored.
+    assert agent_action_match("nope\n```bash\nls\n```", _bash("ls")) == 1.0
+
+
+def test_agent_action_match_scores_unparseable_output_zero_not_none():
+    """Same `missing` (excluded) vs. `unparseable` (counted wrong) distinction
+    `multiple_choice_letter` draws -- a generation with no usable action is a
+    real failure of the arm under test and belongs in the denominator."""
+    from grade_scbench import agent_action_match
+
+    assert agent_action_match("I think we should look at the file.", _bash("ls")) == 0.0
+    # Two blocks is what the scaffold itself rejects, so it is not an action.
+    assert agent_action_match("```bash\nls\n```\n```bash\npwd\n```", _bash("ls")) == 0.0
+
+
+def test_agent_action_match_folds_trailing_space_but_not_heredoc_indentation():
+    """Agent actions routinely carry heredocs whose indentation is part of the
+    program being written, so internal whitespace must NOT be collapsed."""
+    from grade_scbench import agent_action_match
+
+    assert agent_action_match(_bash("ls -la   "), _bash("ls -la")) == 1.0
+    indented = "python - <<'EOF'\n    if x:\n        pass\nEOF"
+    flattened = "python - <<'EOF'\nif x:\npass\nEOF"
+    assert agent_action_match(_bash(indented), _bash(indented)) == 1.0
+    assert agent_action_match(_bash(flattened), _bash(indented)) == 0.0
+
+
+# -- trajectory normalization ----------------------------------------------
+
+
+def _load_normalizer():
+    import importlib.util
+    path = Path(__file__).resolve().parent / "datasets" / "normalize_swebench_trajs.py"
+    spec = importlib.util.spec_from_file_location("_normtraj_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_traj(tmpdir, name, messages, info=None):
+    import json as _json
+    path = Path(tmpdir) / f"{name}.traj.json"
+    path.write_text(_json.dumps({
+        "info": info if info is not None else {"exit_status": "Submitted"},
+        "messages": messages,
+        "instance_id": name,
+    }), encoding="utf-8")
+    return path
+
+
+def test_normalizer_hoists_system_and_keeps_alternating_pairs():
+    import tempfile
+
+    norm = _load_normalizer()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_traj(tmp, "inst-1", [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "act1"},
+            {"role": "user", "content": "obs1"},
+            {"role": "assistant", "content": "act2"},
+        ])
+        row, reason = norm.normalize_one(path)
+    assert reason == "ok"
+    assert row["system"] == "sys"
+    assert row["num_steps"] == 2
+    assert [m["role"] for m in row["messages"]] == [
+        "user", "assistant", "user", "assistant"]
+
+
+def test_normalizer_drops_a_trailing_user_message():
+    """A turn needs both halves -- an observation the agent never acted on is
+    not a step."""
+    import tempfile
+
+    norm = _load_normalizer()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_traj(tmp, "inst-1", [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "act1"},
+            {"role": "user", "content": "obs1"},
+        ])
+        row, reason = norm.normalize_one(path)
+    assert reason == "ok" and row["num_steps"] == 1
+
+
+def test_normalizer_drops_rather_than_repairs_broken_alternation():
+    """See the module's "Filter, never repair": silently patching a gap
+    misaligns every turn after it, and the replay would then score against the
+    wrong action with nothing to show for it."""
+    import tempfile
+
+    norm = _load_normalizer()
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = _write_traj(tmp, "inst-1", [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "user", "content": "task again"},
+            {"role": "assistant", "content": "act1"},
+        ])
+        row, reason = norm.normalize_one(bad)
+        assert row is None and reason == "bad_alternation"
+
+        headless = _write_traj(tmp, "inst-2", [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "act1"},
+        ])
+        row, reason = norm.normalize_one(headless)
+        assert row is None and reason == "no_system"
+
+        crashed = _write_traj(tmp, "inst-3", [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "act1"},
+        ], info={"exit_status": "Error", "traceback": "boom"})
+        row, reason = norm.normalize_one(crashed)
+        assert row is None and reason == "harness_error"
+
+
+# -- replay packing --------------------------------------------------------
+
+
+def _load_swea_prep():
+    import importlib.util
+    path = Path(__file__).resolve().parent / "datasets" / "prep_swebench_agent_replay.py"
+    spec = importlib.util.spec_from_file_location("_swea_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _traj(instance_id, n_steps, action="ls -la", obs="observation"):
+    messages = []
+    for i in range(n_steps):
+        messages.append({"role": "user", "content": f"{obs} {i}"})
+        messages.append({"role": "assistant", "content": _bash(action)})
+    return {"instance_id": instance_id, "exit_status": "Submitted",
+            "num_steps": n_steps, "system": "sys", "messages": messages}
+
+
+def test_replay_mapping_pairs_each_observation_with_the_action_it_caused():
+    """`messages[2i]` is turn i's input and `messages[2i+1]` is its answer. An
+    off-by-one here would grade every turn against the previous turn's action
+    and nothing downstream would catch it."""
+    prep = _load_swea_prep()
+    turns = prep.build_turns(_traj("inst-1", 3), 3, _FakeTok())
+    assert [t["input"] for t in turns] == [
+        "observation 0", "observation 1", "observation 2"]
+    assert all(t["answer"] == _bash("ls -la") for t in turns)
+
+
+def test_replay_uses_a_prefix_and_drops_trajectories_shorter_than_T():
+    prep = _load_swea_prep()
+    tok = _FakeTok()
+
+    def budget_for(_preamble_len):
+        class _AlwaysFits:
+            def fits(self, _query_lens):
+                return True
+        return _AlwaysFits()
+
+    convs, drops = prep.build_conversations(
+        [_traj("inst-1", 5), _traj("inst-2", 2)],
+        budget_for, tok, turns_per_conv=3,
+        max_observation_tokens=10_000, max_action_tokens=10_000)
+    assert drops["too_few_steps"] == 1
+    assert len(convs) == 1
+    # A prefix of a real run, not a truncated one.
+    assert len(convs[0]["turns"]) == 3
+
+
+def test_replay_drops_a_trajectory_whose_reference_action_cannot_be_parsed():
+    """`agent_action_match` treats a 0.0 as a statement about the PREDICTION,
+    which is only true if every reference is scorable."""
+    prep = _load_swea_prep()
+    traj = _traj("inst-1", 3)
+    traj["messages"][3]["content"] = "I will look at the file."   # no bash block
+
+    def budget_for(_preamble_len):
+        class _AlwaysFits:
+            def fits(self, _query_lens):
+                return True
+        return _AlwaysFits()
+
+    convs, drops = prep.build_conversations(
+        [traj], budget_for, _FakeTok(), turns_per_conv=3,
+        max_observation_tokens=10_000, max_action_tokens=10_000)
+    assert convs == [] and drops["action_unparseable"] == 1
+
+
+def test_replay_budget_rejection_drops_the_conversation_whole():
+    """The driver's own check `break`s out of the turn loop rather than
+    skipping, so a conversation that would fail must never be emitted short."""
+    prep = _load_swea_prep()
+
+    def budget_for(_preamble_len):
+        class _NeverFits:
+            def fits(self, _query_lens):
+                return False
+        return _NeverFits()
+
+    convs, drops = prep.build_conversations(
+        [_traj("inst-1", 5)], budget_for, _FakeTok(), turns_per_conv=3,
+        max_observation_tokens=10_000, max_action_tokens=10_000)
+    assert convs == [] and drops["failed_budget"] == 1
+
+
+# -- the live turn source --------------------------------------------------
+
+
+def test_dataset_turns_reproduces_the_previous_inline_reads():
+    """`DatasetTurns` must be a pure rename of the code it replaced, or every
+    existing row changes."""
+    from agentic import DatasetTurns
+
+    src = DatasetTurns()
+    conv = {"id": "c", "turns": [{"input": "a"}, {"input": "b"}]}
+    assert src.live is False
+    assert src.turn_for(conv, 0) == {"input": "a"}
+    assert src.turn_for(conv, 2) is None
+    assert src.is_exhausted(conv, 1) is False
+    assert src.is_exhausted(conv, 2) is True
+
+
+def test_agentic_executes_the_action_and_injects_its_output():
+    sandbox = _FakeSandbox(returncode=0, output="file.py")
+    src = _agentic(sandbox_factory=lambda instance: sandbox)
+    conv = _conv()
+
+    assert src.turn_for(conv, 0) == {"input": "the issue", "answer": ""}
+    src.observe(conv, 0, _bash("ls -la"))
+    assert sandbox.commands == ["ls -la"]
+    assert src.is_exhausted(conv, 1) is False
+    nxt = src.turn_for(conv, 1)
+    assert "<returncode>0</returncode>" in nxt["input"] and "file.py" in nxt["input"]
+
+
+def test_agentic_reminds_on_a_malformed_action_then_gives_up():
+    """A model that fumbles one action usually recovers; killing the run on the
+    first fumble would make the aggressive keep-rate arms look worse for a
+    reason unrelated to selection quality."""
+    from agentic import FORMAT_REMINDER
+
+    src = _agentic(max_format_retries=2)
+    conv = _conv()
+    src.turn_for(conv, 0)
+
+    src.observe(conv, 0, "no action here")
+    assert src.turn_for(conv, 1)["input"] == FORMAT_REMINDER
+    src.observe(conv, 1, "still no action")
+    assert src.turn_for(conv, 2)["input"] == FORMAT_REMINDER
+    src.observe(conv, 2, "and again")
+    assert src.is_exhausted(conv, 3) is True
+    assert src.records[conv["id"]]["exit_reason"] == "format_retries_exhausted"
+    assert src.records[conv["id"]]["invalid_actions"] == 3
+
+
+def test_agentic_retires_on_submit_and_captures_the_patch():
+    src = _agentic()
+    conv = _conv()
+    src.turn_for(conv, 0)
+    src.observe(conv, 0, _bash("submit"))
+
+    record = src.records[conv["id"]]
+    assert record["exit_reason"] == "submitted"
+    assert record["patch"].startswith("diff --git")
+    assert src.is_exhausted(conv, 1) is True
+    assert src.turn_for(conv, 1) is None
+
+
+def test_agentic_retires_at_the_step_limit_with_its_own_exit_reason():
+    """The exit-reason mix is one of the live endpoints, so "ran out of steps"
+    must be distinguishable from "submitted"."""
+    src = _agentic(max_turns=2)
+    conv = _conv()
+    src.turn_for(conv, 0)
+    src.observe(conv, 0, _bash("ls"))
+    assert src.is_exhausted(conv, 1) is False
+    src.turn_for(conv, 1)
+    src.observe(conv, 1, _bash("ls"))
+    assert src.is_exhausted(conv, 2) is True
+    assert src.records[conv["id"]]["exit_reason"] == "step_limit"
+
+
+def test_agentic_truncates_an_observation_middle_out_to_the_token_cap():
+    """The cap is what bounds the session: worst case is
+    context + max_turns * (cap + max_tokens). A head-only cut would lose the
+    tail of a traceback, which is where the failure is named."""
+    src = _agentic(max_observation_tokens=80,
+                   sandbox_factory=lambda instance: _FakeSandbox(
+                       output="HEAD" + "x" * 5000 + "TAIL"))
+    conv = _conv()
+    src.turn_for(conv, 0)
+    src.observe(conv, 0, _bash("cat big.log"))
+    injected = src.turn_for(conv, 1)["input"]
+
+    assert "tokens omitted" in injected
+    assert "<returncode>" in injected      # head survived
+    assert "TAIL" in injected              # tail survived
+    assert len(injected) < 400
+
+
+def test_agentic_teardown_stops_the_container_even_without_a_clean_exit():
+    """`teardown` runs on EVERY retire path including a failed driver
+    pre-flight, and `close` catches whatever an exception left behind."""
+    sandbox = _FakeSandbox()
+    src = _agentic(sandbox_factory=lambda instance: sandbox)
+    conv = _conv()
+    src.turn_for(conv, 0)
+
+    src.teardown(conv)
+    assert sandbox.stopped is True
+    assert src.records[conv["id"]]["exit_reason"] == "driver_retired"
+    assert src.records[conv["id"]]["wall_seconds"] is not None
+
+    other = _FakeSandbox()
+    src2 = _agentic(sandbox_factory=lambda instance: other)
+    src2.turn_for(_conv(), 0)
+    src2.close()
+    assert other.stopped is True
+
+
+def test_agentic_retires_cleanly_when_the_instance_has_no_swebench_row():
+    """A samples file and a --swebench-dataset that disagree must not spend a
+    full turn-0 prefill before failing."""
+    src = _agentic(instances_by_id={})
+    conv = _conv()
+    assert src.turn_for(conv, 0) is None
+    assert src.records[conv["id"]]["exit_reason"] == "no_instance"
+
+
 if __name__ == "__main__":
     _run_all()

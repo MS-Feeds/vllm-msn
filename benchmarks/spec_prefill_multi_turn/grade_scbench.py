@@ -183,6 +183,70 @@ def multiple_choice_letter(prediction: str, ground_truth: str) -> float:
     return 1.0 if match.group(1).upper() == (ground_truth or "").strip().upper() else 0.0
 
 
+#: One fenced ```bash block -- the action format mini-swe-agent's scaffold
+#: enforces, and therefore the format every recorded reference action is in.
+#: `datasets/prep_swebench_agent_replay.py` drops any trajectory whose actions
+#: do not parse, so on this config the GROUND TRUTH side always yields exactly
+#: one command and a 0.0 here is always a statement about the prediction.
+_BASH_BLOCK_RE = re.compile(r"```bash\s*\n(.*?)```", re.DOTALL)
+
+
+def extract_agent_action(text: str) -> Optional[str]:
+    """The single bash command block in an agent action, or None.
+
+    EXACTLY one block, matching the scaffold's own `parse_action` rule ("please
+    provide exactly one action"). A generation carrying two blocks is one the
+    agent harness would itself have rejected and re-prompted, so treating it as
+    a non-action here agrees with what the live loop would do rather than
+    silently grading its first or last block.
+    """
+    blocks = _BASH_BLOCK_RE.findall(text or "")
+    if len(blocks) != 1:
+        return None
+    return blocks[0]
+
+
+def _normalize_command(command: str) -> str:
+    """Line-ending and trailing-whitespace normalization ONLY.
+
+    Internal whitespace is deliberately preserved: agent actions routinely
+    carry heredocs (`python - <<'EOF'` ... `EOF`) whose indentation is part of
+    the program being written, so collapsing runs of spaces the way
+    `normalize_answer` does would call two materially different patches equal.
+    Trailing whitespace and CRLF are safe to fold because no shell semantics
+    depend on them.
+    """
+    lines = (command or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def agent_action_match(prediction: str, ground_truth: str) -> float:
+    """1.0 if the prediction's bash action is the recorded dense action.
+
+    Exact match on the normalized command, not overlap. That is the point: the
+    question this dataset exists to answer is whether sparse selection still
+    leaves the model enough of a 30-turn context to take THE SAME next step,
+    and a partial-credit metric would blur the one signal worth having. A
+    softer secondary metric can be applied afterwards without re-running
+    anything, since `results/<exp_id>_predictions.jsonl` keeps the raw text.
+
+    Unparseable output scores 0.0, NOT None -- same `missing` (excluded) vs.
+    `unparseable` (counted wrong) distinction `multiple_choice_letter` draws.
+    A generation that produced no usable action is a real failure of the arm
+    under test and belongs in the denominator; the live loop would have had to
+    spend a step re-prompting for it.
+    """
+    predicted = extract_agent_action(prediction)
+    if predicted is None:
+        return 0.0
+    reference = extract_agent_action(ground_truth)
+    if reference is None:
+        # Only reachable on a hand-built samples file -- the packer guarantees
+        # otherwise. Scoring 0.0 would blame the arm for a bad reference.
+        return 0.0
+    return 1.0 if _normalize_command(predicted) == _normalize_command(reference) else 0.0
+
+
 _METRIC_BY_CONFIG = {
     "scbench_kv": in_match,
     "scbench_qa_eng": qa_f1_score,
@@ -205,6 +269,24 @@ _METRIC_BY_CONFIG = {
     # partially-kept image span, a slipped position translation, image KV the
     # gather mishandled). Regression test, not selection quality.
     "mmmu_mc": multiple_choice_letter,
+    # Replayed SWE-bench agent trajectories
+    # (datasets/prep_swebench_agent_replay.py). Discrete exact match on the
+    # bash action, so like the two letter metrics a 0.0 means "different
+    # action", not "low overlap", and averaging across a mix of configs is
+    # meaningless -- which is why the report breaks down by config.
+    #
+    # Read this row with care in the OTHER direction from mmmu_mc. There, a
+    # flat row across the keep-rate grid was the expected null. Here it is the
+    # interesting result: these turns genuinely depend on each other (the
+    # action at turn 12 follows from a file read at turn 3), so sparsity that
+    # discards the wrong thing SHOULD show up, and the `turn_idx` breakdown is
+    # where it shows up first.
+    #
+    # This is action agreement under TEACHER FORCING -- every turn's input is
+    # the observation the dense run received, so the arm is snapped back onto
+    # the dense trajectory each step. It is not a SWE-bench resolve rate and
+    # is not comparable to any published SWE-bench number.
+    "swebench_agent": agent_action_match,
 }
 
 

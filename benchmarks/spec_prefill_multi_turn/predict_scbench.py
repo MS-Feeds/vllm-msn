@@ -155,6 +155,17 @@ from timing_model import TimeBreakdown, breakdown_with_residual
 
 sys.path.insert(0, str(Path(__file__).parent))  # for `vllm_patch` imports
 
+#: Where a turn's text comes from -- see `agentic.py`'s module docstring.
+#: `DatasetTurns` is the default everywhere and reproduces the previous inline
+#: `conv["turns"][turn_idx]` reads exactly.
+#:
+#: Safe to import unconditionally: this pulls in `agent_sandbox`, which is
+#: standard library only. Both real dependencies of the live path -- the
+#: `docker` binary and the `swebench` package -- are touched at CALL time
+#: (`DockerSandbox.start`, `image_for_instance`), so a replay run on a machine
+#: with neither still imports and runs.
+from agentic import DatasetTurns  # noqa: E402
+
 try:
     from tqdm import tqdm
 except ImportError:
@@ -1846,7 +1857,7 @@ def _num_decode_steps(out_len: int) -> int:
 def run_baseline(
     llm, tok, conversations, max_tokens, target_max_num_batched_tokens,
     target_min_tokens: int = 0, processor=None, samples_dir: Optional[Path] = None,
-    batch_conversations: int = 1, batch_refill: bool = True,
+    batch_conversations: int = 1, batch_refill: bool = True, turn_source=None,
 ) -> tuple[list[dict], dict]:
     """M000: plain add_request per turn, no worker_cls/proposer/pruning --
     keeps every token of the conversation unconditionally.
@@ -1959,6 +1970,12 @@ def run_baseline(
               "dense_fallbacks": {}}
     target_flop_cfg = _target_flop_config(llm)
 
+    # See `run_sparse_attention`'s own turn-source note. M000 needs this too:
+    # it is the DENSE CONTROL for the live agentic rows, and a control that
+    # replayed a recorded trajectory while the sparse arms drove a live sandbox
+    # would not be a control at all.
+    turn_source = turn_source or DatasetTurns()
+
     batched = batch_conversations > 1
     desc = "M000 baseline"
     if batched:
@@ -1980,6 +1997,7 @@ def run_baseline(
     while True:
         active, retired = plan_wave(active, queue, batch_conversations, batch_refill)
         for session in retired:
+            turn_source.teardown(session.conv)
             if session.turns_emitted > 0:
                 conversations_processed += 1
             progress.update(1)
@@ -1995,7 +2013,13 @@ def run_baseline(
             t_turn_start = time.time()
             conv = session.conv
             turn_idx = session.turn_idx
-            turn = conv["turns"][turn_idx]
+            turn = turn_source.turn_for(conv, turn_idx)
+            if turn is None:
+                # Live rows only -- see `run_sparse_attention`'s twin of this
+                # guard. `DatasetTurns` never returns None here.
+                session.retired = True
+                session.retire_reason = "exhausted"
+                continue
             # Baseline resubmits the WHOLE accumulated prompt every turn, so
             # it needs every image seen so far -- unlike the sparse path,
             # whose persistent session already holds the earlier turns' image
@@ -2180,6 +2204,13 @@ def run_baseline(
                 })
                 session.turns_emitted += 1
 
+                # See `run_sparse_attention`'s twin of this call. `completion.
+                # text` rather than a re-decode: baseline submits a fresh
+                # one-shot request per turn, so its output is this turn's alone
+                # and is not cumulative the way the session path's is.
+                if turn_source.live:
+                    turn_source.observe(conv, turn_idx, completion.text)
+
             # Append this turn's own output to the conversation, so the
             # next turn's `turn_boundary_ids` closes a real assistant turn.
             # Empty when `output is None` (nothing generated), which just
@@ -2187,7 +2218,7 @@ def run_baseline(
             session.chat_ids = session.chat_ids + actual_output_ids
             session.pending = None
             session.turn_idx += 1
-            if session.turn_idx >= len(conv["turns"]):
+            if turn_source.is_exhausted(conv, session.turn_idx):
                 session.retired = True
                 session.retire_reason = "exhausted"
 
@@ -2593,6 +2624,7 @@ def run_sparse_attention(
     target_min_tokens: int = 0,
     batch_conversations: int = 1,
     batch_refill: bool = True,
+    turn_source=None,
 ) -> tuple[list[dict], dict]:
     """SPARSE-k*-g* **and ORACLE-k***: persistent full-KV-cache target
     session, scorer-selected sparse attention over it during decode (see
@@ -2745,6 +2777,13 @@ def run_sparse_attention(
     from vllm_patch.conversation_state import ConversationState
     from vllm_patch.pruner import compute_pruned_turns
 
+    # Where a turn's text comes from. `DatasetTurns` reproduces the previous
+    # inline `conv["turns"][turn_idx]` reads exactly, so every existing row is
+    # untouched; `agentic.py::AgenticTurns` substitutes a live sandbox. See
+    # that module's docstring for why the live path is a turn source rather
+    # than a second copy of this loop.
+    turn_source = turn_source or DatasetTurns()
+
     chat_before, chat_after = chat_wrapper_pieces(tok)
     chat_before_ids = tok.encode(chat_before, add_special_tokens=False)
     chat_after_ids = tok.encode(chat_after, add_special_tokens=False)
@@ -2817,6 +2856,10 @@ def run_sparse_attention(
         aborting an unknown id is not free, and on some engine versions it
         logs alarmingly."""
         proposer.discard_conversation(session.conv["id"])
+        # Releases a live conversation's container. A no-op for DatasetTurns,
+        # and reached on EVERY retire path including a failed pre-flight, so a
+        # conversation that never ran a turn still frees its sandbox.
+        turn_source.teardown(session.conv)
         if session.session_started:
             llm.llm_engine.abort_request([session.target_request_id])
         nonlocal conversations_processed
@@ -2841,7 +2884,15 @@ def run_sparse_attention(
             t_turn_start = time.time()
             turn_idx = session.turn_idx
             conv = session.conv
-            turn = conv["turns"][turn_idx]
+            turn = turn_source.turn_for(conv, turn_idx)
+            if turn is None:
+                # Only reachable on a live row: the agent submitted, hit its
+                # step limit or lost its sandbox between waves, so there is no
+                # next observation to inject. `DatasetTurns` never returns None
+                # here, because the retire check below already fired.
+                session.retired = True
+                session.retire_reason = "exhausted"
+                continue
             query_ids = render_turn_query(tok, turn_idx, turn)
 
             prospective_speculator_len = session.state.total_len + len(query_ids)
@@ -3255,6 +3306,13 @@ def run_sparse_attention(
                 })
                 session.turns_emitted += 1
 
+                # Execute what the model just generated and stash the result
+                # as the next turn's input. A no-op for `DatasetTurns`, and
+                # placed AFTER the prediction is recorded so a sandbox failure
+                # cannot lose the turn that caused it.
+                if turn_source.live:
+                    turn_source.observe(conv, turn_idx, pred_text)
+
             # Advance the resident-length tracker by exactly what this turn
             # added to the session's KV: the submitted delta, plus every
             # generated token whose KV was actually computed. That's
@@ -3267,7 +3325,7 @@ def run_sparse_attention(
             session.state.complete_turn(result.kept_history_pairs, actual_output_ids)
             session.pending = None
             session.turn_idx += 1
-            if session.turn_idx >= len(conv["turns"]):
+            if turn_source.is_exhausted(conv, session.turn_idx):
                 session.retired = True
                 session.retire_reason = "exhausted"
 
@@ -3464,6 +3522,91 @@ def preflight_batch_kv_capacity(
                 f"re-prepped file or the batch effect and the length effect "
                 f"cannot be separated."
             )
+
+
+def build_turn_source(args, tok):
+    """`DatasetTurns` (replay, the default) or `AgenticTurns` (live).
+
+    `AgenticTurns` is imported HERE rather than at module scope so a replay run
+    never constructs anything Docker-shaped, and so an environment without the
+    `swebench` package can still run the whole keep-rate sweep.
+
+    The SWE-bench rows are loaded only to resolve each instance's Docker image
+    name -- the conversation itself comes from the samples file, whose turn 0
+    already holds the issue statement the recorded agent was handed. That is
+    what lets ONE samples file drive both modes.
+    """
+    if not getattr(args, "agentic", False):
+        return DatasetTurns()
+
+    from agentic import AgenticTurns
+    # Resolves to the Hugging Face `datasets` package, not this directory's
+    # `datasets/`: that has no `__init__.py`, so under PEP 420 it is only a
+    # namespace PORTION and the regular package found later on `sys.path`
+    # wins. The prep scripts already depend on this same resolution.
+    from datasets import load_dataset
+
+    print(f"[predict_scbench] agentic mode: loading {args.swebench_dataset} "
+          f"(split={args.swebench_split}) for instance image names", flush=True)
+    rows = load_dataset(args.swebench_dataset, split=args.swebench_split)
+    instances_by_id = {r["instance_id"]: r for r in rows}
+
+    return AgenticTurns(
+        tok,
+        max_turns=args.max_turns,
+        max_observation_tokens=args.max_observation_tokens,
+        instances_by_id=instances_by_id,
+        timeout=args.sandbox_timeout,
+    )
+
+
+def write_agentic_records(turn_source, exp_id: str, out_dir: Path,
+                          model_name: str, suffix: str = "") -> None:
+    """Conversation-level endpoints for a live row.
+
+    Deliberately NOT folded into `all_runs.csv`: that file's `CSV_FIELDS` is
+    append-only and locked by `test_csv_fields_are_append_only`, and these
+    columns exist only for the handful of live rows. A separate file also
+    keeps the read order honest -- wall clock and the exit-reason mix first,
+    resolve rate last (see `AgenticTurns.predictions_payload`).
+    """
+    records = list(turn_source.records.values())
+    if not records:
+        return
+    csv_path = out_dir / f"{exp_id}{suffix}_agentic.csv"
+    fields = ["conversation_id", "instance_id", "steps", "invalid_actions",
+              "exit_reason", "wall_seconds"]
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for rec in records:
+            writer.writerow(rec)
+
+    preds_path = out_dir / f"{exp_id}{suffix}_preds.json"
+    with open(preds_path, "w", encoding="utf-8") as f:
+        json.dump(turn_source.predictions_payload(model_name), f, indent=2)
+
+    reasons: dict[str, int] = {}
+    for rec in records:
+        reasons[str(rec.get("exit_reason"))] = reasons.get(str(rec.get("exit_reason")), 0) + 1
+    submitted = sum(1 for r in records if r.get("exit_reason") == "submitted")
+    wall = [r["wall_seconds"] for r in records if r.get("wall_seconds") is not None]
+    steps = [r["steps"] for r in records]
+    print(f"[predict_scbench] agentic: {len(records)} conversations, "
+          f"submission_rate={submitted / len(records):.1%}, "
+          f"exit_reasons={reasons}")
+    if wall:
+        print(f"[predict_scbench] agentic: wall seconds/instance "
+              f"mean={statistics.mean(wall):.1f} "
+              f"median={statistics.median(wall):.1f} max={max(wall):.1f}")
+    if steps:
+        print(f"[predict_scbench] agentic: steps/instance "
+              f"mean={statistics.mean(steps):.1f} max={max(steps)}")
+    print(f"[predict_scbench] wrote {csv_path} and {preds_path}")
+    print("[predict_scbench] NOTE: resolve rate is the WEAKEST endpoint here "
+          "-- on 500 instances it detects a ~10-point collapse, not a few "
+          "points of quality cost. Read wall clock, throughput and the "
+          "exit-reason mix first.")
 
 
 def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
@@ -4139,9 +4282,29 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
         speculator_model=scorer_model,
     )
 
+    # Refused rather than silently ignored. `run_specprefill` feeds the
+    # dataset's GOLDEN answer forward as history (EXPERIMENT_PLAN.md decision
+    # #1's golden-context mode, which M-k*-g* still uses); a live run has no
+    # golden answer, so the row would quietly measure something else.
+    if getattr(args, "agentic", False) and mode not in {"baseline", *SPARSE_ARCH_MODES}:
+        raise SystemExit(
+            f"--agentic is not supported for {exp_id} (mode={mode!r}): the "
+            f"M-k*-g* path feeds golden answers forward as conversation "
+            f"history, which a live agent run does not have. Use M000 as the "
+            f"dense control and SPARSE-k*/ORACLE-k* for the sparse arms."
+        )
+
+    # Hoisted out of the loop so the `finally` below can always reach it --
+    # see `AgenticTurns.close` for the leak that guards against.
+    turn_source = DatasetTurns()
     try:
         for rep in range(1, args.reps + 1):
             t0 = time.time()
+            # Built fresh per rep: a live source owns containers and
+            # per-conversation records, and reusing one across reps would
+            # merge two runs' endpoints into one set of records.
+            turn_source.close()
+            turn_source = build_turn_source(args, tok)
             if mode == "baseline":
                 predictions, stats = run_baseline(
                     llm, tok, conversations, args.max_tokens,
@@ -4151,6 +4314,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     samples_dir=samples_dir if mm_processor else None,
                     batch_conversations=args.batch_conversations,
                     batch_refill=not args.no_batch_refill,
+                    turn_source=turn_source,
                 )
             elif mode in SPARSE_ARCH_MODES:
                 predictions, stats = run_sparse_attention(
@@ -4160,6 +4324,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     target_min_tokens=args.target_min_tokens,
                     batch_conversations=args.batch_conversations,
                     batch_refill=not args.no_batch_refill,
+                    turn_source=turn_source,
                 )
             else:
                 predictions, stats = run_specprefill(
@@ -4216,6 +4381,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                     for row in predictions:
                         f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 print(f"[predict_scbench] wrote {len(predictions)} predictions -> {pred_path}")
+
+                if turn_source.live:
+                    write_agentic_records(
+                        turn_source, exp_id, OUT_DIR,
+                        model_name=args.target_model,
+                        suffix=args.output_suffix,
+                    )
 
             ttfts_sorted = sorted(stats["ttfts"])
             # turn_idx == 0 pays each conversation's own "cold start" cost
@@ -4443,6 +4615,10 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                         f"treat every FLOP column in this row as wrong."
                     )
     finally:
+        # Before the engine teardown: a live row holds one container per
+        # in-flight conversation, and an exception in the turn loop would
+        # otherwise leave them running indefinitely.
+        turn_source.close()
         del llm
         if proposer is not None:
             del proposer
@@ -4687,6 +4863,48 @@ def main() -> None:
              "Turn 0 stays dense either way (its prefill is where the "
              "context's KV is first computed; see vllm_patch/"
              "kv_cache_utils.py::compute_prefill_gather_view).",
+    )
+    parser.add_argument(
+        "--agentic", action="store_true",
+        help="LIVE agentic mode: instead of reading each turn from the samples "
+             "file, execute the model's own bash action in that instance's "
+             "SWE-bench Docker container and inject the result as the next "
+             "turn. Turn 0's issue statement still comes from the samples "
+             "file, so datasets/swebench_agent_replay.jsonl drives both modes. "
+             "Requires x86_64 Linux + Docker + the `swebench` package. "
+             "Supported for M000 and SPARSE/ORACLE rows only -- the M-k*-g* "
+             "path feeds GOLDEN answers forward, which a live run does not "
+             "have. NOTE: arms diverge under this mode, so per-turn accuracy "
+             "is undefined and grade_scbench.py should not be run on the "
+             "result; read results/<exp_id>_agentic.csv instead. A non-zero "
+             "num_skipped_too_large is EXPECTED here (observation lengths are "
+             "not knowable in advance), unlike on a replay row where it must "
+             "be 0.",
+    )
+    parser.add_argument(
+        "--max-turns", type=int, default=30,
+        help="--agentic only: step limit per instance.",
+    )
+    parser.add_argument(
+        "--max-observation-tokens", type=int, default=2000,
+        help="--agentic only: per-observation token cap, applied middle-out. "
+             "This is what bounds the session: worst case is context + "
+             "--max-turns * (this + --max-tokens).",
+    )
+    parser.add_argument(
+        "--sandbox-timeout", type=int, default=120,
+        help="--agentic only: per-command wall-clock cap inside the container. "
+             "A timeout is reported to the model as an observation, not raised.",
+    )
+    parser.add_argument(
+        "--swebench-dataset", default="princeton-nlp/SWE-bench_Verified",
+        help="--agentic only: the HF dataset whose rows name each instance's "
+             "Docker image. Only the image lookup uses it; the conversation "
+             "comes from --samples.",
+    )
+    parser.add_argument(
+        "--swebench-split", default="test",
+        help="--agentic only: split of --swebench-dataset.",
     )
     parser.add_argument("--max-tokens", type=int, default=64,
                          help="Generation cap per turn.")

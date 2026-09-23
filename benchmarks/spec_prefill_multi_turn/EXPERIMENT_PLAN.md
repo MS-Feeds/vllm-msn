@@ -10,15 +10,21 @@ single-turn precedent to lean on, so treat it as LESS validated than the
 already-unvalidated single-turn baseline it's built on — see "Implementation
 status" below and `REPRODUCE.md`'s validation steps.
 
+**The paper's configuration is the authoritative one.** The table below is
+what the paper draft actually evaluates. An earlier version of this file named
+Llama-3.1-8B, SCBench and 2x A100 — that was the original protocol's plan, not
+what was run, and anything still citing it is stale.
+
 | | |
 |---|---|
-| **Target model** | Llama-3.1-8B-Instruct (greedy decoding) |
-| **Speculator** | Llama-3.2-1B-Instruct |
-| **Precision** | BF16 |
+| **Target / speculator** | Llama-3.1-70B-Instruct + Llama-3.2-1B-Instruct (non-interleaved); Gemma-4-31B-it + Gemma-4-E2B-it (interleaved sliding-window) |
+| **Precision** | BF16, greedy decoding |
 | **Infra** | vLLM (this fork, V1 engine) |
-| **Benchmark** | SCBench — `scbench_qa_eng` / `scbench_kv` / `scbench_summary` configs |
-| **Hardware** | 2x A100 80GB (per the protocol; not yet empirically confirmed necessary) |
-| **ETA** | TBD |
+| **Benchmark** | LongBench-v2-MC, recast as 5-turn conversations (~25K tokens/turn, ~130K budget) — `datasets/prep_longbench_v2_multiturn.py` |
+| **Sweep** | keep ∈ {20, 40, 60, 80}% + a 100% control + a dense no-speculator baseline, at granularity **64** |
+| **Scale** | 18 conversations / 90 turns (Llama); 15 / 75 (Gemma) — built per-family with that family's own tokenizer |
+| **Hardware** | **4 GPUs**; target and speculator both at tensor parallelism 4 on the same four, eager mode, async scheduling disabled |
+| **Scope** | sparse-prefill ON (restricted view applied to each turn's prefill *and* every decode step); KEEP only |
 
 Reference the paper in this directory (`spec_prefill_paper.pdf`, same
 SpecPrefill paper as `../spec_prefill_llama/`'s — this experiment extends
@@ -48,6 +54,14 @@ serving bottleneck across many sequential turns, not just once. Concretely:
    from the full original history every turn) vs. **DISCARD** (the kept set
    only ever shrinks) -- which trades accuracy for speed better, and by how
    much? Per the protocol, KEEP is evaluated first.
+
+   **Paper scope note**: only KEEP is under active experimentation. DISCARD
+   is implemented (`conversation_state.py`'s candidate-pool bookkeeping,
+   `scoring.py`'s monotonic-extension sort) and unit-tested, but no
+   DISCARD run has been executed and no DISCARD result is reported. Text
+   describing "the" multi-turn pruning method (e.g. the paper's problem
+   setup) should describe KEEP's behavior directly rather than hedging
+   with a KEEP-vs-DISCARD comparison that isn't actually being made.
 
 ---
 
@@ -913,6 +927,87 @@ empirically as exactly 5 turns sharing one long context per row, across all
 3 MVP configs, not the HF dataset card's stated "2-4" -- has no analog in
 the single-turn LongBench-v2 pipelines this was built from).
 
+**Superseded as the paper's benchmark.** The paper evaluates on
+**LongBench-v2-MC only**. SCBench remains in the repo and its graded sweep is
+real (see `README.md`), but it is not a paper experiment and its numbers must
+not be presented as one. The reason it was replaced is in
+`prep_longbench_v2_multiturn.py`'s own docstring: SCBench's steady-state
+per-turn delta is `d ~ 70` tokens against `o = 512`, so the saving lands in
+decode, where this pipeline does not convert it to seconds.
+
+The single per-dataset dispatch point in the whole pipeline is
+`grade_scbench.py`'s `_METRIC_BY_CONFIG` -- nothing in `predict_scbench.py` or
+`vllm_patch/` branches on dataset identity, which is why replacing the
+benchmark needed no driver change.
+
+| Dataset | Prep | Config | In the paper? |
+|---|---|---|---|
+| Synthetic multi-turn LongBench v2 | `datasets/prep_longbench_v2_multiturn.py` | `longbench_v2_mc` | **Yes -- the paper's only benchmark.** 5 turns, one ~25K-token document each, ~130K budget. |
+| SCBench | `datasets/prep_scbench.py` | `scbench_*` | No. Superseded (`d ~ 70` puts the saving in decode). |
+| Synthetic multi-turn MMMU | `datasets/prep_mmmu_multiturn.py` | `mmmu_mc` | No. Multimodal regression test for the sparse path; items are independent, so a flat row is the expected null. |
+| Replayed SWE-bench agent trajectories | `datasets/prep_swebench_agent_replay.py` | `swebench_agent` | No -- built, never run. Proposed extension, see below. |
+
+### SWE-bench: two phases, two claims (proposed, not run)
+
+**Scope note.** Nothing in this subsection is a paper experiment. The code is
+written and unit-tested but has never been run on hardware, and no result from
+it exists. It is here as a designed extension, and the paper's Conclusion
+("future work should test larger target models and a wider speculator-target
+size gap") is the honest description of where it sits. Do not cite it.
+
+SWE-bench is unusable natively here: it is single-turn, its ground truth is
+executable (FAIL_TO_PASS / PASS_TO_PASS in Docker), and it has no per-turn
+answer. Run through an agent scaffold it becomes the only available workload
+with genuine cross-turn dependence -- the action at turn 12 follows from a
+file read at turn 3 -- which is motivating question #2 above, and the gap
+`RELATED_WORK.md` names in the literature.
+
+The economics also fit: an agent step's delta is a tool output (a few hundred
+to a few thousand tokens) against an output that is one bash command, so
+`SPECULATION_ECONOMICS.md`'s `d > 0.45*o + 5.5` is cleared by an order of
+magnitude, and small turns allow a large `T` -- removable prefill attention is
+`(T-1)/T`, i.e. ~94% at T=16 against 80% at the paper's T=5.
+
+The tradeoff runs the other way on per-turn size, and it matters: the paper's
+saving comes from a ~25K-token turn attending ~100K of history, and the fitted
+model in its scaling section is explicit that only the history-scaling term
+shrinks. Agent turns are one to two orders of magnitude smaller, so the
+absolute per-turn saving is much smaller even though the removable *share* is
+higher. This dataset would test whether selection quality survives a long
+dependent conversation -- not whether the speedup is larger.
+
+**Phase 1 -- replay (`--samples datasets/swebench_agent_replay.jsonl`).**
+Trajectories recorded once with the dense target are replayed as fixed turns.
+Every arm sees the identical conversation, so the sweep is paired and the
+`(config, turn_idx)` breakdown means something; a 30-row matrix is affordable.
+Metric: `agent_action_match`, exact match on the bash action. This is action
+agreement under TEACHER FORCING and **not** a SWE-bench resolve rate. It
+structurally cannot see divergence compounding.
+
+**Phase 2 -- live (`--agentic`).** The model's action is executed in that
+instance's container and the result becomes the next turn. This is the row
+that supports "the method works with coding agents"; Phase 1 only selects its
+operating point. Not a third driving loop -- `agentic.py::AgenticTurns` is
+swapped in behind the two reads that used to say `conv["turns"][turn_idx]`,
+so the live path inherits every finding in the sparse-attention section above
+rather than re-acquiring them. Supported for `M000` and `SPARSE-*`/`ORACLE-*`
+only; `M-k*-g*` feeds golden answers forward and a live run has none.
+
+Endpoints for Phase 2, in the order they should be read -- arms diverge, so
+none of these need a shared per-turn reference:
+
+1. wall-clock to completion per instance;
+2. sustained tokens/s and per-step TTFT against resident context length;
+3. degeneracy proxies -- submission rate, steps-to-submit, invalid-action
+   rate, exit-reason mix;
+4. resolve rate, last, and with its limits stated: on 500 instances it
+   detects a ~10-point collapse, **not** a few points of quality cost.
+
+`num_skipped_too_large` is expected to be non-zero on live rows (observation
+lengths are not knowable in advance, so the driver's pre-flight retires an
+overlong conversation cleanly) and must be **0** on replay rows, where
+`prep_swebench_agent_replay.py` verified every conversation ahead of time.
+
 ---
 
 ## Success criteria
@@ -937,18 +1032,23 @@ the single-turn LongBench-v2 pipelines this was built from).
 
 ## Resource requirements
 
-**2x A100 80GB**, per the protocol document this plan was built from. Not
-yet empirically re-derived for this specific pipeline (Llama-3.1-8B target +
-Llama-3.2-1B speculator, same combined ~9B-parameter footprint as
-`../spec_prefill_llama/`'s single-turn version, which itself estimates "likely
-fits on a single GPU" but hasn't confirmed it) -- follow the protocol's
-stated requirement rather than the single-turn sibling's smaller estimate
-until this pipeline's own validation scripts (`REPRODUCE.md` step 5) confirm
-otherwise, since the multi-turn speculator's growing, long-lived KV cache
-(vs. the single-turn pipeline's per-call throwaway one) is a real, new
-memory-footprint variable that estimate didn't have to account for.
+**4 GPUs.** Both target and speculator run at tensor parallelism 4 on the
+same four devices, in eager mode with asynchronous scheduling disabled. This
+is what the paper's experiments were run on, for both model pairs.
 
-**ETA**: TBD
+It is set by the targets, not by the datasets: Llama-3.1-70B and Gemma-4-31B
+in BF16 do not co-reside with a speculator and a ~130K-token persistent KV
+cache on fewer devices. The speculators (Llama-3.2-1B, Gemma-4-E2B) are small
+enough to share those same four rather than needing their own.
+
+Sharing all four between both engines is also why `--batch-conversations`
+stays at 1 for the paper's rows: the LongBench-v2 prep sizes every
+conversation to fill `--target-max-num-batched-tokens`, so a second concurrent
+conversation needs a second full copy of that KV.
+
+An earlier version of this section said "2x A100 80GB, per the protocol
+document" against a Llama-3.1-8B target. That was the original plan, not the
+experiment; it is superseded.
 
 ---
 
@@ -977,7 +1077,13 @@ memory-footprint variable that estimate didn't have to account for.
 | `validate_resumable_session.py` | GPU-node validation: target-side session persistence (TTFT evidence) -- see "Persistent KV cache + sparse attention" section |
 | `validate_sparse_attention.py` | GPU-node validation: decode-step block-gather sparse attention (needle-in-haystack) -- see "Persistent KV cache + sparse attention" section |
 | `datasets/prep_scbench.py` | Downloads `microsoft/SCBench`'s 3 MVP configs, writes `datasets/scbench_samples.jsonl` |
+| `datasets/prep_longbench_v2_multiturn.py` | One LongBench-v2 document per turn (`longbench_v2_mc`), optionally distractor-packed into a length band |
+| `datasets/prep_mmmu_multiturn.py` | One MMMU question (with images) per turn (`mmmu_mc`) -- multimodal regression test |
+| `datasets/normalize_swebench_trajs.py` | Flattens mini-swe-agent `.traj.json` files into one JSONL of linear message histories |
+| `datasets/prep_swebench_agent_replay.py` | Replays those trajectories as one-action-cycle-per-turn conversations (`swebench_agent`) |
+| `agentic.py` | `DatasetTurns` / `AgenticTurns` -- where a turn's text comes from. The live path is a turn source, not a second driving loop |
+| `agent_sandbox.py` | `execute`/`get_patch` over one instance's SWE-bench Docker image, for `--agentic` |
 | `predict_scbench.py` | Runs the M000/M-k*-g*/ORACLE-k*/SPARSE-k*-g*/EARLY-k*-g32-L<n> matrix, writes a per-turn predictions JSONL per experiment |
-| `grade_scbench.py` | Scores a predictions file against `prep_scbench.py`'s samples, per-config metrics |
-| `datasets/` | SCBench prep output (gitignored) |
+| `grade_scbench.py` | Scores a predictions file against a samples file, per-config metrics (`_METRIC_BY_CONFIG` is the pipeline's only per-dataset dispatch) |
+| `datasets/` | Dataset prep output (gitignored) |
 | `results/` | Output directory (gitignored) |

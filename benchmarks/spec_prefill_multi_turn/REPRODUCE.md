@@ -71,6 +71,15 @@ source benchmarks/spec_prefill_multi_turn/.env_exports.sh
 
 ## 2. Model checkpoints
 
+> **To reproduce the paper you need different checkpoints than this section
+> downloads.** The paper's two pairs are `meta-llama/Llama-3.1-70B-Instruct` +
+> `meta-llama/Llama-3.2-1B-Instruct`, and `google/gemma-4-31B-it` +
+> `google/gemma-4-E2B-it`. `.env_exports.sh` already carries
+> `GEMMA4_31B_MODEL_PATH` / `GEMMA4_E2B_MODEL_PATH`; add a 70B path alongside
+> `LLAMA31_8B_MODEL_PATH`. The 8B instructions below are what the earlier
+> SCBench work used and are kept because the rest of this file's validation
+> steps reference them — they will not reproduce the paper's numbers.
+
 Same two gated Hugging Face checkpoints as `../spec_prefill_llama/`
 (`meta-llama/Llama-3.1-8B-Instruct` target, `meta-llama/Llama-3.2-1B-Instruct`
 speculator). **Request access on each model's Hugging Face page first**
@@ -174,6 +183,107 @@ python3 grade_scbench.py \
     --output results/scbench_result.json
 ```
 
+## 3b. SWE-bench agent trajectories (proposed extension, never run)
+
+> **Not part of reproducing the paper.** The paper's results come from
+> LongBench-v2-MC (§3a equivalent — `datasets/prep_longbench_v2_multiturn.py`),
+> not from anything in this section. The code here is written and unit-tested
+> but has never been executed on hardware. Skip this section entirely if you
+> are reproducing published numbers.
+
+The code-agent workload. Two phases that answer two different claims — see
+`EXPERIMENT_PLAN.md`'s Benchmark section for why neither substitutes for the
+other. Phase 1 needs no Docker; Phase 2 needs x86_64 Linux, Docker, and the
+`swebench` package.
+
+### 3b.1 Record (once, needs Docker)
+
+Serve the **target** dense through stock vLLM, then drive
+[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) against it.
+Record with the target and not a frontier model: the recorded action becomes
+the grading reference, and a reference the target could never have produced
+collapses `M000`'s dynamic range so a 5% criterion sits inside the noise.
+
+```bash
+vllm serve "$TARGET_MODEL_PATH" --port 8000
+```
+
+Point mini-swe-agent's `swebench.yaml` at it (`model_name:
+"hosted_vllm/<path>"`, `model_kwargs.api_base: "http://localhost:8000/v1"`,
+plus a `registry.json` for its cost tracking), then:
+
+```bash
+mini-extra swebench --subset verified --split test --workers 4 -o ./sweb_out
+```
+
+### 3b.2 Normalize and pack (no Docker)
+
+```bash
+python3 datasets/normalize_swebench_trajs.py --traj-dir ./sweb_out
+```
+
+Read its "trajectories with at least T steps" table before choosing
+`--turns-per-conv`: a trajectory shorter than `T` is dropped whole.
+
+```bash
+python3 datasets/prep_swebench_agent_replay.py \
+    --tokenizer "$TARGET_MODEL_PATH" \
+    --turns-per-conv 16 --max-tokens 512 \
+    --max-observation-tokens 4000 \
+    --target-max-num-batched-tokens 130560 \
+    --speculator-max-num-batched-tokens 131063 \
+    --seed 42 \
+    --output datasets/swebench_agent_replay.jsonl
+```
+
+### 3b.3 Phase 1 — replay sweep (paired, gradable)
+
+```bash
+python3 predict_scbench.py \
+    --exp M000,SPARSE-k80-g32,SPARSE-k40-g32,SPARSE-k20-g32 \
+    --samples datasets/swebench_agent_replay.jsonl \
+    --output-suffix=-sweagent
+```
+
+```bash
+python3 grade_scbench.py --batch --samples datasets/swebench_agent_replay.jsonl
+```
+
+**Gate before spending the matrix:** run `M000` alone on ~20 conversations
+first and read `overall`. Below ~0.5 the dataset is not discriminative enough
+to resolve a 5% effect — switch the headline metric to a softer one, or
+re-record so the recorded and replayed prompts match exactly.
+
+What to read: `overall_turn0` must **not** move between arms (turn 0's prefill
+is dense under both scopes, so a difference there is a bug); the
+`(config, turn_idx)` breakdown is the multi-turn signal; and
+`num_skipped_too_large` must be **0** — a non-zero means the prep-time and
+run-time budget checks disagree and every affected row is incomparable.
+
+### 3b.4 Phase 2 — live agentic (needs Docker)
+
+Same samples file; turn 0's issue statement is read from it and every later
+turn comes from the container.
+
+```bash
+python3 predict_scbench.py --exp M000 --agentic \
+    --samples datasets/swebench_agent_replay.jsonl \
+    --max-turns 30 --max-observation-tokens 2000 \
+    --max-conversations 1 --output-suffix=-agentsmoke
+```
+
+Then the three arms (`M000` plus the keep rates Phase 1 selected). Results
+land in `results/<exp_id>_agentic.csv` and `results/<exp_id>_preds.json`.
+
+Two things differ from replay and are **not** bugs:
+
+- `num_skipped_too_large` is expected to be non-zero. Observation lengths are
+  not knowable in advance, so the driver's own pre-flight retires an
+  overlong conversation cleanly at the turn it would have overrun.
+- `grade_scbench.py` should **not** be run on the output. Arms diverge, so
+  there is no shared per-turn reference; read the `_agentic.csv` endpoints
+  instead — wall clock, exit-reason mix and steps first, resolve rate last.
+
 ## 4. Validating the Algorithm pieces built so far (`vllm_patch/`)
 
 Three checks, in order — each depends on the previous passing. **None have
@@ -251,10 +361,22 @@ single-turn pipeline's own step 5 was, since there's no prior multi-turn run
 
 ## Expected runtime / hardware
 
-**2x A100 80GB**, per the protocol document (see `EXPERIMENT_PLAN.md`'s
-"Resource requirements" for why this pipeline follows the protocol's stated
-figure rather than the single-turn sibling's smaller "likely fits on one
-GPU" estimate — the multi-turn speculator's long-lived, growing KV cache is
-a new memory variable that estimate never had to account for).
+**4 GPUs.** Target and speculator both at tensor parallelism 4 on the same
+four devices, eager mode, asynchronous scheduling disabled — for both model
+pairs (Llama-3.1-70B + Llama-3.2-1B, Gemma-4-31B + Gemma-4-E2B). This is what
+the paper's experiments ran on.
 
-**ETA**: TBD
+The count is set by the targets: a 70B or 31B model in BF16 will not
+co-reside with a speculator and a ~130K-token persistent KV cache on fewer
+devices. The speculators are small enough to share those same four rather
+than needing their own.
+
+Keep `--batch-conversations` at 1. The LongBench-v2 prep sizes every
+conversation to fill `--target-max-num-batched-tokens`, so a second concurrent
+conversation needs a second full copy of that KV, and the paper's rows were
+all measured serially.
+
+An earlier version of this section said "2x A100 80GB, per the protocol
+document" against a Llama-3.1-8B target. That was the original plan, not the
+experiment; see `EXPERIMENT_PLAN.md`'s header table for the authoritative
+configuration.
