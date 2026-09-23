@@ -56,7 +56,54 @@ export TORCHINDUCTOR_COMPILE_THREADS=1
 # be disabling real model compilation too.
 export TORCHDYNAMO_DISABLE=1
 
-# Target model (Llama-3.1-8B-Instruct). Reuse the same downloaded snapshot
+# ---------------------------------------------------------------------------
+# Snapshot resolution helper.
+#
+# Defined HERE, above every model path, rather than down beside the Gemma
+# block where it started: a `export X=$(_resolve_hf_snapshot ...)` placed
+# before the definition does not fail loudly, it sets X to the empty string
+# and the run dies much later against a path that looks like a relative
+# filename. Keeping the definition first means any model path below can use
+# it.
+#
+# Resolved from the snapshot directory rather than hardcoded.
+#
+# A hand-written hash is easy to malform, and the failure is opaque: a single
+# missing slash produced ".../snapshots842da37...", which huggingface_hub then
+# tried to read as a REPO ID and rejected with
+# `HFValidationError: Repo id must be in the form 'repo_name' or
+# 'namespace/repo_name'` -- a message that says nothing about the real problem.
+# A stale hash after a repo update fails just as unhelpfully. Globbing the
+# snapshots directory cannot get either wrong.
+_resolve_hf_snapshot() {
+    local cache_dir="$1"
+    local resolved
+    resolved=$(ls -d "$cache_dir"/snapshots/*/ 2>/dev/null | head -1)
+    if [ -z "$resolved" ]; then
+        echo "[.env_exports] WARNING: no snapshot under $cache_dir/snapshots" >&2
+        return 1
+    fi
+    # Strip the trailing slash: from_pretrained accepts either, but the bare
+    # form is what every log line and error message in this pipeline prints.
+    echo "${resolved%/}"
+}
+
+# ---------------------------------------------------------------------------
+# PAPER TARGET (Llama pair): Llama-3.1-70B-Instruct + Llama-3.2-1B-Instruct.
+#
+# This is the Llama half of the paper's two model pairs (the other is the
+# Gemma-4-31B / E2B pair below); see EXPERIMENT_PLAN.md's header table. Both
+# run at tensor parallelism 4 on the same four GPUs.
+#
+# Resolved rather than hardcoded, unlike the three 8B/1B/3B paths below, which
+# predate this helper and carry hand-written snapshot hashes that their own
+# comments flag as placeholders.
+export LLAMA31_70B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/hub/models--meta-llama--Llama-3.1-70B-Instruct)
+
+# Target model (Llama-3.1-8B-Instruct). NOT the paper's target -- this is the
+# smaller pair the earlier SCBench work used, kept because the ORACLE/FLOP
+# analyses and several validate_*.py scripts still reference it. Reuse the
+# same downloaded snapshot
 # path as ../spec_prefill_llama/.env_exports.sh if you already have one --
 # TODO: fill in with this node's real path (gated HF repo -- request access
 # and export HF_TOKEN before downloading, see REPRODUCE.md step 2).
@@ -115,32 +162,8 @@ export LLAMA32_3B_MODEL_PATH=/scratch/hf_cache/hub/models--meta-llama--Llama-3.2
 # access and export HF_TOKEN first). Verify before trusting:
 #   ls -la /scratch/hf_cache/hub/models--google--gemma-4-31B-it/snapshots/*/
 #   ls -la /scratch/hf_cache/hub/models--google--gemma-4-E2B-it/snapshots/*/
-# Resolved from the snapshot directory rather than hardcoded.
-#
-# A hand-written hash is easy to malform, and the failure is opaque: a single
-# missing slash produced ".../snapshots842da37...", which huggingface_hub then
-# tried to read as a REPO ID and rejected with
-# `HFValidationError: Repo id must be in the form 'repo_name' or
-# 'namespace/repo_name'` -- a message that says nothing about the real problem.
-# A stale hash after a repo update fails just as unhelpfully. Globbing the
-# snapshots directory cannot get either wrong.
-#
-# Unset (not empty-and-silent) when the checkpoint is absent, so a run fails
-# on a missing variable rather than on an empty path that looks like a
-# relative filename.
-_resolve_hf_snapshot() {
-    local cache_dir="$1"
-    local resolved
-    resolved=$(ls -d "$cache_dir"/snapshots/*/ 2>/dev/null | head -1)
-    if [ -z "$resolved" ]; then
-        echo "[.env_exports] WARNING: no snapshot under $cache_dir/snapshots" >&2
-        return 1
-    fi
-    # Strip the trailing slash: from_pretrained accepts either, but the bare
-    # form is what every log line and error message in this pipeline prints.
-    echo "${resolved%/}"
-}
-
+# `_resolve_hf_snapshot` is defined near the top of this file, above every
+# model path -- see the comment there for why it moved.
 export GEMMA4_31B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/hub/models--google--gemma-4-31B-it)
 export GEMMA4_E2B_MODEL_PATH=$(_resolve_hf_snapshot /scratch/hf_cache/hub/models--google--gemma-4-E2B-it)
 

@@ -199,11 +199,23 @@ def extract_agent_action(text: str) -> Optional[str]:
     agent harness would itself have rejected and re-prompted, so treating it as
     a non-action here agrees with what the live loop would do rather than
     silently grading its first or last block.
+
+    The capture is `.strip()`ped, so the returned value is the command and
+    nothing else. Without it the fence's own newline rides along
+    (`"ls -la\\n"`), which `_normalize_command` would hide on the grading path
+    but `agentic.py` hands straight to `sandbox.execute`. Harmless to `bash
+    -lc`, but it means the recorded action and the executed one differ by
+    whitespace, and every log line and command echo carries a stray newline.
+    Interior whitespace is untouched -- heredoc indentation is part of the
+    program being written (see `_normalize_command`).
     """
     blocks = _BASH_BLOCK_RE.findall(text or "")
     if len(blocks) != 1:
         return None
-    return blocks[0]
+    action = blocks[0].strip()
+    # A fenced but empty block is not an action. Returning "" would send an
+    # empty command to the sandbox and read back as a successful no-op.
+    return action or None
 
 
 def _normalize_command(command: str) -> str:

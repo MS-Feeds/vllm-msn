@@ -7372,6 +7372,38 @@ def test_agent_action_match_scores_unparseable_output_zero_not_none():
     assert agent_action_match("```bash\nls\n```\n```bash\npwd\n```", _bash("ls")) == 0.0
 
 
+def test_extract_agent_action_returns_the_command_without_fence_whitespace():
+    """The extracted action is handed straight to `sandbox.execute`, so it must
+    be the command and nothing else -- the fence's own newline used to ride
+    along."""
+    from grade_scbench import extract_agent_action
+
+    assert extract_agent_action(_bash("ls -la")) == "ls -la"
+    assert extract_agent_action("```bash\n\n  pwd  \n\n```") == "pwd"
+    # Interior structure survives; only the ends are trimmed.
+    heredoc = "python - <<'EOF'\n    if x:\n        pass\nEOF"
+    assert extract_agent_action(_bash(heredoc)) == heredoc
+
+
+def test_extract_agent_action_treats_an_empty_block_as_no_action():
+    """An empty command would run as a successful no-op and read back as a
+    clean observation, which is worse than being told the action was bad."""
+    from grade_scbench import extract_agent_action
+
+    assert extract_agent_action("```bash\n```") is None
+    assert extract_agent_action("```bash\n   \n```") is None
+
+
+def test_agent_action_match_ignores_trailing_space_on_an_interior_line():
+    """What `_normalize_command`'s per-line rstrip is for -- the outer strip in
+    `extract_agent_action` cannot reach a trailing space mid-command."""
+    from grade_scbench import agent_action_match
+
+    clean = "echo one\necho two"
+    trailing = "echo one   \necho two"
+    assert agent_action_match(_bash(trailing), _bash(clean)) == 1.0
+
+
 def test_agent_action_match_folds_trailing_space_but_not_heredoc_indentation():
     """Agent actions routinely carry heredocs whose indentation is part of the
     program being written, so internal whitespace must NOT be collapsed."""

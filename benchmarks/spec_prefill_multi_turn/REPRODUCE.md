@@ -74,9 +74,10 @@ source benchmarks/spec_prefill_multi_turn/.env_exports.sh
 > **To reproduce the paper you need different checkpoints than this section
 > downloads.** The paper's two pairs are `meta-llama/Llama-3.1-70B-Instruct` +
 > `meta-llama/Llama-3.2-1B-Instruct`, and `google/gemma-4-31B-it` +
-> `google/gemma-4-E2B-it`. `.env_exports.sh` already carries
-> `GEMMA4_31B_MODEL_PATH` / `GEMMA4_E2B_MODEL_PATH`; add a 70B path alongside
-> `LLAMA31_8B_MODEL_PATH`. The 8B instructions below are what the earlier
+> `google/gemma-4-E2B-it`. `.env_exports.sh` carries all four —
+> `LLAMA31_70B_MODEL_PATH`, `LLAMA32_1B_MODEL_PATH`, `GEMMA4_31B_MODEL_PATH`,
+> `GEMMA4_E2B_MODEL_PATH` — and resolves the snapshot hashes itself, so
+> downloading the checkpoints is the only step. The 8B instructions below are what the earlier
 > SCBench work used and are kept because the rest of this file's validation
 > steps reference them — they will not reproduce the paper's numbers.
 
@@ -162,6 +163,12 @@ resolve; older downloads on some nodes landed one level up, without `hub/`
 
 ## 3. SCBench dataset
 
+> **Not the paper's benchmark** — see §3a below for LongBench-v2-MC, which is.
+> SCBench was superseded (its steady-state per-turn delta `d ~ 70` against
+> `o = 512` puts the saving in decode, where this pipeline does not convert it
+> to seconds). Kept because the ORACLE/FLOP analyses and the granularity grid
+> in `README.md` were measured on it.
+
 `datasets/prep_scbench.py` fetches `microsoft/SCBench`'s 3 MVP configs
 (`scbench_qa_eng`, `scbench_kv`, `scbench_summary`) from Hugging Face and
 writes `datasets/scbench_samples.jsonl` (one row per conversation/context,
@@ -182,6 +189,58 @@ python3 grade_scbench.py \
     --predictions results/<exp_id>_predictions.jsonl \
     --output results/scbench_result.json
 ```
+
+## 3a. LongBench-v2-MC — the paper's benchmark
+
+Two builds, one per model family. This is not optional duplication:
+`prep_longbench_v2_multiturn.py` measures every turn's length with
+`--tokenizer`, which **must be the target's**, and Llama's tokenizer is less
+efficient on English than Gemma's — so the same length band selects a
+different, smaller set of documents. The two files genuinely do not pose the
+same questions, which is why the paper reports 18 conversations / 90 turns for
+Llama and 15 / 75 for Gemma.
+
+It loads the single-turn LongBench-v2 prep from a sibling directory by
+explicit path, so that file must exist first:
+
+```bash
+ls ../spec_prefill_llama/datasets/prep_longbench_v2.py
+```
+
+Llama pair:
+
+```bash
+python3 datasets/prep_longbench_v2_multiturn.py \
+    --tokenizer "$LLAMA31_70B_MODEL_PATH" \
+    --target-max-num-batched-tokens 130560 \
+    --speculator-max-num-batched-tokens 131063 \
+    --max-tokens 512 --seed 42 \
+    --output datasets/longbench_v2_multiturn_llama.jsonl
+```
+
+Gemma pair (`datasets/longbench_v2_multiturn.jsonl` is the script's own
+`DEFAULT_OUTPUT`; rename to `_gemma` if you prefer symmetry with the Llama
+file above):
+
+```bash
+python3 datasets/prep_longbench_v2_multiturn.py \
+    --tokenizer "$GEMMA4_31B_MODEL_PATH" \
+    --target-max-num-batched-tokens 130560 \
+    --speculator-max-num-batched-tokens 131063 \
+    --max-tokens 512 --seed 42 \
+    --output datasets/longbench_v2_multiturn.jsonl
+```
+
+`datasets/*.jsonl` is gitignored, so neither file is in the repo — a fresh
+node must rebuild both, and the `--tokenizer` used is not recoverable from the
+file afterwards. Pass the matching `--samples` to `predict_scbench.py`: running
+the Llama file against a Gemma target silently measures a dataset built for
+someone else's tokenizer.
+
+Read the prep's closing report before running anything: it prints per-turn `d`
+deciles, both engines' headroom with a `<-- BINDING` marker, and the mean d:o
+ratio. The binding side is normally the **speculator**, since it must hold the
+whole conversation to score it.
 
 ## 3b. SWE-bench agent trajectories (proposed extension, never run)
 
