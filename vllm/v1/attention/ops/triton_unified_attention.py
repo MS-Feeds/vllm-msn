@@ -954,6 +954,19 @@ def unified_attention(
         launch_num_warps = 8
         launch_num_stages = 2
 
+    # CodeGuru sm_80 decode tuning (Gemma4 campaign). The high-concurrency
+    # DECODE path (num_seqs > seq_threshold_3D runs the 2D single-pass kernel)
+    # is launched below with ``tile_size = TILE_SIZE_PREFILL`` = 32 for bf16,
+    # which is the PREFILL-tuned tile, not the decode tile (16). This is a
+    # decode/prefill mis-tiling on the memory-bound decode kernel. Allow an
+    # env override of the 2D-decode tile size + Triton pipelining stages +
+    # num_warps so we can sweep the decode-native geometry without a full
+    # kernel rewrite. Numerics-neutral (same softmax, only tile geometry +
+    # num_stages + num_warps change).
+    _decode2d_tile = envs.VLLM_GEMMA4_DECODE2D_TILE
+    _decode2d_stages = envs.VLLM_GEMMA4_DECODE2D_STAGES
+    _decode2d_warps = envs.VLLM_GEMMA4_DECODE2D_WARPS
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
@@ -1086,6 +1099,18 @@ def unified_attention(
         launch_kwargs["num_warps"] = launch_num_warps
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
+
+    # CodeGuru sm_80 decode tuning: if the user set an explicit 2D-decode tile,
+    # apply it to the high-concurrency 2D path (which otherwise uses the
+    # prefill tile size). The overrides also apply the requested pipelining
+    # stages and num_warps. Guarded so default behavior (override tile == 0) is
+    # unchanged.
+    if _decode2d_tile and not use_3d:
+        tile_size = _decode2d_tile
+    if _decode2d_stages:
+        launch_kwargs["num_stages"] = _decode2d_stages
+    if _decode2d_warps:
+        launch_kwargs["num_warps"] = _decode2d_warps
 
     kernel_unified_attention[grid](
         output_ptr=out,
