@@ -660,12 +660,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # triton_unified_attention.py. Numerics-neutral geometry sweep for the
     # high-concurrency decode path (batch > seq_threshold_3D). 0/unset =
     # default behavior.
-    "VLLM_GEMMA4_DECODE2D_TILE": lambda: int(os.getenv("VLLM_GEMMA4_DECODE2D_TILE", "0")),
-    "VLLM_GEMMA4_DECODE2D_STAGES": lambda: int(
-        os.getenv("VLLM_GEMMA4_DECODE2D_STAGES", "0")
+    "D2G_TILE": lambda: int(os.getenv("D2G_TILE", "0")),
+    "D2G_STAGES": lambda: int(
+        os.getenv("D2G_STAGES", "0")
     ),
-    "VLLM_GEMMA4_DECODE2D_WARPS": lambda: int(
-        os.getenv("VLLM_GEMMA4_DECODE2D_WARPS", "0")
+    "D2G_WARPS": lambda: int(
+        os.getenv("D2G_WARPS", "0")
     ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs

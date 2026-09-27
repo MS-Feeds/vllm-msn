@@ -963,9 +963,9 @@ def unified_attention(
     # num_warps so we can sweep the decode-native geometry without a full
     # kernel rewrite. Numerics-neutral (same softmax, only tile geometry +
     # num_stages + num_warps change).
-    _decode2d_tile = envs.VLLM_GEMMA4_DECODE2D_TILE
-    _decode2d_stages = envs.VLLM_GEMMA4_DECODE2D_STAGES
-    _decode2d_warps = envs.VLLM_GEMMA4_DECODE2D_WARPS
+    _decode2d_tile = envs.D2G_TILE
+    _decode2d_stages = envs.D2G_STAGES
+    _decode2d_warps = envs.D2G_WARPS
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
