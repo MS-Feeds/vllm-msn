@@ -3557,11 +3557,13 @@ def build_turn_source(args, tok):
         max_observation_tokens=args.max_observation_tokens,
         instances_by_id=instances_by_id,
         timeout=args.sandbox_timeout,
+        backend=args.sandbox_backend,
     )
 
 
 def write_agentic_records(turn_source, exp_id: str, out_dir: Path,
-                          model_name: str, suffix: str = "") -> None:
+                          model_name: str, suffix: str = "",
+                          conversations=None) -> None:
     """Conversation-level endpoints for a live row.
 
     Deliberately NOT folded into `all_runs.csv`: that file's `CSV_FIELDS` is
@@ -3585,6 +3587,25 @@ def write_agentic_records(turn_source, exp_id: str, out_dir: Path,
     preds_path = out_dir / f"{exp_id}{suffix}_preds.json"
     with open(preds_path, "w", encoding="utf-8") as f:
         json.dump(turn_source.predictions_payload(model_name), f, indent=2)
+
+    # The recording half. A DENSE live run is how the replay dataset gets
+    # made: this file is exactly what `prep_swebench_agent_replay.py` reads,
+    # so `normalize_swebench_trajs.py` is only needed for the mini-swe-agent
+    # route. Written for every live row, not just M000 -- a sparse arm's own
+    # trajectory is worth keeping for inspection even though it is not what a
+    # replay should be built from.
+    system_by_conv = {c["id"]: c.get("context", "") for c in (conversations or [])}
+    trajectories = turn_source.trajectories_payload(system_by_conv)
+    traj_path = out_dir / f"{exp_id}{suffix}_trajectories.jsonl"
+    with open(traj_path, "w", encoding="utf-8") as f:
+        for row in trajectories:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    steps = [r["num_steps"] for r in trajectories]
+    if steps:
+        print(f"[predict_scbench] wrote {len(trajectories)} trajectories -> "
+              f"{traj_path} (steps min={min(steps)} max={max(steps)})")
+        for t in (8, 12, 16, 24):
+            print(f"    usable at T={t:>2}: {sum(1 for s in steps if s >= t)}")
 
     reasons: dict[str, int] = {}
     for rec in records:
@@ -4387,6 +4408,7 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                         turn_source, exp_id, OUT_DIR,
                         model_name=args.target_model,
                         suffix=args.output_suffix,
+                        conversations=conversations,
                     )
 
             ttfts_sorted = sorted(stats["ttfts"])
@@ -4895,6 +4917,16 @@ def main() -> None:
         "--sandbox-timeout", type=int, default=120,
         help="--agentic only: per-command wall-clock cap inside the container. "
              "A timeout is reported to the model as an observation, not raised.",
+    )
+    parser.add_argument(
+        "--sandbox-backend", default="docker",
+        choices=["docker", "podman", "udocker"],
+        help="--agentic only: container runtime. `udocker` (pip install "
+             "udocker && udocker install) needs no root and no daemon, which "
+             "is the option on a cluster node without Docker -- it persists "
+             "state in an extracted rootfs rather than a running container, "
+             "and is several times slower under its PRoot backend. Set "
+             "UDOCKER_DIR to a large filesystem; images are a few GB each.",
     )
     parser.add_argument(
         "--swebench-dataset", default="princeton-nlp/SWE-bench_Verified",

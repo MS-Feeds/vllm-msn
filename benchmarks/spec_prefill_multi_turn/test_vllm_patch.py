@@ -7372,6 +7372,68 @@ def test_agent_action_match_scores_unparseable_output_zero_not_none():
     assert agent_action_match("```bash\nls\n```\n```bash\npwd\n```", _bash("ls")) == 0.0
 
 
+_UDOCKER_REAL_OUTPUT = """
+ ******************************************************************************
+ *                                                                            *
+ *               STARTING 05931124-3b73-3d60-bd3a-4c9566ecaf97                *
+ *                                                                            *
+ ******************************************************************************
+ executing: bash
+hi
+"""
+
+
+def test_strip_udocker_banner_removes_the_real_banner():
+    """Verbatim from a real `udocker run` on the cluster node. Unfiltered this
+    lands in every observation the model sees -- wasted context, a corrupted
+    trajectory, and a replay dataset full of udocker noise."""
+    from agent_sandbox import strip_udocker_banner
+
+    assert strip_udocker_banner(_UDOCKER_REAL_OUTPUT).strip() == "hi"
+
+
+def test_strip_udocker_banner_handles_two_banners_and_leaves_output_alone():
+    """Two runs' worth (stdout+stderr concatenated), and output that merely
+    mentions starting must survive -- the regex anchors on the asterisk rules,
+    not on the word STARTING."""
+    from agent_sandbox import strip_udocker_banner
+
+    doubled = _UDOCKER_REAL_OUTPUT + _UDOCKER_REAL_OUTPUT
+    assert strip_udocker_banner(doubled).split() == ["hi", "hi"]
+
+    innocent = "STARTING the test suite\nexecuting: 3 tests\nok\n"
+    assert strip_udocker_banner(innocent) == innocent
+    assert strip_udocker_banner("") == ""
+
+
+def test_make_sandbox_maps_backends_and_rejects_unknown_ones():
+    from agent_sandbox import DockerSandbox, UdockerSandbox, SandboxError, make_sandbox
+
+    assert isinstance(make_sandbox("docker", image="i"), DockerSandbox)
+    assert isinstance(make_sandbox("udocker", image="i"), UdockerSandbox)
+    # podman reuses DockerSandbox with a different binary rather than getting a
+    # near-duplicate class.
+    podman = make_sandbox("podman", image="i")
+    assert isinstance(podman, DockerSandbox) and podman.binary == "podman"
+    try:
+        make_sandbox("containerd", image="i")
+    except SandboxError as exc:
+        assert "containerd" in str(exc)
+    else:
+        raise AssertionError("expected SandboxError for an unknown backend")
+
+
+def test_udocker_sandbox_sets_the_workdir_by_cd_not_by_flag():
+    """udocker has no `-w`, and relying on `--workdir` would tie this to the
+    versions that support it."""
+    from agent_sandbox import UdockerSandbox
+
+    sb = UdockerSandbox(image="i", workdir="/testbed")
+    assert sb._in_workdir("pytest -x") == "cd /testbed && pytest -x"
+    quoted = UdockerSandbox(image="i", workdir="/odd dir")
+    assert quoted._in_workdir("ls") == "cd '/odd dir' && ls"
+
+
 def test_extract_agent_action_returns_the_command_without_fence_whitespace():
     """The extracted action is handed straight to `sandbox.execute`, so it must
     be the command and nothing else -- the fence's own newline used to ride
@@ -7710,6 +7772,47 @@ def test_agentic_teardown_stops_the_container_even_without_a_clean_exit():
     src2.turn_for(_conv(), 0)
     src2.close()
     assert other.stopped is True
+
+
+def test_agentic_records_a_replayable_trajectory():
+    """A live dense run is how the replay dataset gets made, so the message
+    history must come out alternating user/assistant in the normalizer's
+    shape -- the observations exist nowhere else."""
+    src = _agentic(sandbox_factory=lambda instance: _FakeSandbox(output="out1"))
+    conv = _conv()
+
+    src.turn_for(conv, 0)
+    src.observe(conv, 0, _bash("ls"))
+    src.turn_for(conv, 1)
+    src.observe(conv, 1, _bash("submit"))
+
+    rows = src.trajectories_payload({conv["id"]: "the system prompt"})
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["instance_id"] == "inst-1"
+    assert row["system"] == "the system prompt"
+    assert row["num_steps"] == 2
+    assert [m["role"] for m in row["messages"]] == [
+        "user", "assistant", "user", "assistant"]
+    assert row["messages"][0]["content"] == "the issue"
+    assert "out1" in row["messages"][2]["content"]
+    assert row["exit_status"] == "submitted"
+
+
+def test_agentic_trajectory_drops_a_trailing_unanswered_observation():
+    """Same rule the normalizer applies: an observation the agent never acted
+    on is not a step, and an odd-length history would misalign the replay's
+    positional mapping."""
+    src = _agentic(sandbox_factory=lambda instance: _FakeSandbox())
+    conv = _conv()
+
+    src.turn_for(conv, 0)
+    src.observe(conv, 0, _bash("ls"))
+    src.turn_for(conv, 1)          # injected, but never acted on
+
+    row = src.trajectories_payload({})[0]
+    assert row["num_steps"] == 1
+    assert [m["role"] for m in row["messages"]] == ["user", "assistant"]
 
 
 def test_agentic_retires_cleanly_when_the_instance_has_no_swebench_row():

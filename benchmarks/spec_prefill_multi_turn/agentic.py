@@ -60,7 +60,12 @@ import re
 import time
 from typing import Optional
 
-from agent_sandbox import DockerSandbox, SandboxError, format_observation, image_for_instance
+from agent_sandbox import (
+    SandboxError,
+    format_observation,
+    image_for_instance,
+    make_sandbox,
+)
 from grade_scbench import extract_agent_action
 
 #: Sent back when the generation carried no single bash block. Mirrors what a
@@ -125,6 +130,7 @@ class AgenticTurns:
                  max_format_retries: int = 3,
                  submit_re: re.Pattern = DEFAULT_SUBMIT_RE,
                  workdir: Optional[str] = None,
+                 backend: str = "docker",
                  on_event=None,
                  sandbox_factory=None):
         self.tok = tok
@@ -138,6 +144,9 @@ class AgenticTurns:
         self.max_format_retries = max_format_retries
         self.submit_re = submit_re
         self.workdir = workdir
+        #: "docker", "podman" or "udocker" -- see `agent_sandbox.make_sandbox`.
+        #: udocker is the one that works without root or a daemon.
+        self.backend = backend
         #: `f(str)` for diagnostics. Defaults to `print` rather than a no-op:
         #: the messages it carries are things like "docker is not on PATH" and
         #: "no SWE-bench row for this instance", which would otherwise be
@@ -148,10 +157,17 @@ class AgenticTurns:
         #: `f(instance_row) -> sandbox`. The seam the tests use: the control
         #: flow worth testing (format retries, submit detection, truncation,
         #: the step limit) is all in this class, and none of it needs Docker.
-        #: Defaults to a started `DockerSandbox` for the real path.
+        #: Defaults to a started sandbox of `backend` for the real path.
         self.sandbox_factory = sandbox_factory or self._default_sandbox
 
-        self._sandboxes: dict[str, DockerSandbox] = {}
+        self._sandboxes: dict = {}
+        #: The full linear history per conversation, in
+        #: `normalize_swebench_trajs.py`'s output shape. Recorded because the
+        #: driver's predictions file keeps only the model's ACTIONS -- the
+        #: observations live nowhere else, and without them a live run cannot
+        #: seed a replay dataset. Alternating user/assistant by construction:
+        #: `turn_for` appends the user half, `observe` the assistant half.
+        self._messages: dict[str, list] = {}
         self._pending: dict[str, str] = {}
         self._finished: dict[str, bool] = {}
         self._format_failures: dict[str, int] = {}
@@ -178,7 +194,9 @@ class AgenticTurns:
             # supplies -- the replay file's turn 0 already holds exactly this
             # (the issue statement the recorded agent was handed), which is why
             # one samples file drives both modes.
-            return {"input": conv["turns"][0]["input"], "answer": ""}
+            task = conv["turns"][0]["input"]
+            self._record(conv_id, "user", task)
+            return {"input": task, "answer": ""}
 
         observation = self._pending.pop(conv_id, None)
         if observation is None:
@@ -186,6 +204,7 @@ class AgenticTurns:
             # the turn produced no output at all. Either way there is nothing
             # to inject and the session should retire rather than repeat a turn.
             return None
+        self._record(conv_id, "user", observation)
         return {"input": observation, "answer": ""}
 
     def observe(self, conv: dict, turn_idx: int, pred_text: str) -> None:
@@ -199,6 +218,7 @@ class AgenticTurns:
             # KeyError here would lose the whole run over a bookkeeping slip.
             return
         record["steps"] = turn_idx + 1
+        self._record(conv_id, "assistant", pred_text)
 
         action = extract_agent_action(pred_text)
         if action is None:
@@ -283,8 +303,13 @@ class AgenticTurns:
 
     # -- internals ----------------------------------------------------------
 
-    def _default_sandbox(self, instance: dict) -> DockerSandbox:
-        sandbox = DockerSandbox(
+    def _record(self, conv_id: str, role: str, content: str) -> None:
+        self._messages.setdefault(conv_id, []).append(
+            {"role": role, "content": content})
+
+    def _default_sandbox(self, instance: dict):
+        sandbox = make_sandbox(
+            self.backend,
             image=image_for_instance(instance),
             timeout=self.timeout,
             **({"workdir": self.workdir} if self.workdir else {}),
@@ -362,6 +387,35 @@ class AgenticTurns:
         return f"{head}\n... [{omitted} tokens omitted] ...\n{tail}"
 
     # -- reporting ----------------------------------------------------------
+
+    def trajectories_payload(self, system_by_conv: dict) -> list[dict]:
+        """The run's trajectories, in `normalize_swebench_trajs.py`'s output
+        shape, ready for `prep_swebench_agent_replay.py`.
+
+        This is what makes a live dense run a RECORDER: replay needs
+        (observation, action) pairs, and recording here rather than through
+        mini-swe-agent means the prompts were rendered by `render_turn_query`
+        -- byte-identical to what the replay will feed back. That is what lets
+        `M000` be a near-1.0 control instead of scoring against actions it took
+        under someone else's prompt format.
+
+        A trailing user message is dropped, exactly as the normalizer does: it
+        is an observation the agent never acted on, so it is not a step.
+        """
+        rows = []
+        for conv_id, messages in self._messages.items():
+            body = messages[:-1] if len(messages) % 2 == 1 else list(messages)
+            if not body:
+                continue
+            record = self.records.get(conv_id, {})
+            rows.append({
+                "instance_id": record.get("instance_id") or conv_id,
+                "exit_status": record.get("exit_reason"),
+                "num_steps": len(body) // 2,
+                "system": system_by_conv.get(conv_id, ""),
+                "messages": body,
+            })
+        return rows
 
     def predictions_payload(self, model_name: str) -> dict:
         """SWE-bench `preds.json`, for the Docker harness or `sb-cli`.
