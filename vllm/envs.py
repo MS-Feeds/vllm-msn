@@ -657,12 +657,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRITON_ATTN_USE_TD": lambda: _deprecated_triton_attn_use_td(),
     # CodeGuru sm_80 decode tuning (Gemma4 campaign): env overrides of the
     # 2D-decode tile size, Triton pipelining stages, and num_warps in
-    # triton_unified_attention.py. Numerics-neutral geometry sweep for the
-    # high-concurrency decode path (batch > seq_threshold_3D). 0/unset =
-    # default behavior.
-    "D2G_TILE": lambda: int(os.getenv("D2G_TILE", "0")),
+    # triton_unified_attention.py. Numerics-neutral geometry for the
+    # high-concurrency decode path (batch > seq_threshold_3D). ROUND-25 winner:
+    # D2G_TILE=32 + D2G_STAGES=2 = 2392 TPS (+13.6% vs plain, t=23.1), now baked
+    # in as the fork default so a plain runner-branch clone gets the win with no
+    # env plumbing. Set D2G_*=0 to revert to stock prefill-tuned behavior.
+    "D2G_TILE": lambda: int(os.getenv("D2G_TILE", "32")),
     "D2G_STAGES": lambda: int(
-        os.getenv("D2G_STAGES", "0")
+        os.getenv("D2G_STAGES", "2")
     ),
     "D2G_WARPS": lambda: int(
         os.getenv("D2G_WARPS", "0")
