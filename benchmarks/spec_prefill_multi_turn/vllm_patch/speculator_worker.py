@@ -875,6 +875,8 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         score_layers: Optional[str] = None,
         score_head_set: Optional[list] = None,
         mask_sliding_window: bool = False,
+        select_strategy: str = "attention",
+        select_seed: int = 0,
     ):
         """Combines `end_capture` + `retrieve_keys` + the scoring/selection
         pipeline (`scoring.score_and_select_indices`) into ONE in-process
@@ -919,6 +921,8 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
         34s total with everything forced onto CPU, most of that plausibly
         this exact inefficiency (a large matmul + softmax over an
         88k-token context on CPU instead of GPU)."""
+        import random
+
         from .config import SpecConfig
         from .scoring import score_and_select_indices
 
@@ -944,7 +948,23 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             score_layers=score_layers,
             score_head_set=score_head_set,
             mask_sliding_window=mask_sliding_window,
+            select_strategy=select_strategy,
+            select_seed=select_seed,
         )
+        # Seeded from `request_id`, which is `"{conversation_salt}::turn{n}"`
+        # (see `proposer.py::_begin_and_submit_turn`), so a turn's random
+        # selection is a pure function of (seed, conversation, turn_idx) and is
+        # NOT affected by which other conversations shared its wave. Drawing
+        # from one stream instead would make the same row irreproducible across
+        # `--batch-conversations` values. Inert unless
+        # `select_strategy == "random"`.
+        #
+        # Under speculator tensor parallelism every rank must select the SAME
+        # indices, which holds here because the seed is derived from arguments
+        # all ranks receive identically -- the same guarantee the all-reduce in
+        # `_tp_shard_reducer` provides for the attention path, by a different
+        # route. A rank-local `random` stream would silently diverge.
+        rng = random.Random(f"{select_seed}:{request_id}")
         kept_local_indices = score_and_select_indices(
             query_buffer,
             key_buffer_per_layer,
@@ -952,6 +972,7 @@ class SpeculatorGPUModelRunner(GPUModelRunner):
             spec_config,
             self.layer_geometry(),
             self._tp_shard_reducer(spec_config),
+            rng=rng,
         )
         return kept_local_indices, actual_look_ahead_cnt
 
@@ -1360,15 +1381,17 @@ class SpeculatorWorker(Worker):
         score_layers: Optional[str] = None,
         score_head_set: Optional[list] = None,
         mask_sliding_window: bool = False,
+        select_strategy: str = "attention",
+        select_seed: int = 0,
     ):
         """RPC-callable wrapper -- see `SpeculatorGPUModelRunner.
         end_capture_and_score`'s docstring for the full reasoning (in-
         process K retrieval + scoring, only the small resulting index list
         crosses `collective_rpc`).
 
-        `score_aggregation`/`score_layers`/`mask_sliding_window` default to
-        the reference behavior, so this stays callable with the old
-        5-argument signature.
+        `score_aggregation`/`score_layers`/`mask_sliding_window`/
+        `select_strategy`/`select_seed` all default to the reference behavior,
+        so this stays callable with the old 5-argument signature.
 
         **This signature must track the runner method's, and nothing checks
         that for you.** `collective_rpc` dispatches by name to THIS class, so
@@ -1379,7 +1402,7 @@ class SpeculatorWorker(Worker):
         return self.model_runner.end_capture_and_score(
             request_id, conversation_salt, full_sequence_len, pool_kernel_size,
             keep_kwargs, score_aggregation, score_layers, score_head_set,
-            mask_sliding_window,
+            mask_sliding_window, select_strategy, select_seed,
         )
 
     def end_capture_and_score_many(self, specs):

@@ -8,6 +8,17 @@ export HF_HOME=/scratch/hf_cache
 export HF_TOKEN=${HF_TOKEN:?Set HF_TOKEN in shell before sourcing this file}
 export HUGGINGFACE_HUB_TOKEN=$HF_TOKEN
 
+# udocker's image store, for the LIVE agentic rows (`--sandbox-backend
+# udocker`). Alongside HF_HOME because it has the same problem: udocker
+# defaults to ~/.udocker, and a SWE-bench image is a few GB extracted, so a
+# handful of instances fills a home quota. Nothing else in this pipeline reads
+# it -- the replay rows need no container at all.
+#
+# `:-` so a node with a differently-mounted scratch can override it in the
+# shell before sourcing, rather than editing this file per node (the same
+# mistake the hardcoded snapshot hashes used to make).
+export UDOCKER_DIR=${UDOCKER_DIR:-/scratch/$USER/udocker}
+
 # Same reasoning as ../spec_prefill_llama/.env_exports.sh: LlamaForCausalLM
 # is not in DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES (vllm/config/vllm.py),
 # so this fork would not auto-select the newer "v2" runner for it anyway --

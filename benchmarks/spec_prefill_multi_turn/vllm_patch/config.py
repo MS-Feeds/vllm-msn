@@ -39,6 +39,18 @@ import yaml
 # closed set keeps both of those honest. Extend the set when a variant earns
 # a row in the experiment matrix.
 SCORE_AGGREGATIONS = frozenset({"max", "mean", "zmean"})
+#: How kept chunks are picked once token importance exists.
+#:
+#: `"attention"` is the method: top-k chunks by the speculator's aggregated
+#: attention. `"random"` is the ABLATION FLOOR -- uniformly random chunks at the
+#: same keep rate, which answers a question the keep-rate sweep alone cannot:
+#: flat accuracy down to k=20% is equally consistent with "selection is good"
+#: and "the model tolerates losing 80% of its context however you choose it".
+#:
+#: `"random"` deliberately still pays the full scoring pass (see
+#: `scoring.chunk_select_from_smoothed_attention`), so a RANDOM row's cost
+#: columns stay directly comparable to its SPARSE partner's.
+SELECT_STRATEGIES = frozenset({"attention", "random"})
 SCORE_LAYER_SELECTIONS = frozenset(
     {None, "skip_first2", "second_half", "last_quarter", "global_only"}
 )
@@ -113,6 +125,17 @@ class SpecConfig:
     #                    degenerates to the default.
     score_aggregation: str = "max"
     score_layers: Optional[str] = None
+    #: See `SELECT_STRATEGIES`. `"attention"` reproduces every published row.
+    select_strategy: str = "attention"
+    #: Base seed for `select_strategy="random"`. Inert otherwise.
+    #:
+    #: The per-turn RNG is derived from this PLUS the request id rather than
+    #: drawn from one stream, because waves are formed dynamically
+    #: (`--batch-conversations`, `batch_refill`, and conversations retired by
+    #: the driver's pre-flight length checks). A single stream would make a
+    #: conversation's selection depend on which other conversations happened to
+    #: share its wave, so the same row would not reproduce across batch sizes.
+    select_seed: int = 0
     # Drop cross-layer-KV-sharing layers (Gemma 3n/4's last
     # `num_kv_shared_layers`) from the vote.
     #
@@ -211,6 +234,10 @@ class SpecConfig:
         assert self.score_layers in SCORE_LAYER_SELECTIONS, (
             f"score_layers must be one of {sorted(x for x in SCORE_LAYER_SELECTIONS if x)} "
             f"or None, got {self.score_layers!r}"
+        )
+        assert self.select_strategy in SELECT_STRATEGIES, (
+            f"select_strategy must be one of {sorted(SELECT_STRATEGIES)}, "
+            f"got {self.select_strategy!r}"
         )
         if self.score_head_set is not None:
             self.score_head_set = [int(h) for h in self.score_head_set]

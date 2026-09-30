@@ -848,9 +848,59 @@ def _chunked_topk_indices(
     return token_indices[token_indices < seq_len]
 
 
+def _chunked_random_indices(
+    seq_len: int, chunk_size: int, percentage: float, rng, device
+) -> torch.Tensor:
+    """The ABLATION FLOOR: uniformly random chunks at the same keep rate.
+
+    Mirrors `_chunked_topk_indices`'s arithmetic exactly, and that fidelity is
+    the whole point: both selectors keep the SAME NUMBER OF CHUNKS for the same
+    `(seq_len, chunk_size, percentage)`, or the comparison stops being about
+    selection quality and becomes about keep rate. Two details carried over
+    deliberately:
+
+    - `chunk_cnt` counts the PADDED chunks, so a context whose length is not a
+      multiple of `chunk_size` has the same chunk count both ways.
+    - `keep_chunk_cnt = ceil(chunk_cnt * percentage)` -- same rounding.
+
+    Note the *token* count can still differ by up to `chunk_size - 1`, because
+    the final chunk is short and selecting it keeps fewer tokens. That is not a
+    fidelity gap -- `topk` has exactly the same property, and which selector
+    happens to pick the tail chunk is itself part of what is being compared.
+    Equal chunk counts is the invariant; see the tests.
+
+    Takes a `random.Random` rather than seeding globally, and returns positions
+    UNSORTED -- the caller sorts, exactly as it does for the topk path (see
+    `chunk_select_from_smoothed_attention`'s note on why that sort is
+    load-bearing for DISCARD).
+    """
+    chunk_cnt = math.ceil(seq_len / chunk_size)
+    keep_chunk_cnt = math.ceil(chunk_cnt * percentage)
+    # `sample` is without replacement -- a chunk selected twice would silently
+    # reduce the realised keep rate.
+    chunk_indices = rng.sample(range(chunk_cnt), min(keep_chunk_cnt, chunk_cnt))
+
+    starts = torch.tensor(chunk_indices, dtype=torch.long, device=device) * chunk_size
+    offsets = torch.arange(chunk_size, device=device)
+    token_indices = (starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+    return token_indices[token_indices < seq_len]
+
+
+def _random_token_indices(
+    seq_len: int, percentage: float, rng, device
+) -> torch.Tensor:
+    """Token-granularity (`chunk: False`) counterpart of the above, matching
+    the `math.ceil(seq_len * percentage)` count the topk path uses."""
+    topk = min(math.ceil(seq_len * percentage), seq_len)
+    return torch.tensor(
+        rng.sample(range(seq_len), topk), dtype=torch.long, device=device
+    )
+
+
 def chunk_select_from_smoothed_attention(
     token_importance: List[torch.Tensor],
     spec_config: SpecConfig,
+    rng=None,
 ) -> List[torch.LongTensor]:
     """Algorithm line 16: T <- chunk_select_from_smoothed_attention(A).
 
@@ -870,8 +920,22 @@ def chunk_select_from_smoothed_attention(
     survivors are never silently reordered turn to turn, so turn N's final
     pruned prompt is guaranteed to be turn N-1's plus a suffix, with no
     extra bookkeeping needed here to enforce that.
+
+    `spec_config.select_strategy == "random"` replaces the top-k decision with
+    uniformly random chunks at the same keep rate (the ablation floor -- see
+    `SELECT_STRATEGIES`). `token_importance` is still COMPUTED and still passed
+    in, and only its length is read: the scoring pass is deliberately paid in
+    full so a RANDOM row's speculator cost matches its SPARSE partner's and the
+    two arms differ in exactly one thing. `rng` is required in that mode and is
+    per-turn (see `SpecConfig.select_seed`).
     """
     kept_indices = []
+    random_select = spec_config.select_strategy == "random"
+    if random_select and rng is None:
+        raise ValueError(
+            "select_strategy='random' needs an rng -- selection would "
+            "otherwise be unseeded and the row unreproducible."
+        )
 
     for sample_ti in token_importance:
         seq_len = len(sample_ti)
@@ -879,7 +943,15 @@ def chunk_select_from_smoothed_attention(
 
         if spec_config.keep_kwargs.get("chunk", False):
             chunk_size = spec_config.keep_kwargs.get("chunk_size", 32)
-            indices = _chunked_topk_indices(sample_ti, seq_len, chunk_size, percentage)
+            if random_select:
+                indices = _chunked_random_indices(
+                    seq_len, chunk_size, percentage, rng, sample_ti.device)
+            else:
+                indices = _chunked_topk_indices(
+                    sample_ti, seq_len, chunk_size, percentage)
+        elif random_select:
+            indices = _random_token_indices(
+                seq_len, percentage, rng, sample_ti.device)
         else:
             topk = math.ceil(seq_len * percentage)
             _, indices = torch.topk(sample_ti, k=topk, dim=-1)
@@ -896,6 +968,7 @@ def score_and_select_indices(
     spec_config: SpecConfig,
     geometry: Optional[LayerGeometry] = None,
     shard_reducer=None,
+    rng=None,
 ) -> List[int]:
     """One-sample convenience wrapper chaining lines 12/14/16 above
     (`compute_attention_score` -> `aggregate_attention_score` ->
@@ -924,7 +997,12 @@ def score_and_select_indices(
     that combination is only exact at this point, and
     `speculator_worker.py::_tp_shard_reducer` for the all-reduce that
     implements it. `None` (the default, and every pre-existing caller) leaves
-    this function exactly as it was."""
+    this function exactly as it was.
+
+    `rng` is forwarded to the selection step and is only read when
+    `spec_config.select_strategy == "random"` (the ablation floor). Note the
+    scoring above still runs in full in that mode, on purpose -- see
+    `chunk_select_from_smoothed_attention`."""
     key_buffer = [[k] for k in key_buffer_per_layer]  # one sample
     attn_scores = compute_attention_score(
         query_buffer, key_buffer, [actual_look_ahead_cnt], geometry,
@@ -941,5 +1019,6 @@ def score_and_select_indices(
     if shard_reducer is not None:
         collapsed = [shard_reducer(c) for c in collapsed]
     token_importance = [c.mean(0) for c in collapsed]
-    kept_local_indices = chunk_select_from_smoothed_attention(token_importance, spec_config)[0]
+    kept_local_indices = chunk_select_from_smoothed_attention(
+        token_importance, spec_config, rng=rng)[0]
     return kept_local_indices.tolist()

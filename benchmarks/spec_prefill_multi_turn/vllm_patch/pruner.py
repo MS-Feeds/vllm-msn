@@ -77,6 +77,19 @@ class PrunedTurnResult:
     # `run_turn_and_score`. Carried on the result rather than returned
     # separately so the whole speculator phase stays one value to thread.
     stage_seconds: dict = field(default_factory=dict)
+    #: `len(candidate_pool)` for this turn -- the number of tokens that were
+    #: ELIGIBLE to be selected, before selection.
+    #:
+    #: Recorded because `orig_len` cannot stand in for it. `orig_len` is the
+    #: absolute conversation length, which grows monotonically under BOTH
+    #: keep modes; under DISCARD the keep percentage applies to the shrunken
+    #: pool, so `orig_len` says nothing about how much the pool has collapsed.
+    #: Per-turn `candidate_pool_len` is the only direct evidence that a DISCARD
+    #: arm did what its name claims -- flat under KEEP, decaying under DISCARD.
+    #:
+    #: Defaults to -1 ("not recorded") rather than 0 so a genuinely empty pool
+    #: stays distinguishable from a construction site that predates this field.
+    candidate_pool_len: int = -1
 
 
 def _positions_from_kept_indices(
@@ -309,6 +322,12 @@ def compute_pruned_turns(
             "score_layers": spec_config.score_layers,
             "score_head_set": spec_config.score_head_set,
             "mask_sliding_window": spec_config.mask_sliding_window,
+            # Ablation floor (SELECT_STRATEGIES). Threaded for the same reason
+            # as the scoring variants above: selection happens inside the
+            # speculator's worker process, which cannot see the driver's
+            # SpecConfig.
+            "select_strategy": spec_config.select_strategy,
+            "select_seed": spec_config.select_seed,
         }
         for state, _pool, _fkq, full_token_ids in prepared
     ])
@@ -331,6 +350,7 @@ def compute_pruned_turns(
             actual_look_ahead_cnt=actual_look_ahead_cnt,
             num_cached_tokens=num_cached_tokens,
             stage_seconds=stage_seconds,
+            candidate_pool_len=len(candidate_pool),
         ))
     return results
 

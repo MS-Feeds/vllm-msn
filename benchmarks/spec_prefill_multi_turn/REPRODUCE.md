@@ -190,6 +190,77 @@ python3 grade_scbench.py \
     --output results/scbench_result.json
 ```
 
+## 3c. Ablations — the selection floor and the persistence counterfactual
+
+Two ablations, on SCBench because that is where they can show anything: all five
+turns share ONE long context, so a token dropped at turn 2 may genuinely be
+needed at turn 5. On `prep_longbench_v2_multiturn.py`'s file each turn carries
+its own document and its own force-kept query, so neither ablation could move —
+the same structural reason `prep_mmmu_multiturn.py` is a regression test rather
+than a selection-quality benchmark.
+
+`scbench_qa_eng` only. The SCBench prep takes no `--tokenizer`, so **one samples
+file serves both model families** — prep once:
+
+```bash
+python3 datasets/prep_scbench.py --configs scbench_qa_eng --max-keep-per-config -1
+```
+
+### Cheap DISCARD pre-flight
+
+DISCARD has never been run, and has no integration coverage above
+`ConversationState`. These two already accept `--keep-mode discard` and drive the
+real `compute_pruned_turn` path, so they surface a collapse before a sweep pays
+for one:
+
+```bash
+python3 diagnose_gold_survival.py --keep-mode discard --samples datasets/scbench_samples.jsonl
+```
+
+```bash
+python3 diagnose_speculator_selection.py --keep-mode discard --samples datasets/scbench_samples.jsonl
+```
+
+If gold-answer survival collapses at turn 1–2, the full run tells you nothing
+you don't already know.
+
+### The four arms
+
+Llama (masking is a no-op there, so the unmasked rows):
+
+```bash
+python3 predict_scbench.py --exp M000,SPARSE-k20-g64,RANDOM-k20-g64,SPARSE-k20-g64-discard --sparse-prefill --scbench-config scbench_qa_eng --samples datasets/scbench_samples.jsonl --target-model $LLAMA31_70B_MODEL_PATH --speculator-model $LLAMA32_1B_MODEL_PATH --target-tensor-parallel-size 4 --target-gpu-memory-utilization 0.80 --speculator-device cuda:0 --speculator-tensor-parallel-size 4 --speculator-gpu-memory-utilization 0.10 --scorer-prefill-chunk-tokens 8192 --target-prefill-chunk-tokens 8192 --max-tokens 512 --baseline-async-scheduling off --output-suffix=-abl-llama
+```
+
+Gemma (masked twins — Gemma's interleaved sliding-window layers):
+
+```bash
+python3 predict_scbench.py --exp M000,SPARSE-k20-g64-masked,RANDOM-k20-g64-masked,SPARSE-k20-g64-masked-discard --sparse-prefill --scbench-config scbench_qa_eng --samples datasets/scbench_samples.jsonl --target-model $GEMMA4_31B_MODEL_PATH --speculator-model $GEMMA4_E2B_MODEL_PATH --target-tensor-parallel-size 4 --target-gpu-memory-utilization 0.75 --speculator-device cuda:0 --speculator-tensor-parallel-size 4 --speculator-gpu-memory-utilization 0.12 --scorer-prefill-chunk-tokens 8192 --target-prefill-chunk-tokens 8192 --max-tokens 512 --baseline-async-scheduling off --output-suffix=-abl-gemma
+```
+
+```bash
+python3 grade_scbench.py --batch --samples datasets/scbench_samples.jsonl
+```
+
+### What to read
+
+- **`SPARSE` − `RANDOM`** at matched k. ~0 means selection is not doing the
+  work — the most important negative result the sweep can produce.
+- **`by (config, turn_idx)`** for keep vs discard. KEEP flat, DISCARD degrading
+  with turn index is the predicted signature.
+- **`flop_inputs.spec_candidate_pool_len` by turn** — the evidence DISCARD
+  actually shrank. `spec_pool_len` cannot serve: it is the absolute conversation
+  length and grows under both modes.
+- **`overall_turn0` must be identical across all four arms.** Turn 0 is dense and
+  mode-identical by construction (the discard pool is seeded with the full
+  context), so movement there is a bug, not a result.
+
+Do not read speedup off the DISCARD arm — it shrinks the scorer's prompt, not
+target KV. If both ablations come back flat, retry with
+`--scbench-config scbench_kv` (exact retrieval, where the published sweep's
+degradation was largest) before concluding the effects are absent; that is a
+flag change, not a code change.
+
 ## 3a. LongBench-v2-MC — the paper's benchmark
 
 Two builds, one per model family. This is not optional duplication:

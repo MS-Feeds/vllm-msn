@@ -411,6 +411,17 @@ POOL_KERNEL_SIZE = 13
 # reasoning as the single-turn pipeline's P001 not paying for
 # SpecPrefillWorker when nothing is pruned).
 KEEP_RATES = [0.8, 0.6, 0.4, 0.2]
+#: Granularity the two ablation families (RANDOM-*, *-discard) are defined at.
+#: 64 is the paper's, and staying off 32 also keeps both families clear of
+#: `test_oracle_rows_pair_one_to_one_with_a_sparse_row`, which asserts ORACLE
+#: keep rates equal the set of sparse rates AT GRANULARITY 32.
+ABLATION_GRANULARITY = "64"
+#: Keep rates the persistence (KEEP vs DISCARD) ablation runs at. Fewer than
+#: `KEEP_RATES` on purpose: DISCARD's harm compounds with turn index and with
+#: aggressiveness, so k20 is where it should be largest and k60 is the check
+#: that the effect scales rather than being a single-point artifact. At k80 the
+#: pool barely shrinks and the arm would be nearly indistinguishable from KEEP.
+PERSISTENCE_RATES = [0.6, 0.2]
 GRANULARITIES = {
     "token": {"chunk": False},
     "16": {"chunk": True, "chunk_size": 16},
@@ -881,6 +892,81 @@ def _build_experiments() -> dict:
             "keep_percentage": rate, "granularity": early_gran,
             "scorer_num_layers": num_layers,
         }
+    # ---------------------------------------------------------------------
+    # ABLATION FAMILIES. Both carry `"ablation": True`, which keeps them OUT
+    # of `--exp sparse` (see `main`'s group-keyword chain) -- they share
+    # `mode="sparse"` with the main sweep, so without that marker a habitual
+    # `--exp sparse` run would silently grow and mix ablation rows into the
+    # sweep's own output.
+    #
+    # Both are defined at granularity 64 (the paper's) and in unmasked +
+    # masked pairs: masking is a no-op on a non-interleaved model (Llama), so
+    # the unmasked rows are the Llama rows and the masked ones are Gemma's.
+    # ---------------------------------------------------------------------
+
+    # A. RANDOM: the selection FLOOR. Same keep rate, same granularity, same
+    # speculator cost -- chunks chosen uniformly at random instead of by the
+    # speculator's attention. This exists because flat accuracy across the
+    # keep-rate grid is equally consistent with "selection is good" and "the
+    # model tolerates losing 80% of its context however you choose it", and
+    # nothing else in the matrix tells those apart. Read against its SPARSE
+    # partner it completes the decomposition ORACLE starts: ORACLE is the
+    # ceiling (a perfect estimator), RANDOM is the floor (no estimator).
+    #
+    # Still pays the full scoring pass on purpose -- see
+    # `SELECT_STRATEGIES` -- so the cost columns stay comparable and the two
+    # arms differ in exactly one variable.
+    for masked in (False, True):
+        for rate in KEEP_RATES:
+            suffix = "-masked" if masked else ""
+            exp_id = f"RANDOM-k{int(rate * 100)}-g{ABLATION_GRANULARITY}{suffix}"
+            experiments[exp_id] = {
+                "label": f"RANDOM chunk selection (ablation floor) "
+                         f"keep={int(rate * 100)}% "
+                         f"granularity={ABLATION_GRANULARITY}"
+                         f"{' scoring=masked' if masked else ''}",
+                "mode": "sparse", "keep_mode": "keep",
+                "keep_percentage": rate,
+                "granularity": ABLATION_GRANULARITY,
+                "select_strategy": "random",
+                "ablation": True,
+                **(SCORE_MODE_VARIANTS["masked"] if masked else {}),
+            }
+
+    # B. PERSISTENCE: forced DISCARD against the same row's KEEP default.
+    # This is the counterfactual for the project's central claim -- that never
+    # discarding a token is what lets a token dropped at turn 2 be re-selected
+    # at turn 5, which eviction-based methods (H2O, KVzip) cannot do.
+    #
+    # Note the section "KEEP mode only" in EXPERIMENT_PLAN.md says DISCARD is
+    # VACUOUS on this architecture, because nothing is ever physically
+    # evicted. That is true of the mechanism and beside the point here: under
+    # forced DISCARD a token dropped at turn 2 can never be attended again,
+    # because the scorer can never nominate it. The KV is still resident but
+    # unreachable, which for ACCURACY is exactly eviction -- so this simulates
+    # those methods' information loss inside the architecture the results are
+    # actually reported on.
+    #
+    # It does NOT simulate their cost benefit: DISCARD shrinks only the
+    # scorer's prompt here, not target KV. Read accuracy and
+    # `candidate_pool_len`, not speedup.
+    for masked in (False, True):
+        for rate in PERSISTENCE_RATES:
+            suffix = "-masked" if masked else ""
+            exp_id = (f"SPARSE-k{int(rate * 100)}-g{ABLATION_GRANULARITY}"
+                      f"{suffix}-discard")
+            experiments[exp_id] = {
+                "label": f"Sparse attention, DISCARD pool (persistence ablation) "
+                         f"keep={int(rate * 100)}% "
+                         f"granularity={ABLATION_GRANULARITY}"
+                         f"{' scoring=masked' if masked else ''}",
+                "mode": "sparse", "keep_mode": "discard",
+                "keep_percentage": rate,
+                "granularity": ABLATION_GRANULARITY,
+                "ablation": True,
+                **(SCORE_MODE_VARIANTS["masked"] if masked else {}),
+            }
+
     return experiments
 
 
@@ -2461,6 +2547,12 @@ def run_specprefill(
                     flop_fields = _record_turn_flops(
                         stats, bd, turn_idx,
                         spec_pool_len=result.orig_len,
+                        # The pool that was actually ELIGIBLE for selection. Distinct from
+                        # `spec_pool_len` above, which is the absolute conversation length and
+                        # therefore grows monotonically under BOTH keep modes -- it cannot show
+                        # a DISCARD arm collapsing. This is the persistence ablation's headline
+                        # figure: flat under KEEP, decaying under DISCARD.
+                        spec_candidate_pool_len=result.candidate_pool_len,
                         spec_cached_tokens=result.num_cached_tokens,
                         spec_look_ahead=result.actual_look_ahead_cnt,
                         target_prompt_len=len(prompt_ids),
@@ -3284,6 +3376,12 @@ def run_sparse_attention(
                     flop_fields = _record_turn_flops(
                         stats, bd, turn_idx,
                         spec_pool_len=result.orig_len,
+                        # The pool that was actually ELIGIBLE for selection. Distinct from
+                        # `spec_pool_len` above, which is the absolute conversation length and
+                        # therefore grows monotonically under BOTH keep modes -- it cannot show
+                        # a DISCARD arm collapsing. This is the persistence ablation's headline
+                        # figure: flat under KEEP, decaying under DISCARD.
+                        spec_candidate_pool_len=result.candidate_pool_len,
                         spec_cached_tokens=result.num_cached_tokens,
                         spec_look_ahead=result.actual_look_ahead_cnt,
                         target_resident_len=session.target_resident_len,
@@ -4143,18 +4241,43 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
             score_layers=exp_cfg.get("score_layers"),
             score_head_set=head_set,
             mask_sliding_window=exp_cfg.get("mask_sliding_window", False),
+            select_strategy=exp_cfg.get("select_strategy", "attention"),
+            select_seed=args.random_select_seed,
             force_keep_query=not args.no_force_keep_query,
         )
         if (
             exp_cfg.get("score_aggregation", "max") != "max"
             or exp_cfg.get("score_layers")
             or exp_cfg.get("mask_sliding_window")
+            or exp_cfg.get("select_strategy", "attention") != "attention"
         ):
             print(
                 f"[predict_scbench] scoring variant: "
                 f"score_aggregation={spec_config.score_aggregation!r} "
                 f"score_layers={spec_config.score_layers!r} "
-                f"mask_sliding_window={spec_config.mask_sliding_window!r}"
+                f"mask_sliding_window={spec_config.mask_sliding_window!r} "
+                f"select_strategy={spec_config.select_strategy!r}"
+            )
+        # An ABLATION row is not a measurement of the method, and the two are
+        # easy to confuse once they are side by side in all_runs.csv. Say so
+        # once, loudly, at startup.
+        if exp_cfg.get("select_strategy", "attention") == "random":
+            print(
+                f"[predict_scbench] ABLATION FLOOR: chunks are selected "
+                f"UNIFORMLY AT RANDOM (seed={args.random_select_seed}), not by "
+                f"the speculator. The scoring pass still runs in full so cost "
+                f"stays comparable to the SPARSE partner; its scores are "
+                f"discarded. This row measures what selection is worth, not "
+                f"the method."
+            )
+        if keep_mode == "discard":
+            print(
+                "[predict_scbench] PERSISTENCE ABLATION: candidate pool is "
+                "MONOTONICALLY SHRINKING (keep_mode=discard). A token dropped "
+                "at turn t can never be re-selected, simulating an "
+                "eviction-based method's information loss. Read accuracy and "
+                "flop_inputs.candidate_pool_len by turn_idx -- NOT speedup: "
+                "this shrinks the scorer's prompt, not the target's KV."
             )
 
         # Same clamp-to-native-ceiling reasoning as the target above --
@@ -4510,7 +4633,13 @@ def run_experiment(exp_id: str, exp_cfg: dict, args) -> None:
                 # `mode`/`label` disambiguate which model the number is for.
                 "speculator_gpu_memory_utilization": scorer_gpu_memory_utilization,
                 "target_max_num_batched_tokens": target_max_num_batched_tokens,
-                "rep": rep, "seed": 0, "max_tokens": args.max_tokens,
+                # `seed` was hardcoded 0 while nothing in the pipeline was
+                # stochastic. The RANDOM-* ablation rows are, so it now
+                # records the seed that actually determined their selection.
+                # Still 0 by default, so every existing row's value is
+                # unchanged.
+                "rep": rep, "seed": args.random_select_seed,
+                "max_tokens": args.max_tokens,
                 "num_conversations_loaded": len(conversations),
                 "num_conversations": num_conversations_processed,
                 "num_turns": len(predictions),
@@ -4659,7 +4788,14 @@ def main() -> None:
         help="Comma-separated experiment IDs (see --list), or one of the "
              "group keywords 'specprefill' (all M-k*-g* rows of the "
              "physically-pruned architecture), 'sparse' (all SPARSE-k*-g* "
-             "rows, the persistent-cache + sparse-attention architecture), "
+             "rows of the persistent-cache + sparse-attention architecture, "
+             "EXCLUDING the ablation families below), "
+             "'random' (the RANDOM-k*-g64 selection-floor ablation -- same "
+             "keep rate and same speculator cost, chunks chosen at random, so "
+             "SPARSE minus RANDOM is what selection is worth), "
+             "'persistence' (the KEEP-vs-DISCARD ablation: every *-discard "
+             "row PLUS the KEEP row it is read against), "
+             "'ablation' (both ablation families at once), "
              "'oracle' (all ORACLE-k* rows -- the same sparse architecture "
              "scored by the TARGET checkpoint instead of the 1B speculator, "
              "i.e. the accuracy ceiling for the SPARSE rows), 'score' (the "
@@ -4887,6 +5023,14 @@ def main() -> None:
              "kv_cache_utils.py::compute_prefill_gather_view).",
     )
     parser.add_argument(
+        "--random-select-seed", type=int, default=0,
+        help="Seed for the RANDOM-* ablation rows' chunk selection. Inert for "
+             "every other row. The per-turn RNG is derived from this plus the "
+             "request id, so a row reproduces regardless of "
+             "--batch-conversations; recorded in the existing `seed` CSV "
+             "column.",
+    )
+    parser.add_argument(
         "--agentic", action="store_true",
         help="LIVE agentic mode: instead of reading each turn from the samples "
              "file, execute the model's own bash action in that instance's "
@@ -5087,7 +5231,25 @@ def main() -> None:
     if exp_arg == "specprefill":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "specprefill"]
     elif exp_arg == "sparse":
-        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "sparse"]
+        # `not cfg.get("ablation")` is load-bearing, not tidiness: the RANDOM-*
+        # and *-discard families share `mode="sparse"`, so without this clause a
+        # habitual `--exp sparse` run would silently grow by 12 rows and mix
+        # ablation arms into the main sweep's own output. They have their own
+        # keywords below.
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items()
+                   if cfg["mode"] == "sparse" and not cfg.get("ablation")]
+    elif exp_arg == "random":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items()
+                   if cfg.get("select_strategy") == "random"]
+    elif exp_arg == "persistence":
+        # Both arms of the comparison, so one keyword runs a readable pair:
+        # each `*-discard` row plus the KEEP row it is read against.
+        discard_ids = [eid for eid, cfg in EXPERIMENTS.items()
+                       if cfg.get("keep_mode") == "discard"]
+        partners = [eid.replace("-discard", "") for eid in discard_ids]
+        exp_ids = [eid for eid in EXPERIMENTS if eid in set(discard_ids) | set(partners)]
+    elif exp_arg == "ablation":
+        exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg.get("ablation")]
     elif exp_arg == "oracle":
         exp_ids = [eid for eid, cfg in EXPERIMENTS.items() if cfg["mode"] == "oracle"]
     elif exp_arg == "heads":

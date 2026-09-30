@@ -2840,8 +2840,12 @@ def test_oracle_rows_pair_one_to_one_with_a_sparse_row():
         and cfg["granularity"] == EXPERIMENTS[oracle_ids[0]]["granularity"]
         # Diagnostic control rows are exempt: they exist to isolate a
         # mechanism, not to measure a keep rate, so they have no oracle
-        # partner by design.
-        and not cfg.get("control")
+        # partner by design. Ablation rows (RANDOM-*, *-discard) are exempt
+        # for the same reason -- their partner is the SPARSE row they are read
+        # against, not an ORACLE row. Both families are currently defined at
+        # granularity 64 so they would not reach this set anyway; the
+        # exclusion is here so that stays true if one is ever added at 32.
+        and not (cfg.get("control") or cfg.get("ablation"))
     }
     assert oracle_rates == sparse_rates_at_oracle_gran, (
         f"oracle keep rates {sorted(oracle_rates)} do not cover the SPARSE "
@@ -3001,6 +3005,10 @@ def _run_experiment_with_stubs(exp_id, **arg_overrides):
         # default, which is what every published M000 row ran under.
         baseline_async_scheduling="auto",
         output_suffix="", head_set_from=None,
+        # Mirrors the flag's default. Inert for every row except RANDOM-*, but
+        # `run_experiment` reads it unconditionally when building SpecConfig, so
+        # omitting it here is an AttributeError in every stub run.
+        random_select_seed=0,
     )
     for k, v in arg_overrides.items():
         assert hasattr(args, k), f"unknown arg override {k!r}"
@@ -7822,6 +7830,385 @@ def test_agentic_retires_cleanly_when_the_instance_has_no_swebench_row():
     conv = _conv()
     assert src.turn_for(conv, 0) is None
     assert src.records[conv["id"]]["exit_reason"] == "no_instance"
+
+
+# ---------------------------------------------------------------------------
+# Ablations: the RANDOM-* selection floor and the KEEP-vs-DISCARD persistence
+# pair. CPU-only -- the random selector is pure index arithmetic, and the
+# matrix/keyword assertions are pure dict work.
+# ---------------------------------------------------------------------------
+
+
+def _keep_kwargs(chunk_size, percentage):
+    return {"chunk": True, "chunk_size": chunk_size, "percentage": percentage}
+
+
+def _random_cfg(chunk_size, percentage, seed=0):
+    from vllm_patch.config import SpecConfig
+
+    return SpecConfig(
+        keep_strategy="percentage",
+        keep_kwargs=_keep_kwargs(chunk_size, percentage),
+        select_strategy="random",
+        select_seed=seed,
+    )
+
+
+def test_random_chunk_selection_keeps_the_same_chunk_count_as_topk():
+    """Equal CHUNK count is the invariant that makes the keep rates comparable.
+
+    Not equal token count: the final chunk is short whenever `seq_len` is not a
+    multiple of `chunk_size`, so selecting it keeps fewer tokens -- and `topk`
+    has exactly that property too. Asserting equal token counts here would be
+    asserting something false about both selectors. Token counts are checked
+    for the exact-multiple case, where the two do coincide.
+    """
+    import random as _random
+
+    import torch
+
+    from vllm_patch.config import SpecConfig
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    for seq_len in (64, 100, 257, 1000):
+        for chunk_size in (16, 32, 64):
+            for pct in (0.2, 0.4, 0.6, 0.8):
+                ti = [torch.rand(seq_len)]
+                topk_cfg = SpecConfig(
+                    keep_strategy="percentage",
+                    keep_kwargs=_keep_kwargs(chunk_size, pct),
+                )
+                topk_idx = chunk_select_from_smoothed_attention(ti, topk_cfg)[0]
+                topk_chunks = {int(i) // chunk_size for i in topk_idx}
+
+                for seed in range(5):
+                    rnd = chunk_select_from_smoothed_attention(
+                        ti, _random_cfg(chunk_size, pct),
+                        rng=_random.Random(seed))[0]
+                    rnd_chunks = {int(i) // chunk_size for i in rnd}
+                    assert len(rnd_chunks) == len(topk_chunks), (
+                        f"seq_len={seq_len} chunk={chunk_size} pct={pct} "
+                        f"seed={seed}: random kept {len(rnd_chunks)} chunks, "
+                        f"topk kept {len(topk_chunks)}"
+                    )
+                    if seq_len % chunk_size == 0:
+                        assert len(rnd) == len(topk_idx), (
+                            f"seq_len={seq_len} is an exact multiple, so token "
+                            f"counts must match too: {len(rnd)} vs {len(topk_idx)}"
+                        )
+
+
+def test_random_chunk_selection_is_sorted_and_in_range():
+    """Ascending order is load-bearing, not cosmetic: DISCARD's
+    monotonic-extension property depends on kept indices coming back in
+    original-position order (see `chunk_select_from_smoothed_attention`), and
+    ablation B runs DISCARD."""
+    import random as _random
+
+    import torch
+
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    idx = chunk_select_from_smoothed_attention(
+        [torch.rand(257)], _random_cfg(32, 0.4), rng=_random.Random(7))[0]
+    assert list(idx) == sorted(idx)
+    assert len(set(idx.tolist())) == len(idx), "duplicate indices"
+    assert int(idx.min()) >= 0 and int(idx.max()) < 257
+
+
+def test_random_chunk_selection_picks_whole_chunks():
+    """It selects CHUNKS, not tokens -- so kept indices must be contiguous runs
+    aligned to chunk_size. A token-level sampler at the same count would be a
+    different (and weaker) ablation."""
+    import random as _random
+
+    import torch
+
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    chunk_size, seq_len = 32, 256
+    idx = chunk_select_from_smoothed_attention(
+        [torch.rand(seq_len)], _random_cfg(chunk_size, 0.5),
+        rng=_random.Random(3))[0].tolist()
+    starts = {i - (i % chunk_size) for i in idx}
+    for start in starts:
+        expected = list(range(start, min(start + chunk_size, seq_len)))
+        assert [i for i in idx if start <= i < start + chunk_size] == expected
+
+
+def test_random_chunk_selection_is_seed_determined():
+    """A row has to reproduce. Same seed -> same selection; different seed ->
+    different selection (with enough chunks that a collision is not plausible)."""
+    import random as _random
+
+    import torch
+
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    ti = [torch.rand(4096)]
+    cfg = _random_cfg(32, 0.2)
+    a = chunk_select_from_smoothed_attention(ti, cfg, rng=_random.Random(11))[0]
+    b = chunk_select_from_smoothed_attention(ti, cfg, rng=_random.Random(11))[0]
+    c = chunk_select_from_smoothed_attention(ti, cfg, rng=_random.Random(12))[0]
+    assert a.tolist() == b.tolist()
+    assert a.tolist() != c.tolist()
+
+
+def test_random_selection_ignores_the_scores_entirely():
+    """The floor must not be influenced by importance, or it is not a floor.
+    Two opposite importance vectors, same seed, must select identically."""
+    import random as _random
+
+    import torch
+
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    cfg = _random_cfg(32, 0.3)
+    rising = [torch.arange(1024, dtype=torch.float32)]
+    falling = [torch.arange(1024, 0, -1, dtype=torch.float32)]
+    a = chunk_select_from_smoothed_attention(rising, cfg, rng=_random.Random(5))[0]
+    b = chunk_select_from_smoothed_attention(falling, cfg, rng=_random.Random(5))[0]
+    assert a.tolist() == b.tolist()
+
+
+def test_random_selection_without_an_rng_is_refused():
+    """Silently unseeded selection would make a row unreproducible, which is
+    worse than failing."""
+    import torch
+
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    try:
+        chunk_select_from_smoothed_attention([torch.rand(128)], _random_cfg(32, 0.5))
+    except ValueError as exc:
+        assert "rng" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when rng is None")
+
+
+def test_random_token_granularity_matches_topk_count():
+    """The `chunk: False` path too -- `math.ceil(seq_len * percentage)`."""
+    import math
+    import random as _random
+
+    import torch
+
+    from vllm_patch.scoring import chunk_select_from_smoothed_attention
+
+    from vllm_patch.config import SpecConfig
+
+    cfg = SpecConfig(
+        keep_strategy="percentage",
+        keep_kwargs={"chunk": False, "percentage": 0.25},
+        select_strategy="random",
+    )
+    idx = chunk_select_from_smoothed_attention(
+        [torch.rand(400)], cfg, rng=_random.Random(1))[0]
+    assert len(idx) == math.ceil(400 * 0.25)
+    assert list(idx) == sorted(idx)
+
+
+def test_spec_config_rejects_unknown_select_strategy():
+    from vllm_patch.config import SpecConfig
+
+    try:
+        SpecConfig(keep_strategy="percentage",
+                   keep_kwargs=_keep_kwargs(32, 0.5),
+                   select_strategy="topk")
+    except AssertionError as exc:
+        assert "select_strategy" in str(exc)
+    else:
+        raise AssertionError("expected AssertionError for a bad select_strategy")
+
+
+# -- the matrix -------------------------------------------------------------
+
+
+def test_ablation_families_exist_with_partners_they_are_read_against():
+    """Each ablation row is only meaningful next to a specific SPARSE row, so
+    that partner must exist in the matrix."""
+    from predict_scbench import ABLATION_GRANULARITY, EXPERIMENTS, PERSISTENCE_RATES
+
+    random_ids = [e for e, c in EXPERIMENTS.items() if c.get("select_strategy") == "random"]
+    discard_ids = [e for e, c in EXPERIMENTS.items() if c.get("keep_mode") == "discard"]
+    assert random_ids and discard_ids
+
+    for eid in random_ids:
+        cfg = EXPERIMENTS[eid]
+        assert cfg["mode"] == "sparse" and cfg["ablation"] is True
+        # RANDOM must keep KEEP semantics -- mixing in DISCARD would conflate
+        # the two ablations.
+        assert cfg["keep_mode"] == "keep"
+        assert cfg["granularity"] == ABLATION_GRANULARITY
+        partner = eid.replace("RANDOM", "SPARSE")
+        assert partner in EXPERIMENTS, f"{eid} has no SPARSE partner {partner}"
+        assert EXPERIMENTS[partner]["keep_percentage"] == cfg["keep_percentage"]
+        # Same masking as the partner, so cost is comparable.
+        assert (EXPERIMENTS[partner].get("mask_sliding_window", False)
+                == cfg.get("mask_sliding_window", False))
+
+    assert {EXPERIMENTS[e]["keep_percentage"] for e in discard_ids} == set(PERSISTENCE_RATES)
+    for eid in discard_ids:
+        cfg = EXPERIMENTS[eid]
+        assert cfg["mode"] == "sparse" and cfg["ablation"] is True
+        assert cfg["granularity"] == ABLATION_GRANULARITY
+        # The KEEP arm of the comparison, reached by dropping the suffix.
+        partner = eid.replace("-discard", "")
+        assert partner in EXPERIMENTS, f"{eid} has no KEEP partner {partner}"
+        keep_cfg = EXPERIMENTS[partner]
+        assert keep_cfg["keep_mode"] == "keep"
+        # Differ in keep_mode ALONE, or the ablation measures two things.
+        for field in ("mode", "keep_percentage", "granularity"):
+            assert keep_cfg[field] == cfg[field], f"{eid} vs {partner}: {field}"
+        assert (keep_cfg.get("mask_sliding_window", False)
+                == cfg.get("mask_sliding_window", False))
+
+
+def test_ablation_rows_come_in_masked_and_unmasked_pairs():
+    """Masking is a no-op on Llama and required on Gemma, so each family needs
+    both. For DISCARD it is a correctness matter (the scorer decides what
+    survives); for RANDOM it is only cost parity."""
+    from predict_scbench import EXPERIMENTS
+
+    for eid, cfg in EXPERIMENTS.items():
+        if not cfg.get("ablation"):
+            continue
+        twin = (eid.replace("-masked", "") if "-masked" in eid
+                else eid.replace("-discard", "-masked-discard") if eid.endswith("-discard")
+                else f"{eid}-masked")
+        assert twin in EXPERIMENTS, f"{eid} has no masking twin {twin}"
+        assert (EXPERIMENTS[twin].get("mask_sliding_window", False)
+                != cfg.get("mask_sliding_window", False))
+
+
+def _select_exp_ids(keyword):
+    """Re-implements `main`'s group-keyword resolution for the keywords under
+    test. The chain itself is inline in `main` behind argparse, so this asserts
+    the predicates rather than the dispatch -- the first coverage of any of
+    those keywords."""
+    from predict_scbench import EXPERIMENTS
+
+    if keyword == "sparse":
+        return [e for e, c in EXPERIMENTS.items()
+                if c["mode"] == "sparse" and not c.get("ablation")]
+    if keyword == "random":
+        return [e for e, c in EXPERIMENTS.items()
+                if c.get("select_strategy") == "random"]
+    if keyword == "ablation":
+        return [e for e, c in EXPERIMENTS.items() if c.get("ablation")]
+    raise AssertionError(keyword)
+
+
+def test_exp_sparse_excludes_the_ablation_families():
+    """Without this, a habitual `--exp sparse` run silently grows and mixes
+    ablation arms into the main sweep's output."""
+    from predict_scbench import EXPERIMENTS
+
+    sparse = set(_select_exp_ids("sparse"))
+    ablation = set(_select_exp_ids("ablation"))
+    assert ablation, "no ablation rows found"
+    assert not (sparse & ablation)
+    # And the exclusion must not have swallowed the real sweep.
+    assert "SPARSE-k20-g64" in sparse and "SPARSE-k20-g32" in sparse
+    assert set(_select_exp_ids("random")) <= ablation
+    # Every ablation row really is mode=sparse -- i.e. the exclusion is doing
+    # work rather than being vacuous.
+    assert all(EXPERIMENTS[e]["mode"] == "sparse" for e in ablation)
+
+
+# -- DISCARD bookkeeping ----------------------------------------------------
+
+
+def test_conversation_state_discard_shrinks_across_two_consecutive_turns():
+    """The compounding case DISCARD is entirely about, which the existing
+    monotonic-extension test does not reach -- its last turn keeps everything.
+    Asserts on (token, position) PAIRS, so a position drift in the surviving
+    prefix cannot slip through a token-only comparison."""
+    from vllm_patch.conversation_state import ConversationState
+
+    state = ConversationState("c", [10, 11, 12, 13, 14, 15], "discard")
+
+    pool_1, query_1 = state.begin_turn([90, 91])
+    assert pool_1 == [(10, 0), (11, 1), (12, 2), (13, 3), (14, 4), (15, 5)]
+    # Keep 3 of 6.
+    state.complete_turn([(10, 0), (12, 2), (14, 4)], [80])
+
+    pool_2, query_2 = state.begin_turn([92])
+    # Survivors keep their ORIGINAL absolute positions; the golden answer (80)
+    # is excluded from the pool but still advanced the ledger, so turn 2's
+    # query lands at 9 rather than 8.
+    assert pool_2 == [(10, 0), (12, 2), (14, 4), (90, 6), (91, 7)]
+    assert query_2 == [(92, 9)]
+    # Shrink AGAIN: 2 of 5.
+    state.complete_turn([(12, 2), (90, 6)], [81])
+
+    pool_3, query_3 = state.begin_turn([93])
+    assert pool_3 == [(12, 2), (90, 6), (92, 9)]
+    assert query_3 == [(93, 11)]
+
+    # The point of the ablation: strictly decreasing eligibility.
+    assert len(pool_1) > len(pool_2) > len(pool_3)
+    # And a token dropped at turn 1 (11) never returns.
+    assert 11 not in [tid for tid, _ in pool_3]
+    # Ledger length is mode-independent and still grows -- which is exactly why
+    # `orig_len` cannot stand in for pool size (see PrunedTurnResult).
+    assert state.total_len == 12
+
+
+def test_keep_mode_pool_grows_where_discard_shrinks():
+    """The contrast the ablation rests on, asserted directly."""
+    from vllm_patch.conversation_state import ConversationState
+
+    keep = ConversationState("k", [10, 11, 12, 13], "keep")
+    keep.begin_turn([90])
+    keep.complete_turn([(10, 0)], [80])
+    keep_pool, _ = keep.begin_turn([91])
+    # KEEP rebuilds from the whole ledger, so the token dropped at turn 1 (11)
+    # is eligible again and the answer (80) has joined.
+    assert keep_pool == [(10, 0), (11, 1), (12, 2), (13, 3), (90, 4), (80, 5)]
+
+    disc = ConversationState("d", [10, 11, 12, 13], "discard")
+    disc.begin_turn([90])
+    disc.complete_turn([(10, 0)], [80])
+    disc_pool, _ = disc.begin_turn([91])
+    assert disc_pool == [(10, 0), (90, 4)]
+    assert len(disc_pool) < len(keep_pool)
+
+
+def test_random_row_wiring_dispatches_to_the_sparse_loop():
+    """A RANDOM row must reach `run_sparse_attention` with a scorer engine
+    built, since it deliberately still pays the speculator. Also pins that the
+    stub arg namespace stays in sync with what `run_experiment` reads."""
+    out = _run_experiment_with_stubs("RANDOM-k20-g64")
+    assert out["loop"] == "sparse"
+    assert out["proposer_kwargs"] is not None, (
+        "RANDOM must still construct a scorer engine -- the ablation pays the "
+        "speculator so its cost stays comparable to the SPARSE partner"
+    )
+
+
+def test_discard_row_wiring_dispatches_to_the_sparse_loop():
+    out = _run_experiment_with_stubs("SPARSE-k20-g64-discard")
+    assert out["loop"] == "sparse"
+
+
+def test_pruned_turn_result_records_the_eligible_pool_size():
+    """`orig_len` grows monotonically under both modes, so it cannot evidence a
+    DISCARD arm collapsing; `candidate_pool_len` is what does."""
+    from vllm_patch.pruner import PrunedTurnResult
+
+    default = PrunedTurnResult(
+        pruned_token_ids=[], kept_positions=[], orig_len=0,
+        kept_history_pairs=[], actual_look_ahead_cnt=0, num_cached_tokens=0,
+    )
+    # -1 ("not recorded"), deliberately not 0, so an empty pool stays
+    # distinguishable from a construction site predating the field.
+    assert default.candidate_pool_len == -1
+    assert PrunedTurnResult(
+        pruned_token_ids=[], kept_positions=[], orig_len=0,
+        kept_history_pairs=[], actual_look_ahead_cnt=0, num_cached_tokens=0,
+        candidate_pool_len=42,
+    ).candidate_pool_len == 42
 
 
 if __name__ == "__main__":

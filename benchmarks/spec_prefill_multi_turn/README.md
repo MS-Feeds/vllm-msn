@@ -184,12 +184,69 @@ Confirmed MVP scope: 3 SCBench configs (`scbench_qa_eng`/`scbench_kv`/
 | SPARSE-k{80,60,40,20}-g{16,32,64} | Persistent cache + sparse attention | 80/60/40/20% | 16/32/64 | keep (only) |
 | EARLY-k20-g32-L{1..8} | Scorer = the target's own first n layers (`r = n/32`) | 20% | 32 | keep |
 | EARLY-k{60,80}-g32-L{2,4} | Same, at the keep rates a cheap `r` unlocks | 60/80% | 32 | keep |
+| RANDOM-k{80,60,40,20}-g64\[-masked] | **Ablation floor** — chunks chosen uniformly at random | 80/60/40/20% | 64 | keep |
+| SPARSE-k{60,20}-g64\[-masked]-discard | **Persistence ablation** — monotonically shrinking pool | 60/20% | 64 | **discard** |
+
+The two ablation families are **excluded from `--exp sparse`** even though they
+share `mode="sparse"`; they have their own keywords (`--exp random`,
+`--exp persistence`, `--exp ablation`). Each comes in an unmasked and a
+`-masked` form: masking is a no-op on Llama (no sliding-window layers), so the
+unmasked rows are the Llama rows and the masked ones are Gemma's.
 
 Shared SpecPrefill hyperparameters (matches `../spec_prefill_llama/`'s
 single-turn matrix): BF16, look-ahead count **8**, `pool_kernel_size`
 **13**, `enforce_eager=True` on both engines.
 
 `predict_scbench.py --list` prints this matrix programmatically.
+
+### Ablations: the floor, and the persistence counterfactual
+
+Two families, both at granularity 64, both excluded from `--exp sparse`.
+
+**`RANDOM-k{N}-g64` — the selection floor.** `SPARSE-k{N}-g64` with one thing
+changed: chunks are chosen uniformly at random instead of by the speculator's
+attention, at the same keep rate and the same granularity. It **still pays the
+full scoring pass** — the speculator prefills and runs its lookahead exactly as
+normal and its scores are then discarded — so the cost columns stay directly
+comparable and the two arms differ in exactly one variable. Seeded per turn from
+`(--random-select-seed, request_id)`, so a row reproduces regardless of
+`--batch-conversations`; the seed lands in the existing `seed` CSV column.
+
+Read `SPARSE − RANDOM`. If that gap is ~0, selection is not doing the work, and
+that is the most important negative result the sweep can produce.
+
+**`SPARSE-k{N}-g64-discard` — the persistence counterfactual.** The same row
+with `keep_mode="discard"`: the candidate pool is turn N−1's survivors plus
+turn N−1's query, so it shrinks monotonically and a token dropped at turn 2 can
+never be re-selected.
+
+Note that "KEEP mode only" below says DISCARD is *vacuous* on this
+architecture, because nothing is ever physically evicted. That is true of the
+mechanism and beside the point here. Under forced DISCARD a dropped token can
+never be attended again — the scorer can never nominate it — so although its KV
+is still resident it is unreachable, and **for accuracy that is exactly
+eviction**. This is how the information loss of eviction-based methods
+(H2O, KVzip; see `RELATED_WORK.md`) gets simulated inside the architecture the
+results are actually reported on.
+
+**What it does not claim.** DISCARD shrinks only the *scorer's* prompt here, not
+the target's KV, so eviction methods' real benefit — memory — is not modeled.
+Report accuracy and pool size from this arm, never speedup.
+
+Two things to read, neither of which is the headline accuracy number alone:
+
+- **`by (config, turn_idx)`.** KEEP flat and DISCARD degrading with turn index
+  is the predicted signature. A flat DISCARD row means persistence buys nothing
+  on that dataset.
+- **`flop_inputs.spec_candidate_pool_len` by turn.** The evidence the arm did
+  what its name says. `spec_pool_len` cannot serve here — it is the absolute
+  conversation length, which grows monotonically under *both* modes.
+
+One confound worth stating in any write-up: DISCARD's pool excludes the model's
+own generated answers (`complete_turn` folds in survivors and the query, not the
+answer — deliberate, see `conversation_state.py`). So the arm is shrinkage *plus*
+answers-excluded, not pure shrinkage. On short-answer configs like
+`scbench_qa_eng` the second part is small.
 
 ### ORACLE-k\*: what it is and what it bounds
 
@@ -206,6 +263,13 @@ halves:
 |---|---|
 | `ORACLE-k{N}` − `SPARSE-k{N}-g32` | what the 1B speculator's estimation error costs |
 | `M000` − `ORACLE-k{N}` | what block-granular sparse decode costs with the estimator held as good as this method allows |
+| `SPARSE-k{N}` − `RANDOM-k{N}-g64` | **what the speculator's selection is worth at all** — the floor to ORACLE's ceiling |
+| `SPARSE-k{N}-g64` keep − `-discard` | **what never discarding a token buys** |
+
+The last two are the ablation families; see "Ablations" below. ORACLE bounds the
+method from above, RANDOM from below — without the floor, flat accuracy across
+the keep-rate grid is equally consistent with "selection is good" and "the model
+tolerates losing 80% of its context however you choose it."
 
 Whichever dominates says where accuracy work should go: better scoring
 (layer/head aggregation, retrieval-head filtering, lookahead source) versus

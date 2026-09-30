@@ -481,6 +481,8 @@ class SpecPrefillProposer:
         score_layers: Optional[str] = None,
         score_head_set: Optional[List[int]] = None,
         mask_sliding_window: bool = False,
+        select_strategy: str = "attention",
+        select_seed: int = 0,
     ) -> Tuple[Optional[List[int]], int, int, dict]:
         """Same driving/submission as `run_turn` (via the shared
         `_submit_and_drive_turn` helper), but retrieves K and runs the
@@ -533,6 +535,8 @@ class SpecPrefillProposer:
                 score_layers,
                 score_head_set,
                 mask_sliding_window,
+                select_strategy,
+                select_seed,
             ),
         )[0]
         num_kept = len(kept_local_indices) if kept_local_indices is not None else None
@@ -610,6 +614,8 @@ class SpecPrefillProposer:
                 spec.get("score_layers"),
                 spec.get("score_head_set"),
                 spec.get("mask_sliding_window", False),
+                spec.get("select_strategy", "attention"),
+                spec.get("select_seed", 0),
             )
             for spec, sub in zip(specs, submissions)
         ]

@@ -465,6 +465,29 @@ costs nothing extra at turn 5 (it was never evicted) -- DISCARD mode's
 whole reason for existing (reconstructing genuinely-lost data) doesn't
 apply here. `SPARSE-k*-g*` rows always use `keep_mode="keep"`.
 
+**Except deliberately, as an ablation** (added 2026-09-29). The reasoning above
+is about MECHANISM COST and remains correct: on this architecture DISCARD saves
+nothing, because nothing was lost. But the project's central claim is about
+ACCURACY -- that never discarding is what lets a token dropped at turn 2 serve
+turn 5, which eviction-based methods cannot do -- and that claim has no
+counterfactual unless DISCARD is forced. Under forced DISCARD a dropped token
+can never be attended again, because the scorer can never nominate it: the KV is
+resident but unreachable, which for accuracy *is* eviction. The
+`SPARSE-k{60,20}-g64[-masked]-discard` rows exist to supply exactly that
+counterfactual, inside the architecture the headline results are reported on.
+
+Two consequences to respect when reading them:
+
+- **Accuracy and `spec_candidate_pool_len` only.** DISCARD shrinks the scorer's
+  prompt, not target KV, so no speed or memory claim follows from these rows.
+- **`orig_len` is not pool size.** It is the absolute conversation length and
+  grows monotonically under both modes, so `actual_keep_rate` and
+  `spec_pool_len` mean different things in the two arms and must not be compared
+  directly. `PrunedTurnResult.candidate_pool_len` was added for this.
+
+The documented `cache_salt` blocker (decision #3) does **not** apply: it lives in
+`pruner.py::prune_and_add_turn`, which only the `M-k*-g*` path calls.
+
 ### Files
 
 New: `vllm_patch/sparse_target_runner.py` (`SparseTargetGPUModelRunner`/
@@ -810,12 +833,26 @@ implemented this pass.
 | SPARSE-k{80,60,40,20}-g{16,32,64} | Persistent cache + sparse attention (see that section above) | 80/60/40/20% | 16/32/64 (no `token` -- block-gather is block-granular only) | keep (only) |
 | EARLY-k20-g32-L{1..8} | Scorer = the target's own first n layers, `r = n/32` (see below) | 20% | 32 | keep |
 | EARLY-k{60,80}-g32-L{2,4} | Same, at the keep rates a cheap `r` unlocks | 60/80% | 32 | keep |
+| RANDOM-k{80,60,40,20}-g64\[-masked] | **Ablation floor**: chunks chosen uniformly at random, same keep rate, same scorer cost | 80/60/40/20% | 64 | keep |
+| SPARSE-k{60,20}-g64\[-masked]-discard | **Persistence ablation**: monotonically shrinking candidate pool | 60/20% | 64 | **discard** |
+
+The two ablation families carry `"ablation": True` and are **excluded from
+`--exp sparse`** despite sharing `mode="sparse"` -- without that a habitual
+`--exp sparse` run would silently grow by 12 rows and mix ablation arms into the
+sweep's own output. Each exists in an unmasked and a `-masked` form, because
+masking is a no-op on a non-interleaved model: the unmasked rows are Llama's, the
+masked ones Gemma's. For DISCARD that pairing is a correctness matter (the
+scorer's output decides what survives into the next pool); for RANDOM it is only
+cost parity, since RANDOM discards the scores.
 
 `predict_scbench.py --list` prints this matrix (generated programmatically,
 not hand-enumerated -- see that script's `_build_experiments`). Use
 `--exp specprefill` for all M-k*-g* rows, `--exp sparse` for all
-SPARSE-k*-g* rows, `--exp oracle` for the 4 ORACLE-k* ceiling rows,
-`--exp early` for the 12 EARLY-k*-g32-L<n> rows, or `--exp all` for
+SPARSE-k*-g* rows (ablations excluded), `--exp oracle` for the 4 ORACLE-k*
+ceiling rows, `--exp early` for the 12 EARLY-k*-g32-L<n> rows,
+`--exp random` for the RANDOM floor, `--exp persistence` for each
+`*-discard` row **plus the KEEP row it is read against**, `--exp ablation` for
+both families, or `--exp all` for
 everything.
 
 Metrics captured per turn: per-config metric (`grade_scbench.py` --
