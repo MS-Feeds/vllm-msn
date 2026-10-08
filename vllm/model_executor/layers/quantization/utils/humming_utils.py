@@ -128,7 +128,12 @@ def _humming_weight_schema_to_quant_key(
     scale = ScaleDesc(dtype=scale_dtype, static=True, group_shape=group_shape)
 
     scale2 = None
-    if schema.weight_scale_type == WeightScaleType.GROUP_TENSOR:
+    # humming-kernels WeightScaleType has no GROUP_TENSOR member; the
+    # "grouped weights + per-tensor 2nd scale" idiom is GROUP + scale_2==TENSOR.
+    if (
+        schema.weight_scale_type == WeightScaleType.GROUP
+        and str(schema.weight_scale_2_type).rsplit(".", 1)[-1] == "TENSOR"
+    ):
         scale2 = ScaleDesc(
             dtype=torch.float32,
             static=True,
