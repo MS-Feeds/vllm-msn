@@ -374,14 +374,17 @@ class HummingLinearMethod(LinearMethodBase):
                 # online quant (fp16/bf16 -> quant_type)
                 assert isinstance(self.weight_schema, _hm.HummingWeightSchema)
                 f16_dtype = _hm.DataType.from_torch_dtype(layer.param_dtype)
-                has_global_scale = "TENSOR" in str(self.weight_schema.weight_scale_type)
                 tensor_list = _hm.quantize_weight(
                     weight=loaded_weight,
                     dtype=self.weight_schema.b_dtype,
                     scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
                     group_size=self.weight_schema.weight_scale_group_size,
                     has_zero_point=self.weight_schema.has_zero_point,
-                    has_global_scale=has_global_scale,
+                    weight_scale_2_type=(
+                        self.weight_schema.weight_scale_2_type.value
+                        if self.weight_schema.weight_scale_2_type is not None
+                        else None
+                    ),
                     is_fp_zero_point=self.weight_schema.is_fp_zero_point,
                     pack=True,
                 )
@@ -635,14 +638,17 @@ class HummingMoEMethod(FusedMoEMethodBase):
             if is_unquantized:
                 assert isinstance(self.weight_schema, _hm.HummingWeightSchema)
                 f16_dtype = _hm.DataType.from_torch_dtype(layer.param_dtype)
-                has_global_scale = "TENSOR" in str(self.weight_schema.weight_scale_type)
                 tensor_list = _hm.quantize_weight(
                     weight=loaded_weight,
                     dtype=self.weight_schema.b_dtype,
                     scale_dtype=self.weight_schema.bs_dtype or f16_dtype,
                     group_size=self.weight_schema.weight_scale_group_size,
                     has_zero_point=self.weight_schema.has_zero_point,
-                    has_global_scale=has_global_scale,
+                    weight_scale_2_type=(
+                        self.weight_schema.weight_scale_2_type.value
+                        if self.weight_schema.weight_scale_2_type is not None
+                        else None
+                    ),
                     is_fp_zero_point=self.weight_schema.is_fp_zero_point,
                     pack=True,
                 )
