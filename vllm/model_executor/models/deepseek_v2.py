@@ -32,21 +32,6 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
-# Indexer logger for Top-K logit distribution analysis
-try:
-    import sys
-    from pathlib import Path
-    # Add the indexer logger path (check if running from examples/dsa_indexer)
-    _indexer_path = Path(__file__).parent.parent.parent.parent.parent / "examples" / "dsa_indexer" / "vllm"
-    if _indexer_path.exists():
-        sys.path.insert(0, str(_indexer_path))
-    from _indexer_logger import record as _log_indexer_record, is_enabled as _indexer_is_enabled
-    _INDEXER_LOGGER_AVAILABLE = True
-except ImportError:
-    _INDEXER_LOGGER_AVAILABLE = False
-    _indexer_is_enabled = lambda: False
-    _log_indexer_record = lambda *args, **kwargs: None
-
 import vllm._custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
@@ -391,61 +376,6 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             router_logits, _ = self.gate(hidden_states)
-
-            # ===== INDEXER LOGGER INSTRUMENTATION START =====
-            # Capture post-activation router scores for Top-K distribution analysis
-            if _indexer_is_enabled():
-                try:
-                    # Get scoring function from router config
-                    scoring_func = getattr(
-                        self.experts.runner.router, 'scoring_func', 'softmax'
-                    )
-
-                    # Apply same activation as fused_topk will use
-                    with torch.no_grad():
-                        if scoring_func == "softmax":
-                            # Post-softmax probabilities [0, 1]
-                            router_scores = torch.softmax(router_logits.float(), dim=-1)
-                        elif scoring_func == "sigmoid":
-                            # Post-sigmoid scores [0, 1]
-                            router_scores = torch.sigmoid(router_logits.float())
-                        else:
-                            # Fallback: raw logits (shouldn't happen)
-                            router_scores = router_logits.float()
-
-                        # Infer phase from batch size (heuristic)
-                        # Prefill: typically larger batches
-                        # Decode: typically smaller (one token per sequence)
-                        num_tokens_cur = router_scores.shape[0]
-                        phase = "prefill" if num_tokens_cur > 128 else "decode"
-
-                        # All experts are valid (no masking needed)
-                        num_experts = router_scores.shape[1]
-                        key_valid_starts = torch.zeros(
-                            num_tokens_cur, dtype=torch.long, device=router_scores.device
-                        )
-                        key_valid_ends = torch.full(
-                            (num_tokens_cur,), num_experts,
-                            dtype=torch.long, device=router_scores.device
-                        )
-
-                        # Log to indexer with layer prefix
-                        _log_indexer_record(
-                            k_cache_prefix=self.gate.prefix if hasattr(self.gate, 'prefix') else "unknown_layer",
-                            phase=phase,
-                            logits=router_scores,
-                            index_topk=self.experts.top_k,
-                            key_valid_starts=key_valid_starts,
-                            key_valid_ends=key_valid_ends,
-                        )
-                except Exception as e:
-                    # Don't crash inference if logging fails
-                    import sys
-                    print(
-                        f"[deepseek_v2] indexer logging failed: {e!r}",
-                        file=sys.stderr
-                    )
-            # ===== INDEXER LOGGER INSTRUMENTATION END =====
 
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits

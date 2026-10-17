@@ -190,6 +190,8 @@ def plot_stream_a_panels(d: dict, out_dir: Path) -> None:
 
 def plot_p1_by_layer(d: dict, out_dir: Path) -> None:
     """Per-layer p1 (lower 1% quantile) of the relative-gap distribution."""
+    if d["gap_count_prefill"].sum() == 0 and d["gap_count_decode"].sum() == 0:
+        return  # Stream A disabled - nothing real to plot
     layers = d["layer_ids"]
     lo = float(d["gap_range_lo"])
     hi = float(d["gap_range_hi"])
@@ -344,6 +346,8 @@ def plot_stream_b_saturation(d: dict, out_dir: Path) -> None:
 
 def plot_stream_c_summary(d: dict, out_dir: Path) -> None:
     """Per-layer top-k winner range, with format-max horizontal lines."""
+    if d["topk_count_prefill"].sum() == 0 and d["topk_count_decode"].sum() == 0:
+        return  # Stream C disabled - nothing real to plot
     layers = d["layer_ids"]
     fig, ax = plt.subplots(figsize=(11, 5))
     for phase, color in [("prefill", "navy"), ("decode", "darkorange")]:
@@ -387,7 +391,15 @@ K_NUM_FINAL_ITEMS = 2048
 
 
 def _stream_d_present(d: dict) -> bool:
-    return "radix_bits_sweep" in d and "radix_bkt_hist_prefill" in d
+    # `_indexer_logger.py` always writes the full schema regardless of which
+    # streams were actually enabled (zero-filled for disabled ones), so a
+    # bare key-existence check is always True. Check for real data instead.
+    return (
+        "radix_bits_sweep" in d
+        and "radix_bkt_hist_prefill" in d
+        and (d["radix_bkt_count_prefill"].sum() > 0
+             or d["radix_bkt_count_decode"].sum() > 0)
+    )
 
 
 def _fits_fraction(hist_row: np.ndarray, bkt_bins: int,
@@ -935,23 +947,46 @@ def write_text_summary(d: dict, out_dir: Path) -> None:
     """One-page text dump: counts, p1, safety verdict."""
     layers = d["layer_ids"]
     lo = float(d["gap_range_lo"]); hi = float(d["gap_range_hi"])
+    b_lo = float(d["range_lo"]); b_hi = float(d["range_hi"])
     lines = []
     lines.append(f"k_index_topk={int(d['k_index_topk'])}  "
                  f"gap_window={int(d['gap_window'])}  "
                  f"gap_eps_norm={float(d['gap_eps_norm']):.1e}")
     lines.append(f"layers: {len(layers)}  "
-                 f"prefill rows total: {int(d['gap_count_prefill'].sum())}  "
-                 f"decode rows total: {int(d['gap_count_decode'].sum())}")
+                 f"prefill rows total: {int(d['count_prefill'].sum())}  "
+                 f"decode rows total: {int(d['count_decode'].sum())}")
     lines.append("")
     for phase in ("prefill", "decode"):
-        if d[f"gap_count_{phase}"].sum() == 0:
+        have_a = d[f"gap_count_{phase}"].sum() > 0
+        have_b = d[f"count_{phase}"].sum() > 0
+        have_c = d[f"topk_count_{phase}"].sum() > 0
+        if not have_a and not have_b:
             lines.append(f"--- {phase}: no data captured")
+            continue
+        lines.append(f"--- {phase} ---")
+        if have_b:
+            cnt = d[f"count_{phase}"].astype(np.float64)
+            denom = np.where(cnt > 0, cnt, 1)
+            mean = d[f"sum_{phase}"] / denom
+            var = np.maximum(d[f"sum_sq_{phase}"] / denom - mean ** 2, 0)
+            std = np.sqrt(var)
+            sat = (d[f"below_{phase}"] + d[f"above_{phase}"]) / denom
+            worst_sat = int(layers[int(np.argmax(sat))])
+            lines.append(f"  Stream B (raw logits): {int(cnt.sum())} samples, "
+                         f"range=[{b_lo:.0f},{b_hi:.0f}]")
+            lines.append(f"    mean across layers: min={mean.min():.3f}  max={mean.max():.3f}")
+            lines.append(f"    std  across layers: min={std.min():.3f}  max={std.max():.3f}")
+            lines.append(f"    global min={float(d[f'min_{phase}'].min()):.3f}  "
+                         f"global max={float(d[f'max_{phase}'].max()):.3f}")
+            lines.append(f"    saturation (fraction outside range): "
+                         f"mean={sat.mean():.3e}  worst_layer={worst_sat} ({sat.max():.3e})")
+        if not have_a:
+            lines.append("")
             continue
         p1 = np.array([_quantile_from_hist(d[f"gap_hist_{phase}"][i], lo, hi, 0.01)
                        for i in range(len(layers))])
         worst_layer = int(layers[int(np.nanargmin(p1))])
         p1_min = float(np.nanmin(p1))
-        lines.append(f"--- {phase} ---")
         lines.append(f"  p1 of relative_gap across layers: "
                      f"min={p1_min:.3e} (layer {worst_layer})   "
                      f"median={np.nanmedian(p1):.3e}   "
@@ -961,6 +996,9 @@ def write_text_summary(d: dict, out_dir: Path) -> None:
             r = p1_min / eps
             verdict = "SAFE" if r > 3 else ("MARGINAL" if r > 1 else "UNSAFE")
             lines.append(f"    {name:12s} ε={eps:.4f}   p1_min/ε={r:7.2f}   {verdict}")
+        if not have_c:
+            lines.append("")
+            continue
         # Winners stream — max magnitude
         max_win = float(max(np.abs(d[f"topk_min_{phase}"]).max(),
                              np.abs(d[f"topk_max_{phase}"]).max()))

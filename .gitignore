@@ -250,3 +250,6 @@ outputs/
 .deps/
 examples/experiment_results/
 benchmarks/gemma4_moe_fp8/datasets/
+examples/dsa_indexer/indexer_logits/
+examples/dsa_indexer/logs/
+.local/bin/

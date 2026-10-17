@@ -3,7 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SRC="$SCRIPT_DIR/vllm"
+SRC="$SCRIPT_DIR/vllm_patches"
 DST="${VLLM_INSTALL_PATH:-/mnt/remote/guangtaow/conda_env/vllm_glm5_py312/lib/python3.12/site-packages/vllm}"
 
 if [[ ! -d "$SRC" ]]; then
@@ -36,8 +36,9 @@ echo ""
 echo "✓ Synced ${#FILES[@]} files successfully."
 echo ""
 echo "Patched files:"
-echo "  - _indexer_logger.py (updated for DeepSeek expert routing)"
-echo "  - model_executor/models/deepseek_v2.py (added instrumentation)"
+echo "  - _indexer_logger.py (per-layer, per-phase logit recorder)"
+echo "  - model_executor/layers/sparse_attn_indexer.py (records lightning-indexer"
+echo "    attention logits; used by GLM-5.1 and DeepSeek-V3.2's Indexer class)"
 echo ""
 echo "To verify, run:"
-echo "  python -c 'from vllm.model_executor.models.deepseek_v2 import DeepseekV2MoE; print(\"OK\")'"
+echo "  python -c 'from vllm.model_executor.layers.sparse_attn_indexer import sparse_attn_indexer; print(\"OK\")'"

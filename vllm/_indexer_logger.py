@@ -17,6 +17,11 @@ Usage modes:
   1. GLM-5.1 sparse attention: raw attention logits (INDEXER_IS_EXPERT_ROUTING=0)
   2. DeepSeek MoE: post-softmax expert scores (INDEXER_IS_EXPERT_ROUTING=1)
 
+INDEXER_STREAMS (default "A,B,C,D") selects which of the four streams above
+to compute; e.g. INDEXER_STREAMS=B,C skips A's extra topk() call and D's
+radix-bucket sort simulation entirely (not just their output fields), for a
+cheaper capture when you only need the raw-logit histogram and/or winners.
+
 No-op when INDEXER_LOGIT_DUMP_DIR is unset. See INDEXER_LOGIT_EXPERIMENT.md
 for the full design.
 """
@@ -65,6 +70,13 @@ def _env_int_list(name: str, default: list[int]) -> list[int]:
     return [int(x.strip()) for x in v.split(",") if x.strip()]
 
 
+def _env_str_set(name: str, default: frozenset[str]) -> frozenset[str]:
+    v = os.environ.get(name)
+    if not v:
+        return default
+    return frozenset(x.strip().upper() for x in v.split(",") if x.strip())
+
+
 @dataclass
 class _Config:
     dump_dir: Path
@@ -80,6 +92,10 @@ class _Config:
     # Stream D — radix boundary-bucket sweep
     radix_bits_sweep: list[int]   # d values to probe, e.g. [4, 6, 8, 12, 16]
     radix_bkt_bins: int           # histogram bins for boundary-bucket sizes
+    # Which streams to actually compute. Streams A (relative gap) and D
+    # (radix boundary-bucket) each do extra GPU work per call (topk / sort);
+    # dropping them here skips that work, not just the output fields.
+    enable_streams: frozenset[str]
 
     @classmethod
     def from_env(cls):
@@ -113,6 +129,9 @@ class _Config:
             dump_every=_env_int("INDEXER_LOGIT_DUMP_EVERY", 0),
             radix_bits_sweep=_env_int_list("INDEXER_RADIX_BITS_SWEEP", [4, 6, 8, 12, 16]),
             radix_bkt_bins=_env_int("INDEXER_RADIX_BKT_BINS", 256),
+            enable_streams=_env_str_set(
+                "INDEXER_STREAMS", frozenset({"A", "B", "C", "D"})
+            ),
         )
 
 
@@ -297,13 +316,16 @@ def _float32_to_sortable_uint32(t: torch.Tensor) -> torch.Tensor:
     Negative floats: flip all bits → more-negative gets smaller uint.
     Works correctly for ±0, ±inf, NaN (NaN → very large uint, sorts last).
     """
-    bits = t.view(torch.int32).view(torch.uint8)  # reinterpret, no copy
     # Operate as int32 for the XOR (torch has no uint32 bitwise on older builds)
     i32 = t.view(torch.int32)
     # where sign bit set (negative float): flip all 32 bits
-    # where sign bit clear (non-negative): flip only sign bit (0x80000000)
+    # where sign bit clear (non-negative): flip only sign bit (0x80000000).
+    # -0x80000000 is the same bit pattern as 0x80000000 but fits in int32's
+    # range ([-2^31, 2^31-1]); the literal 0x80000000 overflows torch.int32
+    # on strict builds (this is the bug behind the run03_buggy_int32overflow
+    # capture directory).
     flip_all = i32 ^ (-1)                           # ^= 0xFFFFFFFF
-    flip_sign = i32 ^ torch.tensor(0x80000000, dtype=torch.int32, device=t.device)
+    flip_sign = i32 ^ torch.tensor(-0x80000000, dtype=torch.int32, device=t.device)
     neg_mask = (i32 < 0)
     sortable_i32 = torch.where(neg_mask, flip_all, flip_sign)
     # Treat as unsigned: view as int32 is fine for >> shift (logical on positive
@@ -402,6 +424,10 @@ class _IndexerRecorder:
     def _record_inner(self, layer, phase, logits, k, ks_t, ke_t):
         cfg = self.cfg
         nd = len(cfg.radix_bits_sweep)
+        want_A = "A" in cfg.enable_streams
+        want_B = "B" in cfg.enable_streams
+        want_C = "C" in cfg.enable_streams
+        want_D = "D" in cfg.enable_streams
         with torch.no_grad():
             logits = logits.detach()
             if logits.dtype not in (torch.float32, torch.float64):
@@ -422,26 +448,38 @@ class _IndexerRecorder:
             valid_mask = (col >= ks.unsqueeze(1)) & (col < ke.unsqueeze(1))
             valid_per_row = (ke - ks).clamp_min(0)
 
-            # ---- Stream B (valid raw logits) ----
-            valid_vals = logits[valid_mask]
-            cntB = int(valid_vals.numel())
-            if cntB == 0:
-                # nothing valid this call — record skip and bail
+            # Cheap bail-out check, independent of which streams are enabled:
+            # if there's no valid data at all, every stream would be empty.
+            if int(valid_mask.sum().item()) == 0:
                 with self.lock:
                     sA, _, _ = self._get(layer, phase)
                     sA.skipped += N_q
                 return
 
-            histB_gpu = torch.histc(
-                valid_vals, bins=cfg.bins,
-                min=float(cfg.range_lo), max=float(cfg.range_hi),
-            )
-            belowB = (valid_vals < cfg.range_lo).sum()
-            aboveB = (valid_vals >= cfg.range_hi).sum()
-            mnB = valid_vals.amin()
-            mxB = valid_vals.amax()
-            sumB = valid_vals.sum().to(torch.float64)
-            sumsqB = (valid_vals.float() * valid_vals.float()).sum().to(torch.float64)
+            # ---- Stream B (valid raw logits) ----
+            if want_B:
+                valid_vals = logits[valid_mask]
+                cntB = int(valid_vals.numel())
+                histB_gpu = torch.histc(
+                    valid_vals, bins=cfg.bins,
+                    min=float(cfg.range_lo), max=float(cfg.range_hi),
+                )
+                belowB = (valid_vals < cfg.range_lo).sum()
+                aboveB = (valid_vals >= cfg.range_hi).sum()
+                mnB = valid_vals.amin()
+                mxB = valid_vals.amax()
+                sumB = valid_vals.sum().to(torch.float64)
+                sumsqB = (valid_vals.float() * valid_vals.float()).sum().to(torch.float64)
+            else:
+                valid_vals = None
+                cntB = 0
+                histB_gpu = torch.zeros(cfg.bins, dtype=torch.float32, device=device)
+                belowB = torch.tensor(0, dtype=torch.int64, device=device)
+                aboveB = torch.tensor(0, dtype=torch.int64, device=device)
+                mnB = torch.tensor(float("inf"), dtype=torch.float32, device=device)
+                mxB = torch.tensor(float("-inf"), dtype=torch.float32, device=device)
+                sumB = torch.tensor(0.0, dtype=torch.float64, device=device)
+                sumsqB = torch.tensor(0.0, dtype=torch.float64, device=device)
 
             # ---- Streams A and C: only on rows with enough valid keys ----
             rows_ok = valid_per_row >= need
@@ -465,7 +503,7 @@ class _IndexerRecorder:
             winners_for_reservoir: torch.Tensor | None = None
             skipped_A = N_q
 
-            if n_rows_ok > 0:
+            if (want_A or want_C) and n_rows_ok > 0:
                 masked = torch.where(
                     valid_mask, logits,
                     torch.full_like(logits, float("-inf")),
@@ -475,35 +513,37 @@ class _IndexerRecorder:
                 ).values
                 top_ok = top[rows_ok]                                    # [N_ok, need]
 
-                # Stream C: winners (top-k values themselves)
-                winners = top_ok[:, :k]                                  # [N_ok, k]
-                sumC = winners.sum().to(torch.float64)
-                sumsqC = (winners.float() * winners.float()).sum().to(torch.float64)
-                mnC = winners.amin()
-                mxC = winners.amax()
-                cntC = int(winners.numel())
-                winners_for_reservoir = winners.reshape(-1)
+                if want_C:
+                    # Stream C: winners (top-k values themselves)
+                    winners = top_ok[:, :k]                              # [N_ok, k]
+                    sumC = winners.sum().to(torch.float64)
+                    sumsqC = (winners.float() * winners.float()).sum().to(torch.float64)
+                    mnC = winners.amin()
+                    mxC = winners.amax()
+                    cntC = int(winners.numel())
+                    winners_for_reservoir = winners.reshape(-1)
 
-                # Stream A: boundary gap
-                diffs = top_ok[:, :-1] - top_ok[:, 1:]                   # [N_ok, k+w]
-                window = diffs[:, k - w : k + w]                         # [N_ok, 2w]
-                window_gap = window.min(dim=-1).values                   # [N_ok]
-                denom = top_ok[:, k].abs()                               # [N_ok]
-                finite = denom > cfg.eps_norm
-                rel = (window_gap / denom)[finite]
-                cntA = int(rel.numel())
-                if cntA > 0:
-                    histA_gpu = torch.histc(
-                        rel, bins=cfg.gap_bins,
-                        min=0.0, max=float(cfg.gap_range_hi),
-                    )
-                    aboveA = (rel >= cfg.gap_range_hi).sum()
-                    mnA = rel.amin()
-                    mxA = rel.amax()
-                    sumA = rel.sum().to(torch.float64)
-                    sumsqA = (rel.float() * rel.float()).sum().to(torch.float64)
-                skipped_A = N_q - cntA
-                rel_for_reservoir = rel
+                if want_A:
+                    # Stream A: boundary gap
+                    diffs = top_ok[:, :-1] - top_ok[:, 1:]               # [N_ok, k+w]
+                    window = diffs[:, k - w : k + w]                     # [N_ok, 2w]
+                    window_gap = window.min(dim=-1).values               # [N_ok]
+                    denom = top_ok[:, k].abs()                           # [N_ok]
+                    finite = denom > cfg.eps_norm
+                    rel = (window_gap / denom)[finite]
+                    cntA = int(rel.numel())
+                    if cntA > 0:
+                        histA_gpu = torch.histc(
+                            rel, bins=cfg.gap_bins,
+                            min=0.0, max=float(cfg.gap_range_hi),
+                        )
+                        aboveA = (rel >= cfg.gap_range_hi).sum()
+                        mnA = rel.amin()
+                        mxA = rel.amax()
+                        sumA = rel.sum().to(torch.float64)
+                        sumsqA = (rel.float() * rel.float()).sum().to(torch.float64)
+                    skipped_A = N_q - cntA
+                    rel_for_reservoir = rel
 
             # ---- Stream D: radix boundary-bucket sizes ----
             # We need rows that have at least k valid keys (boundary exists).
@@ -517,7 +557,7 @@ class _IndexerRecorder:
             d_bkt_sum       = []
             d_bkt_sum_sq    = []
             d_bkt_max       = []
-            n_rows_k_ok = int(rows_k_ok.sum().item())
+            n_rows_k_ok = int(rows_k_ok.sum().item()) if want_D else 0
 
             if n_rows_k_ok > 0:
                 # Mask logits to valid positions only; replace invalid with -inf

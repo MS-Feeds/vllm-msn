@@ -8,15 +8,6 @@ import regex as re
 import torch
 import torch.nn as nn
 
-# Indexer logger for Top-K logit distribution analysis
-try:
-    from _indexer_logger import record as _log_indexer_record, is_enabled as _indexer_is_enabled
-    _INDEXER_LOGGER_AVAILABLE = True
-except ImportError:
-    _INDEXER_LOGGER_AVAILABLE = False
-    _indexer_is_enabled = lambda: False
-    _log_indexer_record = lambda *args, **kwargs: None
-
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -783,54 +774,6 @@ class DeepseekV4MoE(nn.Module):
         org_shape = hidden_states.shape
         normed_x, router_logits = self.norm_gate(hidden_states)
 
-        # ===== INDEXER LOGGER INSTRUMENTATION START =====
-        # Capture post-activation router scores for Top-K distribution analysis
-        if _indexer_is_enabled():
-            try:
-                # Apply same activation as fused_topk_bias will use
-                with torch.no_grad():
-                    if self.scoring_func == "softmax":
-                        # Post-softmax probabilities [0, 1]
-                        router_scores = torch.softmax(router_logits.float(), dim=-1)
-                    elif self.scoring_func == "sigmoid":
-                        # Post-sigmoid scores [0, 1]
-                        router_scores = torch.sigmoid(router_logits.float())
-                    else:
-                        # Fallback: raw logits
-                        router_scores = router_logits.float()
-
-                    # Infer phase from batch size (heuristic)
-                    num_tokens_cur = router_scores.shape[0]
-                    phase = "prefill" if num_tokens_cur > 128 else "decode"
-
-                    # All experts are valid (no masking needed)
-                    num_experts = router_scores.shape[1]
-                    key_valid_starts = torch.zeros(
-                        num_tokens_cur, dtype=torch.long, device=router_scores.device
-                    )
-                    key_valid_ends = torch.full(
-                        (num_tokens_cur,), num_experts,
-                        dtype=torch.long, device=router_scores.device
-                    )
-
-                    # Log to indexer with layer prefix
-                    _log_indexer_record(
-                        k_cache_prefix=self.norm_gate.prefix if hasattr(self.norm_gate, 'prefix') else "unknown_layer",
-                        phase=phase,
-                        logits=router_scores,
-                        index_topk=self.n_activated_experts,
-                        key_valid_starts=key_valid_starts,
-                        key_valid_ends=key_valid_ends,
-                    )
-            except Exception as e:
-                # Don't crash inference if logging fails
-                import sys
-                print(
-                    f"[deepseek_v4] indexer logging failed: {e!r}",
-                    file=sys.stderr
-                )
-        # ===== INDEXER LOGGER INSTRUMENTATION END =====
-
         topk_weights, topk_ids = fused_topk_bias(
             hidden_states=normed_x,
             gating_output=router_logits,
@@ -867,34 +810,6 @@ class DeepseekV4MoE(nn.Module):
         assert not self.experts.is_internal_router
         org_shape = hidden_states.shape
         normed_x, router_logits = self.norm_gate(hidden_states)
-
-        # ===== INDEXER LOGGER INSTRUMENTATION START =====
-        if _indexer_is_enabled():
-            try:
-                with torch.no_grad():
-                    if self.scoring_func == "softmax":
-                        router_scores = torch.softmax(router_logits.float(), dim=-1)
-                    elif self.scoring_func == "sigmoid":
-                        router_scores = torch.sigmoid(router_logits.float())
-                    else:
-                        router_scores = router_logits.float()
-
-                    num_tokens_cur = router_scores.shape[0]
-                    phase = "prefill" if num_tokens_cur > 128 else "decode"
-                    num_experts = router_scores.shape[1]
-
-                    _log_indexer_record(
-                        k_cache_prefix=self.norm_gate.prefix if hasattr(self.norm_gate, 'prefix') else "unknown_layer",
-                        phase=phase,
-                        logits=router_scores,
-                        index_topk=self.n_activated_experts,
-                        key_valid_starts=torch.zeros(num_tokens_cur, dtype=torch.long, device=router_scores.device),
-                        key_valid_ends=torch.full((num_tokens_cur,), num_experts, dtype=torch.long, device=router_scores.device),
-                    )
-            except Exception as e:
-                import sys
-                print(f"[deepseek_v4] indexer logging failed in _forward_fused_moe: {e!r}", file=sys.stderr)
-        # ===== INDEXER LOGGER INSTRUMENTATION END =====
 
         final_hidden_states = self.experts(
             hidden_states=normed_x,

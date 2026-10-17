@@ -1,0 +1,16 @@
+k_index_topk=2048  gap_window=8  gap_eps_norm=1.0e-06
+layers: 61  prefill rows total: 149307016  decode rows total: 30134338306
+
+--- prefill ---
+  Stream B (raw logits): 149307016 samples, range=[-50,50]
+    mean across layers: min=-4.093  max=4.998
+    std  across layers: min=0.952  max=3.001
+    global min=-16.749  global max=11.070
+    saturation (fraction outside range): mean=0.000e+00  worst_layer=0 (0.000e+00)
+
+--- decode ---
+  Stream B (raw logits): 30134338306 samples, range=[-50,50]
+    mean across layers: min=-6.382  max=3.079
+    std  across layers: min=0.914  max=3.308
+    global min=-23.646  global max=12.211
+    saturation (fraction outside range): mean=0.000e+00  worst_layer=0 (0.000e+00)
