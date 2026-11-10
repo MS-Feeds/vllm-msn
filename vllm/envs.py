@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     VLLM_LOGGING_CONFIG_PATH: str | None = None
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
+    FORCE_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
@@ -386,6 +387,18 @@ def use_mega_aot_artifact():
     )
 
     return os.environ.get("VLLM_USE_MEGA_AOT_ARTIFACT", default_value) == "1"
+
+
+def compile_on_one_rank() -> bool:
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import is_torch_equal_or_newer
+
+    if not is_torch_equal_or_newer("2.14.0.dev"):
+        return False
+    # Inductor implements the mode for CUDA/ROCm and XPU only.
+    if not (current_platform.is_cuda_alike() or current_platform.is_xpu()):
+        return False
+    return os.environ.get("VLLM_COMPILE_ON_ONE_RANK", "0") == "1"
 
 
 def env_with_choices(
@@ -872,6 +885,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOGGING_COLOR": lambda: os.getenv("VLLM_LOGGING_COLOR", "auto"),
     # Standard unix flag for disabling ANSI color codes
     "NO_COLOR": lambda: os.getenv("NO_COLOR", "0") != "0",
+    # If set, vllm will force color in log output
+    "FORCE_COLOR": lambda: os.getenv("FORCE_COLOR", "0") != "0",
     # If set, vllm will log stats at this interval in seconds
     # If not set, vllm will log stats every 10 seconds.
     "VLLM_LOG_STATS_INTERVAL": lambda: (
@@ -2197,6 +2212,127 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
         int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))
     ),
+    "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
+        int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
+    ),
+    "VLLM_BEAM_ALWAYS_CONSTRAIN_OUTPUT": lambda: (
+        os.getenv("VLLM_BEAM_ALWAYS_CONSTRAIN_OUTPUT", "True").lower() in ("true", "1")
+    ),
+    "VLLM_CHAT_TEMPLATE_FUEL": lambda: int(
+        os.environ.get("VLLM_CHAT_TEMPLATE_FUEL", "500000")
+    ),
+    "VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT": lambda: float(
+        os.environ.get("VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT", "30")
+    ),
+    "VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("VLLM_COHERE2_ATTN_MOE_DUAL_STREAM_TOKEN_THRESHOLD", "256")
+    ),
+    "VLLM_COMPILE_ON_ONE_RANK": compile_on_one_rank,
+    "VLLM_CONFIDENTIAL_COMPUTE": lambda: os.getenv("VLLM_CONFIDENTIAL_COMPUTE"),
+    "VLLM_ENABLE_GEMM_RS": lambda: bool(int(os.getenv("VLLM_ENABLE_GEMM_RS", "0"))),
+    "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    "VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_FREE_FULL_WEIGHTS": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_FREE_FULL_WEIGHTS", "0"))
+    ),
+    "VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_MEMSET_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_CUTEDSL_MOE_LOCALIZE_MEMSET_OVERLAP", "1"))
+    ),
+    "VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE", "0"))
+    ),
+    "VLLM_HTTP_MAX_REQUEST_BODY_SIZE": lambda: int(
+        os.environ.get("VLLM_HTTP_MAX_REQUEST_BODY_SIZE", str(32 * 1024 * 1024))
+    ),
+    "VLLM_MAX_EMBED_DECODE_BYTES": lambda: int(
+        os.getenv("VLLM_MAX_EMBED_DECODE_BYTES", "2147483648")
+    ),
+    "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES": lambda: int(
+        os.getenv("VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES", "715827880")
+    ),
+    "VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB": lambda: int(
+        os.getenv("VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB", "256")
+    ),
+    "VLLM_MOE_LOCALIZE_BACKFILL": lambda: bool(
+        int(os.getenv("VLLM_MOE_LOCALIZE_BACKFILL", "0"))
+    ),
+    "VLLM_MOONCAKE_CONNECTOR_TIMEOUT": lambda: float(
+        os.getenv("VLLM_MOONCAKE_CONNECTOR_TIMEOUT", "30.0")
+    ),
+    "VLLM_MOONCAKE_STORE_SELECTIVE_LEASE": lambda: (
+        os.getenv("VLLM_MOONCAKE_STORE_SELECTIVE_LEASE", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD": lambda: int(
+        os.getenv("VLLM_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD", "256")
+    ),
+    "VLLM_MORI_EP_V2": lambda: maybe_convert_bool(os.getenv("VLLM_MORI_EP_V2")),
+    "VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD": lambda: (
+        os.getenv("VLLM_MXFP4_EMULATION_DEQUANT_AT_LOAD", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_P2P_HANDSHAKE_TIMEOUT_S": lambda: int(
+        os.getenv("VLLM_P2P_HANDSHAKE_TIMEOUT_S", "30")
+    ),
+    "VLLM_P2P_IDLE_TIMEOUT_S": lambda: int(os.getenv("VLLM_P2P_IDLE_TIMEOUT_S", "300")),
+    "VLLM_P2P_MAX_PEERS": lambda: int(os.getenv("VLLM_P2P_MAX_PEERS", "128")),
+    "VLLM_P2P_TRANSFER_STALL_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_P2P_TRANSFER_STALL_TIMEOUT_S", "20")
+    ),
+    "VLLM_PP_TRANSPORT": env_with_choices(
+        "VLLM_PP_TRANSPORT", "auto", ["auto", "nccl", "copy_engine"]
+    ),
+    "VLLM_RELOAD_MODE": env_with_choices(
+        "VLLM_RELOAD_MODE", "layerwise", ["layerwise", "direct"]
+    ),
+    "VLLM_REQUEST_BODY_LOG_LEVEL": lambda: os.getenv(
+        "VLLM_REQUEST_BODY_LOG_LEVEL", "DEBUG"
+    ).upper(),
+    "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT": lambda: os.getenv(
+        "VLLM_ROCM_MUSE_MOE_ONLINE_QUANT", ""
+    ).lower(),
+    "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE": lambda: os.getenv(
+        "VLLM_ROCM_MUSE_MOE_REDUCE_DTYPE", "fp32"
+    ).lower(),
+    "VLLM_ROCM_PARALLEL_INDEX_TOPK": lambda: (
+        os.getenv("VLLM_ROCM_PARALLEL_INDEX_TOPK", "0") == "1"
+    ),
+    "VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4": lambda: maybe_convert_bool(
+        os.getenv("VLLM_ROCM_USE_AITER_MOE_A4W4_DSV4")
+    ),
+    "VLLM_ROCM_USE_AITER_MOE_SITUV2": env_with_choices(
+        "VLLM_ROCM_USE_AITER_MOE_SITUV2",
+        "auto",
+        ["auto", "a4w4", "a8w4", "a16w4", "0", "1"],
+        case_sensitive=False,
+    ),
+    "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA", "False").lower()
+        in ("true", "1")
+    ),
+    "VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES": lambda: int(
+        os.getenv("VLLM_SKINNY_GEMM_MAX_WEIGHT_BYTES", "0")
+    ),
+    "VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB": lambda: int(
+        os.getenv("VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB", "2048")
+    ),
+    "VLLM_STEP5_SHARD_SP_SHARED_EXPERT": lambda: bool(
+        int(os.getenv("VLLM_STEP5_SHARD_SP_SHARED_EXPERT", "0"))
+    ),
+    "VLLM_TRITON_JIT_WARMUP_NUM_THREADS": lambda: int(
+        os.getenv("VLLM_TRITON_JIT_WARMUP_NUM_THREADS", "4")
+    ),
+    "VLLM_USE_FUSED_MQA_TOPK": lambda: bool(
+        int(os.getenv("VLLM_USE_FUSED_MQA_TOPK", "1"))
+    ),
+    "VLLM_USE_LOCALITY_DOMAINS": lambda: bool(
+        int(os.getenv("VLLM_USE_LOCALITY_DOMAINS", "0"))
+    ),
+    "VLLM_XPU_FORCE_N_CONTIG_WEIGHT": lambda: bool(
+        int(os.getenv("VLLM_XPU_FORCE_N_CONTIG_WEIGHT", "0"))
+    ),
+    "VLLM_XPU_PP_MICROBATCH": lambda: bool(
+        int(os.getenv("VLLM_XPU_PP_MICROBATCH", "1"))
+    ),
 }
 
 
@@ -2363,7 +2499,17 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        "FORCE_COLOR",
         "VLLM_SKIP_VERSION_SUFFIX",
+        "VLLM_CHAT_TEMPLATE_FUEL",
+        "VLLM_HTTP_MAX_REQUEST_BODY_SIZE",
+        "VLLM_MAX_EMBED_DECODE_BYTES",
+        "VLLM_MAX_MEDIA_REQUEST_DECODE_BYTES",
+        "VLLM_MAX_MEDIA_REQUEST_DOWNLOAD_SIZE_MB",
+        "VLLM_PP_TRANSPORT",
+        "VLLM_RELOAD_MODE",
+        "VLLM_REQUEST_BODY_LOG_LEVEL",
+        "VLLM_TRITON_JIT_WARMUP_NUM_THREADS",
     }
 
     from vllm.config.utils import normalize_value
