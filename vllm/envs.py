@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     VLLM_USE_PRECOMPILED: bool = False
     VLLM_USE_PRECOMPILED_RUST: bool = False
     VLLM_SKIP_PRECOMPILED_VERSION_SUFFIX: bool = False
+    VLLM_SKIP_VERSION_SUFFIX: bool = False
     VLLM_DOCKER_BUILD_CONTEXT: bool = False
     VLLM_BUILD_COMMIT: str = "unknown"
     VLLM_BUILD_PIPELINE: str = "local"
@@ -2192,6 +2193,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # Whether to skip version suffix when building package.
+    "VLLM_SKIP_VERSION_SUFFIX": lambda: bool(
+        int(os.getenv("VLLM_SKIP_VERSION_SUFFIX", "0"))
+    ),
 }
 
 
@@ -2358,6 +2363,7 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        "VLLM_SKIP_VERSION_SUFFIX",
     }
 
     from vllm.config.utils import normalize_value
