@@ -964,6 +964,23 @@ def unified_attention(
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
         tile_size = TILE_SIZE_DECODE
 
+    # CodeGuru sm_80 decode tuning (Qwen3.5 campaign). The high-concurrency
+    # DECODE path (num_seqs > seq_threshold_3D runs the 2D single-pass kernel)
+    # is launched with ``TILE_SIZE_PREFILL`` (32 for bf16), which is the
+    # PREFILL-tuned tile, not the decode tile (16) — a decode/prefill
+    # mis-tiling on the memory-bound decode kernel. Allow an env override of
+    # the 2D-decode tile + Triton pipelining stages + num_warps so we can
+    # select the decode-native geometry without a full kernel rewrite.
+    # Numerics-neutral (same softmax; only tile geometry + num_stages +
+    # num_warps change).
+    _decode2d_tile = envs.D2G_TILE
+    _decode2d_stages = envs.D2G_STAGES
+    _decode2d_warps = envs.D2G_WARPS
+    if _decode2d_tile and not use_3d:
+        tile_size = _decode2d_tile
+    _num_warps = _decode2d_warps or None
+    _num_stages = _decode2d_stages or None
+
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1033,6 +1050,8 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        num_warps=_num_warps,
+        num_stages=_num_stages,
     )
 
     if use_3d:
