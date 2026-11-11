@@ -625,6 +625,16 @@ def _resolve_rust_cli_path() -> str | None:
     return raw
 
 
+# Environment variables that were removed, mapped to a migration hint. Setting
+# one is an error rather than an "unknown variable" warning.
+removed_environment_variables: dict[str, str] = {
+    "VLLM_MARLIN_INPUT_DTYPE": (
+        "Marlin no longer supports 8-bit activations. Use "
+        "`--quantization humming` and set the activation dtype with "
+        'VLLM_HUMMING_INPUT_QUANT_CONFIG, e.g. \'{"dtype":"int8"}\'.'
+    ),
+}
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
