@@ -21,6 +21,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import refill_derived
+from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 
 from .gemma4_mtp import Gemma4MTPAttention, Gemma4MTPDecoderLayer
 from .qwen3_dflash import (
@@ -52,7 +53,7 @@ class Gemma4DSparkAttention(Gemma4MTPAttention):
             config, "attention_k_eq_v", False
         )
 
-        layer_config = config.per_layer_config[layer_idx]
+        layer_config = gemma4_layer_config(config, layer_idx)
         head_dim = layer_config.head_dim
         num_kv_heads = layer_config.num_key_value_heads
         super().__init__(

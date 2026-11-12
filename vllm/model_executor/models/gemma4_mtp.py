@@ -46,6 +46,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import refill_derived
 from vllm.sequence import IntermediateTensors
+from vllm.transformers_utils.configs.gemma4 import gemma4_layer_config
 from vllm.v1.worker.gpu.spec_decode.gemma4.config import Gemma4MTPSpeculatorConfig
 
 from .gemma4 import Gemma4MLP, _get_text_config
@@ -266,7 +267,7 @@ class Gemma4MTPDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         layer_idx = extract_layer_index(prefix)
-        layer_config = config.per_layer_config[layer_idx]
+        layer_config = gemma4_layer_config(config, layer_idx)
         head_dim = layer_config.head_dim
         num_kv_heads = layer_config.num_key_value_heads
 
