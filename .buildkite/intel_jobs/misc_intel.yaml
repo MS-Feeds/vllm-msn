@@ -236,7 +236,7 @@ steps:
   device: intel_gpu_k8s
   num_devices: 4
   resource_claim_template: b70-4
-  working_dir: "/vllm-workspace/"
+  working_dir: "/workspace/vllm/"
   env:
     VLLM_TEST_DEVICE: "xpu"
   source_file_dependencies:
@@ -363,11 +363,16 @@ steps:
 - label: ":intel: (BMG) Detokenizer Stop Strings (XPU)"
   key: detokenizer-stop-strings-xpu
   timeout_in_minutes: 45
-  device: intel_gpu_k8s
-  num_devices: 1
-  resource_claim_template: b70-1
-  working_dir: "/vllm-workspace/"
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 24+
+  no_plugin: true
+  working_dir: "."
   env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
     VLLM_TEST_DEVICE: "xpu"
   source_file_dependencies:
   - vllm/assets/
@@ -387,8 +392,10 @@ steps:
   - tests/multimodal
   - tests/utils_
   commands:
-    - cd tests
-    - pytest -v -s detokenizer/test_stop_strings.py
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      pytest -v -s detokenizer/test_stop_strings.py'
 
 - label: ":intel: (BMG) Fusion Unit Tests"
   key: fusion-unit-tests
