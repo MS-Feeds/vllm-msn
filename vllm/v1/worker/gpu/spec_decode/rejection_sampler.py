@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from vllm.config import SpeculativeConfig
-from vllm.envs import envs
+import vllm.envs as envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
