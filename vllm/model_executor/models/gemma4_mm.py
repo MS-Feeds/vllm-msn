@@ -616,8 +616,6 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
             video_timestamps_per_video: list[list[float]] = []
             video_frame_counts: list[int] = []
 
-            video_replacements: list[str] = []
-
             for item in videos:
                 video_array, metadata = item
 
@@ -669,31 +667,9 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
                 video_timestamps_per_video.append(timestamps)
                 video_frame_counts.append(len(frames))
 
-                # Build expanded replacement text for this video.
-                ts_strs = [f"{int(s // 60):02d}:{int(s % 60):02d}" for s in timestamps]
-                replacement = " ".join(
-                    f"{t} {processor.boi_token}"
-                    f"{processor.video_token * n}"
-                    f"{processor.eoi_token}"
-                    for t, n in zip(ts_strs, num_soft_per_frame)
-                )
-                video_replacements.append(replacement)
-
-            # Replace all <|video|> placeholders at once. We split on
-            # video_token to get N+1 parts, then interleave with the
-            # N replacement strings. This avoids the iterative
-            # split-replace bug where replacement text (which itself
-            # contains <|video|> tokens) collides with later splits.
-            vt = processor.video_token
-            parts = prompt_text.split(vt, len(video_replacements))
-
-            # NOTE: len(parts) <= len(video_replacements) + 1
-            parts_with_repl: list[str] = []
-            for part, repl in zip(parts, video_replacements):
-                parts_with_repl.extend([part, repl])
-            parts_with_repl.extend(parts[len(video_replacements) :])
-
-            prompt_text = "".join(parts_with_repl)
+            # Videos were processed above, so drop their placeholders from the text.
+            mm_counts = {**mm_items.get_all_counts(), "video": 0}
+            prompt_text = self._get_hf_mm_text(mm_counts)
 
             video_outputs = {
                 "pixel_values_videos": torch.cat(all_video_pixel_values, dim=0),
@@ -741,11 +717,14 @@ class Gemma4MultiModalProcessor(BaseMultiModalProcessor[Gemma4ProcessingInfo]):
         if val is not None and is_top_level_max_soft_tokens:
             patched_mm_kwargs["max_soft_tokens"] = val
 
-        processed_data = self.info.ctx.call_hf_processor(
-            self.info.get_hf_processor(**patched_mm_kwargs),
-            dict(text=prompt_text, **mm_data),
-            patched_mm_kwargs,
-        )
+        if hf_data:
+            processed_data = self.info.ctx.call_hf_processor(
+                self.info.get_hf_processor(**patched_mm_kwargs),
+                dict(text=prompt_text, **hf_data),
+                patched_mm_kwargs,
+            )
+        else:
+            processed_data = BatchFeature()
 
         # HF uses 'image_position_ids'; vLLM uses 'pixel_position_ids'.
         # Remap here to keep a single translation point.
@@ -1275,6 +1254,148 @@ class Gemma4ForConditionalGeneration(
         # plus the matmul output that live alongside it at peak.
         cost = patches_per_item * 4 * position_embedding_size * 8
         return max(1, budget // cost) if cost > 0 else 1
+
+
+    def _normalize_pixel_values(
+        self, pixel_values: torch.Tensor, dtype: torch.dtype
+    ) -> torch.Tensor:
+        # With mm_device_do_normalize the processor skips the rescale, so
+        # pixel_values hold raw uint8 patches. Patches are channel-last, so
+        # normalize per pixel.
+        num_channels = getattr(self.config.vision_config, "num_channels", 3)
+        return self.vision_input_norm(
+            pixel_values.reshape(-1, num_channels), dtype
+        ).view(pixel_values.shape)
+
+    def _embed_patches(
+        self,
+        pixel_values: torch.Tensor,
+        pixel_position_ids: torch.Tensor,
+        padding_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        pixel_values = self._normalize_pixel_values(pixel_values, self.model_dtype)
+        # Inline `Gemma4VisionPatchEmbedder.forward` with the pixel values in
+        # the model dtype. Transformers casts them to `input_proj.weight.dtype`,
+        # which is the storage dtype (e.g. FP8) once `input_proj` is quantized.
+        embedder = self.vision_tower.patch_embedder
+        pixel_values = (2 * (pixel_values - 0.5)).to(self.model_dtype)
+        hidden_states = embedder.input_proj(pixel_values)
+        position_embeddings = embedder._position_embeddings(
+            pixel_position_ids, padding_positions
+        )
+        return (hidden_states + position_embeddings).to(self.model_dtype)
+
+    # ------------------------------------------------------------------ #
+    # Data-parallel ViT execution
+    # ------------------------------------------------------------------ #
+
+    def _dp_execute_and_gather(
+        self,
+        mm_kwargs: dict[str, Any],
+        process_fn: Callable[[dict[str, Any]], list[torch.Tensor]],
+    ) -> list[torch.Tensor]:
+        item_specs = self.get_encoder_cudagraph_item_specs(mm_kwargs)
+        total_items = len(item_specs)
+        if total_items == 0:
+            return []
+
+        per_item_input_sizes = [spec.input_size for spec in item_specs]
+
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        (image_rank_assignment, images_per_rank, _) = get_load_balance_assignment(
+            per_item_input_sizes, tp_size
+        )
+
+        cum_images_per_rank = [0, *itertools.accumulate(images_per_rank)]
+        local_indices = image_rank_assignment[
+            cum_images_per_rank[tp_rank] : cum_images_per_rank[tp_rank + 1]
+        ]
+
+        if len(local_indices) == 0:
+            local_outputs = []
+        else:
+            local_mm_kwargs = self.select_encoder_cudagraph_items(
+                mm_kwargs, local_indices
+            )
+            local_outputs = process_fn(local_mm_kwargs)
+
+        device = next(self.parameters()).device
+        local_len_tensor = torch.zeros(total_items, dtype=torch.int64, device=device)
+        for idx, output in zip(local_indices, local_outputs):
+            local_len_tensor[idx] = output.shape[0]
+        actual_item_lens = tensor_model_parallel_all_reduce(local_len_tensor).tolist()
+
+        hidden_size = self.config.text_config.hidden_size
+        max_output_tokens_per_rank = max(
+            sum(
+                actual_item_lens[i]
+                for i in image_rank_assignment[
+                    cum_images_per_rank[r] : cum_images_per_rank[r + 1]
+                ]
+            )
+            for r in range(tp_size)
+        )
+
+        if max_output_tokens_per_rank == 0:
+            return [
+                torch.empty(
+                    (0, hidden_size),
+                    device=device,
+                    dtype=self.model_dtype,
+                )
+                for _ in range(total_items)
+            ]
+
+        if len(local_outputs) > 0:
+            local_concat = torch.cat(local_outputs, dim=0)
+        else:
+            local_concat = torch.empty(
+                (0, hidden_size),
+                device=device,
+                dtype=self.model_dtype,
+            )
+
+        current_len = local_concat.shape[0]
+        if current_len < max_output_tokens_per_rank:
+            padding = torch.empty(
+                (max_output_tokens_per_rank - current_len, hidden_size),
+                dtype=self.model_dtype,
+                device=device,
+            )
+            local_padded = torch.cat([local_concat, padding], dim=0)
+        else:
+            local_padded = local_concat
+
+        gathered = tensor_model_parallel_all_gather(local_padded, dim=0)
+
+        rank_outputs: list[torch.Tensor] = []
+        current_idx = 0
+        for rank in range(tp_size):
+            start = rank * max_output_tokens_per_rank
+            rank_count = images_per_rank[rank]
+            rank_indices = image_rank_assignment[current_idx : current_idx + rank_count]
+            rank_tokens = sum(actual_item_lens[i] for i in rank_indices)
+            current_idx += rank_count
+            rank_outputs.append(gathered[start : start + rank_tokens])
+
+        result: list[torch.Tensor | None] = [None] * total_items
+        current_idx = 0
+        for rank in range(tp_size):
+            count = images_per_rank[rank]
+            if count > 0:
+                rank_items = image_rank_assignment[current_idx : current_idx + count]
+                scatter_output_slices(
+                    rank_outputs[rank],
+                    rank_items,
+                    actual_item_lens,
+                    result,
+                )
+                current_idx += count
+
+        return [res for res in result if res is not None]
+
 
     # ------------------------------------------------------------------ #
     # Image processing
@@ -1958,13 +2079,13 @@ class Gemma4ForConditionalGeneration(
 
     def encoder_cudagraph_forward(
         self,
-        inputs: dict[str, torch.Tensor],
+        values: dict[str, torch.Tensor],
         path: str = "default",
         **kwargs: Any,
     ) -> torch.Tensor:
-        pixel_values = inputs["pixel_values"]
-        pixel_position_ids = inputs["pixel_position_ids"]
-        gather_indices = inputs["gather_indices"]
+        pixel_values = values["pixel_values"]
+        pixel_position_ids = values["pixel_position_ids"]
+        gather_indices = values["gather_indices"]
 
         pad_tensor = (pixel_position_ids == -1).all(dim=-1)
 
@@ -2028,6 +2149,15 @@ class Gemma4ForConditionalGeneration(
 
         return torch.cat(embeddings, dim=0)
 
+    def _per_layer_embeddings_on(self, device: torch.device) -> torch.Tensor:
+        # A plain attribute, not a buffer, so the IPC weight cache never shares
+        # this per-step scratch; reallocate if the model was moved after init.
+        if self.per_layer_embeddings.device != device:
+            self.per_layer_embeddings = torch.zeros_like(
+                self.per_layer_embeddings, device=device
+            )
+        return self.per_layer_embeddings
+
     def embed_input_ids(
         self,
         input_ids: torch.Tensor,
@@ -2060,9 +2190,9 @@ class Gemma4ForConditionalGeneration(
                     self.config.text_config.num_hidden_layers,
                     self.config.text_config.hidden_size_per_layer_input,
                 )
-                self.per_layer_embeddings[: per_layer_inputs.shape[0]].copy_(
-                    per_layer_inputs
-                )
+                self._per_layer_embeddings_on(per_layer_inputs.device)[
+                    : per_layer_inputs.shape[0]
+                ].copy_(per_layer_inputs)
 
         if multimodal_embeddings is None or is_multimodal is None:
             return super().embed_input_ids(input_ids)
@@ -2091,7 +2221,9 @@ class Gemma4ForConditionalGeneration(
         # Select the pre-cached PLEs for this batch (None when PLE
         # is disabled for variants without PLE).
         per_layer_inputs = (
-            self.per_layer_embeddings[: inputs_embeds.shape[0]]
+            self._per_layer_embeddings_on(inputs_embeds.device)[
+                : inputs_embeds.shape[0]
+            ]
             if self.per_layer_embeddings is not None and inputs_embeds is not None
             else None
         )
