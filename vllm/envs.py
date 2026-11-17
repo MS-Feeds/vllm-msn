@@ -706,6 +706,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "D2G_WARPS": lambda: int(
         os.getenv("D2G_WARPS", "0")
     ),
+    # CodeGuru Gemma4 campaign: make greedy speculative decode lossless by
+    # capping acceptance at the target's first EOS argmax. DSpark's separate
+    # workspace lane never proposes EOS, so without this cap it block-feeds
+    # continuations past the natural stop and over-generates (~2415 vs ~1320
+    # tok/req). Default off = byte-identical existing behavior.
+    "VLLM_GEMMA4_EOS_CAP_S2": lambda: int(
+        os.getenv("VLLM_GEMMA4_EOS_CAP_S2", "0")
+    ),
     # Maximum number of compilation jobs to run in parallel.
     # By default this is the number of CPUs
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),

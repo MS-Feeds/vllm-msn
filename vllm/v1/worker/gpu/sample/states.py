@@ -24,6 +24,11 @@ class SamplingStates:
         self.top_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.min_p = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.seeds = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        # Per-request end-of-sequence token id used to make greedy speculative
+        # decode lossless (stop at the target's first EOS argmax). -1 disables
+        # EOS capping for a request.
+        self.eos_token_id = UvaBackedTensor(max_num_reqs, dtype=torch.int64)
+        self.eos_token_id.np.fill(-1)
         # Tracks whether `seed` was set explicitly by the user, so callers
         # can fall back from RNG paths that don't honor per-request seeds.
         self.seeds_set = np.zeros(max_num_reqs, dtype=bool)
@@ -51,6 +56,9 @@ class SamplingStates:
         self.top_k.np[req_idx] = top_k
         self.min_p.np[req_idx] = min_p
 
+        eos = sampling_params.eos_token_id
+        self.eos_token_id.np[req_idx] = -1 if eos is None else eos
+
         seed = sampling_params.seed
         self.seeds_set[req_idx] = seed is not None
         if seed is None:
@@ -77,6 +85,7 @@ class SamplingStates:
         self.top_k.copy_to_uva()
         self.min_p.copy_to_uva()
         self.seeds.copy_to_uva()
+        self.eos_token_id.copy_to_uva()
 
     def apply_temperature(
         self,

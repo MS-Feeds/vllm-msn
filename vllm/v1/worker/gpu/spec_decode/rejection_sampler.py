@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from vllm.config import SpeculativeConfig
+from vllm.envs import envs
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
@@ -164,6 +165,9 @@ class RejectionSampler:
             assert isinstance(sampler, GPUWatermarkSampler)
         self.num_speculative_steps = spec_config.num_speculative_tokens
         self.enable_adaptive_verification = spec_config.enable_adaptive_verification
+        # CodeGuru Gemma4 campaign: cap greedy acceptance at the request's EOS
+        # argmax for lossless stop-at-EOS (fixes DSpark over-generation).
+        self.eos_cap = bool(envs.VLLM_GEMMA4_EOS_CAP_S2)
         rejection_sample_method = spec_config.rejection_sample_method
         self.use_block_verification: bool = False
         self.fly_window_size = 0
@@ -304,6 +308,8 @@ class RejectionSampler:
             skip_masked_vocab_blocks=bool(
                 np.any(self.sampler.may_mask_logits[idx_mapping_np])
             ),
+            req_eos=self.sampler.sampling_states.eos_token_id.gpu,
+            eos_cap=self.eos_cap,
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),

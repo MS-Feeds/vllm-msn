@@ -572,12 +572,15 @@ def _rejection_kernel(
     # [num_logits]
     fly_entropy_ptr,
     fly_entropy_threshold,
+    # [max_num_reqs]
+    req_eos_ptr,
     vocab_num_blocks,
     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
     HAS_DRAFT_LOGITS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
     USE_BLOCK_VERIFICATION: tl.constexpr,
     FLY_WINDOW_SIZE: tl.constexpr,
+    EOS_CAP: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
@@ -595,6 +598,11 @@ def _rejection_kernel(
     target_lse = 0.0
     draft_lse = 0.0
     verifying = True
+    if EOS_CAP:
+        eos_id = tl.load(req_eos_ptr + req_state_idx).to(tl.int64)
+    else:
+        eos_id = tl.full((), -1, tl.int64)
+    eos_cap_active = EOS_CAP and eos_id >= 0 and is_greedy
     for i in range(num_draft_tokens):
         logit_idx = start_idx + i
         draft_sampled = tl.load(draft_sampled_ptr + logit_idx + 1).to(tl.int64)
@@ -633,6 +641,21 @@ def _rejection_kernel(
                 else:
                     accepted = target_argmax == draft_sampled
                 accepted &= is_valid_draft
+                # Lossless stop-at-EOS: a greedy request must terminate as soon
+                # as the target's argmax is EOS, exactly like dense autoregressive
+                # generation. DSpark's separate workspace lane never proposes EOS,
+                # so without this cap the target is block-fed (and accepts)
+                # continuations past the natural stop, over-generating (~2415 vs
+                # ~1320 tok/req). When the target argmax at a draft position is
+                # EOS, the generated EOS must be the final committed token.
+                if FLY_WINDOW_SIZE == 0 and eos_cap_active and target_argmax == eos_id:
+                    # Reject at this position so the resampler inserts EOS here,
+                    # and cap the accepted length at i so nothing is committed
+                    # after it. check_stop (scheduler.py _update_request_with_output)
+                    # then sees EOS as the last token and terminates the request.
+                    if accepted_length == i:
+                        accepted = False
+                        accepted_length = i
                 if FLY_WINDOW_SIZE > 0:
                     target_logit = tl.load(
                         target_logits_ptr
@@ -1158,6 +1181,8 @@ def rejection_sample(
     fly_entropy_threshold: float = 0.3,
     fly_entropy_top_k: int = 3,
     skip_masked_vocab_blocks: bool = False,
+    req_eos: torch.Tensor | None = None,
+    eos_cap: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
     draft_logits = None
@@ -1170,6 +1195,11 @@ def rejection_sample(
     )
     num_reqs = cu_num_logits.shape[0] - 1
     num_logits, vocab_size = target_logits.shape
+
+    if eos_cap:
+        assert req_eos is not None and req_eos.shape[0] >= num_reqs, (
+            "eos_cap requires a per-request eos token id tensor"
+        )
 
     watermark = contexts is not None
     assert watermark == (watermarking is not None) == (watermark_key is not None), (
@@ -1351,6 +1381,12 @@ def rejection_sample(
     sampled = draft_sampled.new_empty(
         num_reqs, num_speculative_steps + 1, dtype=torch.int64
     )
+    if req_eos is None:
+        # Triton requires a real tensor pointer for the EOS argument even when
+        # EOS_CAP is compile-time disabled (its load is dead in that case). On
+        # the default path this is a single tiny, hot-tolerable allocation; the
+        # EOS_CAP constexpr keeps the load out of the compiled kernel.
+        req_eos = torch.full((num_reqs,), -1, dtype=torch.int64, device=target_logits.device)
     num_sampled = sampled.new_empty(num_reqs, dtype=torch.int32)
     target_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
     draft_rejected_logsumexp = target_logits.new_empty(num_reqs, dtype=torch.float32)
@@ -1388,12 +1424,14 @@ def rejection_sample(
         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
         fly_entropy,
         fly_entropy_threshold,
+        req_eos,
         vocab_num_blocks,
         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
         HAS_DRAFT_LOGITS=has_draft_logits,
         SYNTHETIC_MODE=synthetic_conditional_rates is not None,
         USE_BLOCK_VERIFICATION=use_block_verification,
         FLY_WINDOW_SIZE=fly_window_size,
+        EOS_CAP=eos_cap,
         num_warps=1,
     )
 
